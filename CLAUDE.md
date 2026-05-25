@@ -19,8 +19,10 @@ at startup. Per-row processing (potentially billions of rows) runs the compiled
 A script is a sequence of tulisp forms. The pipeline verbs are registered with
 `ctx.defspecial`, so they receive their **raw, unevaluated** argument forms and
 compile them — column names stay symbols, they are never looked up as
-variables. Everything else in tulisp (`let`, `dolist`, `mapcar`, string fns…) is
-available to *generate* a pipeline, but only the compiled verbs run per row.
+variables. tulisp control flow (`if`/`when`/`dotimes`…) runs at compile time and
+can emit pipeline steps conditionally or repeatedly, but because verbs read
+their column arguments literally, a loop variable is not interpolated into a
+column name. Only the compiled verbs run per row.
 
 | csvm DSL                         | csvm-rs Lisp                                  |
 |----------------------------------|-----------------------------------------------|
@@ -90,7 +92,8 @@ lifetime, so there is one `apply` implementation.
 ## CLI (parity with csvm)
 
 `csvm [-f IN] [-o OUT] [-n THREADS] [-t TMPDIR] [--chunk-size BYTES]
-[--print-engine] SCRIPT`. Defaults: stdin/stdout, threads = 1, chunk = 1 MB.
+[--sort-buffer BYTES] [--print-engine] SCRIPT`. Defaults: stdin/stdout,
+threads = all CPUs, chunk = 1 MB, sort buffer = 256 MiB.
 
 ## Conventions
 
