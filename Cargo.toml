@@ -1,0 +1,30 @@
+[package]
+name = "csvm-rs"
+version = "0.1.0"
+edition = "2024"
+description = "A multithreaded CSV manipulation tool with a Lisp command language."
+license = "GPL-3.0"
+
+[lib]
+name = "csvm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "csvm"
+path = "src/main.rs"
+
+[dependencies]
+# tulisp is the command language: it parses and *compiles* the script into a
+# plain-Rust execution plan once at startup. It is never invoked per row.
+tulisp = { path = "../tulisp" }
+# MPMC bounded channels for the parse -> work -> write pipeline.
+crossbeam-channel = "0.5"
+# SIMD-accelerated byte scanning for the zero-copy CSV scanner.
+memchr = "2"
+# Backs the `=~` / `!~` match operators in `select`.
+regex = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
