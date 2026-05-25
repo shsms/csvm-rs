@@ -243,12 +243,13 @@ impl Sorter {
 /// one run (kept in memory, or spilled if over budget).
 fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
     let mut batch: Vec<OwnedRow> = Vec::new();
+    let mut scratch: Vec<Field> = Vec::new();
     let mut err: Option<Error> = None;
     csv::parse_chunk(block, |row| {
         if err.is_some() {
             return;
         }
-        match apply_stmts(&ctx.pre, row) {
+        match apply_stmts(&ctx.pre, row, &mut scratch) {
             Ok(true) => batch.push(row.iter().map(|f| f.clone().into_owned()).collect()),
             Ok(false) => {}
             Err(e) => err = Some(e),

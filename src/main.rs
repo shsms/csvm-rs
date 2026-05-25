@@ -1,5 +1,6 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Write};
+use std::path::Path;
 use std::process;
 
 use csvm::cli::{self, Parsed};
@@ -24,36 +25,59 @@ fn run() -> Result<(), String> {
 
     // tulisp compiles the script into a plan here, once.
     let mut plan = compile::compile(&args.script).map_err(|e| e.to_string())?;
-
-    let mut input: Box<dyn BufRead> = match args.in_file.as_deref() {
-        Some(path) if path != "-" => Box::new(BufReader::new(
-            File::open(path).map_err(|e| format!("cannot open input '{path}': {e}"))?,
-        )),
-        _ => Box::new(BufReader::new(io::stdin())),
-    };
-
-    let header = exec::read_header(&mut input).map_err(|e| e.to_string())?;
-    let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
-
-    if args.print_engine {
-        print!("{}", exec::describe(&plan));
-        return Ok(());
-    }
-
-    let mut output: Box<dyn Write + Send> = match args.out_file.as_deref() {
-        Some(path) if path != "-" => Box::new(BufWriter::new(
-            File::create(path).map_err(|e| format!("cannot open output '{path}': {e}"))?,
-        )),
-        _ => Box::new(BufWriter::new(io::stdout())),
-    };
-
     let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,
         temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
         sort_buffer: args.sort_buffer,
     };
-    exec::run(&plan, &out_header, &opts, &mut input, &mut output).map_err(|e| e.to_string())?;
-    output.flush().map_err(|e| e.to_string())?;
+
+    // A real file goes through the sharding-capable path; stdin/`-` streams.
+    match args.in_file.as_deref().filter(|p| *p != "-") {
+        Some(path) => {
+            let path = Path::new(path);
+            let (header, data_start, file_len) =
+                exec::read_header_from_path(path).map_err(|e| e.to_string())?;
+            let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
+            if args.print_engine {
+                print!("{}", exec::describe(&plan));
+                return Ok(());
+            }
+            let mut output = open_output(&args)?;
+            exec::run_file(
+                &plan,
+                &out_header,
+                &opts,
+                path,
+                data_start,
+                file_len,
+                &mut output,
+            )
+            .map_err(|e| e.to_string())?;
+            output.flush().map_err(|e| e.to_string())?;
+        }
+        None => {
+            let mut input = BufReader::new(io::stdin());
+            let header = exec::read_header(&mut input).map_err(|e| e.to_string())?;
+            let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
+            if args.print_engine {
+                print!("{}", exec::describe(&plan));
+                return Ok(());
+            }
+            let mut output = open_output(&args)?;
+            exec::run(&plan, &out_header, &opts, &mut input, &mut output)
+                .map_err(|e| e.to_string())?;
+            output.flush().map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
+}
+
+fn open_output(args: &cli::Args) -> Result<Box<dyn Write + Send>, String> {
+    Ok(match args.out_file.as_deref() {
+        Some(path) if path != "-" => Box::new(BufWriter::new(
+            File::create(path).map_err(|e| format!("cannot open output '{path}': {e}"))?,
+        )),
+        _ => Box::new(BufWriter::new(io::stdout())),
+    })
 }

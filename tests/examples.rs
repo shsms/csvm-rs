@@ -5,6 +5,8 @@
 
 use csvm::exec::{self, RunOpts};
 use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const INPUT: &str = "\
 id,fieldA,fieldB,countA,countZ
@@ -154,6 +156,87 @@ fn conditional_step_via_when() {
         run_checked("(when nil (drop-cols fieldA)) (cols id fieldA)", INPUT),
         "id,fieldA\n1,t\n2,f\n3,t\n4,t\n5,f\n"
     );
+}
+
+static SEQ: AtomicU32 = AtomicU32::new(0);
+
+fn temp_csv(content: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "csvm_it_{}_{}.csv",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, content).unwrap();
+    path
+}
+
+fn run_file_str(script: &str, path: &std::path::Path, threads: usize) -> String {
+    let mut plan = csvm::compile::compile(script).unwrap();
+    let (header, data_start, file_len) = exec::read_header_from_path(path).unwrap();
+    let out_header = plan.resolve(&header).unwrap();
+    let opts = RunOpts {
+        chunk_size: 1 << 20,
+        threads,
+        temp_dir: std::env::temp_dir(),
+        sort_buffer: 1 << 20,
+    };
+    let mut out = Vec::new();
+    exec::run_file(
+        &plan,
+        &out_header,
+        &opts,
+        path,
+        data_start,
+        file_len,
+        &mut out,
+    )
+    .unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+#[test]
+fn sharded_file_matches_serial_for_many_thread_counts() {
+    // Rows of varied length so shard boundaries (at total/N offsets) land at
+    // different points inside the data, stressing the line-boundary snapping.
+    let mut content = String::from("id,grp,val\n");
+    for i in 0..3000u32 {
+        content.push_str(&format!(
+            "{i},{},{}\n",
+            i % 5,
+            "v".repeat((i % 23) as usize)
+        ));
+    }
+    let path = temp_csv(&content);
+
+    for script in [
+        "(cols val id)",
+        r#"(select (== grp "2"))"#,
+        "(drop-cols grp)",
+        r#"(select (and (== grp "1") (> id 1000)))"#,
+    ] {
+        // Serial (reader over the same bytes) is the ground truth.
+        let serial = run(script, &content, 1).unwrap();
+        for n in [1usize, 2, 3, 5, 8, 16, 64] {
+            assert_eq!(
+                run_file_str(script, &path, n),
+                serial,
+                "script={script} threads={n}"
+            );
+        }
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn sharded_file_no_trailing_newline() {
+    // Last line lacks a newline — boundary snapping must still cover it once.
+    let content = "id,v\n1,a\n2,b\n3,c\n4,d"; // no final '\n'
+    let path = temp_csv(content);
+    let serial = run("(cols id v)", content, 1).unwrap();
+    for n in [1usize, 2, 4, 8] {
+        assert_eq!(run_file_str("(cols id v)", &path, n), serial, "threads={n}");
+    }
+    std::fs::remove_file(&path).ok();
 }
 
 #[test]

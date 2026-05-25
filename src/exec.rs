@@ -7,16 +7,18 @@
 //! later modules.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::thread;
 
 use crossbeam_channel::bounded;
+use memchr::memchr;
 
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
-use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt};
+use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt, apply_stmts};
 use crate::sort::{OwnedRow, Sorter};
 
 /// Knobs for a run: chunk size, worker count, and where sort spills its temp
@@ -27,18 +29,6 @@ pub struct RunOpts {
     pub threads: usize,
     pub temp_dir: PathBuf,
     pub sort_buffer: usize,
-}
-
-/// Apply a transform stage's statements to a row, returning whether it
-/// survives. The hot inner call — no interpreter involved.
-#[inline]
-pub fn apply_transform(stmts: &[Stmt], row: &mut Vec<Field>) -> Result<bool, Error> {
-    for s in stmts {
-        if !s.apply(row)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
 }
 
 /// Read and parse the header line from `input`.
@@ -82,10 +72,8 @@ fn read_fully<R: io::Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     Ok(total)
 }
 
-/// Run a compiled plan, writing the output header and rows to `output`.
-///
-/// A lone transform stage streams with `threads` workers (or single-threaded
-/// when `threads <= 1`); anything with a `sort` runs the staged path.
+/// Run a compiled plan over a reader (e.g. stdin), writing header and rows to
+/// `output`. A seekable file should go through [`run_file`], which can shard.
 pub fn run<R: BufRead, W: Write + Send>(
     plan: &Plan,
     out_header: &[String],
@@ -94,7 +82,16 @@ pub fn run<R: BufRead, W: Write + Send>(
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
+    run_body(plan, opts, input, output)
+}
 
+/// Dispatch the body of a run over a reader (header already written).
+fn run_body<R: BufRead, W: Write + Send>(
+    plan: &Plan,
+    opts: &RunOpts,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
     match plan.stages.as_slice() {
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
@@ -102,6 +99,49 @@ pub fn run<R: BufRead, W: Write + Send>(
         [Stage::Transform(stmts)] => stream_transform(stmts, opts.chunk_size, input, output),
         _ => run_staged(plan, opts, input, output),
     }
+}
+
+/// Read and parse the header of a file, returning the header, the byte offset
+/// where the data rows begin, and the file length.
+pub fn read_header_from_path(path: &Path) -> Result<(Vec<String>, u64, u64), Error> {
+    let file_len = std::fs::metadata(path)?.len();
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = Vec::new();
+    reader.read_until(b'\n', &mut line)?;
+    if line.is_empty() {
+        return Err(Error::Other("could not read header (empty input)".into()));
+    }
+    let data_start = line.len() as u64; // bytes consumed including the newline
+    let text = std::str::from_utf8(&line)
+        .map_err(|e| Error::Other(format!("header is not valid UTF-8: {e}")))?;
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    Ok((csv::parse_header(text), data_start, file_len))
+}
+
+/// Run a plan over a seekable file. A lone transform stage with `threads > 1`
+/// is **sharded**: each worker reads its own byte range, with no central reader
+/// or channel. Everything else falls back to the reader-based path.
+pub fn run_file<W: Write + Send>(
+    plan: &Plan,
+    out_header: &[String],
+    opts: &RunOpts,
+    path: &Path,
+    data_start: u64,
+    file_len: u64,
+    output: &mut W,
+) -> Result<(), Error> {
+    write_header(output, out_header)?;
+
+    if let [Stage::Transform(stmts)] = plan.stages.as_slice()
+        && opts.threads > 1
+    {
+        return run_sharded(stmts, opts.threads, path, data_start, file_len, output);
+    }
+
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(data_start))?;
+    let mut reader = BufReader::new(file);
+    run_body(plan, opts, &mut reader, output)
 }
 
 fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error> {
@@ -122,12 +162,13 @@ fn stream_transform<R: BufRead, W: Write>(
     let mut out_buf = String::new();
     while let Some(chunk) = next_chunk(input, chunk_size)? {
         out_buf.clear();
+        let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
         csv::parse_chunk(&chunk, |row| {
             if err.is_some() {
                 return;
             }
-            match apply_transform(stmts, row) {
+            match apply_stmts(stmts, row, &mut scratch) {
                 Ok(true) => csv::write_row(&mut out_buf, row),
                 Ok(false) => {}
                 Err(e) => err = Some(e),
@@ -163,12 +204,13 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
             scope.spawn(move || {
                 while let Ok((id, chunk)) = chunk_rx.recv() {
                     let mut out_buf = String::new();
+                    let mut scratch: Vec<Field> = Vec::new();
                     let mut err: Option<Error> = None;
                     csv::parse_chunk(&chunk, |row| {
                         if err.is_some() {
                             return;
                         }
-                        match apply_transform(stmts, row) {
+                        match apply_stmts(stmts, row, &mut scratch) {
                             Ok(true) => csv::write_row(&mut out_buf, row),
                             Ok(false) => {}
                             Err(e) => err = Some(e),
@@ -232,6 +274,122 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
     })
 }
 
+/// Sharded transform: split the file's data region into `threads` line-aligned
+/// byte ranges and process each on its own thread (no central reader, no
+/// channel). Shard outputs are concatenated in file order, preserving row
+/// order.
+fn run_sharded<W: Write>(
+    stmts: &[Stmt],
+    threads: usize,
+    path: &Path,
+    data_start: u64,
+    file_len: u64,
+    output: &mut W,
+) -> Result<(), Error> {
+    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    if ranges.is_empty() {
+        return Ok(()); // header only, no data rows
+    }
+    let results: Vec<Result<String, Error>> = thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .map(|(start, end)| scope.spawn(move || process_range(stmts, path, start, end)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(Error::Other("shard worker panicked".into())))
+            })
+            .collect()
+    });
+    for result in results {
+        output.write_all(result?.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Divide `[data_start, file_len)` into up to `n` contiguous ranges, each
+/// starting and ending on a line boundary, so every row falls in exactly one
+/// shard. Empty ranges (more threads than lines) are dropped.
+fn shard_ranges(
+    path: &Path,
+    data_start: u64,
+    file_len: u64,
+    n: usize,
+) -> Result<Vec<(u64, u64)>, Error> {
+    if data_start >= file_len {
+        return Ok(Vec::new());
+    }
+    let mut file = File::open(path)?;
+    let total = file_len - data_start;
+    let mut bounds = Vec::with_capacity(n + 1);
+    bounds.push(data_start);
+    for i in 1..n {
+        let nominal = data_start + total * i as u64 / n as u64;
+        bounds.push(snap_to_newline(&mut file, nominal, file_len)?);
+    }
+    bounds.push(file_len);
+
+    let mut ranges = Vec::with_capacity(n);
+    for w in bounds.windows(2) {
+        if w[0] < w[1] {
+            ranges.push((w[0], w[1]));
+        }
+    }
+    Ok(ranges)
+}
+
+/// The byte offset of the start of the line following `pos` (i.e. just past the
+/// next `\n` at or after `pos`). Returns `file_len` if no newline follows.
+fn snap_to_newline(file: &mut File, pos: u64, file_len: u64) -> Result<u64, Error> {
+    if pos >= file_len {
+        return Ok(file_len);
+    }
+    file.seek(SeekFrom::Start(pos))?;
+    let mut buf = [0u8; 64 * 1024];
+    let mut scanned = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(file_len);
+        }
+        if let Some(rel) = memchr(b'\n', &buf[..n]) {
+            return Ok(pos + scanned + rel as u64 + 1);
+        }
+        scanned += n as u64;
+    }
+}
+
+/// Read one shard's byte range, parse it, apply the statements, and return the
+/// serialized survivors.
+fn process_range(stmts: &[Stmt], path: &Path, start: u64, end: u64) -> Result<String, Error> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut bytes)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+
+    let mut out = String::with_capacity(bytes.len() / 2 + 64);
+    let mut scratch: Vec<Field> = Vec::new();
+    let mut err: Option<Error> = None;
+    csv::parse_chunk(text, |row| {
+        if err.is_some() {
+            return;
+        }
+        match apply_stmts(stmts, row, &mut scratch) {
+            Ok(true) => csv::write_row(&mut out, row),
+            Ok(false) => {}
+            Err(e) => err = Some(e),
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(out),
+    }
+}
+
 /// Run a plan that contains a `sort`. The common case — exactly one sort —
 /// streams input through the pre-sort transforms into an [`ExternalSorter`]
 /// (which spills to temp files when large), then streams the merged output
@@ -279,9 +437,10 @@ fn run_staged<R: BufRead, W: Write>(
 
     // Stream the sorted rows through the post-sort transforms.
     let mut out_buf = String::new();
+    let mut scratch: Vec<Field> = Vec::new();
     for row in sorter.finish()? {
         let mut row = row?;
-        if apply_transform(post, &mut row)? {
+        if apply_stmts(post, &mut row, &mut scratch)? {
             csv::write_row(&mut out_buf, &row);
             if out_buf.len() >= 1 << 16 {
                 output.write_all(out_buf.as_bytes())?;
@@ -314,8 +473,9 @@ fn run_staged_in_memory<R: BufRead, W: Write>(
         match stage {
             Stage::Transform(stmts) => {
                 let mut kept = Vec::with_capacity(rows.len());
+                let mut scratch: Vec<Field> = Vec::new();
                 for mut row in rows.drain(..) {
-                    if apply_transform(stmts, &mut row)? {
+                    if apply_stmts(stmts, &mut row, &mut scratch)? {
                         kept.push(row);
                     }
                 }

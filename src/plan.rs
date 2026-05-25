@@ -255,26 +255,32 @@ impl BoolExpr {
     }
 }
 
-/// Project a row to `positions`, building a fresh row. Positions may repeat
-/// (duplicating a column) or skip; an out-of-range position yields an empty
-/// field rather than panicking.
+/// Project a row to `positions` using a reusable `scratch` buffer (swapped in,
+/// so no per-row allocation). Positions may repeat (duplicating a column) or
+/// skip; an out-of-range position yields an empty field rather than panicking.
 #[inline]
-fn project(row: &mut Vec<Field>, positions: &[usize]) {
-    let mut out = Vec::with_capacity(positions.len());
+fn project<'a>(row: &mut Vec<Field<'a>>, positions: &[usize], scratch: &mut Vec<Field<'a>>) {
+    scratch.clear();
+    scratch.reserve(positions.len());
     for &p in positions {
-        out.push(row.get(p).cloned().unwrap_or(Field::Str("")));
+        scratch.push(row.get(p).cloned().unwrap_or(Field::Str("")));
     }
-    *row = out;
+    std::mem::swap(row, scratch);
 }
 
 impl Stmt {
     /// Apply to a row, returning whether the row survives (only `Select` can
-    /// drop it).
+    /// drop it). `scratch` is a caller-owned buffer reused across rows so
+    /// projection (`cols`/`drop-cols`) doesn't allocate per row.
     #[inline]
-    pub fn apply(&self, row: &mut Vec<Field>) -> Result<bool, Error> {
+    pub fn apply<'a>(
+        &self,
+        row: &mut Vec<Field<'a>>,
+        scratch: &mut Vec<Field<'a>>,
+    ) -> Result<bool, Error> {
         match self {
             Stmt::Cols(p) => {
-                project(row, &p.positions);
+                project(row, &p.positions, scratch);
                 Ok(true)
             }
             Stmt::Select(expr) => expr.eval(row),
@@ -386,10 +392,15 @@ fn num_of(row: &[Field], pos: usize) -> f64 {
 
 /// Apply a sequence of statements to a row, returning whether it survives (only
 /// a `Select` can drop it). The per-row hot path — no interpreter involved.
+/// `scratch` is a caller-owned buffer reused across rows (see [`Stmt::apply`]).
 #[inline]
-pub fn apply_stmts(stmts: &[Stmt], row: &mut Vec<Field>) -> Result<bool, Error> {
+pub fn apply_stmts<'a>(
+    stmts: &[Stmt],
+    row: &mut Vec<Field<'a>>,
+    scratch: &mut Vec<Field<'a>>,
+) -> Result<bool, Error> {
     for s in stmts {
-        if !s.apply(row)? {
+        if !s.apply(row, scratch)? {
             return Ok(false);
         }
     }
