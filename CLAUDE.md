@@ -95,6 +95,17 @@ lifetime, so there is one `apply` implementation.
 [--sort-buffer BYTES] [--print-engine] SCRIPT`. Defaults: stdin/stdout,
 threads = all CPUs, chunk = 1 MB, sort buffer = 256 MiB.
 
+## Known pass-2 opportunities
+
+- The sort path materializes **owned** rows (every field becomes a `String`),
+  so a 3M-row sort is allocation-bound (~5s) while a zero-copy filter over the
+  same data is ~40ms. Sorting an index / row-id permutation, or interning, would
+  cut this.
+- The multi-stage (sort) pipeline is single-threaded; only the lone-transform
+  path uses `-n` workers. csvm parallelizes the sort feed and merge.
+- The k-way merge is a linear min-scan over runs and single-level; a heap and
+  multi-level merge would help when there are very many runs.
+
 ## Conventions
 
 - Git identity: `Sahas Subramanian <sahas.subramanian@proton.me>` (author +
