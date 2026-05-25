@@ -27,14 +27,15 @@ available to *generate* a pipeline, but only the compiled verbs run per row.
 | `cols(id, a, b)`                 | `(cols id a b)`                               |
 | `!cols(a, b)`                    | `(drop-cols a b)`                             |
 | `select(a == 't' && b != '0')`   | `(select (and (== a "t") (!= b "0")))`        |
-| `sort(a, b:r)`                   | `(sort a (b :reverse))`                       |
+| `sort(a, b:r)`                   | `(sort-by a (b :reverse))`                    |
 | `to_num(a, b)` / `to_str(a, b)`  | `(to-num a b)` / `(to-str a b)`               |
 
 - **Operators** in `select`: `== = != /= < > <= >=`, `=~` / `!~` (regex),
   `and`/`&&`, `or`/`||`, `not`/`!`. `and`/`or` are n-ary and short-circuit.
 - **Operands**: bare symbols are column references; `"…"` are string literals;
   numbers are numeric literals.
-- **sort spec**: a bare `col`, or `(col :reverse :numeric)`. Aliases:
+- **sort spec** (the verb is `sort-by`, not `sort` — tulisp's prelude already
+  binds `sort`): a bare `col`, or `(col :reverse :numeric)`. Aliases:
   `:r`/`:desc` for reverse, `:n`/`:num` for numeric. Multi-key, stable.
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 
