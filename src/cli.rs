@@ -30,7 +30,7 @@ usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
 
   -f IN              input CSV file (default: stdin)
   -o OUT             output CSV file (default: stdout)
-  -n THREADS         worker threads (default: all CPUs; <=0 means 1)
+  -n THREADS         worker threads (default: 1; <=0 means 1)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
   --chunk-size BYTES input chunk size in bytes (default: 1000000)
   --sort-buffer BYTES in-memory budget before sort spills to temp files
@@ -114,13 +114,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         return Err("no script given".to_string());
     };
 
-    // csvm clamps a non-positive thread count to 1; we default to all CPUs.
+    // Default to single-threaded (like csvm): the parallel path only pays off
+    // for heavier per-row work, and stdin can't be sharded. Users opt in with
+    // `-n`. A non-positive count clamps to 1.
     let threads = match threads {
         Some(n) if n >= 1 => n as usize,
-        Some(_) => 1,
-        None => std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+        _ => 1,
     };
 
     Ok(Parsed::Run(Box::new(Args {
@@ -151,6 +150,7 @@ mod tests {
         let a = args(&["(cols a)"]).unwrap();
         assert_eq!(a.script, "(cols a)");
         assert_eq!(a.in_file, None);
+        assert_eq!(a.threads, 1);
         assert_eq!(a.chunk_size, DEFAULT_CHUNK_SIZE);
         assert!(!a.print_engine);
     }

@@ -33,7 +33,7 @@ csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR]
 |------------------|---------------------------------------------------------------|
 | `-f IN`          | input file (default: stdin)                                   |
 | `-o OUT`         | output file (default: stdout)                                 |
-| `-n THREADS`     | worker threads (default: all CPUs; `<=0` ⇒ 1)                 |
+| `-n THREADS`     | worker threads (default: 1; `<=0` ⇒ 1)                        |
 | `-t, --temp-dir` | directory for sort spill files (default: system temp)         |
 | `--chunk-size`   | input chunk size in bytes (default: 1 000 000)                |
 | `--sort-buffer`  | in-memory budget before `sort` spills to disk (default 256 MiB) |
@@ -156,9 +156,11 @@ stage 3 (transform):
 - **Compile once.** tulisp parses the script and runs the pipeline verbs, which
   are special forms (`defspecial`) that receive their arguments *unevaluated* and
   append to a plan. The plan is plain Rust data — no interpreter is retained.
-- **Stream in parallel.** Input is split into line-aligned chunks fed to `-n`
-  workers over a bounded channel; a writer thread reassembles output in input
-  order, so results are identical regardless of thread count.
+- **Parallel by sharding.** With `-n N` over a seekable file, the data region is
+  split into N line-aligned byte ranges and each worker reads and processes its
+  own range — no central reader or channel. Shard outputs are concatenated in
+  file order, so results are identical regardless of thread count. (stdin can't
+  seek, so it streams single-threaded unless `-n` forces a channel pipeline.)
 - **Zero-copy.** Fields are sliced straight out of the chunk buffer; only an
   unescaped `""` or a parsed number allocates.
 - **Sort runs in parallel and scales past memory.** `sort-by` farms input
@@ -193,7 +195,8 @@ time ./target/release/csvm -f /tmp/huge.csv -n 8 \
 - `to_num`/`to_str` are implicit (see above).
 - `=~` regex matching is implemented (csvm left it as a stub).
 - Proper RFC-4180 quote handling on input and output.
-- `-n` defaults to all CPUs (csvm defaults to 1); `--sort-buffer` is new.
+- `--sort-buffer` is new. `-n` defaults to 1 (like csvm); for a seekable file,
+  `-n N` shards the input across N threads.
 
 ## License
 

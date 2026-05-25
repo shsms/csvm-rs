@@ -96,7 +96,7 @@ lifetime, so there is one `apply` implementation.
 
 `csvm [-f IN] [-o OUT] [-n THREADS] [-t TMPDIR] [--chunk-size BYTES]
 [--sort-buffer BYTES] [--print-engine] SCRIPT`. Defaults: stdin/stdout,
-threads = all CPUs, chunk = 1 MB, sort buffer = 256 MiB.
+threads = 1, chunk = 1 MB, sort buffer = 256 MiB.
 
 ## Known pass-2 opportunities
 
