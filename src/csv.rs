@@ -11,27 +11,23 @@
 use crate::field::Field;
 use memchr::{memchr, memchr_iter};
 
-/// Parse every row in `chunk`, calling `on_row` with a reused buffer for each.
-///
-/// `row` is cleared and refilled per line so the caller can amortize its
-/// allocation across the whole chunk. Fields borrow from `chunk`.
-pub fn parse_chunk<'a>(
-    chunk: &'a str,
-    row: &mut Vec<Field<'a>>,
-    mut on_row: impl FnMut(&mut Vec<Field<'a>>),
-) {
+/// Parse every row in `chunk`, calling `on_row` for each. The row buffer is
+/// owned here and reused across the chunk's rows (one allocation per chunk);
+/// the fields it holds borrow from `chunk`, so it cannot outlive the chunk.
+pub fn parse_chunk<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>>)) {
+    let mut row: Vec<Field<'a>> = Vec::new();
     let bytes = chunk.as_bytes();
     let mut start = 0;
     for nl in memchr_iter(b'\n', bytes) {
-        parse_line(strip_cr(&chunk[start..nl]), row);
-        on_row(row);
+        parse_line(strip_cr(&chunk[start..nl]), &mut row);
+        on_row(&mut row);
         start = nl + 1;
     }
     // Trailing content not terminated by a newline is still a row; a trailing
     // newline (start == len) leaves nothing and emits no spurious empty row.
     if start < chunk.len() {
-        parse_line(strip_cr(&chunk[start..]), row);
-        on_row(row);
+        parse_line(strip_cr(&chunk[start..]), &mut row);
+        on_row(&mut row);
     }
 }
 
@@ -166,8 +162,7 @@ mod tests {
 
     fn rows(chunk: &str) -> Vec<Vec<String>> {
         let mut out = Vec::new();
-        let mut row = Vec::new();
-        parse_chunk(chunk, &mut row, |r| {
+        parse_chunk(chunk, |r| {
             out.push(r.iter().map(|f| f.as_str().into_owned()).collect());
         });
         out

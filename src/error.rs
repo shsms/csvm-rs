@@ -15,6 +15,8 @@ pub enum Error {
     Num(NumError),
     /// I/O failure reading input or writing output.
     Io(std::io::Error),
+    /// A runtime condition that isn't one of the above (e.g. a missing header).
+    Other(String),
 }
 
 impl fmt::Display for Error {
@@ -24,6 +26,7 @@ impl fmt::Display for Error {
             Error::Column(name) => write!(f, "column not found in header: {name}"),
             Error::Num(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "{e}"),
+            Error::Other(msg) => write!(f, "{msg}"),
         }
     }
 }

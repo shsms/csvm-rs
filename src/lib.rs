@@ -4,9 +4,11 @@
 //! startup, then run over the rows with no Lisp in the hot path. See
 //! `CLAUDE.md` for the full architecture.
 
+pub mod cli;
 pub mod compile;
 pub mod csv;
 pub mod error;
+pub mod exec;
 pub mod field;
 pub mod plan;
 
