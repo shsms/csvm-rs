@@ -4,5 +4,8 @@
 //! startup, then run over the rows with no Lisp in the hot path. See
 //! `CLAUDE.md` for the full architecture.
 
+pub mod csv;
+pub mod field;
+
 /// The crate version, surfaced by the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
