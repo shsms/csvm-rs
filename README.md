@@ -164,6 +164,17 @@ stage 3 (transform):
 - **Sort scales past memory.** `sort-by` buffers up to `--sort-buffer`, spills
   stably-sorted runs to temp files, and k-way merges them.
 
+## Benchmarking
+
+`examples/gen_csv.rs` generates a deterministic 10-column CSV (same row count ⇒
+same bytes), so benchmarks are reproducible:
+
+```sh
+cargo run --release --example gen_csv -- 3000000 /tmp/huge.csv   # ~151 MB
+time ./target/release/csvm -f /tmp/huge.csv -n 8 \
+  '(select (and (== flag "t") (> amount 50000) (=~ status "^a"))) (cols id region amount)'
+```
+
 ## CSV details
 
 - `,`-separated, `"`-quoted fields; `""` is an escaped quote; quoted fields may
