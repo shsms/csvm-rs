@@ -6,7 +6,11 @@
 //! runs stage by stage. Parallelism and external-merge sort are layered on in
 //! later modules.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::thread;
+
+use crossbeam_channel::bounded;
 
 use crate::csv;
 use crate::error::Error;
@@ -70,19 +74,25 @@ fn read_fully<R: io::Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 }
 
 /// Run a compiled plan, writing the output header and rows to `output`.
-pub fn run<R: BufRead, W: Write>(
+///
+/// A lone transform stage streams with `threads` workers (or single-threaded
+/// when `threads <= 1`); anything with a `sort` runs the staged path.
+pub fn run<R: BufRead, W: Write + Send>(
     plan: &Plan,
     out_header: &[String],
     chunk_size: usize,
+    threads: usize,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
-    if let [Stage::Transform(stmts)] = plan.stages.as_slice() {
-        stream_transform(stmts, chunk_size, input, output)
-    } else {
-        run_staged(plan, chunk_size, input, output)
+    match plan.stages.as_slice() {
+        [Stage::Transform(stmts)] if threads > 1 => {
+            stream_transform_parallel(stmts, threads, chunk_size, input, output)
+        }
+        [Stage::Transform(stmts)] => stream_transform(stmts, chunk_size, input, output),
+        _ => run_staged(plan, chunk_size, input, output),
     }
 }
 
@@ -121,6 +131,97 @@ fn stream_transform<R: BufRead, W: Write>(
         output.write_all(out_buf.as_bytes())?;
     }
     Ok(())
+}
+
+/// Parallel transform: the calling thread reads chunks and tags them with a
+/// sequence id, `threads` workers parse + apply + serialize, and a writer
+/// thread reassembles output in id order. Each worker owns its chunk, so the
+/// borrowed rows never cross a thread boundary.
+fn stream_transform_parallel<R: BufRead, W: Write + Send>(
+    stmts: &[Stmt],
+    threads: usize,
+    chunk_size: usize,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
+    let cap = threads * 2 + 1;
+    let (chunk_tx, chunk_rx) = bounded::<(u64, String)>(cap);
+    let (out_tx, out_rx) = bounded::<(u64, Result<String, Error>)>(cap);
+
+    thread::scope(|scope| {
+        for _ in 0..threads {
+            let chunk_rx = chunk_rx.clone();
+            let out_tx = out_tx.clone();
+            scope.spawn(move || {
+                while let Ok((id, chunk)) = chunk_rx.recv() {
+                    let mut out_buf = String::new();
+                    let mut err: Option<Error> = None;
+                    csv::parse_chunk(&chunk, |row| {
+                        if err.is_some() {
+                            return;
+                        }
+                        match apply_transform(stmts, row) {
+                            Ok(true) => csv::write_row(&mut out_buf, row),
+                            Ok(false) => {}
+                            Err(e) => err = Some(e),
+                        }
+                    });
+                    let stop = err.is_some();
+                    let msg = err.map_or(Ok(out_buf), Err);
+                    if out_tx.send((id, msg)).is_err() || stop {
+                        break;
+                    }
+                }
+            });
+        }
+        // Drop the spare handles so the channels close once the spawned
+        // workers (and the reader below) are done.
+        drop(chunk_rx);
+        drop(out_tx);
+
+        let writer = scope.spawn(move || -> Result<(), Error> {
+            let mut next = 0u64;
+            let mut pending: HashMap<u64, String> = HashMap::new();
+            let mut first_err: Option<Error> = None;
+            while let Ok((id, res)) = out_rx.recv() {
+                match res {
+                    Ok(buf) => {
+                        pending.insert(id, buf);
+                        while let Some(buf) = pending.remove(&next) {
+                            output.write_all(buf.as_bytes())?;
+                            next += 1;
+                        }
+                    }
+                    Err(e) if first_err.is_none() => first_err = Some(e),
+                    Err(_) => {}
+                }
+            }
+            first_err.map_or(Ok(()), Err)
+        });
+
+        // Reader: this thread feeds chunks until input is exhausted or errors.
+        let mut id = 0u64;
+        let mut read_err = None;
+        loop {
+            match next_chunk(input, chunk_size) {
+                Ok(Some(chunk)) => {
+                    if chunk_tx.send((id, chunk)).is_err() {
+                        break;
+                    }
+                    id += 1;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    read_err = Some(e);
+                    break;
+                }
+            }
+        }
+        drop(chunk_tx);
+
+        let writer_result = writer.join().expect("writer thread panicked");
+        read_err.map_or(Ok(()), Err).and(writer_result)
+    })
 }
 
 /// Materialize all rows, run each stage in turn, then serialize. Used when the
@@ -287,12 +388,16 @@ mod tests {
 
     /// Compile, resolve against the input's header, and run end to end.
     fn run_str(script: &str, input: &str) -> Result<String, Error> {
+        run_with(script, input, 1, 1_000_000)
+    }
+
+    fn run_with(script: &str, input: &str, threads: usize, chunk: usize) -> Result<String, Error> {
         let mut plan = compile(script)?;
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
         let mut out = Vec::new();
-        run(&plan, &out_header, 1_000_000, &mut reader, &mut out)?;
+        run(&plan, &out_header, chunk, threads, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -353,6 +458,22 @@ mod tests {
         );
         // lexical (default): "10" < "100" < "9"
         assert_eq!(run_str("(sort-by n)", input).unwrap(), "n\n10\n100\n9\n");
+    }
+
+    #[test]
+    fn parallel_preserves_order_and_matches_serial() {
+        // Many rows + a tiny chunk size forces multiple chunks across workers;
+        // output must come back in input order regardless of thread count.
+        let mut input = String::from("id,keep\n");
+        for i in 0..5000 {
+            input.push_str(&format!("{i},{}\n", i % 2));
+        }
+        let script = r#"(select (== keep "1"))"#;
+        let serial = run_with(script, &input, 1, 1_000_000).unwrap();
+        let parallel = run_with(script, &input, 8, 64).unwrap();
+        assert_eq!(serial, parallel);
+        // Spot-check ordering: first data rows are 1, 3, 5, ...
+        assert!(parallel.starts_with("id,keep\n1,1\n3,1\n5,1\n"));
     }
 
     #[test]

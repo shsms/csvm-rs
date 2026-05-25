@@ -40,15 +40,22 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let mut output: Box<dyn Write> = match args.out_file.as_deref() {
+    let mut output: Box<dyn Write + Send> = match args.out_file.as_deref() {
         Some(path) if path != "-" => Box::new(BufWriter::new(
             File::create(path).map_err(|e| format!("cannot open output '{path}': {e}"))?,
         )),
         _ => Box::new(BufWriter::new(io::stdout())),
     };
 
-    exec::run(&plan, &out_header, args.chunk_size, &mut input, &mut output)
-        .map_err(|e| e.to_string())?;
+    exec::run(
+        &plan,
+        &out_header,
+        args.chunk_size,
+        args.threads,
+        &mut input,
+        &mut output,
+    )
+    .map_err(|e| e.to_string())?;
     output.flush().map_err(|e| e.to_string())?;
     Ok(())
 }
