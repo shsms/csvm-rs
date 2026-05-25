@@ -34,6 +34,11 @@ use crate::plan::{SortStmt, Stmt, apply_stmts};
 /// Default in-memory budget before runs start spilling to disk.
 pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
 
+/// Max runs merged at once. With more runs, intermediate groups of this many
+/// are merged (in parallel) into larger runs first, so the final merge never
+/// opens more than this many files and the heap stays small.
+const DEFAULT_FANOUT: usize = 32;
+
 /// Process-global run-file counter so concurrent sorters never collide on a
 /// temp file name (csvm uses the same trick).
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -130,6 +135,9 @@ struct WorkerCtx {
 pub struct Sorter {
     sort: Arc<SortStmt>,
     block_size: usize,
+    threads: usize,
+    temp_dir: PathBuf,
+    fanout: usize,
     seq: u64,
     work_tx: Option<Sender<(u64, String)>>,
     results: Receiver<Result<Run, Error>>,
@@ -167,7 +175,7 @@ impl Sorter {
             pre: Arc::new(pre.to_vec()),
             in_mem: AtomicUsize::new(0),
             budget,
-            temp_dir,
+            temp_dir: temp_dir.clone(),
         });
 
         let (work_tx, work_rx) = bounded::<(u64, String)>(threads);
@@ -190,11 +198,21 @@ impl Sorter {
         Sorter {
             sort,
             block_size,
+            threads,
+            temp_dir,
+            fanout: DEFAULT_FANOUT,
             seq: 0,
             work_tx: Some(work_tx),
             results: res_rx,
             workers,
         }
+    }
+
+    /// Override the merge fan-out (tests use a small value to force multi-level
+    /// merging with few runs).
+    #[cfg(test)]
+    fn set_fanout(&mut self, fanout: usize) {
+        self.fanout = fanout.max(2);
     }
 
     /// The block size the caller should read input in.
@@ -227,8 +245,100 @@ impl Sorter {
         if let Some(e) = first_err {
             return Err(e);
         }
-        Merge::new(runs, self.sort)
+        // Multi-level merge: with more than `fanout` runs, merge groups of them
+        // into larger runs first (in parallel) so the final merge is bounded.
+        let runs = consolidate(runs, &self.sort, self.threads, &self.temp_dir, self.fanout)?;
+        Merge::new(runs, Arc::clone(&self.sort))
     }
+}
+
+/// Reduce `runs` to at most `fanout` runs by repeatedly merging groups of
+/// `fanout` (in input/`seq` order) into larger spilled runs. Groups within a
+/// level are merged in parallel across `threads` workers.
+fn consolidate(
+    mut runs: Vec<Run>,
+    sort: &Arc<SortStmt>,
+    threads: usize,
+    temp_dir: &Path,
+    fanout: usize,
+) -> Result<Vec<Run>, Error> {
+    let fanout = fanout.max(2);
+    while runs.len() > fanout {
+        runs.sort_by_key(|r| r.seq);
+        let mut groups: Vec<Vec<Run>> = Vec::new();
+        let mut iter = runs.into_iter();
+        loop {
+            let group: Vec<Run> = iter.by_ref().take(fanout).collect();
+            if group.is_empty() {
+                break;
+            }
+            groups.push(group);
+        }
+        runs = merge_groups(groups, sort, threads, temp_dir)?;
+    }
+    runs.sort_by_key(|r| r.seq);
+    Ok(runs)
+}
+
+/// Merge each group of runs into one spilled run, across `threads` workers.
+fn merge_groups(
+    groups: Vec<Vec<Run>>,
+    sort: &Arc<SortStmt>,
+    threads: usize,
+    temp_dir: &Path,
+) -> Result<Vec<Run>, Error> {
+    let (work_tx, work_rx) = unbounded::<Vec<Run>>();
+    for group in groups {
+        let _ = work_tx.send(group);
+    }
+    drop(work_tx);
+    let (res_tx, res_rx) = unbounded::<Result<Run, Error>>();
+
+    thread::scope(|scope| {
+        for _ in 0..threads.max(1) {
+            let work_rx = work_rx.clone();
+            let res_tx = res_tx.clone();
+            let sort = Arc::clone(sort);
+            scope.spawn(move || {
+                while let Ok(group) = work_rx.recv() {
+                    if res_tx.send(merge_group(group, &sort, temp_dir)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(work_rx);
+        drop(res_tx);
+
+        let mut out = Vec::new();
+        let mut first_err = None;
+        for result in res_rx.iter() {
+            match result {
+                Ok(run) => out.push(run),
+                Err(e) if first_err.is_none() => first_err = Some(e),
+                Err(_) => {}
+            }
+        }
+        first_err.map_or(Ok(out), Err)
+    })
+}
+
+/// Merge one group of runs into a single spilled run. Its `seq` is the group's
+/// minimum, so consolidated runs stay in input order (keeping the sort stable).
+fn merge_group(group: Vec<Run>, sort: &Arc<SortStmt>, temp_dir: &Path) -> Result<Run, Error> {
+    let seq = group.iter().map(|r| r.seq).min().unwrap_or(0);
+    let file_seq = RUN_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    let path = temp_dir.join(format!("csvm.{}.{}.tmp", std::process::id(), file_seq));
+    let mut writer = BufWriter::new(File::create(&path)?);
+    Merge::new(group, Arc::clone(sort))?.for_each_line(|line| {
+        writer.write_all(line)?;
+        Ok(())
+    })?;
+    writer.flush()?;
+    Ok(Run {
+        seq,
+        data: RunData::File(TempRun { path }),
+    })
 }
 
 /// Parse a block, apply the pre-sort statements, serialize + key-encode each
@@ -596,5 +706,82 @@ mod tests {
             sort_lines(&s, &["a,1", "b,5", "a,9", "b,2"], 4, 1),
             ["a,9", "a,1", "b,5", "b,2"]
         );
+    }
+
+    /// Sort with a forced fan-out so groups of runs are merged in several
+    /// levels before the final merge.
+    fn sort_multilevel(lines: &[&str], threads: usize, budget: usize, fanout: usize) -> Vec<i64> {
+        let sort = SortStmt {
+            keys: vec![key(0, false, true)],
+        };
+        let mut s = Sorter::with_params(&sort, &[], threads, std::env::temp_dir(), budget, 1 << 20);
+        s.set_fanout(fanout);
+        for line in lines {
+            s.push_block(format!("{line}\n"));
+        }
+        let mut out = Vec::new();
+        s.finish()
+            .unwrap()
+            .for_each_line(|line| {
+                let n: i64 = std::str::from_utf8(line)
+                    .unwrap()
+                    .trim_end()
+                    .parse()
+                    .unwrap();
+                out.push(n);
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn multi_level_merge_spilled_and_in_memory() {
+        let lines: Vec<String> = (0..40).map(|i| ((i * 17) % 40).to_string()).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let mut expected: Vec<i64> = refs.iter().map(|s| s.parse().unwrap()).collect();
+        expected.sort();
+
+        // fanout = 3 with 40 one-row blocks forces multiple merge levels.
+        // budget = 1 spills every run; a large budget keeps them in memory and
+        // consolidation merges the in-memory runs into files.
+        assert_eq!(sort_multilevel(&refs, 4, 1, 3), expected, "spilled");
+        assert_eq!(sort_multilevel(&refs, 4, 1 << 30, 3), expected, "in-memory");
+        assert_eq!(sort_multilevel(&refs, 1, 1, 2), expected, "single thread");
+    }
+
+    #[test]
+    fn multi_level_merge_is_stable() {
+        // Tag column carried along; equal keys must keep input order across all
+        // the merge levels.
+        let sort = SortStmt {
+            keys: vec![key(0, false, true)],
+        };
+        let lines: Vec<String> = (0..30).map(|i| format!("{},{i}", i % 3)).collect();
+        let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
+        let mut s = Sorter::with_params(&sort, &[], 4, std::env::temp_dir(), 1, 1 << 20);
+        s.set_fanout(2);
+        for line in &refs {
+            s.push_block(format!("{line}\n"));
+        }
+        let mut out = Vec::new();
+        s.finish()
+            .unwrap()
+            .for_each_line(|line| {
+                out.push(std::str::from_utf8(line).unwrap().trim_end().to_string());
+                Ok(())
+            })
+            .unwrap();
+        // Within each key group, tags ascend (input order preserved).
+        for grp in 0..3 {
+            let tags: Vec<i64> = out
+                .iter()
+                .filter(|r| r.starts_with(&format!("{grp},")))
+                .map(|r| r.split(',').nth(1).unwrap().parse().unwrap())
+                .collect();
+            let mut sorted = tags.clone();
+            sorted.sort();
+            assert_eq!(tags, sorted, "group {grp} not stable");
+        }
     }
 }
