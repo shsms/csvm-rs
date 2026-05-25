@@ -11,6 +11,7 @@ pub mod error;
 pub mod exec;
 pub mod field;
 pub mod plan;
+pub mod sort;
 
 pub use error::Error;
 

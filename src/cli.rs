@@ -16,10 +16,13 @@ pub struct Args {
     pub threads: usize,
     pub temp_dir: Option<PathBuf>,
     pub chunk_size: usize,
+    pub sort_buffer: usize,
     pub print_engine: bool,
 }
 
 const DEFAULT_CHUNK_SIZE: usize = 1_000_000;
+/// In-memory budget before `sort` spills a run to a temp file.
+pub const DEFAULT_SORT_BUFFER: usize = 256 << 20;
 
 pub const USAGE: &str = "\
 usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
@@ -30,6 +33,8 @@ usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   -n THREADS         worker threads (default: all CPUs; <=0 means 1)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
   --chunk-size BYTES input chunk size in bytes (default: 1000000)
+  --sort-buffer BYTES in-memory budget before sort spills to temp files
+                     (default: 256 MiB)
   --print-engine     print the compiled execution plan and exit
   -h, --help         show this help
 
@@ -51,6 +56,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut threads: Option<i64> = None;
     let mut temp_dir = None;
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
+    let mut sort_buffer = DEFAULT_SORT_BUFFER;
     let mut print_engine = false;
 
     let mut it = args.into_iter();
@@ -77,6 +83,17 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                     .map_err(|_| format!("invalid --chunk-size value: {v}"))?;
                 chunk_size = if n <= 0 {
                     DEFAULT_CHUNK_SIZE
+                } else {
+                    n as usize
+                };
+            }
+            "--sort-buffer" => {
+                let v = value!();
+                let n: i64 = v
+                    .parse()
+                    .map_err(|_| format!("invalid --sort-buffer value: {v}"))?;
+                sort_buffer = if n <= 0 {
+                    DEFAULT_SORT_BUFFER
                 } else {
                     n as usize
                 };
@@ -113,6 +130,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         threads,
         temp_dir,
         chunk_size,
+        sort_buffer,
         print_engine,
     })))
 }

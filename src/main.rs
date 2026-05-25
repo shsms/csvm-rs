@@ -47,15 +47,13 @@ fn run() -> Result<(), String> {
         _ => Box::new(BufWriter::new(io::stdout())),
     };
 
-    exec::run(
-        &plan,
-        &out_header,
-        args.chunk_size,
-        args.threads,
-        &mut input,
-        &mut output,
-    )
-    .map_err(|e| e.to_string())?;
+    let opts = exec::RunOpts {
+        chunk_size: args.chunk_size,
+        threads: args.threads,
+        temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
+        sort_buffer: args.sort_buffer,
+    };
+    exec::run(&plan, &out_header, &opts, &mut input, &mut output).map_err(|e| e.to_string())?;
     output.flush().map_err(|e| e.to_string())?;
     Ok(())
 }

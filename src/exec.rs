@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::thread;
 
 use crossbeam_channel::bounded;
@@ -16,9 +17,17 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt};
+use crate::sort::{ExternalSorter, OwnedRow};
 
-/// An owned row, detached from any chunk buffer.
-pub type OwnedRow = Vec<Field<'static>>;
+/// Knobs for a run: chunk size, worker count, and where sort spills its temp
+/// files.
+#[derive(Clone, Debug)]
+pub struct RunOpts {
+    pub chunk_size: usize,
+    pub threads: usize,
+    pub temp_dir: PathBuf,
+    pub sort_buffer: usize,
+}
 
 /// Apply a transform stage's statements to a row, returning whether it
 /// survives. The hot inner call — no interpreter involved.
@@ -80,19 +89,18 @@ fn read_fully<R: io::Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
 pub fn run<R: BufRead, W: Write + Send>(
     plan: &Plan,
     out_header: &[String],
-    chunk_size: usize,
-    threads: usize,
+    opts: &RunOpts,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
     match plan.stages.as_slice() {
-        [Stage::Transform(stmts)] if threads > 1 => {
-            stream_transform_parallel(stmts, threads, chunk_size, input, output)
+        [Stage::Transform(stmts)] if opts.threads > 1 => {
+            stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
         }
-        [Stage::Transform(stmts)] => stream_transform(stmts, chunk_size, input, output),
-        _ => run_staged(plan, chunk_size, input, output),
+        [Stage::Transform(stmts)] => stream_transform(stmts, opts.chunk_size, input, output),
+        _ => run_staged(plan, opts, input, output),
     }
 }
 
@@ -224,9 +232,88 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
     })
 }
 
-/// Materialize all rows, run each stage in turn, then serialize. Used when the
-/// plan has a `sort` (which must see every row).
+/// Run a plan that contains a `sort`. The common case — exactly one sort —
+/// streams input through the pre-sort transforms into an [`ExternalSorter`]
+/// (which spills to temp files when large), then streams the merged output
+/// through the post-sort transforms. Plans with more than one sort fall back to
+/// the simpler in-memory path.
 fn run_staged<R: BufRead, W: Write>(
+    plan: &Plan,
+    opts: &RunOpts,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
+    let sort_count = plan
+        .stages
+        .iter()
+        .filter(|s| matches!(s, Stage::Sort(_)))
+        .count();
+    if sort_count != 1 {
+        return run_staged_in_memory(plan, opts.chunk_size, input, output);
+    }
+
+    let sort_idx = plan
+        .stages
+        .iter()
+        .position(|s| matches!(s, Stage::Sort(_)))
+        .unwrap();
+    let pre = transform_stmts(&plan.stages[..sort_idx]);
+    let Stage::Sort(sort) = &plan.stages[sort_idx] else {
+        unreachable!()
+    };
+    let post = transform_stmts(&plan.stages[sort_idx + 1..]);
+
+    // Feed the pre-sort survivors into the sorter.
+    let mut sorter = ExternalSorter::with_budget(sort, opts.temp_dir.clone(), opts.sort_buffer);
+    while let Some(chunk) = next_chunk(input, opts.chunk_size)? {
+        let mut feed_err: Option<Error> = None;
+        csv::parse_chunk(&chunk, |row| {
+            if feed_err.is_some() {
+                return;
+            }
+            match apply_transform(pre, row) {
+                Ok(true) => {
+                    let owned: OwnedRow = row.iter().map(|f| f.clone().into_owned()).collect();
+                    if let Err(e) = sorter.push(owned) {
+                        feed_err = Some(e);
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => feed_err = Some(e),
+            }
+        });
+        if let Some(e) = feed_err {
+            return Err(e);
+        }
+    }
+
+    // Stream the sorted rows through the post-sort transforms.
+    let mut out_buf = String::new();
+    for row in sorter.finish()? {
+        let mut row = row?;
+        if apply_transform(post, &mut row)? {
+            csv::write_row(&mut out_buf, &row);
+            if out_buf.len() >= 1 << 16 {
+                output.write_all(out_buf.as_bytes())?;
+                out_buf.clear();
+            }
+        }
+    }
+    output.write_all(out_buf.as_bytes())?;
+    Ok(())
+}
+
+/// The statements of an optional single transform stage (empty otherwise).
+fn transform_stmts(stages: &[Stage]) -> &[Stmt] {
+    match stages {
+        [Stage::Transform(stmts)] => stmts,
+        _ => &[],
+    }
+}
+
+/// Materialize all rows, run each stage in turn, then serialize. The fallback
+/// for plans with more than one `sort`.
+fn run_staged_in_memory<R: BufRead, W: Write>(
     plan: &Plan,
     chunk_size: usize,
     input: &mut R,
@@ -397,7 +484,31 @@ mod tests {
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
         let mut out = Vec::new();
-        run(&plan, &out_header, chunk, threads, &mut reader, &mut out)?;
+        let opts = RunOpts {
+            chunk_size: chunk,
+            threads,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+        };
+        run(&plan, &out_header, &opts, &mut reader, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// Run a sort plan with a tiny sort buffer so the external merge (temp-file
+    /// spilling) path is exercised end to end.
+    fn run_spilled(script: &str, input: &str) -> Result<String, Error> {
+        let mut plan = compile(script)?;
+        let mut reader = io::BufReader::new(input.as_bytes());
+        let header = read_header(&mut reader)?;
+        let out_header = plan.resolve(&header)?;
+        let mut out = Vec::new();
+        let opts = RunOpts {
+            chunk_size: 64,
+            threads: 1,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: 1, // spill after every row
+        };
+        run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -458,6 +569,22 @@ mod tests {
         );
         // lexical (default): "10" < "100" < "9"
         assert_eq!(run_str("(sort-by n)", input).unwrap(), "n\n10\n100\n9\n");
+    }
+
+    #[test]
+    fn external_sort_spilling_matches_in_memory() {
+        let mut input = String::from("id,val\n");
+        for i in 0..1000 {
+            input.push_str(&format!("{i},{}\n", (i * 37) % 1000));
+        }
+        let script = "(sort-by (val :numeric) id)";
+        let in_memory = run_str(script, &input).unwrap();
+        let spilled = run_spilled(script, &input).unwrap();
+        assert_eq!(in_memory, spilled);
+        // Spot-check: smallest val (0) sorts first after the header.
+        assert!(spilled.starts_with("id,val\n"));
+        let first_data = spilled.lines().nth(1).unwrap();
+        assert!(first_data.ends_with(",0"));
     }
 
     #[test]
