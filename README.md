@@ -161,8 +161,10 @@ stage 3 (transform):
   order, so results are identical regardless of thread count.
 - **Zero-copy.** Fields are sliced straight out of the chunk buffer; only an
   unescaped `""` or a parsed number allocates.
-- **Sort scales past memory.** `sort-by` buffers up to `--sort-buffer`, spills
-  stably-sorted runs to temp files, and k-way merges them.
+- **Sort runs in parallel and scales past memory.** `sort-by` farms input
+  blocks to `-n` workers that parse and stably sort each into a run (kept in
+  memory, or spilled to a temp file past `--sort-buffer`); a single-threaded
+  binary-heap k-way merge then produces the sorted output.
 
 ## Benchmarking
 

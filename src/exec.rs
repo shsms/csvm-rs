@@ -17,7 +17,7 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt};
-use crate::sort::{ExternalSorter, OwnedRow};
+use crate::sort::{OwnedRow, Sorter};
 
 /// Knobs for a run: chunk size, worker count, and where sort spills its temp
 /// files.
@@ -263,28 +263,18 @@ fn run_staged<R: BufRead, W: Write>(
     };
     let post = transform_stmts(&plan.stages[sort_idx + 1..]);
 
-    // Feed the pre-sort survivors into the sorter.
-    let mut sorter = ExternalSorter::with_budget(sort, opts.temp_dir.clone(), opts.sort_buffer);
-    while let Some(chunk) = next_chunk(input, opts.chunk_size)? {
-        let mut feed_err: Option<Error> = None;
-        csv::parse_chunk(&chunk, |row| {
-            if feed_err.is_some() {
-                return;
-            }
-            match apply_transform(pre, row) {
-                Ok(true) => {
-                    let owned: OwnedRow = row.iter().map(|f| f.clone().into_owned()).collect();
-                    if let Err(e) = sorter.push(owned) {
-                        feed_err = Some(e);
-                    }
-                }
-                Ok(false) => {}
-                Err(e) => feed_err = Some(e),
-            }
-        });
-        if let Some(e) = feed_err {
-            return Err(e);
-        }
+    // Feed raw input blocks to the sorter; its workers parse, apply the
+    // pre-sort statements, and sort each block in parallel.
+    let mut sorter = Sorter::new(
+        sort,
+        pre,
+        opts.threads,
+        opts.temp_dir.clone(),
+        opts.sort_buffer,
+    );
+    let block_size = sorter.block_size();
+    while let Some(block) = next_chunk(input, block_size)? {
+        sorter.push_block(block);
     }
 
     // Stream the sorted rows through the post-sort transforms.

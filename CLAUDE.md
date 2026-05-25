@@ -80,9 +80,12 @@ the chunk buffer. A `csv`-backed strict mode could be a future option.
 - No-sort plans run as a single streaming stage: each worker parses a chunk
   (borrowed rows), applies the stage, serializes to a buffer, tags it with the
   chunk id. A writer thread reassembles output in id order. Fully zero-copy.
-- `sort` is a blocking stage: rows are materialized as owned `Field<'static>`,
-  sorted (in-memory stable multi-key; external merge via tmp files for large
-  inputs), then handed to the next stage.
+- `sort` is a blocking stage handled by a **parallel external merge sort**
+  (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks, `-n`
+  workers each parse + apply the pre-sort statements + stably sort a block into
+  a run (kept in memory, or spilled to a temp file past the budget), and a
+  single-threaded binary-heap k-way merge produces the sorted stream. A block is
+  a contiguous input range, so its sequence number keeps the merge stable.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls
@@ -97,14 +100,14 @@ threads = all CPUs, chunk = 1 MB, sort buffer = 256 MiB.
 
 ## Known pass-2 opportunities
 
-- The sort path materializes **owned** rows (every field becomes a `String`),
-  so a 3M-row sort is allocation-bound (~5s) while a zero-copy filter over the
-  same data is ~40ms. Sorting an index / row-id permutation, or interning, would
-  cut this.
-- The multi-stage (sort) pipeline is single-threaded; only the lone-transform
-  path uses `-n` workers. csvm parallelizes the sort feed and merge.
-- The k-way merge is a linear min-scan over runs and single-level; a heap and
-  multi-level merge would help when there are very many runs.
+- Sort parse+sort is parallel (`-n` workers) but the final k-way merge is
+  single-threaded and single-level. csvm also parallelizes intermediate merges
+  (`merge_tmp` workers consolidate runs to files) and the file readback, and
+  does multi-level merge so very large inputs don't open thousands of run files
+  at once. Those are the remaining sort wins.
+- Rows are materialized as **owned** `Field`s for sorting (every field becomes a
+  `String`). Sorting an index/row-id permutation, or interning, would cut the
+  allocation cost that bounds the serial merge + write tail.
 
 ## Conventions
 

@@ -384,6 +384,18 @@ fn num_of(row: &[Field], pos: usize) -> f64 {
     }
 }
 
+/// Apply a sequence of statements to a row, returning whether it survives (only
+/// a `Select` can drop it). The per-row hot path — no interpreter involved.
+#[inline]
+pub fn apply_stmts(stmts: &[Stmt], row: &mut Vec<Field>) -> Result<bool, Error> {
+    for s in stmts {
+        if !s.apply(row)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 impl Plan {
     /// Resolve every column reference against the input header, returning the
     /// output header (the input header reshaped by any `cols`/`drop-cols`).
