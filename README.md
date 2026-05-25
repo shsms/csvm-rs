@@ -178,9 +178,12 @@ byte-identical output.
 ## CSV details
 
 - `,`-separated, `"`-quoted fields; `""` is an escaped quote; quoted fields may
-  contain commas.
-- A row is a line — **fields may not contain newlines** (required for parallel
-  chunking; matches csvm).
+  contain commas. LF and CRLF line endings; trailing newline optional.
+- **RFC 4180-conformant with one deviation:** a row is a line, so **fields may
+  not contain embedded newlines** (this is what lets the input be chunked and
+  sharded in parallel; csvm has the same constraint). `tests/csv_conformance.rs`
+  checks field-for-field agreement with the `csv` crate on well-formed input and
+  pins the deviation.
 - UTF-8 in and out. On output, a field is quoted only if it contains a comma,
   quote, or carriage return.
 

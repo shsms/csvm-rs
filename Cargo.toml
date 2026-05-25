@@ -21,6 +21,10 @@ memchr = "2"
 # Backs the `=~` / `!~` match operators in `select`.
 regex = "1"
 
+[dev-dependencies]
+# Reference RFC-4180 parser, used only to confirm our scanner's conformance.
+csv = "1"
+
 [profile.release]
 lto = true
 codegen-units = 1
