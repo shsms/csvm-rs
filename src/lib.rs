@@ -5,7 +5,11 @@
 //! `CLAUDE.md` for the full architecture.
 
 pub mod csv;
+pub mod error;
 pub mod field;
+pub mod plan;
+
+pub use error::Error;
 
 /// The crate version, surfaced by the CLI.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
