@@ -654,15 +654,15 @@ fn cmp_symbol(op: CmpOp) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compile::compile;
+    use crate::parse::parse;
 
-    /// Compile, resolve against the input's header, and run end to end.
+    /// Parse, resolve against the input's header, and run end to end.
     fn run_str(script: &str, input: &str) -> Result<String, Error> {
         run_with(script, input, 1, 1_000_000)
     }
 
     fn run_with(script: &str, input: &str, threads: usize, chunk: usize) -> Result<String, Error> {
-        let mut plan = compile(script)?;
+        let mut plan = parse(script)?;
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
@@ -680,7 +680,7 @@ mod tests {
     /// Run a sort plan with a tiny sort buffer so the external merge (temp-file
     /// spilling) path is exercised end to end.
     fn run_spilled(script: &str, input: &str) -> Result<String, Error> {
-        let mut plan = compile(script)?;
+        let mut plan = parse(script)?;
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
@@ -700,11 +700,11 @@ mod tests {
     #[test]
     fn cols_reorder_and_drop() {
         assert_eq!(
-            run_str("(cols countZ id)", INPUT).unwrap(),
+            run_str("cols countZ,id", INPUT).unwrap(),
             "countZ,id\n5,1\n0,2\n0,3\n9,4\n"
         );
         assert_eq!(
-            run_str("(drop-cols fieldA)", INPUT).unwrap(),
+            run_str("cols -v fieldA", INPUT).unwrap(),
             "id,countZ\n1,5\n2,0\n3,0\n4,9\n"
         );
     }
@@ -712,12 +712,12 @@ mod tests {
     #[test]
     fn select_string_and_implicit_numeric() {
         assert_eq!(
-            run_str(r#"(select (== fieldA "t"))"#, INPUT).unwrap(),
+            run_str("select fieldA == 't'", INPUT).unwrap(),
             "id,fieldA,countZ\n1,t,5\n3,t,0\n4,t,9\n"
         );
         // Implicit numeric: no to-num needed.
         assert_eq!(
-            run_str(r#"(select (and (== fieldA "t") (> countZ 0)))"#, INPUT).unwrap(),
+            run_str("select fieldA == 't' && countZ > 0", INPUT).unwrap(),
             "id,fieldA,countZ\n1,t,5\n4,t,9\n"
         );
     }
@@ -726,7 +726,7 @@ mod tests {
     fn numeric_sort_then_filter() {
         // sort by countZ descending, numerically; output numbers print cleanly.
         assert_eq!(
-            run_str("(sort-by (countZ :reverse :numeric))", INPUT).unwrap(),
+            run_str("sort countZ=nr", INPUT).unwrap(),
             "id,fieldA,countZ\n4,t,9\n1,t,5\n2,f,0\n3,t,0\n"
         );
     }
@@ -735,7 +735,7 @@ mod tests {
     fn pipeline_with_sort_stage_split() {
         // filter, sort, then drop a column — three stages.
         let out = run_str(
-            "(select (== fieldA \"t\")) (sort-by (countZ :n)) (drop-cols fieldA)",
+            "select fieldA == 't' | sort countZ=n | cols -v fieldA",
             INPUT,
         )
         .unwrap();
@@ -746,12 +746,9 @@ mod tests {
     fn lexical_vs_numeric_sort() {
         let input = "n\n10\n9\n100\n";
         // numeric: 9 < 10 < 100
-        assert_eq!(
-            run_str("(sort-by (n :numeric))", input).unwrap(),
-            "n\n9\n10\n100\n"
-        );
+        assert_eq!(run_str("sort n=n", input).unwrap(), "n\n9\n10\n100\n");
         // lexical (default): "10" < "100" < "9"
-        assert_eq!(run_str("(sort-by n)", input).unwrap(), "n\n10\n100\n9\n");
+        assert_eq!(run_str("sort n", input).unwrap(), "n\n10\n100\n9\n");
     }
 
     #[test]
@@ -760,7 +757,7 @@ mod tests {
         for i in 0..1000 {
             input.push_str(&format!("{i},{}\n", (i * 37) % 1000));
         }
-        let script = "(sort-by (val :numeric) id)";
+        let script = "sort val=n id";
         let in_memory = run_str(script, &input).unwrap();
         let spilled = run_spilled(script, &input).unwrap();
         assert_eq!(in_memory, spilled);
@@ -778,7 +775,7 @@ mod tests {
         for i in 0..5000 {
             input.push_str(&format!("{i},{}\n", i % 2));
         }
-        let script = r#"(select (== keep "1"))"#;
+        let script = "select keep == '1'";
         let serial = run_with(script, &input, 1, 1_000_000).unwrap();
         let parallel = run_with(script, &input, 8, 64).unwrap();
         assert_eq!(serial, parallel);
@@ -788,9 +785,6 @@ mod tests {
 
     #[test]
     fn missing_column_is_an_error() {
-        assert!(matches!(
-            run_str("(cols nope)", INPUT),
-            Err(Error::Column(_))
-        ));
+        assert!(matches!(run_str("cols nope", INPUT), Err(Error::Column(_))));
     }
 }

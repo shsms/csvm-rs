@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process;
 
 use csvm::cli::{self, Parsed};
-use csvm::{compile, exec};
+use csvm::{exec, parse};
 
 fn main() {
     if let Err(msg) = run() {
@@ -23,8 +23,8 @@ fn run() -> Result<(), String> {
         Err(e) => return Err(format!("{e}\n\n{}", cli::USAGE)),
     };
 
-    // tulisp compiles the script into a plan here, once.
-    let mut plan = compile::compile(&args.script).map_err(|e| e.to_string())?;
+    // Parse the pipe script into a plan here, once.
+    let mut plan = parse::parse(&args.script).map_err(|e| e.to_string())?;
     let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,

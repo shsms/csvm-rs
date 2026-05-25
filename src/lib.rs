@@ -1,15 +1,16 @@
-//! csvm — a multithreaded CSV manipulation tool with a Lisp command language.
+//! csvm — a fast, multithreaded CSV manipulation tool with a pipe command
+//! language.
 //!
-//! A script is compiled by `tulisp` into a plain-Rust execution plan once at
-//! startup, then run over the rows with no Lisp in the hot path. See
-//! `CLAUDE.md` for the full architecture.
+//! A script (`cols a,b | select "amount > 1000" | sort amount=nr`) is parsed
+//! into a plain-Rust execution plan once at startup, then run over the rows
+//! with no interpreter in the hot path. See `CLAUDE.md` for the architecture.
 
 pub mod cli;
-pub mod compile;
 pub mod csv;
 pub mod error;
 pub mod exec;
 pub mod field;
+pub mod parse;
 pub mod plan;
 pub mod sort;
 

@@ -1,7 +1,7 @@
-//! End-to-end tests driving the public API the way the binary does: compile a
-//! script, read the header, resolve, and run. Covers the csvm README examples
-//! (translated to Lisp), implicit numeric behavior, regex, quoting, the sort
-//! pipeline, and compile-time pipeline generation.
+//! End-to-end tests driving the public API the way the binary does: parse a
+//! script, read the header, resolve, and run. Covers the csvm example set (in
+//! the pipe syntax), implicit numeric behavior, regex, quoting, the sort
+//! pipeline, and sharded file processing.
 
 use csvm::exec::{self, RunOpts};
 use std::io::BufReader;
@@ -18,7 +18,7 @@ id,fieldA,fieldB,countA,countZ
 ";
 
 fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
-    let mut plan = csvm::compile::compile(script).map_err(|e| e.to_string())?;
+    let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(input.as_bytes());
     let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
@@ -47,15 +47,15 @@ fn run_checked(script: &str, input: &str) -> String {
 #[test]
 fn cols_keep_in_order() {
     assert_eq!(
-        run_checked("(cols id fieldA countZ)", INPUT),
+        run_checked("cols id fieldA countZ", INPUT),
         "id,fieldA,countZ\n1,t,5\n2,f,0\n3,t,0\n4,t,9\n5,f,2\n"
     );
 }
 
 #[test]
-fn drop_cols_keeps_rest() {
+fn cols_exclude_keeps_rest() {
     assert_eq!(
-        run_checked("(drop-cols fieldA fieldB countA)", INPUT),
+        run_checked("cols -v fieldA,fieldB,countA", INPUT),
         "id,countZ\n1,5\n2,0\n3,0\n4,9\n5,2\n"
     );
 }
@@ -63,7 +63,7 @@ fn drop_cols_keeps_rest() {
 #[test]
 fn select_string_equality() {
     assert_eq!(
-        run_checked(r#"(select (and (== fieldA "t") (!= countZ "0")))"#, INPUT),
+        run_checked("select fieldA == 't' && countZ != '0'", INPUT),
         "id,fieldA,fieldB,countA,countZ\n1,t,x,3,5\n4,t,z,7,9\n"
     );
 }
@@ -73,7 +73,7 @@ fn select_implicit_numeric() {
     // No to-num: a comparison against a number is numeric. -2 is not > 0.
     assert_eq!(
         run_checked(
-            r#"(select (and (== fieldA "t") (or (> countZ 0) (> countA 0)))) (cols id)"#,
+            "select fieldA == 't' && (countZ > 0 || countA > 0) | cols id",
             INPUT,
         ),
         "id\n1\n4\n"
@@ -85,7 +85,7 @@ fn explicit_to_num_to_str_roundtrip() {
     // to-num then to-str canonicalizes the number but is otherwise transparent.
     assert_eq!(
         run_checked(
-            "(to-num countA) (select (> countA 0)) (to-str countA) (cols id countA)",
+            "to-num countA | select countA > 0 | to-str countA | cols id,countA",
             INPUT
         ),
         "id,countA\n1,3\n4,7\n"
@@ -95,11 +95,11 @@ fn explicit_to_num_to_str_roundtrip() {
 #[test]
 fn regex_match_and_negation() {
     assert_eq!(
-        run_checked(r#"(select (=~ fieldB "^x$")) (cols id)"#, INPUT),
+        run_checked("select fieldB =~ '^x$' | cols id", INPUT),
         "id\n1\n3\n"
     );
     assert_eq!(
-        run_checked(r#"(select (!~ fieldB "[xy]")) (cols id)"#, INPUT),
+        run_checked("select fieldB !~ '[xy]' | cols id", INPUT),
         "id\n4\n"
     );
 }
@@ -107,10 +107,7 @@ fn regex_match_and_negation() {
 #[test]
 fn sort_numeric_reverse() {
     assert_eq!(
-        run_checked(
-            "(sort-by (countZ :reverse :numeric)) (cols id countZ)",
-            INPUT
-        ),
+        run_checked("sort countZ=nr | cols id,countZ", INPUT),
         "id,countZ\n4,9\n1,5\n5,2\n2,0\n3,0\n"
     );
 }
@@ -119,7 +116,7 @@ fn sort_numeric_reverse() {
 fn sort_multi_key_lexical_then_reverse() {
     // forward by fieldA, then reverse by id (lexical) within ties
     assert_eq!(
-        run_checked("(sort-by fieldA (id :reverse)) (cols id fieldA)", INPUT),
+        run_checked("sort fieldA id=r | cols id,fieldA", INPUT),
         "id,fieldA\n5,f\n2,f\n4,t\n3,t\n1,t\n"
     );
 }
@@ -129,7 +126,7 @@ fn three_stage_pipeline() {
     // filter, sort, drop — splits into transform/sort/transform stages.
     assert_eq!(
         run_checked(
-            r#"(select (== fieldA "t")) (sort-by (countZ :numeric)) (drop-cols fieldB countA)"#,
+            "select fieldA == 't' | sort countZ=n | cols -v fieldB,countA",
             INPUT,
         ),
         "id,fieldA,countZ\n3,t,0\n1,t,5\n4,t,9\n"
@@ -140,21 +137,8 @@ fn three_stage_pipeline() {
 fn quoted_fields_roundtrip() {
     let input = "name,n\n\"last, first\",1\nplain,2\n";
     assert_eq!(
-        run_checked("(select (> n 0))", input),
+        run_checked("select n > 0", input),
         "name,n\n\"last, first\",1\nplain,2\n"
-    );
-}
-
-#[test]
-fn conditional_step_via_when() {
-    // (when t ...) emits the step; (when nil ...) skips it.
-    assert_eq!(
-        run_checked("(when t (drop-cols fieldA)) (cols id fieldB)", INPUT),
-        "id,fieldB\n1,x\n2,y\n3,x\n4,z\n5,y\n"
-    );
-    assert_eq!(
-        run_checked("(when nil (drop-cols fieldA)) (cols id fieldA)", INPUT),
-        "id,fieldA\n1,t\n2,f\n3,t\n4,t\n5,f\n"
     );
 }
 
@@ -171,7 +155,7 @@ fn temp_csv(content: &str) -> PathBuf {
 }
 
 fn run_file_str(script: &str, path: &std::path::Path, threads: usize) -> String {
-    let mut plan = csvm::compile::compile(script).unwrap();
+    let mut plan = csvm::parse::parse(script).unwrap();
     let (header, data_start, file_len) = exec::read_header_from_path(path).unwrap();
     let out_header = plan.resolve(&header).unwrap();
     let opts = RunOpts {
@@ -209,10 +193,10 @@ fn sharded_file_matches_serial_for_many_thread_counts() {
     let path = temp_csv(&content);
 
     for script in [
-        "(cols val id)",
-        r#"(select (== grp "2"))"#,
-        "(drop-cols grp)",
-        r#"(select (and (== grp "1") (> id 1000)))"#,
+        "cols val,id",
+        "select grp == '2'",
+        "cols -v grp",
+        "select grp == '1' && id > 1000",
     ] {
         // Serial (reader over the same bytes) is the ground truth.
         let serial = run(script, &content, 1).unwrap();
@@ -232,21 +216,21 @@ fn sharded_file_no_trailing_newline() {
     // Last line lacks a newline — boundary snapping must still cover it once.
     let content = "id,v\n1,a\n2,b\n3,c\n4,d"; // no final '\n'
     let path = temp_csv(content);
-    let serial = run("(cols id v)", content, 1).unwrap();
+    let serial = run("cols id,v", content, 1).unwrap();
     for n in [1usize, 2, 4, 8] {
-        assert_eq!(run_file_str("(cols id v)", &path, n), serial, "threads={n}");
+        assert_eq!(run_file_str("cols id,v", &path, n), serial, "threads={n}");
     }
     std::fs::remove_file(&path).ok();
 }
 
 #[test]
 fn unknown_column_errors() {
-    let err = run("(cols nope)", INPUT, 1).unwrap_err();
+    let err = run("cols nope", INPUT, 1).unwrap_err();
     assert!(err.contains("column not found"), "got: {err}");
 }
 
 #[test]
-fn bad_script_is_a_compile_error() {
-    let err = run("(select (frobnicate a b))", INPUT, 1).unwrap_err();
-    assert!(err.contains("unknown operator"), "got: {err}");
+fn bad_script_is_a_parse_error() {
+    let err = run("frobnicate a", INPUT, 1).unwrap_err();
+    assert!(err.contains("unknown command"), "got: {err}");
 }

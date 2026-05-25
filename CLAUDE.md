@@ -2,44 +2,51 @@
 
 A Rust port of [csvm](https://github.com/shsms/csvm), a multithreaded CSV
 manipulation tool. The original is C++ (PEGTL + a hand-rolled DSL). This port
-keeps the execution model but replaces the bespoke DSL with **tulisp** (an
-embeddable Emacs-Lisp-compatible interpreter) as the command language.
+keeps the execution model but uses a **pipe command language** parsed into a
+plain-Rust plan. (It briefly used `tulisp`/Lisp; that was dropped for the pipe
+syntax — see git history. The performance backend is unchanged by that swap;
+only `parse.rs` is the frontend.)
 
-## The one hard rule: no tulisp in the hot path
+## The one hard rule: no interpreter in the hot path
 
-tulisp parses and **compiles** the script into a plain-Rust `Plan` exactly once,
-at startup. Per-row processing (potentially billions of rows) runs the compiled
-`Plan` with **zero** Lisp evaluation. Anything that would call into a
-`TulispContext` while rows are flowing is a bug. After compilation the
-`TulispContext` is dropped; the `Plan` contains only owned Rust data and is
-`Send + Sync`, shared across worker threads behind an `Arc`.
+`parse.rs` parses the script into a plain-Rust `Plan` exactly once, at startup.
+Per-row processing (potentially billions of rows) runs the compiled `Plan` —
+column refs are indices, comparisons are monomorphic. The `Plan` contains only
+owned Rust data and is `Send + Sync`, shared across worker threads behind an
+`Arc`. Nothing parses or interprets the script while rows are flowing.
 
-## Command language (Lisp surface)
+## Command language (pipe syntax)
 
-A script is a sequence of tulisp forms. The pipeline verbs are registered with
-`ctx.defspecial`, so they receive their **raw, unevaluated** argument forms and
-compile them — column names stay symbols, they are never looked up as
-variables. tulisp control flow (`if`/`when`/`dotimes`…) runs at compile time and
-can emit pipeline steps conditionally or repeatedly, but because verbs read
-their column arguments literally, a loop variable is not interpolated into a
-column name. Only the compiled verbs run per row.
+A script is a sequence of stages separated by `|`. Commands take comma- or
+space-separated arguments. `select` takes a **bare** infix expression (no
+surrounding quotes — only string *literals* are quoted).
 
-| csvm DSL                         | csvm-rs Lisp                                  |
+```text
+cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
+```
+
+| csvm DSL                         | csvm-rs pipe                                  |
 |----------------------------------|-----------------------------------------------|
-| `cols(id, a, b)`                 | `(cols id a b)`                               |
-| `!cols(a, b)`                    | `(drop-cols a b)`                             |
-| `select(a == 't' && b != '0')`   | `(select (and (== a "t") (!= b "0")))`        |
-| `sort(a, b:r)`                   | `(sort-by a (b :reverse))`                    |
-| `to_num(a, b)` / `to_str(a, b)`  | `(to-num a b)` / `(to-str a b)`               |
+| `cols(id, a, b)`                 | `cols id,a,b`  (or `cols id a b`)             |
+| `!cols(a, b)`                    | `cols -v a,b`                                 |
+| `select(a == 't' && b != '0')`   | `select a == 't' && b != '0'`                 |
+| `sort(a, b:r)`                   | `sort a b=r`                                  |
+| `to_num(a, b)` / `to_str(a, b)`  | `to-num a,b` / `to-str a,b`                   |
 
-- **Operators** in `select`: `== = != /= < > <= >=`, `=~` / `!~` (regex),
-  `and`/`&&`, `or`/`||`, `not`/`!`. `and`/`or` are n-ary and short-circuit.
-- **Operands**: bare symbols are column references; `"…"` are string literals;
-  numbers are numeric literals.
-- **sort spec** (the verb is `sort-by`, not `sort` — tulisp's prelude already
-  binds `sort`): a bare `col`, or `(col :reverse :numeric)`. Aliases:
-  `:r`/`:desc` for reverse, `:n`/`:num` for numeric. Multi-key, stable.
+- **`cols`** keeps/reorders the named columns; **`cols -v`** keeps everything
+  *except* them (like `cut --complement`).
+- **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
+  `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
+  words). Operands: bare identifiers are columns, numbers are numeric literals,
+  `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`
+  fall out for free, and chaining `select`s ANDs them.
+- **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
+  and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
+- `split_stages` splits on a lone unquoted `|`; a `||` (or) and a `|` inside a
+  string literal are left intact, so the bare `select` expression needs no
+  quoting of its own. `parse.rs` is a hand-written tokenizer plus a
+  recursive-descent expression parser producing the `BoolExpr`/`Cmp` IR.
 
 ## Implicit conversions (`to_num`/`to_str` are implicit)
 
@@ -49,8 +56,8 @@ before output. csvm-rs makes these implicit:
 - A comparison against a **numeric literal** ⇒ numeric compare (the field is
   parsed). Against a **string literal** ⇒ string compare.
 - Numbers always serialize correctly on output — no `to-str` needed to print.
-- `(to-num c)` / `(to-str c)` remain as explicit **type overrides** affecting
-  later column-vs-column comparisons and the default sort mode for that column.
+- `to-num c` / `to-str c` remain as explicit **type overrides** affecting later
+  column-vs-column comparisons and the default sort mode for that column.
 
 Numeric coercion: trim, empty ⇒ `0.0`, else parse `f64`; non-numeric is an error
 that aborts the run with the offending value (matches csvm's `to_num` strictness).
@@ -77,9 +84,10 @@ the chunk buffer. A `csv`-backed strict mode could be a future option.
 - A `Plan` is a list of **stages** split at `sort` boundaries (mirrors csvm's
   `tblock`s: statements before a sort form one stage, the sort is its own stage,
   statements after form another).
-- No-sort plans run as a single streaming stage: each worker parses a chunk
-  (borrowed rows), applies the stage, serializes to a buffer, tags it with the
-  chunk id. A writer thread reassembles output in id order. Fully zero-copy.
+- No-sort plans over a **seekable file** with `-n>1` are **sharded**: each
+  worker reads its own line-aligned byte range (no central reader/channel),
+  applies the stage with borrowed rows, and outputs are concatenated in file
+  order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - `sort` is a blocking stage handled by a **parallel external merge sort**
   (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; `-n`
   workers each parse + apply the pre-sort statements, **serialize each row to
@@ -113,13 +121,22 @@ serial merge just copy line bytes.
 
 ### Known pass-2 opportunities
 
-- The k-way merge is single-threaded and single-level. csvm also parallelizes
-  intermediate merges (`merge_tmp` workers consolidate runs to files) and the
-  file readback, and does multi-level merge so very large inputs don't open
-  thousands of run files at once. Those are the remaining sort wins.
-- The order-preserving string key uses a `\0` terminator; a string sort key
-  containing a literal NUL byte (never produced by normal CSV) would order
+- Sort run generation is parallel and the intermediate merges are
+  **multi-level + parallel** (groups of `fanout=32` runs are consolidated
+  across the workers, so huge inputs stay FD-bounded). The **final** merge is
+  still single-threaded; parallelizing it (and, for parquet, projection/filter
+  push-down into the reader) is what's left.
+- The order-preserving string sort key uses a `\0` terminator; a string sort
+  key containing a literal NUL byte (never produced by normal CSV) would order
   slightly off. Numeric keys are exact.
+
+## Roadmap
+
+The pipe language is deliberately built to grow: new verbs are a parse arm plus
+a `Stmt`/`Stage`. Planned: more verbs (`head`, `rename`, computed `add`, …),
+pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and `join` over
+multiple files (a sub-pipeline as the right side; the `Plan` grows a join node
+and becomes a small DAG).
 
 ## Conventions
 

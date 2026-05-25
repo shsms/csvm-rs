@@ -1,16 +1,15 @@
 # csvm-rs
 
 A fast, multithreaded CSV manipulation tool — a Rust port of
-[csvm](https://github.com/shsms/csvm) (originally C++). The bespoke C++ DSL is
-replaced by [tulisp](https://github.com/shsms/tulisp), an embeddable Emacs-Lisp,
-used as the command language.
-
-The script is **compiled once** by tulisp into a plain-Rust execution plan; the
-per-row hot path runs that compiled plan with **no interpreter involved**.
+[csvm](https://github.com/shsms/csvm) (originally C++). Pipelines are written in
+a small shell-pipe-style language:
 
 ```sh
-cat input.csv | csvm '(select (and (== fieldA "t") (> countZ 0))) (drop-cols fieldA)'
+csvm -f input.csv "select fieldA == 't' && countZ > 0 | cols -v fieldA"
 ```
+
+The script is **parsed once** into a plain-Rust execution plan; the per-row hot
+path runs that plan with **no interpreter involved**.
 
 ## Build
 
@@ -19,8 +18,7 @@ cargo build --release        # binary at target/release/csvm
 cargo test                   # unit + integration tests
 ```
 
-The `tulisp` dependency is a path dependency on the sibling `../tulisp`
-checkout.
+No external services or path dependencies; just `cargo build`.
 
 ## Usage
 
@@ -39,57 +37,63 @@ csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR]
 | `--sort-buffer`  | in-memory budget before `sort` spills to disk (default 256 MiB) |
 | `--print-engine` | print the compiled plan and exit                              |
 
-The first input line is the header; columns are referenced by name.
+The first input line is the header; columns are referenced by name. For a
+seekable file, `-n N` shards the work across N threads.
 
 ## The command language
 
-A script is a sequence of Lisp forms. The pipeline verbs are:
+A script is a sequence of stages separated by `|`. Each stage is a command with
+comma- or space-separated arguments:
 
-| Verb                          | Does                                                       |
-|-------------------------------|------------------------------------------------------------|
-| `(cols a b c)`                | keep these columns, in this order                          |
-| `(drop-cols a b)`             | drop these columns, keep the rest                          |
-| `(select EXPR)`               | keep rows where `EXPR` is true                             |
-| `(sort-by SPEC...)`           | sort rows (stable, multi-key)                              |
-| `(to-num a b)` / `(to-str a b)` | mark columns numeric / string (usually unnecessary, see below) |
+| Command            | Does                                                       |
+|--------------------|------------------------------------------------------------|
+| `cols a,b,c`       | keep these columns, in this order                          |
+| `cols -v a,b`      | keep everything *except* these columns                     |
+| `select EXPR`      | keep rows where `EXPR` is true                             |
+| `sort SPEC...`     | sort rows (stable, multi-key)                              |
+| `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
-`to_num` / `to_str` (underscore) are accepted too.
+Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
+`to_num`/`to_str` (underscore) are accepted too.
 
 ### `select` expressions
 
-- **Column reference**: a bare symbol — `fieldA`. (Use a string for names that
-  aren't valid symbols, e.g. `"first,name"`.)
-- **Literals**: strings `"t"`, numbers `0`, `3.14`.
-- **Comparisons**: `==`/`=`, `!=`/`/=`, `<`, `>`, `<=`, `>=`.
-- **Regex**: `(=~ col "pattern")`, `(!~ col "pattern")` (Rust `regex` syntax).
-- **Logic**: `(and …)`, `(or …)`, `(not e)` — also `&&`, `||`, `!`. `and`/`or`
-  are n-ary and short-circuit.
+A bare infix expression (no surrounding quotes — only string *literals* are
+quoted). Shell-quote the whole script so the shell doesn't eat `>`/`|`/spaces.
 
-```lisp
-(select (and (== fieldA "t") (or (> countZ 0) (> countA 0))))
+- **Column reference**: a bare identifier — `fieldA`.
+- **Literals**: numbers (`0`, `3.14`, `-5`); strings in single or double quotes
+  (`'t'`).
+- **Comparisons**: `==` (or `=`), `!=`, `<`, `>`, `<=`, `>=`.
+- **Regex**: `col =~ 'pattern'`, `col !~ 'pattern'` (Rust `regex` syntax).
+- **Logic**: `&&`, `||`, `!`, and parentheses. `&&`/`||` short-circuit. `||` is
+  *not* mistaken for a stage `|`.
+
+```sh
+select fieldA == 't' && (countZ > 0 || countA > 0)
 ```
 
-### `sort-by` specs
+Two handy consequences: a parenthesized expression is just `select (…)`, and
+chaining `select`s ANDs them — `select a > 0 | select b == 't'`.
 
-Each spec is a bare column, or `(column :modifier...)`:
+### `sort` specs
 
-- `:reverse` (aliases `:r`, `:desc`) — descending.
-- `:numeric` (aliases `:n`, `:num`) — compare numerically rather than lexically.
+Each spec is a bare column or `col=flags`, where flags combine:
 
-```lisp
-(sort-by fieldA (fieldB :reverse) (countZ :numeric :reverse))
+- `r` — reverse (descending).
+- `n` — compare numerically rather than lexically.
+
+```sh
+sort fieldA fieldB=r countZ=nr      # by fieldA asc, fieldB desc, countZ numeric desc
 ```
-
-> The verb is `sort-by`, not `sort`: tulisp's standard library already binds
-> `sort`.
 
 ### Conversions are implicit
 
-csvm needs an explicit `to_num` before any numeric comparison or sort and a
+csvm needs an explicit `to_num` before any numeric comparison/sort and a
 `to_str` before output. Here that is automatic:
 
 - A comparison against a **number** is numeric; against a **string** it is
-  lexical. So `(> countZ 0)` just works — no `to-num` needed.
+  lexical. So `countZ > 0` just works — no `to-num` needed.
 - Numbers always print correctly — no `to-str` needed.
 - `to-num` / `to-str` remain available as explicit type overrides (they affect
   column-vs-column comparisons and a column's default sort mode).
@@ -97,51 +101,37 @@ csvm needs an explicit `to_num` before any numeric comparison or sort and a
 Numeric coercion treats empty as `0`; a genuinely non-numeric value where a
 number is required aborts the run with the offending value (as csvm does).
 
-### Programmable pipelines
-
-Because the verbs run while tulisp evaluates the script, ordinary Lisp control
-flow can shape the pipeline at compile time:
-
-```lisp
-(when production (to-num price))   ; include a step conditionally
-(dotimes (_ 3) (select (> x 0)))   ; emit a step repeatedly
-```
-
-Column arguments are read as literal symbols/strings, so a loop variable is
-**not** interpolated into a column name.
-
 ## Examples
 
-csvm's README examples, translated:
+csvm's README examples, in the pipe syntax:
 
 ```sh
 # keep three columns, in order
-csvm '(cols id fieldA countZ)' < input.csv
+csvm 'cols id,fieldA,countZ' < input.csv
 
 # drop a column, write to a file
-csvm -o out.csv '(drop-cols fieldA)' < input.csv
+csvm -o out.csv 'cols -v fieldA' < input.csv
 
 # filter rows
-csvm -f input.csv '(select (and (== fieldA "t") (!= countZ "0")))'
+csvm -f input.csv "select fieldA == 't' && countZ != '0'"
 
 # numeric filter (no to-num needed)
-csvm -f input.csv '(select (and (== fieldA "t") (or (> countZ 0) (> countA 0))))'
+csvm -f input.csv "select fieldA == 't' && (countZ > 0 || countA > 0)"
 
 # filter then drop the filter column
-csvm -f input.csv '(select (== fieldA "t")) (drop-cols fieldA)'
+csvm -f input.csv "select fieldA == 't' | cols -v fieldA"
 
 # filter, forward sort by fieldA, reverse sort by fieldB
-csvm -f input.csv '(select (!= fieldA "t")) (sort-by fieldA (fieldB :reverse))'
+csvm -f input.csv "select fieldA != 't' | sort fieldA fieldB=r"
 
 # numeric filter and numeric reverse sort
-csvm -f input.csv '(select (> countA 0)) (sort-by (countA :reverse :numeric))'
+csvm -f input.csv "select countA > 0 | sort countA=nr"
 ```
 
 `--print-engine` shows the compiled, resolved plan:
 
 ```
-$ csvm -f input.csv --print-engine \
-    '(to-num countZ) (select (> countZ 0)) (sort-by (countZ :r)) (drop-cols fieldB)'
+$ csvm -f input.csv --print-engine "to-num countZ | select countZ > 0 | sort countZ=r | cols -v fieldB"
 stage 1 (transform):
   1.1 to-num ["countZ"] (positions [4])
   1.2 select (> countZ[4] 0)
@@ -153,21 +143,22 @@ stage 3 (transform):
 
 ## How it works
 
-- **Compile once.** tulisp parses the script and runs the pipeline verbs, which
-  are special forms (`defspecial`) that receive their arguments *unevaluated* and
-  append to a plan. The plan is plain Rust data — no interpreter is retained.
+- **Parse once.** `parse.rs` turns the script into a plain-Rust `Plan` (a
+  quote-aware stage/argument tokenizer plus a recursive-descent parser for the
+  `select` expression). The hot path runs the plan — no interpreter is retained.
 - **Parallel by sharding.** With `-n N` over a seekable file, the data region is
   split into N line-aligned byte ranges and each worker reads and processes its
   own range — no central reader or channel. Shard outputs are concatenated in
   file order, so results are identical regardless of thread count. (stdin can't
-  seek, so it streams single-threaded unless `-n` forces a channel pipeline.)
+  seek, so it streams.)
 - **Zero-copy.** Fields are sliced straight out of the chunk buffer; only an
   unescaped `""` or a parsed number allocates.
-- **Sort runs in parallel and scales past memory.** `sort-by` farms input
-  blocks to `-n` workers that parse, serialize each row once, compute an
-  order-preserving key, and sort their block into a run (kept in memory, or
-  spilled to a temp file past `--sort-buffer`). A single-threaded binary-heap
-  k-way merge then copies the already-serialized line bytes out in order.
+- **Sort runs in parallel and scales past memory.** `sort` farms input blocks to
+  `-n` workers that parse, serialize each row once, compute an order-preserving
+  key, and sort their block into a run (kept in memory, or spilled to a temp file
+  past `--sort-buffer`). Groups of runs are merged in parallel (multi-level, so
+  huge inputs stay file-descriptor-bounded), then a binary-heap k-way merge
+  copies the already-serialized line bytes out in order.
 
 ## Benchmarking
 
@@ -177,8 +168,12 @@ same bytes), so benchmarks are reproducible:
 ```sh
 cargo run --release --example gen_csv -- 3000000 /tmp/huge.csv   # ~151 MB
 time ./target/release/csvm -f /tmp/huge.csv -n 8 \
-  '(select (and (== flag "t") (> amount 50000) (=~ status "^a"))) (cols id region amount)'
+  "select flag == 't' && amount > 50000 && status =~ '^a' | cols id,region,amount"
 ```
+
+Benchmarked against the C++ csvm on this file (warm cache), csvm-rs is faster on
+filter, projection, and sort at both `-n 1` and `-n 8` (sort by ~3×), with
+byte-identical output.
 
 ## CSV details
 
@@ -191,13 +186,19 @@ time ./target/release/csvm -f /tmp/huge.csv -n 8 \
 
 ## Differences from csvm
 
-- Command language is Lisp (tulisp), not the C++ DSL; `sort` → `sort-by`,
-  `!cols(...)` → `(drop-cols ...)`.
+- Pipe command language (`|` stages), not the C++ DSL: `!cols(...)` → `cols -v`,
+  `sort(a, b:r)` → `sort a b=r`.
 - `to_num`/`to_str` are implicit (see above).
 - `=~` regex matching is implemented (csvm left it as a stub).
 - Proper RFC-4180 quote handling on input and output.
-- `--sort-buffer` is new. `-n` defaults to 1 (like csvm); for a seekable file,
-  `-n N` shards the input across N threads.
+- `--sort-buffer` is new; `-n` defaults to 1 (like csvm) and shards seekable
+  files.
+
+## Roadmap
+
+The pipe language is built to grow. Planned: more verbs (`head`, `rename`,
+computed `add`), pluggable formats via a `Source`/`Sink` trait (Parquet, TSV),
+and `join` across multiple files.
 
 ## License
 

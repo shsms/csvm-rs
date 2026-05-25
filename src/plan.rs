@@ -1,7 +1,7 @@
 //! The compiled execution plan — the hot path.
 //!
 //! A [`Plan`] is what the `tulisp` script compiles down to (see
-//! [`crate::compile`]). Evaluating it touches no interpreter: column references
+//! [`crate::parse`]). Evaluating it touches no interpreter: column references
 //! are plain indices, comparisons are monomorphic, and `and`/`or` short-circuit.
 //!
 //! Column references start life carrying only a name; [`Plan::resolve`] turns
