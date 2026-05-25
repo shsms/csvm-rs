@@ -81,11 +81,14 @@ the chunk buffer. A `csv`-backed strict mode could be a future option.
   (borrowed rows), applies the stage, serializes to a buffer, tags it with the
   chunk id. A writer thread reassembles output in id order. Fully zero-copy.
 - `sort` is a blocking stage handled by a **parallel external merge sort**
-  (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks, `-n`
-  workers each parse + apply the pre-sort statements + stably sort a block into
-  a run (kept in memory, or spilled to a temp file past the budget), and a
-  single-threaded binary-heap k-way merge produces the sorted stream. A block is
-  a contiguous input range, so its sequence number keeps the merge stable.
+  (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; `-n`
+  workers each parse + apply the pre-sort statements, **serialize each row to
+  bytes once**, compute an **order-preserving encoded key**, and sort their
+  block into a run (kept in memory, or spilled to a temp file past the budget).
+  A single-threaded binary-heap k-way merge then picks the smallest key and
+  emits the row's already-serialized line bytes via a callback — no per-field
+  allocation, no re-serialization on output. A block is a contiguous input
+  range, so its sequence number keeps the merge stable.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls
@@ -98,16 +101,25 @@ lifetime, so there is one `apply` implementation.
 [--sort-buffer BYTES] [--print-engine] SCRIPT`. Defaults: stdin/stdout,
 threads = 1, chunk = 1 MB, sort buffer = 256 MiB.
 
-## Known pass-2 opportunities
+## Performance
 
-- Sort parse+sort is parallel (`-n` workers) but the final k-way merge is
-  single-threaded and single-level. csvm also parallelizes intermediate merges
-  (`merge_tmp` workers consolidate runs to files) and the file readback, and
-  does multi-level merge so very large inputs don't open thousands of run files
-  at once. Those are the remaining sort wins.
-- Rows are materialized as **owned** `Field`s for sorting (every field becomes a
-  `String`). Sorting an index/row-id permutation, or interning, would cut the
-  allocation cost that bounds the serial merge + write tail.
+Benchmarked against the C++ csvm (`gen_csv` 3M rows / 151 MB, warm cache).
+csvm-rs is faster on every case tried — filter, projection, and sort, at both
+`-n 1` and `-n 8` (sort by ~3x). The wins came from: a zero-copy scanner +
+compiled plan; sharded file reads (no central reader/channel for transforms);
+reusing a projection scratch buffer (no per-row alloc); and a sort that
+serializes once in the parallel workers, sorts an encoded key, and lets the
+serial merge just copy line bytes.
+
+### Known pass-2 opportunities
+
+- The k-way merge is single-threaded and single-level. csvm also parallelizes
+  intermediate merges (`merge_tmp` workers consolidate runs to files) and the
+  file readback, and does multi-level merge so very large inputs don't open
+  thousands of run files at once. Those are the remaining sort wins.
+- The order-preserving string key uses a `\0` terminator; a string sort key
+  containing a literal NUL byte (never produced by normal CSV) would order
+  slightly off. Numeric keys are exact.
 
 ## Conventions
 

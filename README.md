@@ -164,9 +164,10 @@ stage 3 (transform):
 - **Zero-copy.** Fields are sliced straight out of the chunk buffer; only an
   unescaped `""` or a parsed number allocates.
 - **Sort runs in parallel and scales past memory.** `sort-by` farms input
-  blocks to `-n` workers that parse and stably sort each into a run (kept in
-  memory, or spilled to a temp file past `--sort-buffer`); a single-threaded
-  binary-heap k-way merge then produces the sorted output.
+  blocks to `-n` workers that parse, serialize each row once, compute an
+  order-preserving key, and sort their block into a run (kept in memory, or
+  spilled to a temp file past `--sort-buffer`). A single-threaded binary-heap
+  k-way merge then copies the already-serialized line bytes out in order.
 
 ## Benchmarking
 

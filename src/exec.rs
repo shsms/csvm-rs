@@ -19,7 +19,11 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt, apply_stmts};
-use crate::sort::{OwnedRow, Sorter};
+use crate::sort::Sorter;
+
+/// An owned row, detached from any chunk buffer (used by the in-memory
+/// multi-sort fallback).
+type OwnedRow = Vec<Field<'static>>;
 
 /// Knobs for a run: chunk size, worker count, and where sort spills its temp
 /// files.
@@ -435,21 +439,50 @@ fn run_staged<R: BufRead, W: Write>(
         sorter.push_block(block);
     }
 
-    // Stream the sorted rows through the post-sort transforms.
-    let mut out_buf = String::new();
-    let mut scratch: Vec<Field> = Vec::new();
-    for row in sorter.finish()? {
-        let mut row = row?;
-        if apply_stmts(post, &mut row, &mut scratch)? {
-            csv::write_row(&mut out_buf, &row);
-            if out_buf.len() >= 1 << 16 {
-                output.write_all(out_buf.as_bytes())?;
-                out_buf.clear();
-            }
+    // The merge hands us already-serialized line bytes (workers serialized them
+    // in parallel). With no post-sort statements we write them straight out;
+    // otherwise we re-parse each line, apply, and re-serialize.
+    let mut out_buf: Vec<u8> = Vec::new();
+    sorter.finish()?.for_each_line(|line| {
+        if post.is_empty() {
+            out_buf.extend_from_slice(line);
+        } else {
+            apply_post_to_line(post, line, &mut out_buf)?;
         }
-    }
-    output.write_all(out_buf.as_bytes())?;
+        if out_buf.len() >= 1 << 16 {
+            output.write_all(&out_buf)?;
+            out_buf.clear();
+        }
+        Ok(())
+    })?;
+    output.write_all(&out_buf)?;
     Ok(())
+}
+
+/// Re-parse one merged line, apply the post-sort statements, and append the
+/// re-serialized survivors to `out`. Only used when a `sort` has trailing
+/// transforms; the common pure-sort path writes line bytes directly.
+fn apply_post_to_line(post: &[Stmt], line: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+    let text = std::str::from_utf8(line)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+    let mut err: Option<Error> = None;
+    let mut buf = String::new();
+    let mut scratch: Vec<Field> = Vec::new();
+    csv::parse_chunk(text, |row| {
+        if err.is_some() {
+            return;
+        }
+        match apply_stmts(post, row, &mut scratch) {
+            Ok(true) => {
+                buf.clear();
+                csv::write_row(&mut buf, row);
+                out.extend_from_slice(buf.as_bytes());
+            }
+            Ok(false) => {}
+            Err(e) => err = Some(e),
+        }
+    });
+    err.map_or(Ok(()), Err)
 }
 
 /// The statements of an optional single transform stage (empty otherwise).
