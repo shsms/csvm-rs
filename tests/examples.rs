@@ -268,8 +268,30 @@ fn rename_changes_header_only() {
 #[test]
 fn fmt_aligns_columns() {
     // fmt is whitespace-aligned, not CSV: columns padded to their widest cell.
+    // The numeric `id` column is right-justified; the text `fieldB` is left.
     let out = run("select fieldA == 't' | cols id,fieldB | fmt", INPUT, 1).unwrap();
-    assert_eq!(out, "id  fieldB\n1   x\n3   x\n4   z\n");
+    assert_eq!(out, "id  fieldB\n 1  x\n 3  x\n 4  z\n");
+}
+
+#[test]
+fn fmt_right_justifies_numeric_columns() {
+    // Every data cell numeric (incl. a negative) => the column is right-justified
+    // so digits line up, and the header rides with its column's width.
+    let out = run_checked("cols id,countA | fmt", INPUT);
+    assert_eq!(
+        out,
+        "id  countA\n 1       3\n 2       0\n 3      -2\n 4       7\n 5       0\n"
+    );
+}
+
+#[test]
+fn fmt_mixes_numeric_and_text_justification() {
+    // numeric, text, numeric: id and amount right-justified, name left.
+    let out = run_checked("hdr id,name,amount | fmt", HEADERLESS);
+    assert_eq!(
+        out,
+        "id  name   amount\n 1  alice     100\n 2  bob       200\n 3  carol     300\n"
+    );
 }
 
 // Headerless input: every line is data; `hdr` supplies the column names.

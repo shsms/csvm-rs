@@ -59,7 +59,7 @@ comma- or space-separated arguments:
 | `head N`           | keep the first `N` rows reaching it                        |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
-| `fmt`              | render the output as a whitespace-aligned table (`column -t`) |
+| `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).

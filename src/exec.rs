@@ -677,8 +677,10 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
 }
 
 /// Re-render CSV bytes as a whitespace-aligned table (`fmt` / `column -t`):
-/// each column is left-padded to its widest cell, columns separated by two
-/// spaces, the trailing column unpadded.
+/// each column is padded to its widest cell, columns separated by two spaces.
+/// A **numeric** column (every data cell reads as a number) is right-justified
+/// so the digits line up; text columns are left-justified and the trailing
+/// column is left unpadded (no trailing whitespace).
 pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), Error> {
     let text = std::str::from_utf8(csv_bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
@@ -695,6 +697,24 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
         }
     }
 
+    // Right-justify a column when every data cell (the rows after the header)
+    // reads as a number under the engine's coercion — blanks are allowed, but at
+    // least one cell must be a real number, so all-blank and text columns stay
+    // left-justified. The header is justified with its column.
+    let numeric: Vec<bool> = (0..ncols)
+        .map(|i| {
+            let mut saw_number = false;
+            for row in rows.iter().skip(1) {
+                let cell = row.get(i).map_or("", String::as_str);
+                if Field::Str(cell).coerce_num().is_err() {
+                    return false;
+                }
+                saw_number |= !cell.trim().is_empty();
+            }
+            saw_number
+        })
+        .collect();
+
     let mut line = String::new();
     for row in &rows {
         line.clear();
@@ -703,10 +723,20 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
             if i > 0 {
                 line.push_str("  ");
             }
-            line.push_str(field);
-            if i != last {
-                for _ in 0..widths[i].saturating_sub(field.chars().count()) {
+            let pad = widths[i].saturating_sub(field.chars().count());
+            if numeric[i] {
+                // Right-justify: pad on the left (so never a trailing space).
+                for _ in 0..pad {
                     line.push(' ');
+                }
+                line.push_str(field);
+            } else {
+                line.push_str(field);
+                // Left-justify: pad on the right, except the last column.
+                if i != last {
+                    for _ in 0..pad {
+                        line.push(' ');
+                    }
                 }
             }
         }

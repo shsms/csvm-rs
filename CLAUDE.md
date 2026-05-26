@@ -52,7 +52,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (file shards start at byte 0). The names are prepended on output.
 - **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
-  CSV (so the executor itself is unchanged).
+  CSV (so the executor itself is unchanged). Columns whose data cells are all
+  numeric are right-justified (digits line up); text columns are left-justified.
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `split_stages` splits on a lone unquoted `|`; a `||` (or) and a `|` inside a
   string literal are left intact, so the bare `select` expression needs no
