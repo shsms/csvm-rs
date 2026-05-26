@@ -114,11 +114,14 @@ streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls
 `into_owned()` to get `Field<'static>`. Compiled statements are generic over the
 lifetime, so there is one `apply` implementation.
 
-## CLI (parity with csvm)
+## CLI
 
-`csvm [-f IN] [-o OUT] [-n THREADS] [-t TMPDIR] [--chunk-size BYTES]
-[--sort-buffer BYTES] [--print-engine] SCRIPT`. Defaults: stdin/stdout,
-threads = 1, chunk = 1 MB, sort buffer = 256 MiB.
+`csvm [-o OUT] [-n THREADS] [-t TMPDIR] [--chunk-size BYTES]
+[--sort-buffer BYTES] [--print-engine] SCRIPT [INPUT]`. The script is the first
+positional; the input file is an optional **second positional** (awk-style;
+default stdin, a bare `-` is stdin). Defaults: stdin/stdout, threads = 1,
+chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN`; this port takes the
+input positionally — flags otherwise mirror csvm.)
 
 ## Performance
 

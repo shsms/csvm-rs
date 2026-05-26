@@ -5,7 +5,7 @@ A fast, multithreaded CSV manipulation tool — a Rust port of
 a small shell-pipe-style language:
 
 ```sh
-csvm -f input.csv "select fieldA == 't' && countZ > 0 | cols -v fieldA"
+csvm "select fieldA == 't' && countZ > 0 | cols -v fieldA" input.csv
 ```
 
 The script is **parsed once** into a plain-Rust execution plan; the per-row hot
@@ -23,13 +23,17 @@ No external services or path dependencies; just `cargo build`.
 ## Usage
 
 ```
-csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR]
-     [--chunk-size BYTES] [--sort-buffer BYTES] [--print-engine] SCRIPT
+csvm [-o OUT] [-n THREADS] [-t TEMPDIR]
+     [--chunk-size BYTES] [--sort-buffer BYTES] [--print-engine] SCRIPT [INPUT]
 ```
 
-| Flag             | Meaning                                                       |
+The input file is an optional **second positional**, like `awk 'prog' file`:
+`csvm 'select x > 1' data.csv`. Omit it (or pass `-`) to read stdin.
+
+| Argument / flag  | Meaning                                                       |
 |------------------|---------------------------------------------------------------|
-| `-f IN`          | input file (default: stdin)                                   |
+| `SCRIPT`         | the pipeline (required, first positional)                     |
+| `INPUT`          | input file (optional second positional; default stdin, `-` ⇒ stdin) |
 | `-o OUT`         | output file (default: stdout)                                 |
 | `-n THREADS`     | worker threads (default: 1; `<=0` ⇒ 1)                        |
 | `-t, --temp-dir` | directory for sort spill files (default: system temp)         |
@@ -99,7 +103,7 @@ output. It is plan-level metadata, so it must be the first command.
 
 ```sh
 # input has no header; name the columns, then work with them
-csvm -f raw.csv 'hdr id,name,amount | select amount > 1000 | cols id,amount'
+csvm 'hdr id,name,amount | select amount > 1000 | cols id,amount' raw.csv
 ```
 
 Without `hdr`, the first input line is taken as the header (the default).
@@ -130,25 +134,25 @@ csvm 'cols id,fieldA,countZ' < input.csv
 csvm -o out.csv 'cols -v fieldA' < input.csv
 
 # filter rows
-csvm -f input.csv "select fieldA == 't' && countZ != '0'"
+csvm "select fieldA == 't' && countZ != '0'" input.csv
 
 # numeric filter (no to-num needed)
-csvm -f input.csv "select fieldA == 't' && (countZ > 0 || countA > 0)"
+csvm "select fieldA == 't' && (countZ > 0 || countA > 0)" input.csv
 
 # filter then drop the filter column
-csvm -f input.csv "select fieldA == 't' | cols -v fieldA"
+csvm "select fieldA == 't' | cols -v fieldA" input.csv
 
 # filter, forward sort by fieldA, reverse sort by fieldB
-csvm -f input.csv "select fieldA != 't' | sort fieldA fieldB=r"
+csvm "select fieldA != 't' | sort fieldA fieldB=r" input.csv
 
 # numeric filter and numeric reverse sort
-csvm -f input.csv "select countA > 0 | sort countA=nr"
+csvm "select countA > 0 | sort countA=nr" input.csv
 ```
 
 `--print-engine` shows the compiled, resolved plan:
 
 ```
-$ csvm -f input.csv --print-engine "to-num countZ | select countZ > 0 | sort countZ=r | cols -v fieldB"
+$ csvm --print-engine "to-num countZ | select countZ > 0 | sort countZ=r | cols -v fieldB" input.csv
 stage 1 (transform):
   1.1 to-num ["countZ"] (positions [4])
   1.2 select (> countZ[4] 0)
@@ -184,8 +188,8 @@ same bytes), so benchmarks are reproducible:
 
 ```sh
 cargo run --release --example gen_csv -- 3000000 /tmp/huge.csv   # ~151 MB
-time ./target/release/csvm -f /tmp/huge.csv -n 8 \
-  "select flag == 't' && amount > 50000 && status =~ '^a' | cols id,region,amount"
+time ./target/release/csvm -n 8 \
+  "select flag == 't' && amount > 50000 && status =~ '^a' | cols id,region,amount" /tmp/huge.csv
 ```
 
 Benchmarked against the C++ csvm on this file (warm cache), csvm-rs is faster on
@@ -213,6 +217,8 @@ byte-identical output.
 - Proper RFC-4180 quote handling on input and output.
 - `--sort-buffer` is new; `-n` defaults to 1 (like csvm) and shards seekable
   files.
+- Input is a positional argument (`csvm SCRIPT [INPUT]`, awk-style) rather than
+  csvm's `-f IN`; `-o` for output is unchanged.
 
 ## Roadmap
 

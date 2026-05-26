@@ -1,9 +1,11 @@
 //! Command-line argument parsing.
 //!
-//! Mirrors csvm's flags: `-f`/`-o` for input/output files (default
-//! stdin/stdout), `-n` for the worker count, `-t`/`--temp-dir` for sort spill
-//! files, `--chunk-size` for the input chunk size, and `--print-engine` to dump
-//! the compiled plan and exit. The script is the one required positional.
+//! The script is the first positional and the input file an optional second
+//! positional (`csvm SCRIPT [INPUT]`, like `awk 'prog' file`); input defaults to
+//! stdin, and a bare `-` is also stdin. `-o` sets the output file (default
+//! stdout), `-n` the worker count, `-t`/`--temp-dir` the sort spill directory,
+//! `--chunk-size` the input chunk size, and `--print-engine` dumps the compiled
+//! plan and exits.
 
 use std::path::PathBuf;
 
@@ -25,10 +27,11 @@ const DEFAULT_CHUNK_SIZE: usize = 1_000_000;
 pub const DEFAULT_SORT_BUFFER: usize = 256 << 20;
 
 pub const USAGE: &str = "\
-usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
-            [--print-engine] SCRIPT
+usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
+            [--print-engine] SCRIPT [INPUT]
 
-  -f IN              input CSV file (default: stdin)
+  SCRIPT             pipe-syntax pipeline (required)
+  INPUT              input CSV file (default: stdin; '-' is stdin)
   -o OUT             output CSV file (default: stdout)
   -n THREADS         worker threads (default: 1; <=0 means 1)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
@@ -39,7 +42,7 @@ usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   -h, --help         show this help
 
 SCRIPT is a pipe-syntax pipeline, e.g.:
-  'select fieldA == \"t\" && countZ > 0 | cols -v fieldA'";
+  csvm 'select fieldA == \"t\" && countZ > 0 | cols -v fieldA' input.csv";
 
 /// Outcome of parsing: either run with `Args`, or print help/usage and exit.
 pub enum Parsed {
@@ -50,8 +53,7 @@ pub enum Parsed {
 /// Parse arguments (excluding argv[0]). Returns an error message suitable for
 /// printing to stderr.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> {
-    let mut script: Option<String> = None;
-    let mut in_file = None;
+    let mut positionals: Vec<String> = Vec::new();
     let mut out_file = None;
     let mut threads: Option<i64> = None;
     let mut temp_dir = None;
@@ -69,7 +71,6 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
-            "-f" => in_file = Some(value!()),
             "-o" => out_file = Some(value!()),
             "-n" => {
                 let v = value!();
@@ -102,17 +103,21 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown option: {other}"));
             }
-            _ => {
-                if script.replace(arg).is_some() {
-                    return Err("more than one script given".to_string());
-                }
-            }
+            _ => positionals.push(arg),
         }
     }
 
-    let Some(script) = script else {
+    // Positionals are `SCRIPT [INPUT]` (awk-style): the script is required, the
+    // input file optional (default stdin). A bare `-` falls through here too, so
+    // `csvm SCRIPT -` is an explicit stdin.
+    let mut positionals = positionals.into_iter();
+    let Some(script) = positionals.next() else {
         return Err("no script given".to_string());
     };
+    let in_file = positionals.next();
+    if positionals.next().is_some() {
+        return Err("too many arguments (expected SCRIPT [INPUT])".to_string());
+    }
 
     // Default to single-threaded (like csvm): the parallel path only pays off
     // for heavier per-row work, and stdin can't be sharded. Users opt in with
@@ -157,22 +162,30 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let a = args(&[
-            "-f",
-            "in.csv",
-            "-o",
-            "out.csv",
-            "-n",
-            "4",
-            "--print-engine",
-            "(sort-by x)",
-        ])
-        .unwrap();
-        assert_eq!(a.in_file.as_deref(), Some("in.csv"));
+        let a = args(&["-o", "out.csv", "-n", "4", "--print-engine", "(sort-by x)"]).unwrap();
         assert_eq!(a.out_file.as_deref(), Some("out.csv"));
         assert_eq!(a.threads, 4);
         assert!(a.print_engine);
         assert_eq!(a.script, "(sort-by x)");
+        assert_eq!(a.in_file, None); // no input positional -> stdin
+    }
+
+    #[test]
+    fn positional_input_file() {
+        // `csvm SCRIPT INPUT` (awk-style): script first, input second.
+        let a = args(&["select x > 1", "data.csv"]).unwrap();
+        assert_eq!(a.script, "select x > 1");
+        assert_eq!(a.in_file.as_deref(), Some("data.csv"));
+        // Flags may surround the positionals.
+        let a = args(&["-n", "4", "cols a", "data.csv"]).unwrap();
+        assert_eq!(a.script, "cols a");
+        assert_eq!(a.in_file.as_deref(), Some("data.csv"));
+        assert_eq!(a.threads, 4);
+        // A bare '-' input means stdin.
+        assert_eq!(
+            args(&["cols a", "-"]).unwrap().in_file.as_deref(),
+            Some("-")
+        );
     }
 
     #[test]
@@ -183,8 +196,11 @@ mod tests {
 
     #[test]
     fn errors() {
-        assert!(parse(["-f".to_string()]).is_err()); // missing value
-        assert!(parse(["--nope".to_string(), "(cols a)".to_string()]).is_err());
+        assert!(parse(["--nope".to_string(), "(cols a)".to_string()]).is_err()); // unknown option
         assert!(parse(std::iter::empty()).is_err()); // no script
+        // A third positional beyond SCRIPT and INPUT is an error.
+        assert!(parse(["s".to_string(), "in.csv".to_string(), "extra".to_string()]).is_err());
+        // `-f` is no longer a flag; input is positional now.
+        assert!(parse(["-f".to_string(), "in.csv".to_string(), "s".to_string()]).is_err());
     }
 }
