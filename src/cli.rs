@@ -38,8 +38,8 @@ usage: csvm [-f IN] [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   --print-engine     print the compiled execution plan and exit
   -h, --help         show this help
 
-SCRIPT is a Lisp pipeline, e.g.:
-  '(select (and (== fieldA \"t\") (> countZ 0))) (drop-cols fieldA)'";
+SCRIPT is a pipe-syntax pipeline, e.g.:
+  'select fieldA == \"t\" && countZ > 0 | cols -v fieldA'";
 
 /// Outcome of parsing: either run with `Args`, or print help/usage and exit.
 pub enum Parsed {
