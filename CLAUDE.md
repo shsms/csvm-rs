@@ -99,6 +99,13 @@ the chunk buffer. A `csv`-backed strict mode could be a future option.
   worker reads its own line-aligned byte range (no central reader/channel),
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
+- **Streaming reads what's available, not a full chunk.** The streaming paths
+  (`head` and a lone transform) read via `next_chunk_available` (a single `read`
+  completed to a line boundary) and flush output per chunk, so a slow or
+  unbounded stream emits promptly instead of stalling until a 1 MB buffer fills
+  (which made `head` hang and `select` withhold output). `sort` and the
+  in-memory fallback still fill large chunks via `next_chunk` (they must read
+  all input before emitting, so batching wins there).
 - `sort` is a blocking stage handled by a **parallel external merge sort**
   (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; `-n`
   workers each parse + apply the pre-sort statements, **serialize each row to

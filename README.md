@@ -42,7 +42,8 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--print-engine` | print the compiled plan and exit                              |
 
 The first input line is the header; columns are referenced by name. For a
-seekable file, `-n N` shards the work across N threads.
+seekable file, `-n N` shards the work across N threads. A streaming input
+(stdin) emits output as rows arrive rather than buffering a full chunk first.
 
 ## The command language
 

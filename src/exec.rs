@@ -65,6 +65,33 @@ fn next_chunk<R: BufRead>(input: &mut R, size: usize) -> Result<Option<String>, 
     Ok(Some(chunk))
 }
 
+/// Like [`next_chunk`], but returns as soon as the reader yields *any* data
+/// (a single `read`, then completed to a line boundary) instead of blocking
+/// until `size` bytes arrive. The streaming paths (`head` and a lone transform)
+/// read through this so they emit promptly on a slow or unbounded stream rather
+/// than waiting to fill a whole chunk that may never come — `head` could stop
+/// early but would block (see the head regression test), and a streaming
+/// `select`/`cols` would withhold all output until a megabyte accumulated.
+/// (`sort` and the in-memory fallback must read all input first, so they stay
+/// on the throughput-batched [`next_chunk`].)
+fn next_chunk_available<R: BufRead>(input: &mut R, size: usize) -> Result<Option<String>, Error> {
+    let mut buf = vec![0u8; size];
+    let n = input.read(&mut buf)?;
+    if n == 0 {
+        return Ok(None);
+    }
+    buf.truncate(n);
+    // A single read may stop mid-line; finish that line so the chunk ends on a
+    // row boundary. This blocks only until the current line completes, not for
+    // a whole chunk.
+    if buf.last() != Some(&b'\n') {
+        input.read_until(b'\n', &mut buf)?;
+    }
+    let chunk = String::from_utf8(buf)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+    Ok(Some(chunk))
+}
+
 fn read_fully<R: io::Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
     let mut total = 0;
     while total < buf.len() {
@@ -134,7 +161,9 @@ fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
 }
 
 /// Stream `[pre | head n | post]` single-threaded, stopping once `n` rows have
-/// reached the head.
+/// reached the head. Reads only as much input as it needs (via
+/// [`next_chunk_available`]) so it emits and stops promptly on a stream rather
+/// than blocking for a full chunk.
 fn stream_head<R: BufRead, W: Write>(
     pre: &[Stmt],
     n: usize,
@@ -146,7 +175,7 @@ fn stream_head<R: BufRead, W: Write>(
     let mut taken = 0usize;
     let mut out_buf = String::new();
     while taken < n {
-        let Some(chunk) = next_chunk(input, chunk_size)? else {
+        let Some(chunk) = next_chunk_available(input, chunk_size)? else {
             break;
         };
         out_buf.clear();
@@ -173,6 +202,7 @@ fn stream_head<R: BufRead, W: Write>(
             return Err(e);
         }
         output.write_all(out_buf.as_bytes())?;
+        output.flush()?; // don't let a live/slow stream's output sit in the BufWriter
     }
     Ok(())
 }
@@ -229,6 +259,8 @@ fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error
 }
 
 /// Stream a single transform stage: parse a chunk, apply, serialize, write.
+/// Reads via [`next_chunk_available`] so output flows as input arrives rather
+/// than only after a full chunk buffers (matters on a live or slow stream).
 fn stream_transform<R: BufRead, W: Write>(
     stmts: &[Stmt],
     chunk_size: usize,
@@ -236,7 +268,7 @@ fn stream_transform<R: BufRead, W: Write>(
     output: &mut W,
 ) -> Result<(), Error> {
     let mut out_buf = String::new();
-    while let Some(chunk) = next_chunk(input, chunk_size)? {
+    while let Some(chunk) = next_chunk_available(input, chunk_size)? {
         out_buf.clear();
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
@@ -254,6 +286,7 @@ fn stream_transform<R: BufRead, W: Write>(
             return Err(e);
         }
         output.write_all(out_buf.as_bytes())?;
+        output.flush()?; // don't let a live/slow stream's output sit in the BufWriter
     }
     Ok(())
 }
@@ -313,9 +346,16 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
                 match res {
                     Ok(buf) => {
                         pending.insert(id, buf);
+                        let mut wrote = false;
                         while let Some(buf) = pending.remove(&next) {
                             output.write_all(buf.as_bytes())?;
                             next += 1;
+                            wrote = true;
+                        }
+                        // Flush once the in-order prefix advanced, so a live
+                        // stream sees output without waiting for the BufWriter.
+                        if wrote {
+                            output.flush()?;
                         }
                     }
                     Err(e) if first_err.is_none() => first_err = Some(e),
@@ -325,11 +365,13 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
             first_err.map_or(Ok(()), Err)
         });
 
-        // Reader: this thread feeds chunks until input is exhausted or errors.
+        // Reader: feed chunks as input arrives (a single read each, not a full
+        // buffer) until input is exhausted or errors, so the workers and writer
+        // make progress on a live stream instead of waiting for a 1 MB fill.
         let mut id = 0u64;
         let mut read_err = None;
         loop {
-            match next_chunk(input, chunk_size) {
+            match next_chunk_available(input, chunk_size) {
                 Ok(Some(chunk)) => {
                     if chunk_tx.send((id, chunk)).is_err() {
                         break;
@@ -912,5 +954,50 @@ mod tests {
     #[test]
     fn missing_column_is_an_error() {
         assert!(matches!(run_str("cols nope", INPUT), Err(Error::Column(_))));
+    }
+
+    #[test]
+    fn head_stops_early_without_reading_to_eof() {
+        // A reader that yields the header and a few rows, then *errors* instead
+        // of signaling EOF — standing in for a stream that has produced some
+        // rows but has not ended (an interactive pipe, `tail -f`, etc.). `head`
+        // must emit its N rows and stop *before* demanding more input. With the
+        // bug it tried to fill a whole 1 MB chunk first, so it would block on a
+        // real stream; here that shows up as the read error propagating.
+        use std::collections::VecDeque;
+
+        struct PausingReader(VecDeque<Vec<u8>>);
+        impl io::Read for PausingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                match self.0.pop_front() {
+                    Some(chunk) => {
+                        assert!(chunk.len() <= buf.len());
+                        buf[..chunk.len()].copy_from_slice(&chunk);
+                        Ok(chunk.len())
+                    }
+                    None => Err(io::Error::new(io::ErrorKind::WouldBlock, "stream paused")),
+                }
+            }
+        }
+
+        let mut chunks: VecDeque<Vec<u8>> = VecDeque::new();
+        chunks.push_back(b"id,val\n".to_vec());
+        for i in 0..5 {
+            chunks.push_back(format!("{i},x\n").into_bytes());
+        }
+        let mut reader = io::BufReader::new(PausingReader(chunks));
+
+        let mut plan = parse("head 2").unwrap();
+        let header = read_header(&mut reader).unwrap();
+        let out_header = plan.resolve(&header).unwrap();
+        let opts = RunOpts {
+            chunk_size: 1_000_000,
+            threads: 1,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+        };
+        let mut out = Vec::new();
+        run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "id,val\n0,x\n1,x\n");
     }
 }
