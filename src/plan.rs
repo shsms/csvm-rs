@@ -145,6 +145,9 @@ pub enum OutputFormat {
 pub struct Plan {
     pub stages: Vec<Stage>,
     pub output: OutputFormat,
+    /// Column names supplied by a `hdr` command, for input that has no header
+    /// line. When set, the whole input is data and this is the header.
+    pub input_header: Option<Vec<String>>,
 }
 
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
@@ -555,6 +558,7 @@ mod tests {
                 })),
             ])],
             output: OutputFormat::Csv,
+            input_header: None,
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -595,6 +599,7 @@ mod tests {
                 positions: vec![],
             })])],
             output: OutputFormat::Csv,
+            input_header: None,
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column(n) if n == "nope"));

@@ -43,7 +43,7 @@ fn run() -> Result<(), String> {
         sort_buffer: args.sort_buffer,
     };
 
-    let (mut source, header) = open_source(&args)?;
+    let (mut source, header) = open_source(&args, plan.input_header.as_deref())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
 
     if args.print_engine {
@@ -64,12 +64,24 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Open the input and read its header.
-fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
+/// Open the input and determine its header. With `input_header` (from a `hdr`
+/// command) the input has no header line: the supplied names are the header and
+/// the whole input is data. Otherwise the first line is read as the header.
+fn open_source(
+    args: &cli::Args,
+    input_header: Option<&[String]>,
+) -> Result<(Source, Vec<String>), String> {
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
-            let (header, data_start, file_len) =
-                exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
+            let (header, data_start, file_len) = match input_header {
+                Some(h) => {
+                    let len = std::fs::metadata(path)
+                        .map_err(|e| format!("cannot stat '{path}': {e}"))?
+                        .len();
+                    (h.to_vec(), 0, len)
+                }
+                None => exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?,
+            };
             let source = Source::File {
                 path: PathBuf::from(path),
                 data_start,
@@ -79,7 +91,10 @@ fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
         }
         None => {
             let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin()));
-            let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
+            let header = match input_header {
+                Some(h) => h.to_vec(),
+                None => exec::read_header(&mut reader).map_err(|e| e.to_string())?,
+            };
             Ok((Source::Stream(reader), header))
         }
     }

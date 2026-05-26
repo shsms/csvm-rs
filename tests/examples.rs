@@ -20,7 +20,11 @@ id,fieldA,fieldB,countA,countZ
 fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
     let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(input.as_bytes());
-    let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
+    // With `hdr`, the input has no header line; the supplied names are the header.
+    let header = match plan.input_header.as_deref() {
+        Some(h) => h.to_vec(),
+        None => exec::read_header(&mut reader).map_err(|e| e.to_string())?,
+    };
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
     let opts = RunOpts {
         chunk_size: 64, // small, to exercise multi-chunk handling
@@ -162,7 +166,10 @@ fn temp_csv(content: &str) -> PathBuf {
 
 fn run_file_str(script: &str, path: &std::path::Path, threads: usize) -> String {
     let mut plan = csvm::parse::parse(script).unwrap();
-    let (header, data_start, file_len) = exec::read_header_from_path(path).unwrap();
+    let (header, data_start, file_len) = match plan.input_header.as_deref() {
+        Some(h) => (h.to_vec(), 0, std::fs::metadata(path).unwrap().len()),
+        None => exec::read_header_from_path(path).unwrap(),
+    };
     let out_header = plan.resolve(&header).unwrap();
     let opts = RunOpts {
         chunk_size: 1 << 20,
@@ -263,6 +270,53 @@ fn fmt_aligns_columns() {
     // fmt is whitespace-aligned, not CSV: columns padded to their widest cell.
     let out = run("select fieldA == 't' | cols id,fieldB | fmt", INPUT, 1).unwrap();
     assert_eq!(out, "id  fieldB\n1   x\n3   x\n4   z\n");
+}
+
+// Headerless input: every line is data; `hdr` supplies the column names.
+const HEADERLESS: &str = "1,alice,100\n2,bob,200\n3,carol,300\n";
+
+#[test]
+fn hdr_prepends_header_all_lines_are_data() {
+    // The first input line is data, not a header — it survives to the output.
+    assert_eq!(
+        run_checked("hdr id,name,amount", HEADERLESS),
+        "id,name,amount\n1,alice,100\n2,bob,200\n3,carol,300\n"
+    );
+}
+
+#[test]
+fn hdr_columns_usable_downstream() {
+    // Names from `hdr` are referenceable; numeric compare works (no header eaten).
+    assert_eq!(
+        run_checked(
+            "hdr id,name,amount | select amount > 150 | cols name",
+            HEADERLESS
+        ),
+        "name\nbob\ncarol\n"
+    );
+}
+
+#[test]
+fn hdr_sharded_file_matches_serial() {
+    // Sharded file path (data_start = 0): first line is data in every shard split.
+    let path = temp_csv(HEADERLESS);
+    let serial = run_file_str("hdr id,name,amount | select id >= 2", &path, 1);
+    let parallel = run_file_str("hdr id,name,amount | select id >= 2", &path, 4);
+    assert_eq!(serial, parallel);
+    assert_eq!(serial, "id,name,amount\n2,bob,200\n3,carol,300\n");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn hdr_must_be_first() {
+    let err = run("select amount > 0 | hdr id,name,amount", HEADERLESS, 1).unwrap_err();
+    assert!(err.contains("must be the first"), "got: {err}");
+}
+
+#[test]
+fn hdr_only_once() {
+    let err = run("hdr a,b,c | hdr d,e,f", HEADERLESS, 1).unwrap_err();
+    assert!(err.contains("only once"), "got: {err}");
 }
 
 #[test]

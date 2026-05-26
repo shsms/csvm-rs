@@ -34,7 +34,7 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
         }
         builder.parse_stage(stage)?;
     }
-    if builder.items.is_empty() && builder.output == OutputFormat::Csv {
+    if builder.items.is_empty() && builder.output == OutputFormat::Csv && builder.header.is_none() {
         return Err(err("empty script"));
     }
     Ok(builder.take_plan())
@@ -61,6 +61,8 @@ struct Builder {
     items: Vec<Item>,
     col_types: HashMap<String, ColType>,
     output: OutputFormat,
+    /// Column names from a `hdr` command, for headerless input.
+    header: Option<Vec<String>>,
 }
 
 impl Builder {
@@ -95,6 +97,7 @@ impl Builder {
         Plan {
             stages,
             output: self.output,
+            input_header: self.header.take(),
         }
     }
 
@@ -109,8 +112,27 @@ impl Builder {
             "head" => self.parse_head(rest),
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
+            "hdr" => self.parse_hdr(rest),
             other => Err(err(format!("unknown command: {other}"))),
         }
+    }
+
+    /// `hdr a,b,c` supplies column names for headerless input: the whole input
+    /// becomes data and these names are prepended as the header on output. It is
+    /// plan-level metadata, so it must come first and may appear only once.
+    fn parse_hdr(&mut self, rest: &str) -> Result<(), Error> {
+        if self.header.is_some() {
+            return Err(err("hdr may be given only once"));
+        }
+        if !self.items.is_empty() || self.output != OutputFormat::Csv {
+            return Err(err("hdr must be the first command in the pipeline"));
+        }
+        let names = split_list(rest);
+        if names.is_empty() {
+            return Err(err("hdr expects at least one column name"));
+        }
+        self.header = Some(names);
+        Ok(())
     }
 
     fn parse_head(&mut self, rest: &str) -> Result<(), Error> {

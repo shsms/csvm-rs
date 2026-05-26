@@ -53,6 +53,7 @@ comma- or space-separated arguments:
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
 | `head N`           | keep the first `N` rows reaching it                        |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
+| `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | render the output as a whitespace-aligned table (`column -t`) |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
@@ -89,6 +90,19 @@ Each spec is a bare column or `col=flags`, where flags combine:
 ```sh
 sort fieldA fieldB=r countZ=nr      # by fieldA asc, fieldB desc, countZ numeric desc
 ```
+
+### Headerless input (`hdr`)
+
+Some CSVs have no header line — every line is data. `hdr` supplies the column
+names: the whole input is treated as data, and the names are prepended on
+output. It is plan-level metadata, so it must be the first command.
+
+```sh
+# input has no header; name the columns, then work with them
+csvm -f raw.csv 'hdr id,name,amount | select amount > 1000 | cols id,amount'
+```
+
+Without `hdr`, the first input line is taken as the header (the default).
 
 ### Conversions are implicit
 
@@ -202,9 +216,10 @@ byte-identical output.
 
 ## Roadmap
 
-The pipe language is built to grow. Planned: more verbs (`head`, `rename`,
-computed `add`), pluggable formats via a `Source`/`Sink` trait (Parquet, TSV),
-and `join` across multiple files.
+The pipe language is built to grow. Planned: a computed `add` column,
+conditional colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait
+(Parquet, TSV), and `join` across multiple files. See `todo.org` for design
+notes.
 
 ## License
 

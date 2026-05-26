@@ -678,6 +678,9 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
 /// the column positions each one resolved to.
 pub fn describe(plan: &Plan) -> String {
     let mut out = String::new();
+    if let Some(h) = &plan.input_header {
+        out.push_str(&format!("input header (hdr): {h:?}\n"));
+    }
     for (i, stage) in plan.stages.iter().enumerate() {
         let n = i + 1;
         match stage {

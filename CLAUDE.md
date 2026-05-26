@@ -46,6 +46,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   early when there's no sort, else truncates in the materialized path).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
+- **`hdr a,b,c`** supplies column names for headerless input: it sets
+  `Plan.input_header` (plan-level metadata, must be the first command), so the
+  whole input is data and `main`/the test harness skip reading a header line
+  (file shards start at byte 0). The names are prepended on output.
 - **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged).
@@ -140,10 +144,10 @@ serial merge just copy line bytes.
 ## Roadmap
 
 The pipe language is deliberately built to grow: new verbs are a parse arm plus
-a `Stmt`/`Stage`. Planned: more verbs (`head`, `rename`, computed `add`, …),
-pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and `join` over
-multiple files (a sub-pipeline as the right side; the `Plan` grows a join node
-and becomes a small DAG).
+a `Stmt`/`Stage`. Planned (see `todo.org` for design notes): a computed `add`
+column, conditional colouring for `fmt`, pluggable formats via a `Source`/`Sink`
+trait (Parquet, TSV), and `join` over multiple files (a sub-pipeline as the
+right side; the `Plan` grows a join node and becomes a small DAG).
 
 ## Conventions
 
