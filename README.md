@@ -197,6 +197,11 @@ Benchmarked against the C++ csvm on this file (warm cache), csvm-rs is faster on
 filter, projection, and sort at both `-n 1` and `-n 8` (sort by ~3×), with
 byte-identical output.
 
+For repeatable in-process microbenchmarks, `cargo bench` runs a
+[criterion](https://github.com/bheisler/criterion.rs) suite (`benches/pipeline.rs`)
+over an in-memory dataset — parse, projection, filtering, conversion, sorting,
+and alignment — reporting per-operation throughput.
+
 ## CSV details
 
 - `,`-separated, `"`-quoted fields; `""` is an escaped quote; quoted fields may
