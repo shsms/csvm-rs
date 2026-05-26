@@ -165,6 +165,8 @@ right side; the `Plan` grows a join node and becomes a small DAG).
 - Git identity: `Sahas Subramanian <sahas.subramanian@proton.me>` (author +
   committer), passed per-command. Default branch `main`.
 - Commits: imperative subject, no prefix tag, no AI co-author footer.
-- Run `cargo fmt` and `cargo clippy` before committing; keep both clean.
+- Run `cargo fmt` and `cargo clippy` before committing; keep both clean. CI
+  (`.github/workflows/ci.yml`) enforces fmt, `clippy --all-targets -D warnings`,
+  `cargo test`, a release build, and `cargo bench --no-run` on every push and PR.
 - `src/lib.rs` holds the library; `src/main.rs` is a thin CLI shim so internals
   are unit-testable.
