@@ -42,6 +42,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   fall out for free, and chaining `select`s ANDs them.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
   and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
+- **`head N`** keeps the first N rows reaching it (own stage; streams + stops
+  early when there's no sort, else truncates in the materialized path).
+- **`rename old=new …`** is a header-only change (resolve renames the header;
+  `apply` is a no-op).
+- **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
+  `Plan.output` flag, applied by `exec::format_aligned` after the run produces
+  CSV (so the executor itself is unchanged).
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `split_stages` splits on a lone unquoted `|`; a `||` (or) and a `|` inside a
   string literal are left intact, so the bare `select` expression needs no

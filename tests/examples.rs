@@ -30,6 +30,12 @@ fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
     };
     let mut out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;
+    // `fmt` aligns the final output (main does this; mirror it here).
+    if plan.output == csvm::plan::OutputFormat::Aligned {
+        let mut aligned = Vec::new();
+        exec::format_aligned(&out, &mut aligned).map_err(|e| e.to_string())?;
+        out = aligned;
+    }
     String::from_utf8(out).map_err(|e| e.to_string())
 }
 
@@ -221,6 +227,42 @@ fn sharded_file_no_trailing_newline() {
         assert_eq!(run_file_str("cols id,v", &path, n), serial, "threads={n}");
     }
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn head_keeps_first_rows() {
+    // Plain head: first N rows.
+    assert_eq!(run_checked("head 2 | cols id", INPUT), "id\n1\n2\n");
+    // select then head: first N *matching* rows.
+    assert_eq!(
+        run_checked("select fieldA == 't' | head 2 | cols id", INPUT),
+        "id\n1\n3\n"
+    );
+    // sort then head: top N.
+    assert_eq!(
+        run_checked("sort countZ=nr | head 2 | cols id,countZ", INPUT),
+        "id,countZ\n4,9\n1,5\n"
+    );
+}
+
+#[test]
+fn rename_changes_header_only() {
+    assert_eq!(
+        run_checked("rename fieldA=flag, countZ=z | cols id,flag,z", INPUT),
+        "id,flag,z\n1,t,5\n2,f,0\n3,t,0\n4,t,9\n5,f,2\n"
+    );
+    // A later stage can refer to the new name. (countZ > 0 for rows 1, 4, 5.)
+    assert_eq!(
+        run_checked("rename countZ=z | select z > 0 | cols id", INPUT),
+        "id\n1\n4\n5\n"
+    );
+}
+
+#[test]
+fn fmt_aligns_columns() {
+    // fmt is whitespace-aligned, not CSV: columns padded to their widest cell.
+    let out = run("select fieldA == 't' | cols id,fieldB | fmt", INPUT, 1).unwrap();
+    assert_eq!(out, "id  fieldB\n1   x\n3   x\n4   z\n");
 }
 
 #[test]

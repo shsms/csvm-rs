@@ -51,6 +51,9 @@ comma- or space-separated arguments:
 | `cols -v a,b`      | keep everything *except* these columns                     |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
+| `head N`           | keep the first `N` rows reaching it                        |
+| `rename old=new …` | rename columns (header only; row data unchanged)           |
+| `fmt`              | render the output as a whitespace-aligned table (`column -t`) |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).

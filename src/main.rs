@@ -1,9 +1,10 @@
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process;
 
 use csvm::cli::{self, Parsed};
+use csvm::plan::OutputFormat;
 use csvm::{exec, parse};
 
 fn main() {
@@ -11,6 +12,16 @@ fn main() {
         eprintln!("csvm: {msg}");
         process::exit(1);
     }
+}
+
+/// Where input rows come from. A seekable file can be sharded; stdin streams.
+enum Source {
+    File {
+        path: PathBuf,
+        data_start: u64,
+        file_len: u64,
+    },
+    Stream(Box<dyn BufRead>),
 }
 
 fn run() -> Result<(), String> {
@@ -32,45 +43,64 @@ fn run() -> Result<(), String> {
         sort_buffer: args.sort_buffer,
     };
 
-    // A real file goes through the sharding-capable path; stdin/`-` streams.
+    let (mut source, header) = open_source(&args)?;
+    let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
+
+    if args.print_engine {
+        print!("{}", exec::describe(&plan));
+        return Ok(());
+    }
+
+    let mut output = open_output(&args)?;
+    if plan.output == OutputFormat::Aligned {
+        // Run into a buffer, then align it (needs all rows for column widths).
+        let mut buf: Vec<u8> = Vec::new();
+        run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
+        exec::format_aligned(&buf, &mut output).map_err(|e| e.to_string())?;
+    } else {
+        run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
+    }
+    output.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Open the input and read its header.
+fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
-            let path = Path::new(path);
             let (header, data_start, file_len) =
-                exec::read_header_from_path(path).map_err(|e| e.to_string())?;
-            let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
-            if args.print_engine {
-                print!("{}", exec::describe(&plan));
-                return Ok(());
-            }
-            let mut output = open_output(&args)?;
-            exec::run_file(
-                &plan,
-                &out_header,
-                &opts,
-                path,
+                exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
+            let source = Source::File {
+                path: PathBuf::from(path),
                 data_start,
                 file_len,
-                &mut output,
-            )
-            .map_err(|e| e.to_string())?;
-            output.flush().map_err(|e| e.to_string())?;
+            };
+            Ok((source, header))
         }
         None => {
-            let mut input = BufReader::new(io::stdin());
-            let header = exec::read_header(&mut input).map_err(|e| e.to_string())?;
-            let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
-            if args.print_engine {
-                print!("{}", exec::describe(&plan));
-                return Ok(());
-            }
-            let mut output = open_output(&args)?;
-            exec::run(&plan, &out_header, &opts, &mut input, &mut output)
-                .map_err(|e| e.to_string())?;
-            output.flush().map_err(|e| e.to_string())?;
+            let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin()));
+            let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
+            Ok((Source::Stream(reader), header))
         }
     }
-    Ok(())
+}
+
+fn run_into<W: Write + Send>(
+    source: &mut Source,
+    plan: &csvm::plan::Plan,
+    out_header: &[String],
+    opts: &exec::RunOpts,
+    output: &mut W,
+) -> Result<(), String> {
+    match source {
+        Source::File {
+            path,
+            data_start,
+            file_len,
+        } => exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output),
+        Source::Stream(reader) => exec::run(plan, out_header, opts, reader, output),
+    }
+    .map_err(|e| e.to_string())
 }
 
 fn open_output(args: &cli::Args) -> Result<Box<dyn Write + Send>, String> {

@@ -96,6 +96,10 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
+    // `head` with no sort streams single-threaded and stops early.
+    if let Some((pre, n, post)) = head_only_shape(plan) {
+        return stream_head(pre, n, post, opts.chunk_size, input, output);
+    }
     match plan.stages.as_slice() {
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
@@ -103,6 +107,74 @@ fn run_body<R: BufRead, W: Write + Send>(
         [Stage::Transform(stmts)] => stream_transform(stmts, opts.chunk_size, input, output),
         _ => run_staged(plan, opts, input, output),
     }
+}
+
+/// If the plan is `[Transform?, Head(n), Transform?]` with no sort, return the
+/// pre-head statements, the limit, and the post-head statements.
+fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
+    if plan.stages.iter().any(|s| matches!(s, Stage::Sort(_))) {
+        return None;
+    }
+    let heads: Vec<usize> = plan
+        .stages
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stage::Head(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let [hi] = heads[..] else { return None };
+    let Stage::Head(n) = plan.stages[hi] else {
+        return None;
+    };
+    Some((
+        transform_stmts(&plan.stages[..hi]),
+        n,
+        transform_stmts(&plan.stages[hi + 1..]),
+    ))
+}
+
+/// Stream `[pre | head n | post]` single-threaded, stopping once `n` rows have
+/// reached the head.
+fn stream_head<R: BufRead, W: Write>(
+    pre: &[Stmt],
+    n: usize,
+    post: &[Stmt],
+    chunk_size: usize,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
+    let mut taken = 0usize;
+    let mut out_buf = String::new();
+    while taken < n {
+        let Some(chunk) = next_chunk(input, chunk_size)? else {
+            break;
+        };
+        out_buf.clear();
+        let mut scratch: Vec<Field> = Vec::new();
+        let mut err: Option<Error> = None;
+        csv::parse_chunk(&chunk, |row| {
+            if err.is_some() || taken >= n {
+                return;
+            }
+            match apply_stmts(pre, row, &mut scratch) {
+                Ok(true) => {
+                    taken += 1;
+                    match apply_stmts(post, row, &mut scratch) {
+                        Ok(true) => csv::write_row(&mut out_buf, row),
+                        Ok(false) => {}
+                        Err(e) => err = Some(e),
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => err = Some(e),
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        output.write_all(out_buf.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Read and parse the header of a file, returning the header, the byte offset
@@ -410,7 +482,10 @@ fn run_staged<R: BufRead, W: Write>(
         .iter()
         .filter(|s| matches!(s, Stage::Sort(_)))
         .count();
-    if sort_count != 1 {
+    let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
+    // The streaming sort path handles exactly one sort and no head; anything
+    // else (head, or multiple sorts) materializes.
+    if sort_count != 1 || has_head {
         return run_staged_in_memory(plan, opts.chunk_size, input, output);
     }
 
@@ -515,6 +590,7 @@ fn run_staged_in_memory<R: BufRead, W: Write>(
                 rows = kept;
             }
             Stage::Sort(sort) => sort_rows(sort, &mut rows)?,
+            Stage::Head(n) => rows.truncate(*n),
         }
     }
     write_rows(output, &rows)
@@ -558,6 +634,46 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
     Ok(())
 }
 
+/// Re-render CSV bytes as a whitespace-aligned table (`fmt` / `column -t`):
+/// each column is left-padded to its widest cell, columns separated by two
+/// spaces, the trailing column unpadded.
+pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), Error> {
+    let text = std::str::from_utf8(csv_bytes)
+        .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    csv::parse_chunk(text, |r| {
+        rows.push(r.iter().map(|f| f.as_str().into_owned()).collect());
+    });
+
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut widths = vec![0usize; ncols];
+    for row in &rows {
+        for (i, field) in row.iter().enumerate() {
+            widths[i] = widths[i].max(field.chars().count());
+        }
+    }
+
+    let mut line = String::new();
+    for row in &rows {
+        line.clear();
+        let last = row.len().saturating_sub(1);
+        for (i, field) in row.iter().enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            line.push_str(field);
+            if i != last {
+                for _ in 0..widths[i].saturating_sub(field.chars().count()) {
+                    line.push(' ');
+                }
+            }
+        }
+        line.push('\n');
+        output.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
 /// Render a resolved plan for `--print-engine`: stages, their statements, and
 /// the column positions each one resolved to.
 pub fn describe(plan: &Plan) -> String {
@@ -575,7 +691,13 @@ pub fn describe(plan: &Plan) -> String {
                 out.push_str(&format!("stage {n} (sort):\n"));
                 out.push_str(&format!("  {n}.1 {}\n", describe_sort(sort)));
             }
+            Stage::Head(limit) => {
+                out.push_str(&format!("stage {n} (head):\n  {n}.1 head {limit}\n"));
+            }
         }
+    }
+    if plan.output == crate::plan::OutputFormat::Aligned {
+        out.push_str("output: aligned\n");
     }
     out
 }
@@ -589,6 +711,7 @@ fn describe_stmt(stmt: &Stmt) -> String {
         Stmt::Select(e) => format!("select {}", fmt_expr(e)),
         Stmt::ToNum(c) => format!("to-num {:?} (positions {:?})", c.names, c.positions),
         Stmt::ToStr(c) => format!("to-str {:?} (positions {:?})", c.names, c.positions),
+        Stmt::Rename(r) => format!("rename {:?}", r.pairs),
     }
 }
 

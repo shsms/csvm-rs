@@ -106,6 +106,12 @@ pub struct SortStmt {
     pub keys: Vec<SortKey>,
 }
 
+/// Rename one or more columns (a header-only change; row data is untouched).
+#[derive(Clone, Debug)]
+pub struct RenameStmt {
+    pub pairs: Vec<(String, String)>,
+}
+
 /// A row-by-row statement.
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -113,19 +119,32 @@ pub enum Stmt {
     Select(BoolExpr),
     ToNum(ConvStmt),
     ToStr(ConvStmt),
+    Rename(RenameStmt),
 }
 
-/// A pipeline stage. Transforms run streaming; a sort blocks on all its rows.
+/// A pipeline stage. Transforms run streaming; a sort blocks on all its rows;
+/// head keeps the first `n` rows reaching it.
 #[derive(Clone, Debug)]
 pub enum Stage {
     Transform(Vec<Stmt>),
     Sort(SortStmt),
+    Head(usize),
+}
+
+/// How the final output is rendered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Csv,
+    /// Whitespace-aligned columns, like `column -t` (set by the `fmt` command).
+    Aligned,
 }
 
 /// A fully compiled pipeline.
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub stages: Vec<Stage>,
+    pub output: OutputFormat,
 }
 
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
@@ -302,6 +321,8 @@ impl Stmt {
                 }
                 Ok(true)
             }
+            // Rename is a header-only change; row data is untouched.
+            Stmt::Rename(_) => Ok(true),
         }
     }
 
@@ -312,6 +333,13 @@ impl Stmt {
             Stmt::Cols(p) => p.resolve(header),
             Stmt::Select(expr) => expr.resolve(header),
             Stmt::ToNum(c) | Stmt::ToStr(c) => c.resolve(header),
+            Stmt::Rename(r) => {
+                for (from, to) in &r.pairs {
+                    let pos = resolve_col(from, header)?;
+                    header[pos] = to.clone();
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -420,6 +448,7 @@ impl Plan {
                     }
                 }
                 Stage::Sort(s) => s.resolve(&header)?,
+                Stage::Head(_) => {} // no columns to resolve
             }
         }
         Ok(header)
@@ -525,6 +554,7 @@ mod tests {
                     numeric: false,
                 })),
             ])],
+            output: OutputFormat::Csv,
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -564,6 +594,7 @@ mod tests {
                 names: vec!["nope".into()],
                 positions: vec![],
             })])],
+            output: OutputFormat::Csv,
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column(n) if n == "nope"));

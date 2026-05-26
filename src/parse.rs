@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use crate::error::Error;
 use crate::plan::{
-    BoolExpr, Cmp, CmpOp, ColRef, ConvStmt, Operand, Plan, ProjectStmt, SortKey, SortStmt, Stage,
-    Stmt,
+    BoolExpr, Cmp, CmpOp, ColRef, ConvStmt, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt,
+    SortKey, SortStmt, Stage, Stmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -34,7 +34,7 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
         }
         builder.parse_stage(stage)?;
     }
-    if builder.items.is_empty() {
+    if builder.items.is_empty() && builder.output == OutputFormat::Csv {
         return Err(err("empty script"));
     }
     Ok(builder.take_plan())
@@ -53,12 +53,14 @@ enum ColType {
 enum Item {
     Stmt(Stmt),
     Sort(SortStmt),
+    Head(usize),
 }
 
 #[derive(Default)]
 struct Builder {
     items: Vec<Item>,
     col_types: HashMap<String, ColType>,
+    output: OutputFormat,
 }
 
 impl Builder {
@@ -67,25 +69,33 @@ impl Builder {
     }
 
     /// Group the flat item list into stages: runs of statements become a
-    /// `Transform`, and each `sort` is isolated into its own stage.
+    /// `Transform`; each `sort` and `head` is isolated into its own stage.
     fn take_plan(&mut self) -> Plan {
         let mut stages = Vec::new();
         let mut transform: Vec<Stmt> = Vec::new();
+        let flush = |transform: &mut Vec<Stmt>, stages: &mut Vec<Stage>| {
+            if !transform.is_empty() {
+                stages.push(Stage::Transform(std::mem::take(transform)));
+            }
+        };
         for item in self.items.drain(..) {
             match item {
                 Item::Stmt(s) => transform.push(s),
                 Item::Sort(s) => {
-                    if !transform.is_empty() {
-                        stages.push(Stage::Transform(std::mem::take(&mut transform)));
-                    }
+                    flush(&mut transform, &mut stages);
                     stages.push(Stage::Sort(s));
+                }
+                Item::Head(n) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Head(n));
                 }
             }
         }
-        if !transform.is_empty() {
-            stages.push(Stage::Transform(transform));
+        flush(&mut transform, &mut stages);
+        Plan {
+            stages,
+            output: self.output,
         }
-        Plan { stages }
     }
 
     fn parse_stage(&mut self, stage: &str) -> Result<(), Error> {
@@ -96,8 +106,46 @@ impl Builder {
             "sort" => self.parse_sort(rest),
             "to-num" | "to_num" => self.parse_conv(rest, true),
             "to-str" | "to_str" => self.parse_conv(rest, false),
+            "head" => self.parse_head(rest),
+            "rename" => self.parse_rename(rest),
+            "fmt" => self.parse_fmt(rest),
             other => Err(err(format!("unknown command: {other}"))),
         }
+    }
+
+    fn parse_head(&mut self, rest: &str) -> Result<(), Error> {
+        let n: usize = rest
+            .trim()
+            .parse()
+            .map_err(|_| err(format!("head expects a row count, got '{rest}'")))?;
+        self.items.push(Item::Head(n));
+        Ok(())
+    }
+
+    fn parse_rename(&mut self, rest: &str) -> Result<(), Error> {
+        let mut pairs = Vec::new();
+        for spec in split_list(rest) {
+            match spec.split_once('=') {
+                Some((from, to)) if !from.is_empty() && !to.is_empty() => {
+                    pairs.push((from.to_string(), to.to_string()));
+                }
+                _ => return Err(err(format!("rename expects old=new pairs, got '{spec}'"))),
+            }
+        }
+        if pairs.is_empty() {
+            return Err(err("rename expects at least one old=new pair"));
+        }
+        self.items
+            .push(Item::Stmt(Stmt::Rename(RenameStmt { pairs })));
+        Ok(())
+    }
+
+    fn parse_fmt(&mut self, rest: &str) -> Result<(), Error> {
+        if !rest.trim().is_empty() {
+            return Err(err("fmt takes no arguments"));
+        }
+        self.output = OutputFormat::Aligned;
+        Ok(())
     }
 
     fn parse_cols(&mut self, rest: &str) -> Result<(), Error> {
@@ -638,6 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn head_rename_fmt() {
+        let plan = parse("select a > 0 | head 5 | cols a").unwrap();
+        // [Transform(select), Head(5), Transform(cols)]
+        assert!(matches!(plan.stages[1], Stage::Head(5)));
+
+        let plan = parse("rename old=new, qty=quantity").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Rename(r) = &stmts[0] else { panic!() };
+        assert_eq!(
+            r.pairs,
+            [
+                ("old".into(), "new".into()),
+                ("qty".into(), "quantity".into())
+            ]
+        );
+
+        let plan = parse("sort a | fmt").unwrap();
+        assert_eq!(plan.output, OutputFormat::Aligned);
+        // fmt is not a stage.
+        assert!(plan.stages.iter().all(|s| !matches!(s, Stage::Head(_))));
+
+        // fmt alone (no transforms) is valid — align the input.
+        assert_eq!(parse("fmt").unwrap().output, OutputFormat::Aligned);
+    }
+
+    #[test]
     fn errors() {
         assert!(parse("").is_err());
         assert!(parse("frobnicate a").is_err());
@@ -646,5 +722,8 @@ mod tests {
         assert!(parse("sort a=z").is_err());
         // A whole-expression quote is rejected (string literals only).
         assert!(parse(r#"select "a > 0""#).is_err());
+        assert!(parse("head abc").is_err()); // head needs a number
+        assert!(parse("rename old").is_err()); // rename needs old=new
+        assert!(parse("fmt x").is_err()); // fmt takes no args
     }
 }
