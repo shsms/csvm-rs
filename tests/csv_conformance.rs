@@ -30,28 +30,24 @@ fn matches_csv_crate_on_wellformed_input() {
     // our scanner and the reference must agree field-for-field.
     let corpus = [
         "a,b,c\n1,2,3\n",
-        "a,b,c\n1,2,3", // no trailing newline
-        "a,,c\n",       // empty middle field
-        "a,b,\n",       // trailing empty field
-        ",,\n",         // all empty
-        "\"x,y\",z\n",  // comma inside quotes
+        "a,b,c\n1,2,3",               // no trailing newline
+        "a,,c\n",                     // empty middle field
+        "a,b,\n",                     // trailing empty field
+        ",,\n",                       // all empty
+        "\"x,y\",z\n",                // comma inside quotes
         "\"he said \"\"hi\"\"\",x\n", // escaped quotes
-        "\"\",\"\"\n",  // two empty quoted fields
+        "\"\",\"\"\n",                // two empty quoted fields
         "plain,\"quoted\",mix\n",
         " leading,trailing \n", // spaces are significant
         "a,b\r\n1,2\r\n",       // CRLF
         "a,b\r\n1,2",           // CRLF, no final newline
         "single\n",
-        "x\ny\nz\n",           // single column, several rows
+        "x\ny\nz\n", // single column, several rows
         "name,age\n\"Doe, John\",42\n\"O'Brien\",37\n",
         "utf8,café,naïve,日本\n1,2,3,4\n",
     ];
     for input in corpus {
-        assert_eq!(
-            ours(input),
-            reference(input),
-            "mismatch on input {input:?}"
-        );
+        assert_eq!(ours(input), reference(input), "mismatch on input {input:?}");
     }
 }
 
@@ -88,7 +84,11 @@ fn write_then_read_roundtrips() {
     use csvm::field::Field;
     // Values that need quoting on output must come back identical when re-read.
     let rows: Vec<Vec<Field>> = vec![
-        vec![Field::Str("plain"), Field::Str("a,b"), Field::Str("he\"said")],
+        vec![
+            Field::Str("plain"),
+            Field::Str("a,b"),
+            Field::Str("he\"said"),
+        ],
         vec![Field::Str(""), Field::Str("  spaced  "), Field::Num(42.0)],
     ];
     let mut buf = String::new();
