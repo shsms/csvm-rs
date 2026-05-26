@@ -1,0 +1,102 @@
+#+title: csvm-rs todo / design notes
+#+startup: showall
+
+Roadmap and design notes for features not yet implemented. Done items live in
+git history; this file is the "what next / what was decided" scratchpad.
+
+* TODO computed column: =add NAME EXPR=
+Append a new column =NAME= computed per row from a value expression over the
+existing columns. If =NAME= already exists, replace it in place (so
+=add price round(price * 1.1)= works). Appends at the end otherwise; reorder
+with =cols= afterward.
+
+Implementation: extend the =select= expression parser so the grammar yields a
+typed *value* (number or string), not just a bool. =select EXPR= then requires
+a bool-valued expression; =add NAME EXPR= takes any. Compiles to a Plan node
+evaluated per row — no interpreter in the hot path, same as today.
+
+** Categories + examples
+*** Arithmetic (=+ - * / %=, parens, precedence)
+#+begin_src sh
+add total   amount * qty
+add net     gross - tax
+add margin  (price - cost) / price * 100
+add price   price * 1.1            # replaces 'price' in place
+#+end_src
+*** Functions (a small standard set)
+#+begin_src sh
+add a   round(price)          # round / floor / ceil / abs
+add lo  min(bid, ask)         # min / max
+add n   len(name)             # string length
+add g   upper(grp)            # upper / lower / trim
+add v   coalesce(nick, name)  # first non-empty
+add k   int(price)            # truncate / parse to integer
+#+end_src
+*** Strings (concat + extraction; use =++= or =concat()=, never overload =+=)
+#+begin_src sh
+add full  first ++ ' ' ++ last
+add dom   split(email, '@', 1)      # nth part
+add area  match(phone, '(\d{3})')   # regex capture group
+#+end_src
+*** Conditional (ternary, reusing the bool expression for the test)
+#+begin_src sh
+add tier  amount > 1000 ? 'big' : 'small'
+add sign  amount < 0 ? 'debit' : 'credit'
+#+end_src
+*** Constants & metadata (tags; useful before a future join/concat)
+#+begin_src sh
+add source  'january.csv'    # constant column
+add rownum  rownum()         # 1-based row index
+#+end_src
+
+** Design decisions to make
+- Typing: arithmetic ⇒ numeric column; string ops ⇒ string. Column refs coerce
+  by context (implicit, like =select=). Numbers format like =to-str= (trimmed).
+- String concat operator: prefer =++= (or only =concat(...)=) so =a + b= is
+  always numeric and unambiguous.
+- Replace vs append when =NAME= exists: lean *replace* (enables in-place
+  transforms). Alternative: =add= must be new, a separate =set= must exist.
+- Booleans: should =add ok amount > 0= yield ='t'/'f'= or =1/0=? (csvm-ish: t/f.)
+- Errors: divide-by-zero / non-numeric in arithmetic — abort with a message
+  (consistent with =to-num=) rather than yielding empty. Lean abort.
+- Starter function set: round, floor, ceil, abs, min, max, len, upper, lower,
+  trim, coalesce. (split / regex-extract / date functions come later.)
+
+** Recommended starter scope
+Arithmetic + comparison/ternary + the function set above + string =++=, with
+=add= replacing an existing name. Covers the bulk and reuses the expression
+parser. =split= / regex / date functions are a follow-up.
+
+* TODO conditional colours when formatting
+Colourize =fmt= output (and maybe plain output to a TTY) based on per-row /
+per-cell conditions — like a spreadsheet's conditional formatting, or what
+tools like =tidy-viewer= / =csvlens= do.
+
+** Sketch of the surface
+A rule = a =select=-style predicate + a colour. Options for spelling it:
+- A =color= command feeding =fmt=:
+  #+begin_src sh
+  color "amount < 0" red | color "status == 'error'" bg:red | fmt
+  #+end_src
+- Or inline on =fmt=: =fmt color:amount<0=red,status=='error'=bwhite-on-red=.
+Lean toward a separate =color RULE= command (composable, reuses the expression
+parser) that attaches rules to the plan; =fmt= (or a TTY-aware default) renders
+them.
+
+** Things to get right
+- Reuse the bool expression parser for the rule predicate (no new grammar).
+- Whole-row vs single-cell colouring: a rule could paint the matching row, or
+  only the cell of a named column (=color amount "amount < 0" red=).
+- ANSI escapes must NOT count toward =fmt='s column-width alignment — pad by
+  *visible* width, not byte length. (Current =format_aligned= pads by
+  =chars().count()=; it must measure the uncoloured text.)
+- =--color auto|always|never=: default =auto= (colour only when stdout is a
+  TTY), so piping to a file or another tool stays clean. Needs an isatty check.
+- Value-based / heatmap colouring (scale a column's colour by its numeric
+  range) is a nice extension once predicate rules exist.
+- First match wins vs. layering (fg from one rule, bg from another) — decide.
+
+* Other ideas (parking lot)
+- Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
+- =join= across files (sub-pipeline as the right side; Plan becomes a DAG).
+- Parallelise the final sort merge; multi-level is already done.
