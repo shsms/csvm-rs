@@ -92,9 +92,26 @@ them.
   =chars().count()=; it must measure the uncoloured text.)
 - =--color auto|always|never=: default =auto= (colour only when stdout is a
   TTY), so piping to a file or another tool stays clean. Needs an isatty check.
-- Value-based / heatmap colouring (scale a column's colour by its numeric
-  range) is a nice extension once predicate rules exist.
 - First match wins vs. layering (fg from one rule, bg from another) — decide.
+
+** Value-based (heatmap) colouring — reuses =stats='s =ColStats=
+Colour a numeric cell by where it falls in its column's range: green at the min,
+red at the max, gradient between. The per-column min/max/mean/stddev already
+exist as =ColStats= (=src/stats.rs=), the accumulator behind =stats=. =fmt=
+computes its *own* =ColStats= over the rows it renders — it never receives them
+from a =stats= stage (in =stats | fmt= the rows *are* the profile), so the reuse
+is at the *type* level, not a shared instance.
+- Bounds default to the column's =min=/=max=; let the user override the gradient
+  range. Same code path: =Option<(lo, hi)>=, falling back to =ColStats= when unset.
+- Outside the range ⇒ solid endpoint colours: clamp =t = (v-lo)/(hi-lo)= to [0,1]
+  before the green→red lerp, and the endpoints fall out for free.
+- Ramp direction is a parameter (low isn't always "good").
+- =mean=/=stddev= ride along in =ColStats=, so z-score / diverging colouring
+  (around the mean) reuses the same struct — no new computation.
+- Put the mapping in a small =color= module (=value, lo, hi, ramp -> ANSI=),
+  shared with the predicate =color RULE= above; both still need fmt to pad by
+  *visible* width (see above).
+- Keep =ColStats= presentation-free (compute only) so =stats= and =fmt= both use it.
 
 * Other ideas (parking lot)
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
