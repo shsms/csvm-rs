@@ -56,7 +56,7 @@ comma- or space-separated arguments:
 | `cols -v a,b`      | keep everything *except* these columns                     |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
-| `head N`           | keep the first `N` rows reaching it                        |
+| `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |

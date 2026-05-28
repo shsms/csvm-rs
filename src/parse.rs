@@ -136,8 +136,25 @@ impl Builder {
     }
 
     fn parse_head(&mut self, rest: &str) -> Result<(), Error> {
-        let n: usize = rest
-            .trim()
+        // Bash-like: no argument means 10 rows; the count may be bare (`head 20`),
+        // via `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the obsolete
+        // `-N` form (`head -20`). Byte mode (`-c`) and negative counts (all but
+        // last N) are not supported.
+        let rest = rest.trim();
+        if rest.is_empty() {
+            self.items.push(Item::Head(DEFAULT_HEAD_ROWS));
+            return Ok(());
+        }
+        let count = head_count_text(rest);
+        if let Some(digits) = count.strip_prefix('-')
+            && !digits.is_empty()
+            && digits.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(err(
+                "head doesn't support a negative count (all-but-last-N)",
+            ));
+        }
+        let n: usize = count
             .parse()
             .map_err(|_| err(format!("head expects a row count, got '{rest}'")))?;
         self.items.push(Item::Head(n));
@@ -260,6 +277,25 @@ impl Builder {
         self.items.push(Item::Stmt(Stmt::Select(expr)));
         Ok(())
     }
+}
+
+/// Rows kept by `head` when no count is given (bash `head` defaults to 10).
+const DEFAULT_HEAD_ROWS: usize = 10;
+
+/// Reduce a `head` argument to its numeric text, accepting bash's spellings:
+/// `-n N` / `-nN`, `--lines N` / `--lines=N`, and the obsolete `-N`. A bare
+/// count is returned unchanged.
+fn head_count_text(rest: &str) -> &str {
+    if let Some(r) = rest.strip_prefix("--lines") {
+        return r.strip_prefix('=').unwrap_or(r).trim_start();
+    }
+    if let Some(r) = rest.strip_prefix("-n") {
+        return r.trim_start();
+    }
+    if let Some(r) = rest.strip_prefix('-') {
+        return r.trim_start(); // obsolete `-N`
+    }
+    rest
 }
 
 // --- stage / word splitting -------------------------------------------------
@@ -774,6 +810,30 @@ mod tests {
 
         // fmt alone (no transforms) is valid — align the input.
         assert_eq!(parse("fmt").unwrap().output, OutputFormat::Aligned);
+    }
+
+    #[test]
+    fn head_count_forms() {
+        // bash-like spellings all yield the same count; bare `head` defaults to 10.
+        for (script, want) in [
+            ("head", 10),
+            ("head 7", 7),
+            ("head -n 7", 7),
+            ("head -n7", 7),
+            ("head --lines 7", 7),
+            ("head --lines=7", 7),
+            ("head -7", 7),
+        ] {
+            let plan = parse(script).unwrap();
+            let got = plan.stages.iter().find_map(|s| match s {
+                Stage::Head(n) => Some(*n),
+                _ => None,
+            });
+            assert_eq!(got, Some(want), "script: {script}");
+        }
+        // negative (all-but-last) is out of scope; a non-integer still errors.
+        assert!(parse("head -n -3").is_err());
+        assert!(parse("head -3.5").is_err());
     }
 
     #[test]

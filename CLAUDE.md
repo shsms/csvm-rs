@@ -43,8 +43,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   fall out for free, and chaining `select`s ANDs them.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
   and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
-- **`head N`** keeps the first N rows reaching it (own stage; streams + stops
-  early when there's no sort, else truncates in the materialized path).
+- **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
+  also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
+  streams + stops early when there's no sort, else truncates in the materialized
+  path. (Negative `-n -N` and byte mode `-c` are not supported.)
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`hdr a,b,c`** supplies column names for headerless input: it sets
