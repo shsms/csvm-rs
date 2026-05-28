@@ -68,9 +68,11 @@ Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 ### `select` expressions
 
 A bare infix expression (no surrounding quotes — only string *literals* are
-quoted). Shell-quote the whole script so the shell doesn't eat `>`/`|`/spaces.
+quoted). Single-quote the whole script so the shell doesn't eat `>`, `|`,
+backticks, or spaces.
 
-- **Column reference**: a bare identifier — `fieldA`.
+- **Column reference**: a bare identifier — `fieldA`. A name that isn't a bare
+  identifier (e.g. it contains `-`) is wrapped in backticks: `` `frequenz-app-edge` ``.
 - **Literals**: numbers (`0`, `3.14`, `-5`); strings in single or double quotes
   (`'t'`).
 - **Comparisons**: `==` (or `=`), `!=`, `<`, `>`, `<=`, `>=`.

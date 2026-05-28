@@ -379,6 +379,24 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
                 i += 1; // closing quote
                 toks.push(ETok::Str(lit));
             }
+            '`' => {
+                // Backtick quotes a column name that isn't a bare identifier
+                // (e.g. it contains '-'); emit an Ident (column ref), not a Str.
+                i += 1;
+                let start = i;
+                while i < cs.len() && cs[i] != '`' {
+                    i += 1;
+                }
+                if i >= cs.len() {
+                    return Err(err("unterminated backtick column name in expression"));
+                }
+                if i == start {
+                    return Err(err("empty backtick column name in expression"));
+                }
+                let name: String = cs[start..i].iter().collect();
+                i += 1; // closing backtick
+                toks.push(ETok::Ident(name));
+            }
             '=' => match cs.get(i + 1) {
                 Some('=') => push2(&mut toks, "==", &mut i),
                 Some('~') => push2(&mut toks, "=~", &mut i),
@@ -687,6 +705,29 @@ mod tests {
             &stmts[0],
             Stmt::Select(BoolExpr::Match { negate: false, .. })
         ));
+    }
+
+    #[test]
+    fn backtick_quoted_column_name() {
+        // A hyphenated name isn't a bare identifier; backticks make it a column
+        // ref (an Ident), not a string literal.
+        let plan = parse(r#"select `frequenz-app-edge` != """#).unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[0] else {
+            panic!()
+        };
+        let Operand::Col(col) = &c.lhs else { panic!() };
+        assert_eq!(col.name, "frequenz-app-edge");
+        assert!(!c.numeric);
+        assert!(matches!(&c.rhs, Operand::Str(s) if s.is_empty()));
+    }
+
+    #[test]
+    fn backtick_errors() {
+        assert!(parse("select `unterminated == 'x'").is_err());
+        assert!(parse("select `` == 'x'").is_err()); // empty name
     }
 
     #[test]

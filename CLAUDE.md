@@ -37,8 +37,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   *except* them (like `cut --complement`).
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
-  words). Operands: bare identifiers are columns, numbers are numeric literals,
-  `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`
+  words). Operands: bare identifiers are columns (backtick-quote a name that
+  isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers are numeric
+  literals, `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`
   fall out for free, and chaining `select`s ANDs them.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
   and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
