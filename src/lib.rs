@@ -6,6 +6,7 @@
 //! with no interpreter in the hot path. See `CLAUDE.md` for the architecture.
 
 pub mod cli;
+pub mod color;
 pub mod csv;
 pub mod error;
 pub mod exec;
