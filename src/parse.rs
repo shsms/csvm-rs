@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use crate::color::{parse_ramp, parse_style};
+use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
     BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand, OutputFormat, Plan,
@@ -231,15 +231,16 @@ impl Builder {
     }
 
     fn parse_color_gradient(&mut self, s: &str) -> Result<(), Error> {
-        let mut it = s.split_whitespace();
+        let mut it = s.split_whitespace().peekable();
         let col = it
             .next()
             .ok_or_else(|| err("color -g expects a column name"))?;
-        let ramp = parse_ramp(
-            it.next()
-                .ok_or_else(|| err("color -g expects a ramp like green:red"))?,
-        )
-        .map_err(err)?;
+        // The ramp is optional (defaults to green:red). A ramp token always
+        // contains ':', which tells it apart from a numeric bound.
+        let ramp = match it.peek() {
+            Some(t) if t.contains(':') => parse_ramp(it.next().unwrap()).map_err(err)?,
+            _ => Ramp::default(),
+        };
         let bounds = match (it.next(), it.next()) {
             (Some(lo), Some(hi)) => Some((
                 lo.parse::<f64>()
@@ -985,6 +986,20 @@ mod tests {
             panic!()
         };
         assert_eq!(*bounds, None);
+
+        // ramp omitted ⇒ default green:red; bounds may still follow.
+        let plan = parse("color -g amount | fmt").unwrap();
+        let ColorRule::Gradient { ramp, bounds, .. } = &plan.colors[0] else {
+            panic!()
+        };
+        assert_eq!(*ramp, Ramp::default());
+        assert_eq!(*bounds, None);
+        let plan = parse("color -g amount 0 5000").unwrap();
+        let ColorRule::Gradient { ramp, bounds, .. } = &plan.colors[0] else {
+            panic!()
+        };
+        assert_eq!(*ramp, Ramp::default());
+        assert_eq!(*bounds, Some((0.0, 5000.0)));
     }
 
     #[test]
@@ -992,9 +1007,8 @@ mod tests {
         assert!(parse("color").is_err()); // no args
         assert!(parse("color red").is_err()); // colour but no expression
         assert!(parse("color notacolour x > 0").is_err()); // unknown colour
-        assert!(parse("color -g amount").is_err()); // gradient needs a ramp
         assert!(parse("color -g amount green:red 0").is_err()); // only one bound
-        assert!(parse("color -g amount notaramp").is_err()); // bad ramp
+        assert!(parse("color -g amount green:notacolour").is_err()); // bad ramp colour
     }
 
     #[test]

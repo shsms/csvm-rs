@@ -108,6 +108,16 @@ pub struct Ramp {
     pub hi: Rgb,
 }
 
+impl Default for Ramp {
+    /// Green at the low end, red at the high end.
+    fn default() -> Self {
+        Ramp {
+            lo: named("green").unwrap(),
+            hi: named("red").unwrap(),
+        }
+    }
+}
+
 /// Parse a ramp spec `locolour:hicolour`, e.g. `green:red`.
 pub fn parse_ramp(spec: &str) -> Result<Ramp, String> {
     let (lo, hi) = spec
@@ -174,6 +184,7 @@ mod tests {
         assert_eq!(r.at(99.0, 0.0, 10.0).fg, named("red")); // above clamps to hi
         assert_eq!(r.at(5.0, 3.0, 3.0).fg, named("green")); // degenerate range
         assert!(parse_ramp("green").is_err());
+        assert_eq!(Ramp::default(), parse_ramp("green:red").unwrap()); // default ramp
     }
 
     #[test]

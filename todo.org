@@ -95,13 +95,16 @@ color -c amount yellow amount > 1000
 
 *** Gradient (heatmap) — value-based
 #+begin_src sh
-color -g COL RAMP [LO HI]    # colour COL's cells by where they fall in a range
+color -g COL [RAMP] [LO HI]   # colour COL's cells by where they fall in a range
 #+end_src
-=RAMP= is =locolour:hicolour= (e.g. =green:red=), interpolated in truecolour.
-=LO HI= are optional numeric bounds; default the column's min/max (from
-=ColStats=), and values outside the range clamp to the endpoint colours.
+=RAMP= is =locolour:hicolour= (e.g. =green:red=), interpolated in truecolour, and
+defaults to =green:red= when omitted. =LO HI= are optional numeric bounds;
+default the column's min/max (from =ColStats=), and values outside the range
+clamp to the endpoint colours. (A ramp token always has a =:=, so it's never
+confused with a numeric bound.)
 #+begin_src sh
-color -g amount green:red          # bounds = column min/max
+color -g amount                    # default green:red, bounds = column min/max
+color -g amount blue:yellow        # custom ramp
 color -g amount green:red 0 5000   # explicit bounds, solid outside
 #+end_src
 
