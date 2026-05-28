@@ -18,10 +18,11 @@
 
 use std::collections::HashMap;
 
+use crate::color::{parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    BoolExpr, Cmp, CmpOp, ColRef, ConvStmt, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt,
-    SortKey, SortStmt, Stage, StatsStmt, Stmt,
+    BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand, OutputFormat, Plan,
+    ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -34,7 +35,11 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
         }
         builder.parse_stage(stage)?;
     }
-    if builder.items.is_empty() && builder.output == OutputFormat::Csv && builder.header.is_none() {
+    if builder.items.is_empty()
+        && builder.output == OutputFormat::Csv
+        && builder.header.is_none()
+        && builder.colors.is_empty()
+    {
         return Err(err("empty script"));
     }
     Ok(builder.take_plan())
@@ -64,6 +69,8 @@ struct Builder {
     output: OutputFormat,
     /// Column names from a `hdr` command, for headerless input.
     header: Option<Vec<String>>,
+    /// Colour rules from `color` commands (plan metadata, not stages).
+    colors: Vec<ColorRule>,
 }
 
 impl Builder {
@@ -103,6 +110,7 @@ impl Builder {
             stages,
             output: self.output,
             input_header: self.header.take(),
+            colors: std::mem::take(&mut self.colors),
         }
     }
 
@@ -116,6 +124,7 @@ impl Builder {
             "to-str" | "to_str" => self.parse_conv(rest, false),
             "head" => self.parse_head(rest),
             "stats" => self.parse_stats(rest),
+            "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
@@ -176,6 +185,79 @@ impl Builder {
             positions: Vec::new(),
             names: Vec::new(),
         }));
+        Ok(())
+    }
+
+    /// `color [-c COL] COLOUR EXPR` (predicate) or `color -g COL RAMP [LO HI]`
+    /// (gradient). Colour rules are plan metadata, not stages — applied to the
+    /// output rows at render time.
+    fn parse_color(&mut self, rest: &str) -> Result<(), Error> {
+        let (first, after) = split_first_word(rest.trim());
+        match first {
+            "" => Err(err("color expects arguments")),
+            "-g" => self.parse_color_gradient(after),
+            "-c" => {
+                let (col, tail) = split_first_word(after);
+                if col.is_empty() {
+                    return Err(err("color -c expects a column name"));
+                }
+                self.parse_color_predicate(ColorScope::Cell(ColRef::new(col.to_string())), tail)
+            }
+            // Colour-first: the rest (colour + expression) is the predicate form.
+            _ => self.parse_color_predicate(ColorScope::Row, rest.trim()),
+        }
+    }
+
+    fn parse_color_predicate(&mut self, scope: ColorScope, s: &str) -> Result<(), Error> {
+        let (spec, expr_src) = split_first_word(s);
+        if spec.is_empty() {
+            return Err(err("color expects a colour"));
+        }
+        let style = parse_style(spec).map_err(err)?;
+        let expr_src = expr_src.trim();
+        if expr_src.is_empty() {
+            return Err(err("color expects a condition expression"));
+        }
+        let toks = lex_expr(expr_src)?;
+        let mut parser = ExprParser {
+            toks,
+            pos: 0,
+            types: &self.col_types,
+        };
+        let expr = parser.parse()?;
+        self.colors
+            .push(ColorRule::Predicate { scope, style, expr });
+        Ok(())
+    }
+
+    fn parse_color_gradient(&mut self, s: &str) -> Result<(), Error> {
+        let mut it = s.split_whitespace();
+        let col = it
+            .next()
+            .ok_or_else(|| err("color -g expects a column name"))?;
+        let ramp = parse_ramp(
+            it.next()
+                .ok_or_else(|| err("color -g expects a ramp like green:red"))?,
+        )
+        .map_err(err)?;
+        let bounds = match (it.next(), it.next()) {
+            (Some(lo), Some(hi)) => Some((
+                lo.parse::<f64>()
+                    .map_err(|_| err(format!("color -g: bad lower bound '{lo}'")))?,
+                hi.parse::<f64>()
+                    .map_err(|_| err(format!("color -g: bad upper bound '{hi}'")))?,
+            )),
+            (None, None) => None,
+            _ => return Err(err("color -g needs both LO and HI, or neither")),
+        };
+        if it.next().is_some() {
+            return Err(err("color -g: too many arguments"));
+        }
+        self.colors.push(ColorRule::Gradient {
+            col: ColRef::new(col.to_string()),
+            ramp,
+            bounds,
+        });
         Ok(())
     }
 
@@ -869,6 +951,50 @@ mod tests {
             panic!()
         };
         assert_eq!(s.cols, ["a", "b"]);
+    }
+
+    #[test]
+    fn color_predicate_and_gradient() {
+        // whole-row predicate
+        let plan = parse("color red amount < 0 | fmt").unwrap();
+        assert_eq!(plan.colors.len(), 1);
+        let ColorRule::Predicate { scope, expr, .. } = &plan.colors[0] else {
+            panic!()
+        };
+        assert!(matches!(scope, ColorScope::Row));
+        assert!(matches!(expr, BoolExpr::Cmp(_)));
+
+        // cell-scoped predicate
+        let plan = parse("color -c amount yellow amount > 1000").unwrap();
+        assert!(matches!(
+            &plan.colors[0],
+            ColorRule::Predicate {
+                scope: ColorScope::Cell(_),
+                ..
+            }
+        ));
+
+        // gradient: explicit bounds, then default bounds
+        let plan = parse("color -g amount green:red 0 5000 | fmt").unwrap();
+        let ColorRule::Gradient { bounds, .. } = &plan.colors[0] else {
+            panic!()
+        };
+        assert_eq!(*bounds, Some((0.0, 5000.0)));
+        let plan = parse("color -g price green:red").unwrap();
+        let ColorRule::Gradient { bounds, .. } = &plan.colors[0] else {
+            panic!()
+        };
+        assert_eq!(*bounds, None);
+    }
+
+    #[test]
+    fn color_errors() {
+        assert!(parse("color").is_err()); // no args
+        assert!(parse("color red").is_err()); // colour but no expression
+        assert!(parse("color notacolour x > 0").is_err()); // unknown colour
+        assert!(parse("color -g amount").is_err()); // gradient needs a ramp
+        assert!(parse("color -g amount green:red 0").is_err()); // only one bound
+        assert!(parse("color -g amount notaramp").is_err()); // bad ramp
     }
 
     #[test]

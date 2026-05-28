@@ -9,6 +9,7 @@
 //! pipeline so a `cols` that reshapes the row is visible to later statements —
 //! exactly as csvm's `set_header` does.
 
+use crate::color::{Ramp, Style};
 use crate::error::Error;
 use crate::field::{Field, format_num};
 use crate::stats::STATS_SCHEMA;
@@ -153,6 +154,49 @@ pub enum OutputFormat {
     Aligned,
 }
 
+/// What a predicate colour rule paints.
+#[derive(Clone, Debug)]
+pub enum ColorScope {
+    /// The whole row.
+    Row,
+    /// Only the named column's cell.
+    Cell(ColRef),
+}
+
+/// One `color` rule, applied to the output rows at render time (so its column
+/// references resolve against the *output* header).
+#[derive(Clone, Debug)]
+pub enum ColorRule {
+    /// Paint `scope` with `style` on rows where `expr` is true.
+    Predicate {
+        scope: ColorScope,
+        style: Style,
+        expr: BoolExpr,
+    },
+    /// Colour `col`'s cells by where each value falls in `bounds` (default: the
+    /// column's min/max), using `ramp`.
+    Gradient {
+        col: ColRef,
+        ramp: Ramp,
+        bounds: Option<(f64, f64)>,
+    },
+}
+
+impl ColorRule {
+    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+        match self {
+            ColorRule::Predicate { scope, expr, .. } => {
+                expr.resolve(header)?;
+                if let ColorScope::Cell(c) = scope {
+                    c.resolve(header)?;
+                }
+            }
+            ColorRule::Gradient { col, .. } => col.resolve(header)?,
+        }
+        Ok(())
+    }
+}
+
 /// A fully compiled pipeline.
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -161,6 +205,8 @@ pub struct Plan {
     /// Column names supplied by a `hdr` command, for input that has no header
     /// line. When set, the whole input is data and this is the header.
     pub input_header: Option<Vec<String>>,
+    /// Colour rules, applied to the output rows at render time.
+    pub colors: Vec<ColorRule>,
 }
 
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
@@ -488,6 +534,10 @@ impl Plan {
                 Stage::Stats(s) => s.resolve(&mut header)?,
             }
         }
+        // Colour rules render the output, so resolve them against the final header.
+        for rule in &mut self.colors {
+            rule.resolve(&header)?;
+        }
         Ok(header)
     }
 }
@@ -593,6 +643,7 @@ mod tests {
             ])],
             output: OutputFormat::Csv,
             input_header: None,
+            colors: Vec::new(),
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -634,6 +685,7 @@ mod tests {
             })])],
             output: OutputFormat::Csv,
             input_header: None,
+            colors: Vec::new(),
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column(n) if n == "nope"));
