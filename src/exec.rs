@@ -18,8 +18,9 @@ use memchr::memchr;
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
-use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, Stmt, apply_stmts};
+use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, StatsStmt, Stmt, apply_stmts};
 use crate::sort::Sorter;
+use crate::stats::ColStats;
 
 /// An owned row, detached from any chunk buffer (used by the in-memory
 /// multi-sort fallback).
@@ -127,6 +128,11 @@ fn run_body<R: BufRead, W: Write + Send>(
     if let Some((pre, n, post)) = head_only_shape(plan) {
         return stream_head(pre, n, post, opts.chunk_size, input, output);
     }
+    // `stats` reduces the stream to a tiny profile; stream the input through it
+    // (O(columns) memory) and run any following stages over that profile.
+    if let Some((pre, stats, post)) = stats_shape(plan) {
+        return run_stats_streaming(pre, stats, post, opts.chunk_size, input, output);
+    }
     match plan.stages.as_slice() {
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
@@ -139,7 +145,11 @@ fn run_body<R: BufRead, W: Write + Send>(
 /// If the plan is `[Transform?, Head(n), Transform?]` with no sort, return the
 /// pre-head statements, the limit, and the post-head statements.
 fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
-    if plan.stages.iter().any(|s| matches!(s, Stage::Sort(_))) {
+    if plan
+        .stages
+        .iter()
+        .any(|s| matches!(s, Stage::Sort(_) | Stage::Stats(_)))
+    {
         return None;
     }
     let heads: Vec<usize> = plan
@@ -205,6 +215,94 @@ fn stream_head<R: BufRead, W: Write>(
         output.flush()?; // don't let a live/slow stream's output sit in the BufWriter
     }
     Ok(())
+}
+
+/// If the plan has exactly one `stats` stage with nothing blocking before it (an
+/// optional leading transform only), return the pre-stats statements, the stats
+/// stage, and the stages that follow it. Anything else (a sort/head before
+/// stats, or multiple stats) returns `None` and takes the in-memory path.
+fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
+    let idxs: Vec<usize> = plan
+        .stages
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stage::Stats(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let [si] = idxs[..] else { return None };
+    let pre: &[Stmt] = match &plan.stages[..si] {
+        [] => &[],
+        [Stage::Transform(stmts)] => stmts,
+        _ => return None,
+    };
+    let Stage::Stats(stats) = &plan.stages[si] else {
+        return None;
+    };
+    Some((pre, stats, &plan.stages[si + 1..]))
+}
+
+/// Stream `[pre | stats]`, folding each surviving row into per-column
+/// accumulators (O(columns) memory, not O(rows)), then run the post-stats
+/// stages over the tiny profile and write it. `stats` must read all input, so it
+/// uses the throughput-batched [`next_chunk`].
+fn run_stats_streaming<R: BufRead, W: Write>(
+    pre: &[Stmt],
+    stats: &StatsStmt,
+    post: &[Stage],
+    chunk_size: usize,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
+    let mut accs: Vec<ColStats> = stats.positions.iter().map(|_| ColStats::new()).collect();
+    while let Some(chunk) = next_chunk(input, chunk_size)? {
+        let mut scratch: Vec<Field> = Vec::new();
+        let mut err: Option<Error> = None;
+        csv::parse_chunk(&chunk, |row| {
+            if err.is_some() {
+                return;
+            }
+            match apply_stmts(pre, row, &mut scratch) {
+                Ok(true) => accumulate(&mut accs, &stats.positions, row),
+                Ok(false) => {}
+                Err(e) => err = Some(e),
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    let rows = apply_stages_over_rows(post, profile_rows(stats, &accs))?;
+    write_rows(output, &rows)
+}
+
+/// Fold one row's profiled cells into the matching accumulators.
+#[inline]
+fn accumulate(accs: &mut [ColStats], positions: &[usize], row: &[Field]) {
+    for (a, &p) in accs.iter_mut().zip(positions) {
+        match row.get(p) {
+            Some(f) => a.update(f),
+            None => a.update(&Field::Str("")),
+        }
+    }
+}
+
+/// Build accumulators over already-materialized rows (the in-memory path).
+fn build_colstats(positions: &[usize], rows: &[OwnedRow]) -> Vec<ColStats> {
+    let mut accs: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
+    for row in rows {
+        accumulate(&mut accs, positions, row);
+    }
+    accs
+}
+
+/// Turn finalized accumulators into the profile rows (one per profiled column).
+fn profile_rows(stats: &StatsStmt, accs: &[ColStats]) -> Vec<OwnedRow> {
+    stats
+        .names
+        .iter()
+        .zip(accs)
+        .map(|(name, a)| a.to_row(name))
+        .collect()
 }
 
 /// Read and parse the header of a file, returning the header, the byte offset
@@ -525,9 +623,10 @@ fn run_staged<R: BufRead, W: Write>(
         .filter(|s| matches!(s, Stage::Sort(_)))
         .count();
     let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
-    // The streaming sort path handles exactly one sort and no head; anything
-    // else (head, or multiple sorts) materializes.
-    if sort_count != 1 || has_head {
+    let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
+    // The streaming sort path handles exactly one sort and no head/stats;
+    // anything else (head, stats, or multiple sorts) materializes.
+    if sort_count != 1 || has_head || has_stats {
         return run_staged_in_memory(plan, opts.chunk_size, input, output);
     }
 
@@ -618,8 +717,19 @@ fn run_staged_in_memory<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let mut rows = materialize(chunk_size, input)?;
-    for stage in &plan.stages {
+    let rows = materialize(chunk_size, input)?;
+    let rows = apply_stages_over_rows(&plan.stages, rows)?;
+    write_rows(output, &rows)
+}
+
+/// Run a sequence of stages over already-materialized rows, returning the final
+/// rows. The in-memory fallback uses it for the whole plan; the streaming stats
+/// path uses it for the (tiny) post-stats stages.
+fn apply_stages_over_rows(
+    stages: &[Stage],
+    mut rows: Vec<OwnedRow>,
+) -> Result<Vec<OwnedRow>, Error> {
+    for stage in stages {
         match stage {
             Stage::Transform(stmts) => {
                 let mut kept = Vec::with_capacity(rows.len());
@@ -633,9 +743,13 @@ fn run_staged_in_memory<R: BufRead, W: Write>(
             }
             Stage::Sort(sort) => sort_rows(sort, &mut rows)?,
             Stage::Head(n) => rows.truncate(*n),
+            Stage::Stats(s) => {
+                let accs = build_colstats(&s.positions, &rows);
+                rows = profile_rows(s, &accs);
+            }
         }
     }
-    write_rows(output, &rows)
+    Ok(rows)
 }
 
 /// Read all input rows as owned values.
@@ -768,6 +882,13 @@ pub fn describe(plan: &Plan) -> String {
             }
             Stage::Head(limit) => {
                 out.push_str(&format!("stage {n} (head):\n  {n}.1 head {limit}\n"));
+            }
+            Stage::Stats(s) => {
+                out.push_str(&format!("stage {n} (stats):\n"));
+                out.push_str(&format!(
+                    "  {n}.1 stats {:?} (positions {:?})\n",
+                    s.names, s.positions
+                ));
             }
         }
     }
@@ -984,6 +1105,43 @@ mod tests {
     #[test]
     fn missing_column_is_an_error() {
         assert!(matches!(run_str("cols nope", INPUT), Err(Error::Column(_))));
+    }
+
+    #[test]
+    fn stats_profiles_every_column() {
+        let out = run_str("stats", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "field,count,empty,min,max,sum,mean,stddev");
+        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
+        // text column: lexical min/max, numeric stats blank
+        assert_eq!(lines[2], "fieldA,4,0,f,t,,,");
+        assert_eq!(lines[3], "countZ,4,0,0,9,14,3.5,4.358899");
+    }
+
+    #[test]
+    fn stats_after_filter_streams_named_column() {
+        // fieldA == 't' keeps countZ values 5,0,9 (streaming path with a pre-filter)
+        let out = run_str("select fieldA == 't' | stats countZ", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2); // header + countZ
+        assert!(lines[1].starts_with("countZ,3,0,0,9,14,4.666667,"));
+    }
+
+    #[test]
+    fn stats_composes_with_sort_and_head() {
+        // largest mean first: countZ(3.5) > id(2.5) > fieldA(blank => 0)
+        let out = run_str("stats | sort mean=nr | head 1", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].starts_with("countZ,"));
+    }
+
+    #[test]
+    fn stats_after_sort_uses_in_memory_path() {
+        // A blocking stage before stats falls back to the materializing path.
+        let out = run_str("sort id=nr | stats id", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
     }
 
     #[test]

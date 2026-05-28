@@ -47,6 +47,15 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort, else truncates in the materialized
   path. (Negative `-n -N` and byte mode `-c` are not supported.)
+- **`stats [cols]`** reduces the input to one summary row per column
+  (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
+  column. A blocking, *reducing* stage: it streams the input through per-column
+  accumulators (`ColStats` in `stats.rs`, O(columns) memory) and rewrites the
+  header to the profile schema, so `sort`/`head`/`fmt` compose after it. Type
+  detection is lenient (a non-numeric cell ⇒ text column; unlike `to-num` it
+  never aborts); min/max are numeric for numeric columns, lexical for text;
+  sample stddev via Welford. `ColStats` is deliberately presentation-free so
+  `fmt`'s planned value-colouring can reuse it (see `todo.org`).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`hdr a,b,c`** supplies column names for headerless input: it sets

@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::error::Error;
 use crate::plan::{
     BoolExpr, Cmp, CmpOp, ColRef, ConvStmt, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt,
-    SortKey, SortStmt, Stage, Stmt,
+    SortKey, SortStmt, Stage, StatsStmt, Stmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -54,6 +54,7 @@ enum Item {
     Stmt(Stmt),
     Sort(SortStmt),
     Head(usize),
+    Stats(StatsStmt),
 }
 
 #[derive(Default)]
@@ -91,6 +92,10 @@ impl Builder {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Head(n));
                 }
+                Item::Stats(s) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Stats(s));
+                }
             }
         }
         flush(&mut transform, &mut stages);
@@ -110,6 +115,7 @@ impl Builder {
             "to-num" | "to_num" => self.parse_conv(rest, true),
             "to-str" | "to_str" => self.parse_conv(rest, false),
             "head" => self.parse_head(rest),
+            "stats" => self.parse_stats(rest),
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
@@ -158,6 +164,18 @@ impl Builder {
             .parse()
             .map_err(|_| err(format!("head expects a row count, got '{rest}'")))?;
         self.items.push(Item::Head(n));
+        Ok(())
+    }
+
+    /// `stats [cols]` profiles the named columns (or all of them, if none are
+    /// named): a blocking stage that reduces the input to one summary row per
+    /// column.
+    fn parse_stats(&mut self, rest: &str) -> Result<(), Error> {
+        self.items.push(Item::Stats(StatsStmt {
+            cols: split_list(rest),
+            positions: Vec::new(),
+            names: Vec::new(),
+        }));
         Ok(())
     }
 
@@ -834,6 +852,23 @@ mod tests {
         // negative (all-but-last) is out of scope; a non-integer still errors.
         assert!(parse("head -n -3").is_err());
         assert!(parse("head -3.5").is_err());
+    }
+
+    #[test]
+    fn stats_all_and_named() {
+        // Bare `stats` profiles every column (empty list).
+        let plan = parse("stats").unwrap();
+        let Stage::Stats(s) = &plan.stages[0] else {
+            panic!()
+        };
+        assert!(s.cols.is_empty());
+
+        // `stats a,b` after a filter is its own stage with the named columns.
+        let plan = parse("select a > 0 | stats a,b").unwrap();
+        let Stage::Stats(s) = &plan.stages[1] else {
+            panic!()
+        };
+        assert_eq!(s.cols, ["a", "b"]);
     }
 
     #[test]

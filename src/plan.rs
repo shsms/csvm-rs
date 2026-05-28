@@ -11,6 +11,7 @@
 
 use crate::error::Error;
 use crate::field::{Field, format_num};
+use crate::stats::STATS_SCHEMA;
 use regex::Regex;
 use std::cmp::Ordering;
 
@@ -106,6 +107,17 @@ pub struct SortStmt {
     pub keys: Vec<SortKey>,
 }
 
+/// `stats [cols]`: reduce the input to one summary row per profiled column
+/// (empty `cols` profiles every column). After resolution `names` holds the
+/// resolved column names (the `field` cell of each output row) and `positions`
+/// their indices; the output header becomes [`STATS_SCHEMA`].
+#[derive(Clone, Debug)]
+pub struct StatsStmt {
+    pub cols: Vec<String>,
+    pub positions: Vec<usize>,
+    pub names: Vec<String>,
+}
+
 /// Rename one or more columns (a header-only change; row data is untouched).
 #[derive(Clone, Debug)]
 pub struct RenameStmt {
@@ -129,6 +141,7 @@ pub enum Stage {
     Transform(Vec<Stmt>),
     Sort(SortStmt),
     Head(usize),
+    Stats(StatsStmt),
 }
 
 /// How the final output is rendered.
@@ -380,6 +393,26 @@ impl ConvStmt {
     }
 }
 
+impl StatsStmt {
+    /// Resolve the profiled columns (empty list ⇒ all) and reshape the header to
+    /// the profile schema for downstream stages.
+    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+        if self.cols.is_empty() {
+            self.positions = (0..header.len()).collect();
+            self.names = header.clone();
+        } else {
+            self.positions = self
+                .cols
+                .iter()
+                .map(|n| resolve_col(n, header))
+                .collect::<Result<_, _>>()?;
+            self.names = self.cols.clone();
+        }
+        *header = STATS_SCHEMA.iter().map(|s| s.to_string()).collect();
+        Ok(())
+    }
+}
+
 impl SortStmt {
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         for k in &mut self.keys {
@@ -452,6 +485,7 @@ impl Plan {
                 }
                 Stage::Sort(s) => s.resolve(&header)?,
                 Stage::Head(_) => {} // no columns to resolve
+                Stage::Stats(s) => s.resolve(&mut header)?,
             }
         }
         Ok(header)

@@ -57,6 +57,7 @@ comma- or space-separated arguments:
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
 | `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
+| `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
@@ -96,6 +97,29 @@ Each spec is a bare column or `col=flags`, where flags combine:
 
 ```sh
 sort fieldA fieldB=r countZ=nr      # by fieldA asc, fieldB desc, countZ numeric desc
+```
+
+### `stats`
+
+`stats` reduces the input to one row per column — a quick profile, like
+`describe`. With no arguments it profiles every column; `stats a,b` limits it to
+the named columns.
+
+| Output column         | Meaning                                                |
+|-----------------------|--------------------------------------------------------|
+| `field`               | the column name                                        |
+| `count` / `empty`     | non-empty / empty cells                                |
+| `min` / `max`         | numeric range for numeric columns, lexical for text    |
+| `sum` / `mean` / `stddev` | numeric columns only (sample stddev); blank for text |
+
+A column counts as numeric when every non-empty cell parses as a number. `stats`
+is a blocking, reducing stage, so it composes: filter first, then sort/limit the
+profile after it.
+
+```sh
+csvm 'stats | fmt' data.csv                          # profile every column, aligned
+csvm 'select region == "EU" | stats amount' data.csv # one column, after a filter
+csvm 'stats | sort mean=nr | head 5 | fmt' data.csv  # the 5 columns with the largest mean
 ```
 
 ### Headerless input (`hdr`)
