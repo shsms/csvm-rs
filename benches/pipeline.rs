@@ -129,7 +129,7 @@ fn align(c: &mut Criterion) {
     let (header, body) = header_and_body(&full);
     let opts = run_opts();
 
-    let mut plan = parse::parse("cols id,region,amount").expect("parse failed");
+    let mut plan = parse::parse("cols id,region,amount | fmt").expect("parse failed");
     let out_header = plan.resolve(&header).expect("resolve failed");
     let mut reader = Cursor::new(body.as_slice());
     let mut csv_out = Vec::new();
@@ -137,10 +137,10 @@ fn align(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("fmt");
     group.throughput(Throughput::Bytes(csv_out.len() as u64));
-    group.bench_function("format_aligned", |b| {
+    group.bench_function("render", |b| {
         b.iter(|| {
             let mut out = Vec::new();
-            exec::format_aligned(&csv_out, &mut out).expect("fmt failed");
+            exec::render(&csv_out, &plan, false, &mut out).expect("fmt failed");
             black_box(&out);
         });
     });

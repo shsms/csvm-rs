@@ -34,10 +34,10 @@ fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
     };
     let mut out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;
-    // `fmt` aligns the final output (main does this; mirror it here).
+    // `fmt` aligns the final output (main does this; mirror it here). Colour off.
     if plan.output == csvm::plan::OutputFormat::Aligned {
         let mut aligned = Vec::new();
-        exec::format_aligned(&out, &mut aligned).map_err(|e| e.to_string())?;
+        exec::render(&out, &plan, false, &mut aligned).map_err(|e| e.to_string())?;
         out = aligned;
     }
     String::from_utf8(out).map_err(|e| e.to_string())

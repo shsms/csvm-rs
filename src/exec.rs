@@ -15,10 +15,14 @@ use std::thread;
 use crossbeam_channel::bounded;
 use memchr::memchr;
 
+use crate::color::Style;
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
-use crate::plan::{BoolExpr, CmpOp, Operand, Plan, SortStmt, Stage, StatsStmt, Stmt, apply_stmts};
+use crate::plan::{
+    BoolExpr, CmpOp, ColorRule, ColorScope, Operand, OutputFormat, Plan, SortStmt, Stage,
+    StatsStmt, Stmt, apply_stmts,
+};
 use crate::sort::Sorter;
 use crate::stats::ColStats;
 
@@ -790,31 +794,128 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
     Ok(())
 }
 
-/// Re-render CSV bytes as a whitespace-aligned table (`fmt` / `column -t`):
-/// each column is padded to its widest cell, columns separated by two spaces.
-/// A **numeric** column (every data cell reads as a number) is right-justified
-/// so the digits line up; text columns are left-justified and the trailing
-/// column is left unpadded (no trailing whitespace).
-pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), Error> {
-    let text = std::str::from_utf8(csv_bytes)
+/// Render buffered output `bytes` to `output`, applying the plan's colour rules
+/// (when `color` is on) and aligning columns when the plan's output is
+/// `Aligned`. Width is measured by *visible* characters, so ANSI escapes never
+/// throw off alignment.
+pub fn render<W: Write>(
+    bytes: &[u8],
+    plan: &Plan,
+    color: bool,
+    output: &mut W,
+) -> Result<(), Error> {
+    let aligned = plan.output == OutputFormat::Aligned;
+    let want_color = color && !plan.colors.is_empty();
+    if !aligned && !want_color {
+        // Nothing to do but copy the bytes through (the caller only buffers when
+        // there is something to render, so this is just a safety net).
+        output.write_all(bytes)?;
+        return Ok(());
+    }
+    let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
     let mut rows: Vec<Vec<String>> = Vec::new();
     csv::parse_chunk(text, |r| {
         rows.push(r.iter().map(|f| f.as_str().into_owned()).collect());
     });
 
+    let styles = if want_color {
+        Some(compute_styles(&plan.colors, &rows)?)
+    } else {
+        None
+    };
+    if aligned {
+        align_and_write(&rows, styles.as_deref(), output)
+    } else {
+        write_csv_colored(&rows, styles.as_deref(), output)
+    }
+}
+
+/// The per-cell [`Style`] grid (`[row][col]`) for the colour rules over `rows`.
+/// The header row (index 0) is never styled. Rules apply in order; each layers
+/// onto what earlier rules set (last wins per attribute).
+fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Result<Vec<Vec<Style>>, Error> {
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
+    for rule in rules {
+        match rule {
+            ColorRule::Predicate { scope, style, expr } => {
+                for (ri, row) in rows.iter().enumerate().skip(1) {
+                    let frow: Vec<Field> = row.iter().map(|s| Field::Str(s)).collect();
+                    if !expr.eval(&frow)? {
+                        continue;
+                    }
+                    match scope {
+                        ColorScope::Row => {
+                            for cell in &mut styles[ri] {
+                                *cell = cell.over(*style);
+                            }
+                        }
+                        ColorScope::Cell(c) => {
+                            if let Some(cell) = styles[ri].get_mut(c.pos) {
+                                *cell = cell.over(*style);
+                            }
+                        }
+                    }
+                }
+            }
+            ColorRule::Gradient { col, ramp, bounds } => {
+                let (lo, hi) = (*bounds).unwrap_or_else(|| column_minmax(rows, col.pos));
+                for (ri, row) in rows.iter().enumerate().skip(1) {
+                    if let Some(v) = row.get(col.pos).and_then(|c| c.trim().parse::<f64>().ok())
+                        && let Some(cell) = styles[ri].get_mut(col.pos)
+                    {
+                        *cell = cell.over(ramp.at(v, lo, hi));
+                    }
+                }
+            }
+        }
+    }
+    Ok(styles)
+}
+
+/// Default gradient bounds: a column's numeric min/max, computed by reusing the
+/// `stats` accumulator. Falls back to `0..1` for a non-numeric column (whose
+/// cells won't parse, so nothing is painted anyway).
+fn column_minmax(rows: &[Vec<String>], pos: usize) -> (f64, f64) {
+    let mut acc = ColStats::new();
+    for row in rows.iter().skip(1) {
+        if let Some(cell) = row.get(pos) {
+            acc.update(&Field::Str(cell));
+        }
+    }
+    acc.num_range().unwrap_or((0.0, 1.0))
+}
+
+/// Look up the style for cell `[ri][ci]`, defaulting to empty.
+#[inline]
+fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
+    styles
+        .and_then(|s| s.get(ri))
+        .and_then(|r| r.get(ci))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Whitespace-align columns (`fmt` / `column -t`): each column padded to its
+/// widest cell, two spaces between. A numeric column (every data cell reads as a
+/// number) is right-justified; text columns left-justified, trailing column
+/// unpadded. Padding is by visible width; the painted text carries the colour.
+fn align_and_write<W: Write>(
+    rows: &[Vec<String>],
+    styles: Option<&[Vec<Style>]>,
+    output: &mut W,
+) -> Result<(), Error> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
-    for row in &rows {
+    for row in rows {
         for (i, field) in row.iter().enumerate() {
             widths[i] = widths[i].max(field.chars().count());
         }
     }
 
-    // Right-justify a column when every data cell (the rows after the header)
-    // reads as a number under the engine's coercion — blanks are allowed, but at
-    // least one cell must be a real number, so all-blank and text columns stay
-    // left-justified. The header is justified with its column.
+    // Right-justify a column when every data cell reads as a number (blanks
+    // allowed, but at least one must be a real number).
     let numeric: Vec<bool> = (0..ncols)
         .map(|i| {
             let mut saw_number = false;
@@ -830,7 +931,7 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
         .collect();
 
     let mut line = String::new();
-    for row in &rows {
+    for (ri, row) in rows.iter().enumerate() {
         line.clear();
         let last = row.len().saturating_sub(1);
         for (i, field) in row.iter().enumerate() {
@@ -838,14 +939,15 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
                 line.push_str("  ");
             }
             let pad = widths[i].saturating_sub(field.chars().count());
+            let painted = style_at(styles, ri, i).paint(field);
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
                 for _ in 0..pad {
                     line.push(' ');
                 }
-                line.push_str(field);
+                line.push_str(&painted);
             } else {
-                line.push_str(field);
+                line.push_str(&painted);
                 // Left-justify: pad on the right, except the last column.
                 if i != last {
                     for _ in 0..pad {
@@ -853,6 +955,29 @@ pub fn format_aligned<W: Write>(csv_bytes: &[u8], output: &mut W) -> Result<(), 
                     }
                 }
             }
+        }
+        line.push('\n');
+        output.write_all(line.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Write CSV rows with each cell painted by its style (for colouring plain,
+/// non-aligned output).
+fn write_csv_colored<W: Write>(
+    rows: &[Vec<String>],
+    styles: Option<&[Vec<Style>]>,
+    output: &mut W,
+) -> Result<(), Error> {
+    let mut line = String::new();
+    for (ri, row) in rows.iter().enumerate() {
+        line.clear();
+        for (i, cell) in row.iter().enumerate() {
+            if i > 0 {
+                line.push(',');
+            }
+            let encoded = csv::encode_field(cell);
+            line.push_str(&style_at(styles, ri, i).paint(&encoded));
         }
         line.push('\n');
         output.write_all(line.as_bytes())?;
@@ -892,10 +1017,29 @@ pub fn describe(plan: &Plan) -> String {
             }
         }
     }
-    if plan.output == crate::plan::OutputFormat::Aligned {
+    if plan.output == OutputFormat::Aligned {
         out.push_str("output: aligned\n");
     }
+    for rule in &plan.colors {
+        out.push_str(&describe_color(rule));
+    }
     out
+}
+
+fn describe_color(rule: &ColorRule) -> String {
+    match rule {
+        ColorRule::Predicate { scope, style, expr } => {
+            let tgt = match scope {
+                ColorScope::Row => "row".to_string(),
+                ColorScope::Cell(c) => format!("cell {}[{}]", c.name, c.pos),
+            };
+            format!("color {tgt} {style:?} when {}\n", fmt_expr(expr))
+        }
+        ColorRule::Gradient { col, ramp, bounds } => format!(
+            "color gradient {}[{}] {ramp:?} bounds {bounds:?}\n",
+            col.name, col.pos
+        ),
+    }
 }
 
 fn describe_stmt(stmt: &Stmt) -> String {
@@ -1012,6 +1156,25 @@ mod tests {
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// Run a script into a buffer, then render it (optionally with colour).
+    fn render_str(script: &str, input: &str, color: bool) -> String {
+        let mut plan = parse(script).unwrap();
+        let mut reader = io::BufReader::new(input.as_bytes());
+        let header = read_header(&mut reader).unwrap();
+        let out_header = plan.resolve(&header).unwrap();
+        let opts = RunOpts {
+            chunk_size: 1_000_000,
+            threads: 1,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+        };
+        let mut buf = Vec::new();
+        run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
+        let mut out = Vec::new();
+        render(&buf, &plan, color, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
     }
 
     const INPUT: &str = "id,fieldA,countZ\n1,t,5\n2,f,0\n3,t,0\n4,t,9\n";
@@ -1142,6 +1305,49 @@ mod tests {
         let out = run_str("sort id=nr | stats id", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
+    }
+
+    #[test]
+    fn color_predicate_paints_matching_rows() {
+        // countZ is 5,0,0,9 — paint rows where countZ == 0.
+        let out = render_str("color red countZ == '0' | fmt", INPUT, true);
+        assert!(out.contains('\x1b')); // some cells coloured
+        // Colour off ⇒ no escapes (aligned, but plain).
+        let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
+        assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn color_gradient_paints_numeric_column() {
+        let out = render_str("color -g countZ green:red | fmt", INPUT, true);
+        assert!(out.contains("\u{1b}[38;2;")); // truecolour foreground
+    }
+
+    #[test]
+    fn color_alignment_unaffected_by_escapes() {
+        // The painted and plain aligned output have the same visible layout:
+        // stripping ANSI from the coloured render reproduces the plain render.
+        let colored = render_str("color red countZ == '0' | fmt", INPUT, true);
+        let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
+        assert_eq!(strip_ansi(&colored), plain);
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                // skip until the SGR terminator 'm'
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
     }
 
     #[test]

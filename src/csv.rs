@@ -136,6 +136,15 @@ pub fn write_row(buf: &mut String, row: &[Field]) {
     buf.push('\n');
 }
 
+/// CSV-encode one field's text (quoting only if needed), returned as a String.
+/// Used when colouring plain CSV output, where each cell is encoded then wrapped
+/// in ANSI separately.
+pub fn encode_field(s: &str) -> String {
+    let mut buf = String::new();
+    write_text(&mut buf, s);
+    buf
+}
+
 #[inline]
 fn write_text(buf: &mut String, s: &str) {
     if s.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r')) {

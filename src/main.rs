@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -51,17 +51,29 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
+    let color_on = color_enabled(args.color, args.out_file.as_deref());
     let mut output = open_output(&args)?;
-    if plan.output == OutputFormat::Aligned {
-        // Run into a buffer, then align it (needs all rows for column widths).
+    // Aligning needs all rows (for column widths) and colouring needs all rows
+    // (for gradient ranges), so either one buffers first, then renders.
+    if plan.output == OutputFormat::Aligned || (color_on && !plan.colors.is_empty()) {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
-        exec::format_aligned(&buf, &mut output).map_err(|e| e.to_string())?;
+        exec::render(&buf, &plan, color_on, &mut output).map_err(|e| e.to_string())?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }
     output.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Whether to emit ANSI colour. `always`/`never` are absolute; `auto` colours
+/// only when writing to a terminal (stdout, not a `-o` file).
+fn color_enabled(when: cli::ColorWhen, out_file: Option<&str>) -> bool {
+    match when {
+        cli::ColorWhen::Always => true,
+        cli::ColorWhen::Never => false,
+        cli::ColorWhen::Auto => out_file.is_none_or(|p| p == "-") && io::stdout().is_terminal(),
+    }
 }
 
 /// Open the input and determine its header. With `input_header` (from a `hdr`

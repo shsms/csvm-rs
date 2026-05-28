@@ -20,6 +20,17 @@ pub struct Args {
     pub chunk_size: usize,
     pub sort_buffer: usize,
     pub print_engine: bool,
+    pub color: ColorWhen,
+}
+
+/// When to emit ANSI colour for `color` rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorWhen {
+    /// Colour only when stdout is a terminal.
+    #[default]
+    Auto,
+    Always,
+    Never,
 }
 
 const DEFAULT_CHUNK_SIZE: usize = 1_000_000;
@@ -39,6 +50,7 @@ usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   --sort-buffer BYTES in-memory budget before sort spills to temp files
                      (default: 256 MiB)
   --print-engine     print the compiled execution plan and exit
+  --color WHEN       colour `color` rules: auto (TTY only), always, never
   -h, --help         show this help
 
 SCRIPT is a pipe-syntax pipeline, e.g.:
@@ -60,6 +72,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
     let mut sort_buffer = DEFAULT_SORT_BUFFER;
     let mut print_engine = false;
+    let mut color = ColorWhen::default();
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -100,6 +113,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--print-engine" => print_engine = true,
+            "--color" => {
+                let v = value!();
+                color = match v.as_str() {
+                    "auto" => ColorWhen::Auto,
+                    "always" => ColorWhen::Always,
+                    "never" => ColorWhen::Never,
+                    _ => return Err(format!("invalid --color value: {v} (auto|always|never)")),
+                };
+            }
             other if other.starts_with('-') && other != "-" => {
                 return Err(format!("unknown option: {other}"));
             }
@@ -136,6 +158,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         chunk_size,
         sort_buffer,
         print_engine,
+        color,
     })))
 }
 

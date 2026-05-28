@@ -58,6 +58,7 @@ comma- or space-separated arguments:
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
 | `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
+| `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
@@ -120,6 +121,30 @@ profile after it.
 csvm 'stats | fmt' data.csv                          # profile every column, aligned
 csvm 'select region == "EU" | stats amount' data.csv # one column, after a filter
 csvm 'stats | sort mean=nr | head 5 | fmt' data.csv  # the 5 columns with the largest mean
+```
+
+### Colouring (`color`)
+
+`color` attaches a colour rule to the output. Rules render when the output is a
+terminal (or with `--color always`), and are most useful alongside `fmt`. Two
+forms:
+
+```sh
+color COLOUR EXPR            # paint the whole row where EXPR holds
+color -c COL COLOUR EXPR     # paint only COL's cell
+color -g COL RAMP [LO HI]    # gradient COL by value (RAMP is lo:hi, e.g. green:red)
+```
+
+Colours are the eight ANSI names (plus `gray`), `bg:NAME` backgrounds, and the
+`bold`/`dim`/`underline` attributes, combined with `+` (e.g. `bold+bg:red`). A
+predicate reuses the `select` expression. A gradient defaults to the column's
+min/max; pass `LO HI` to fix the range (values outside take the endpoint
+colours). Multiple `color`s stack (last wins per attribute), and `--color
+auto|always|never` controls emission (`auto` = only when stdout is a TTY).
+
+```sh
+csvm 'color red amount < 0 | color -c qty bold qty == 0 | fmt' data.csv
+csvm 'color -g amount green:red 0 5000 | fmt' data.csv
 ```
 
 ### Headerless input (`hdr`)

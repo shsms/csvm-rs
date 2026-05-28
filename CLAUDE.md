@@ -55,7 +55,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   detection is lenient (a non-numeric cell ⇒ text column; unlike `to-num` it
   never aborts); min/max are numeric for numeric columns, lexical for text;
   sample stddev via Welford. `ColStats` is deliberately presentation-free so
-  `fmt`'s planned value-colouring can reuse it (see `todo.org`).
+  `fmt`'s value-colouring reuses it (`num_range`).
+- **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
+  mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COL RAMP [LO HI]`
+  a value gradient. Predicate rules reuse the `select` expression parser; rules
+  resolve against the *output* header and render in `exec::render`, which pads by
+  *visible* width so ANSI escapes don't break alignment. Gradients reuse
+  `ColStats::num_range` for default bounds. Colours are truecolour SGR
+  (`src/color.rs`); `--color auto|always|never` gates emission (auto = TTY).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`hdr a,b,c`** supplies column names for headerless input: it sets
