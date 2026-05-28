@@ -72,45 +72,78 @@ Colourize =fmt= output (and maybe plain output to a TTY) based on per-row /
 per-cell conditions — like a spreadsheet's conditional formatting, or what
 tools like =tidy-viewer= / =csvlens= do.
 
-** Sketch of the surface
-A rule = a =select=-style predicate + a colour. Options for spelling it:
-- A =color= command feeding =fmt=:
-  #+begin_src sh
-  color "amount < 0" red | color "status == 'error'" bg:red | fmt
-  #+end_src
-- Or inline on =fmt=: =fmt color:amount<0=red,status=='error'=bwhite-on-red=.
-Lean toward a separate =color RULE= command (composable, reuses the expression
-parser) that attaches rules to the plan; =fmt= (or a TTY-aware default) renders
-them.
+** Command syntax (pinned)
+A separate =color= command appends a rule to the plan (like =fmt= sets the
+output mode); position in the pipe doesn't change semantics, but write it just
+before =fmt=. Multiple =color= commands stack. Rules render with or without
+=fmt=; =--color auto|always|never= gates emission (auto = only when stdout is a
+TTY). Two rule kinds, switched by the =-g= flag:
 
-** Things to get right
-- Reuse the bool expression parser for the rule predicate (no new grammar).
-- Whole-row vs single-cell colouring: a rule could paint the matching row, or
-  only the cell of a named column (=color amount "amount < 0" red=).
+*** Conditional (predicate) — solid colour
+#+begin_src sh
+color COLOUR EXPR            # paint the whole row when EXPR is true
+color -c COL COLOUR EXPR     # paint only COL's cell
+#+end_src
+=COLOUR= comes first (a single token, so it splits cleanly), then a bare
+=select=-style expression — reuses the expression parser and backtick column
+quoting, no new grammar. Examples:
+#+begin_src sh
+color red amount < 0
+color bold+bg:red status == 'error'
+color -c amount yellow amount > 1000
+#+end_src
+
+*** Gradient (heatmap) — value-based
+#+begin_src sh
+color -g COL RAMP [LO HI]    # colour COL's cells by where they fall in a range
+#+end_src
+=RAMP= is =locolour:hicolour= (e.g. =green:red=), interpolated in truecolour.
+=LO HI= are optional numeric bounds; default the column's min/max (from
+=ColStats=), and values outside the range clamp to the endpoint colours.
+#+begin_src sh
+color -g amount green:red          # bounds = column min/max
+color -g amount green:red 0 5000   # explicit bounds, solid outside
+#+end_src
+
+*** Colour vocabulary
+- fg: the 8 ANSI names (=red green yellow blue magenta cyan white black=), =gray=.
+- bg: =bg:NAME=.
+- attrs: =bold=, =dim=, =underline=.
+- combine with =+=: =bold+red=, =white+bg:red=.
+- (=bright-*= / 256 / truecolour names are a later extension; =RAMP= already
+  lerps truecolour.)
+
+*** Layering [decision — can flip]
+Rules apply in order; each sets only the attributes it names, later rules layer
+on top (so =color red … | color bg:yellow …= ⇒ red-on-yellow when both match,
+and a =-g= foreground composes with a predicate =bg:=). Alternative is
+first-match-wins per cell; pinned to *layering, last wins per attribute*.
+
+** Implementation notes
+- Rules evaluate against the *output* rows at render time, so column refs
+  resolve against the output header (after =cols=/=rename=), not the input.
 - ANSI escapes must NOT count toward =fmt='s column-width alignment — pad by
-  *visible* width, not byte length. (Current =format_aligned= pads by
-  =chars().count()=; it must measure the uncoloured text.)
+  *visible* width, not byte length. (=format_aligned= pads by =chars().count()=;
+  it must measure the uncoloured text.)
 - =--color auto|always|never=: default =auto= (colour only when stdout is a
   TTY), so piping to a file or another tool stays clean. Needs an isatty check.
-- First match wins vs. layering (fg from one rule, bg from another) — decide.
+- A =color= rule is plan-level metadata (a =Vec<ColorRule>=, like =output=), not
+  a row-processing stage; =parse= validates the colour/ramp and compiles the
+  predicate to a =BoolExpr=.
 
 ** Value-based (heatmap) colouring — reuses =stats='s =ColStats=
-Colour a numeric cell by where it falls in its column's range: green at the min,
-red at the max, gradient between. The per-column min/max/mean/stddev already
-exist as =ColStats= (=src/stats.rs=), the accumulator behind =stats=. =fmt=
-computes its *own* =ColStats= over the rows it renders — it never receives them
-from a =stats= stage (in =stats | fmt= the rows *are* the profile), so the reuse
-is at the *type* level, not a shared instance.
-- Bounds default to the column's =min=/=max=; let the user override the gradient
-  range. Same code path: =Option<(lo, hi)>=, falling back to =ColStats= when unset.
-- Outside the range ⇒ solid endpoint colours: clamp =t = (v-lo)/(hi-lo)= to [0,1]
-  before the green→red lerp, and the endpoints fall out for free.
-- Ramp direction is a parameter (low isn't always "good").
-- =mean=/=stddev= ride along in =ColStats=, so z-score / diverging colouring
-  (around the mean) reuses the same struct — no new computation.
+The =color -g= form above. The per-column min/max/mean/stddev already exist as
+=ColStats= (=src/stats.rs=), the accumulator behind =stats=. =fmt= computes its
+*own* =ColStats= over the rows it renders — it never receives them from a =stats=
+stage (in =stats | fmt= the rows *are* the profile), so the reuse is at the
+*type* level, not a shared instance.
+- Mechanics: =t = clamp((v-lo)/(hi-lo), 0, 1)=, then lerp =RAMP='s endpoints; the
+  clamp yields the solid-outside behaviour for free. Bounds default to =ColStats=
+  min/max, =LO HI= overrides.
+- =mean=/=stddev= ride along in =ColStats=, so z-score / diverging colouring (a
+  3-stop =lo:mid:hi= ramp centred on the mean) reuses the same struct.
 - Put the mapping in a small =color= module (=value, lo, hi, ramp -> ANSI=),
-  shared with the predicate =color RULE= above; both still need fmt to pad by
-  *visible* width (see above).
+  shared with the predicate rules; both need fmt to pad by *visible* width.
 - Keep =ColStats= presentation-free (compute only) so =stats= and =fmt= both use it.
 
 * Other ideas (parking lot)
