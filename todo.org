@@ -8,13 +8,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
 refs are approximate.
 
-** TODO fmt alignment counts chars, not display width
-=align_and_write= (=exec.rs:913,941=) pads by =field.chars().count()=. CJK/wide
-glyphs (width 2) under-pad and combining marks (width 0) over-pad, so non-ASCII
-tables misalign. Pre-existing (predates colour). Fix: measure with the
-=unicode-width= crate. (The ANSI-escape part of "visible width" is already
-handled — escapes carry no chars.)
-
 ** TODO Numeric parsing accepts NaN/inf
 =field::parse_num= uses =f64::parse=, which accepts ="NaN"/"inf"/"infinity"=. One
 such cell poisons =stats= (=sum/mean/stddev= become NaN) and sorts oddly (NaN

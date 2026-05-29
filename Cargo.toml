@@ -24,6 +24,8 @@ crossbeam-channel = "0.5"
 memchr = "2"
 # Backs the `=~` / `!~` match operators in `select`.
 regex = "1"
+# Display width (CJK/wide + zero-width glyphs) for `fmt` column alignment.
+unicode-width = "0.2"
 
 [dev-dependencies]
 # Reference RFC-4180 parser, used only to confirm our scanner's conformance.

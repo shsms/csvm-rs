@@ -25,6 +25,16 @@ use crate::plan::{
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
+use unicode_width::UnicodeWidthStr;
+
+/// Visible (terminal) width of `s` in columns: CJK/wide glyphs count as 2,
+/// zero-width/combining marks as 0. Used so `fmt` aligns by what's displayed,
+/// not by `chars().count()`. (ANSI escapes never reach here — alignment is
+/// computed on the uncoloured text.)
+#[inline]
+fn vis_width(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
 
 /// An owned row, detached from any chunk buffer (used by the in-memory
 /// multi-sort fallback).
@@ -919,7 +929,7 @@ fn align_and_write<W: Write>(
     let mut widths = vec![0usize; ncols];
     for row in rows {
         for (i, field) in row.iter().enumerate() {
-            widths[i] = widths[i].max(field.chars().count());
+            widths[i] = widths[i].max(vis_width(field));
         }
     }
 
@@ -947,7 +957,7 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 line.push_str("  ");
             }
-            let pad = widths[i].saturating_sub(field.chars().count());
+            let pad = widths[i].saturating_sub(vis_width(field));
             let painted = style_at(styles, ri, i).paint(field);
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
@@ -1324,6 +1334,16 @@ mod tests {
         // Colour off ⇒ no escapes (aligned, but plain).
         let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn fmt_aligns_by_display_width() {
+        // A wide (CJK) glyph occupies two terminal columns; alignment must count
+        // it as 2, not as one char. With char-count the first column would be 1
+        // wide and the 袋 row would gain a stray trailing space.
+        let out = render_str("fmt", "v,tag\n袋,x\nab,y\n", false);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines, ["v   tag", "袋  x", "ab  y"]);
     }
 
     #[test]
