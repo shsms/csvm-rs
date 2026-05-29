@@ -139,7 +139,7 @@ Colours are the eight ANSI names (plus `gray`), `bg:NAME` backgrounds, and the
 `bold`/`dim`/`underline` attributes, combined with `+` (e.g. `bold+bg:red`). A
 predicate reuses the `select` expression. A gradient's `RAMP` defaults to
 `green:red`, and its range defaults to the column's min/max; pass `LO HI` to fix
-the range (values outside take the endpoint colours). Multiple `color`s stack (last wins per attribute), and `--color
+the range (values outside take the endpoint colours), and `LO>HI` inverts it. Multiple `color`s stack (last wins per attribute), and `--color
 auto|always|never` controls emission (`auto` = only when stdout is a TTY).
 
 ```sh

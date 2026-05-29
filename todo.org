@@ -9,9 +9,6 @@ From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
 refs are approximate.
 
 ** TODO Minor / edge
-- =color -g COL LO HI= with =LO>HI= (reversed) silently yields a flat hi-less
-  ramp (=Ramp::at= sets =t=0= when =!(hi>lo)=), rather than an inverted gradient
-  or an error. Decide: error, or support reversed as inverted.
 - =stats= never uses =-n= threads (a stats plan isn't a lone transform, so
   =run_file= won't shard it; =run_stats_streaming= is single-threaded). Partials
   merge associatively — a parallel shard-merge is straightforward later.

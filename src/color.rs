@@ -184,13 +184,16 @@ pub fn parse_ramp(spec: &str) -> Result<Ramp, String> {
 }
 
 impl Ramp {
-    /// The foreground style for `v` placed in `[lo, hi]` (clamped, so values
-    /// outside the range take the solid endpoint colours).
+    /// The foreground style for value `v` mapped onto the ramp between bounds
+    /// `lo` and `hi`: `lo` takes the ramp's low colour, `hi` its high colour, and
+    /// values outside `[lo, hi]` clamp to the endpoints. `lo > hi` inverts the
+    /// gradient (the larger value gets the low colour); `lo == hi` is degenerate
+    /// and yields the low colour.
     pub fn at(&self, v: f64, lo: f64, hi: f64) -> Style {
-        let t = if hi > lo {
-            ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
-        } else {
+        let t = if hi == lo {
             0.0
+        } else {
+            ((v - lo) / (hi - lo)).clamp(0.0, 1.0)
         };
         let lerp = |a: u8, b: u8| (f64::from(a) + (f64::from(b) - f64::from(a)) * t).round() as u8;
         Style {
@@ -237,6 +240,10 @@ mod tests {
         assert_eq!(r.at(-5.0, 0.0, 10.0).fg, named("green")); // below clamps to lo
         assert_eq!(r.at(99.0, 0.0, 10.0).fg, named("red")); // above clamps to hi
         assert_eq!(r.at(5.0, 3.0, 3.0).fg, named("green")); // degenerate range
+        // Reversed bounds (lo > hi) invert: the larger value takes the lo colour.
+        assert_eq!(r.at(10.0, 10.0, 0.0).fg, named("green"));
+        assert_eq!(r.at(0.0, 10.0, 0.0).fg, named("red"));
+        assert_eq!(r.at(99.0, 10.0, 0.0).fg, named("green")); // above lo clamps to lo
         assert!(parse_ramp("green").is_err());
         assert_eq!(Ramp::default(), parse_ramp("green:red").unwrap()); // default ramp
     }
