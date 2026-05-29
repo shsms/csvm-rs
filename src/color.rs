@@ -6,6 +6,8 @@
 //! escapes. This module is presentation-only — *what* to colour is the caller's
 //! decision (see `plan::ColorRule`).
 
+use std::fmt;
+
 /// An RGB triple. Named colours are kept as RGB so gradients can interpolate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
@@ -24,6 +26,24 @@ fn named(name: &str) -> Option<Rgb> {
         "gray" | "grey" => Rgb(127, 127, 127),
         _ => return None,
     })
+}
+
+/// The base-colour name for `c`, or a `#rrggbb` literal when it isn't one of the
+/// named colours (e.g. a value interpolated along a ramp). Inverse of [`named`];
+/// used for the terse `--print-engine` rendering.
+fn rgb_name(c: Rgb) -> String {
+    match (c.0, c.1, c.2) {
+        (0, 0, 0) => "black".into(),
+        (205, 0, 0) => "red".into(),
+        (0, 205, 0) => "green".into(),
+        (205, 205, 0) => "yellow".into(),
+        (0, 0, 238) => "blue".into(),
+        (205, 0, 205) => "magenta".into(),
+        (0, 205, 205) => "cyan".into(),
+        (229, 229, 229) => "white".into(),
+        (127, 127, 127) => "gray".into(),
+        (r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+    }
 }
 
 /// A foreground/background/attribute set.
@@ -79,6 +99,33 @@ impl Style {
     }
 }
 
+impl fmt::Display for Style {
+    /// The `+`-joined spec form (the inverse of [`parse_style`], modulo part
+    /// order), e.g. `bold+red` or `white+bg:red`; `default` when empty.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_empty() {
+            return write!(f, "default");
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if self.bold {
+            parts.push("bold".into());
+        }
+        if self.dim {
+            parts.push("dim".into());
+        }
+        if self.underline {
+            parts.push("underline".into());
+        }
+        if let Some(fg) = self.fg {
+            parts.push(rgb_name(fg));
+        }
+        if let Some(bg) = self.bg {
+            parts.push(format!("bg:{}", rgb_name(bg)));
+        }
+        write!(f, "{}", parts.join("+"))
+    }
+}
+
 /// Parse a colour spec: `+`-separated parts, each an attribute (`bold`/`dim`/
 /// `underline`), a `bg:NAME` background, or a `NAME` foreground.
 pub fn parse_style(spec: &str) -> Result<Style, String> {
@@ -115,6 +162,13 @@ impl Default for Ramp {
             lo: named("green").unwrap(),
             hi: named("red").unwrap(),
         }
+    }
+}
+
+impl fmt::Display for Ramp {
+    /// The `lo:hi` spec form (the inverse of [`parse_ramp`]).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", rgb_name(self.lo), rgb_name(self.hi))
     }
 }
 
@@ -185,6 +239,21 @@ mod tests {
         assert_eq!(r.at(5.0, 3.0, 3.0).fg, named("green")); // degenerate range
         assert!(parse_ramp("green").is_err());
         assert_eq!(Ramp::default(), parse_ramp("green:red").unwrap()); // default ramp
+    }
+
+    #[test]
+    fn display_round_trips_specs() {
+        for spec in ["red", "bold+red", "white+bg:red", "bg:blue"] {
+            assert_eq!(parse_style(spec).unwrap().to_string(), spec);
+        }
+        assert_eq!(Style::default().to_string(), "default");
+        assert_eq!(Ramp::default().to_string(), "green:red");
+        assert_eq!(
+            parse_ramp("blue:yellow").unwrap().to_string(),
+            "blue:yellow"
+        );
+        // A non-named colour (e.g. a ramp-interpolated value) shows as hex.
+        assert_eq!(rgb_name(Rgb(0x12, 0x34, 0x56)), "#123456");
     }
 
     #[test]

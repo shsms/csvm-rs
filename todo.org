@@ -12,8 +12,6 @@ refs are approximate.
 - =color -g COL LO HI= with =LO>HI= (reversed) silently yields a flat hi-less
   ramp (=Ramp::at= sets =t=0= when =!(hi>lo)=), rather than an inverted gradient
   or an error. Decide: error, or support reversed as inverted.
-- =--print-engine= prints colour rules via =Style='s =Debug= (=exec.rs:1029=),
-  e.g. =Style { fg: Some(Rgb(205, 0, 0)), .. }= — verbose. Add a terse Display.
 - =compute_styles= rebuilds a =Vec<Field>= per row per predicate rule
   (=exec.rs:844=). Fine for terminal-sized output, wasteful for =--color always=
   piped to a pager over a big file. Reuse a scratch row.

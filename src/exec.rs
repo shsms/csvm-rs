@@ -1052,12 +1052,18 @@ fn describe_color(rule: &ColorRule) -> String {
                 ColorScope::Row => "row".to_string(),
                 ColorScope::Cell(c) => format!("cell {}[{}]", c.name, c.pos),
             };
-            format!("color {tgt} {style:?} when {}\n", fmt_expr(expr))
+            format!("color {tgt} {style} when {}\n", fmt_expr(expr))
         }
-        ColorRule::Gradient { col, ramp, bounds } => format!(
-            "color gradient {}[{}] {ramp:?} bounds {bounds:?}\n",
-            col.name, col.pos
-        ),
+        ColorRule::Gradient { col, ramp, bounds } => {
+            let b = match bounds {
+                Some((lo, hi)) => format!("{lo}..{hi}"),
+                None => "auto".to_string(),
+            };
+            format!(
+                "color gradient {}[{}] {ramp} bounds {b}\n",
+                col.name, col.pos
+            )
+        }
     }
 }
 
