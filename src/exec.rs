@@ -874,17 +874,22 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Result<Vec<Vec<S
     Ok(styles)
 }
 
-/// Default gradient bounds: a column's numeric min/max, computed by reusing the
-/// `stats` accumulator. Falls back to `0..1` for a non-numeric column (whose
-/// cells won't parse, so nothing is painted anyway).
+/// Default gradient bounds: the min/max over the column's *parseable* cells —
+/// exactly the cells the gradient will paint (same `trim().parse` test as
+/// `compute_styles`). Computed directly rather than via `ColStats`, whose
+/// numeric range is `None` for a column with any non-numeric cell; that would
+/// collapse the bounds to `0..1` and clamp every real value to the hi colour.
+/// Falls back to `0..1` when no cell parses (then nothing is painted anyway).
 fn column_minmax(rows: &[Vec<String>], pos: usize) -> (f64, f64) {
-    let mut acc = ColStats::new();
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
     for row in rows.iter().skip(1) {
-        if let Some(cell) = row.get(pos) {
-            acc.update(&Field::Str(cell));
+        if let Some(v) = row.get(pos).and_then(|c| c.trim().parse::<f64>().ok()) {
+            lo = lo.min(v);
+            hi = hi.max(v);
         }
     }
-    acc.num_range().unwrap_or((0.0, 1.0))
+    if lo <= hi { (lo, hi) } else { (0.0, 1.0) }
 }
 
 /// Look up the style for cell `[ri][ci]`, defaulting to empty.
@@ -1321,6 +1326,24 @@ mod tests {
     fn color_gradient_paints_numeric_column() {
         let out = render_str("color -g countZ green:red | fmt", INPUT, true);
         assert!(out.contains("\u{1b}[38;2;")); // truecolour foreground
+    }
+
+    #[test]
+    fn color_gradient_bounds_ignore_non_numeric_cells() {
+        // A lone non-numeric cell must not collapse the default bounds: the
+        // numeric values still span green(min)..red(max). (Before the fix, the
+        // bounds fell back to 0..1 and clamped every value to the hi colour.)
+        let input = "amount\n10\nNA\n30\n";
+        let out = render_str("color -g amount green:red | fmt", input, true);
+        let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap();
+        assert!(
+            line("10").contains("38;2;0;205;0"), // min -> green
+            "min should be green, got: {out:?}"
+        );
+        assert!(
+            line("30").contains("38;2;205;0;0"), // max -> red
+            "max should be red, got: {out:?}"
+        );
     }
 
     #[test]

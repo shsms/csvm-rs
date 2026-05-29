@@ -56,16 +56,6 @@ impl ColStats {
         Self::default()
     }
 
-    /// The numeric (min, max) when the column is numeric with at least one
-    /// value — the default bounds for `fmt`'s gradient colouring.
-    pub fn num_range(&self) -> Option<(f64, f64)> {
-        if self.numeric && self.count > 0 {
-            Some((self.nmin, self.nmax))
-        } else {
-            None
-        }
-    }
-
     /// Fold one cell into the accumulator.
     pub fn update(&mut self, f: &Field) {
         let s = f.as_str();
