@@ -37,6 +37,25 @@ const DEFAULT_CHUNK_SIZE: usize = 1_000_000;
 /// In-memory budget before `sort` spills a run to a temp file.
 pub const DEFAULT_SORT_BUFFER: usize = 256 << 20;
 
+/// Parse a byte size: a plain integer, or one with a binary `K`/`M`/`G` suffix
+/// (case-insensitive, powers of 1024 — matching the `256 MiB` default). Returns
+/// `i64` so a non-positive value can fall back to the default at the call site.
+fn parse_size(s: &str, what: &str) -> Result<i64, String> {
+    let s = s.trim();
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1i64 << 10),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1i64 << 20),
+        Some(b'g' | b'G') => (&s[..s.len() - 1], 1i64 << 30),
+        _ => (s, 1),
+    };
+    digits
+        .trim()
+        .parse::<i64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid {what} value: {s}"))
+}
+
 pub const USAGE: &str = "\
 usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
             [--print-engine] SCRIPT [INPUT]
@@ -46,9 +65,9 @@ usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   -o, --output OUT   output CSV file (default: stdout)
   -n, --threads N    worker threads (default: 1; <=0 means 1)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
-  --chunk-size BYTES input chunk size in bytes (default: 1000000)
-  --sort-buffer BYTES in-memory budget before sort spills to temp files
-                     (default: 256 MiB)
+  --chunk-size SIZE  input chunk size; K/M/G suffix ok (default: 1000000)
+  --sort-buffer SIZE in-memory budget before sort spills to temp files;
+                     K/M/G suffix ok (default: 256 MiB)
   --print-engine     print the compiled execution plan and exit
   --color WHEN       colour `color` rules: auto (TTY only), always, never
   -h, --help         show this help
@@ -97,10 +116,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             "-t" | "--temp-dir" => temp_dir = Some(PathBuf::from(value!())),
             "--chunk-size" => {
-                let v = value!();
-                let n: i64 = v
-                    .parse()
-                    .map_err(|_| format!("invalid --chunk-size value: {v}"))?;
+                let n = parse_size(&value!(), "--chunk-size")?;
                 chunk_size = if n <= 0 {
                     DEFAULT_CHUNK_SIZE
                 } else {
@@ -108,10 +124,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--sort-buffer" => {
-                let v = value!();
-                let n: i64 = v
-                    .parse()
-                    .map_err(|_| format!("invalid --sort-buffer value: {v}"))?;
+                let n = parse_size(&value!(), "--sort-buffer")?;
                 sort_buffer = if n <= 0 {
                     DEFAULT_SORT_BUFFER
                 } else {
@@ -224,6 +237,39 @@ mod tests {
         assert_eq!(
             args(&["cols a", "-"]).unwrap().in_file.as_deref(),
             Some("-")
+        );
+    }
+
+    #[test]
+    fn size_suffixes() {
+        assert_eq!(
+            args(&["--sort-buffer", "256M", "cols a"])
+                .unwrap()
+                .sort_buffer,
+            256 << 20
+        );
+        assert_eq!(
+            args(&["--chunk-size", "2g", "cols a"]).unwrap().chunk_size,
+            2 << 30
+        );
+        assert_eq!(
+            args(&["--chunk-size", "4096", "cols a"])
+                .unwrap()
+                .chunk_size,
+            4096
+        );
+        // non-positive falls back to the default; garbage errors.
+        assert_eq!(
+            args(&["--chunk-size", "0", "cols a"]).unwrap().chunk_size,
+            DEFAULT_CHUNK_SIZE
+        );
+        assert!(
+            parse([
+                "--chunk-size".to_string(),
+                "5x".to_string(),
+                "cols a".to_string()
+            ])
+            .is_err()
         );
     }
 

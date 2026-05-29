@@ -25,7 +25,6 @@ repeated: =tail=/=uniq= (Review findings), the colour palette (=color: future=),
 pluggable formats (parking lot).
 
 ** TODO Implementing now (straightforward, additive)
-- Size suffixes (K/M/G, binary) for =--chunk-size= / =--sort-buffer=.
 - Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).
 - =-f FILE= / =--file=: read the pipeline from a file (awk-style; dodges shell quoting).
 
