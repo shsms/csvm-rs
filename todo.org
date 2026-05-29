@@ -8,15 +8,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
 refs are approximate.
 
-** TODO Predicate colour rules abort on a non-numeric cell
-=color red amount > 20= over =amount=[10, NA, 30]= aborts the whole run with
-"non-numeric value 'NA'" (=compute_styles= propagates =BoolExpr::eval='s error,
-=exec.rs:845=). Consistent with =select='s strictness, but colour is a *cosmetic*
-overlay — a single bad cell shouldn't kill the output. Meanwhile =fmt= and the
-=-g= gradient both degrade gracefully on the same data.
-- Decision: make predicate rules best-effort (a cell that errors the predicate
-  is simply left unpainted) instead of aborting. Lean best-effort for colour.
-
 ** TODO fmt alignment counts chars, not display width
 =align_and_write= (=exec.rs:913,941=) pads by =field.chars().count()=. CJK/wide
 glyphs (width 2) under-pad and combining marks (width 0) over-pad, so non-ASCII

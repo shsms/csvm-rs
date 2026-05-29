@@ -820,7 +820,7 @@ pub fn render<W: Write>(
     });
 
     let styles = if want_color {
-        Some(compute_styles(&plan.colors, &rows)?)
+        Some(compute_styles(&plan.colors, &rows))
     } else {
         None
     };
@@ -834,7 +834,11 @@ pub fn render<W: Write>(
 /// The per-cell [`Style`] grid (`[row][col]`) for the colour rules over `rows`.
 /// The header row (index 0) is never styled. Rules apply in order; each layers
 /// onto what earlier rules set (last wins per attribute).
-fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Result<Vec<Vec<Style>>, Error> {
+///
+/// Best-effort: a predicate that errors on a row (e.g. a non-numeric cell in a
+/// numeric comparison) leaves that row unpainted rather than aborting — colour
+/// is a cosmetic overlay, so one bad cell shouldn't kill the whole output.
+fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
     for rule in rules {
@@ -842,7 +846,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Result<Vec<Vec<S
             ColorRule::Predicate { scope, style, expr } => {
                 for (ri, row) in rows.iter().enumerate().skip(1) {
                     let frow: Vec<Field> = row.iter().map(|s| Field::Str(s)).collect();
-                    if !expr.eval(&frow)? {
+                    if !matches!(expr.eval(&frow), Ok(true)) {
                         continue;
                     }
                     match scope {
@@ -871,7 +875,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Result<Vec<Vec<S
             }
         }
     }
-    Ok(styles)
+    styles
 }
 
 /// Default gradient bounds: the min/max over the column's *parseable* cells —
@@ -1320,6 +1324,22 @@ mod tests {
         // Colour off ⇒ no escapes (aligned, but plain).
         let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn color_predicate_is_best_effort_on_non_numeric() {
+        // A non-numeric cell in a numeric predicate must not abort the render;
+        // the offending row is just left unpainted. (Before the fix this errored
+        // with "non-numeric value 'NA'".)
+        let input = "amount\n10\nNA\n30\n";
+        let out = render_str("color red amount > 20 | fmt", input, true);
+        let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap();
+        assert!(
+            line("30").contains("38;2;205;0;0"),
+            "30 should be red: {out:?}"
+        );
+        assert!(!line("10").contains('\u{1b}'), "10 unpainted: {out:?}");
+        assert!(!line("NA").contains('\u{1b}'), "NA unpainted: {out:?}");
     }
 
     #[test]
