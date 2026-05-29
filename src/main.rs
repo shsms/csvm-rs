@@ -38,8 +38,14 @@ fn run() -> Result<(), String> {
         Err(e) => return Err(format!("{e}\n\n{}", cli::USAGE)),
     };
 
+    // The pipeline is either the SCRIPT positional or, with `-f`, a file.
+    let script = match &args.script_file {
+        Some(path) => std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read script file '{path}': {e}"))?,
+        None => args.script.clone(),
+    };
     // Parse the pipe script into a plan here, once.
-    let mut plan = parse::parse(&args.script).map_err(|e| e.to_string())?;
+    let mut plan = parse::parse(&script).map_err(|e| e.to_string())?;
     let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,

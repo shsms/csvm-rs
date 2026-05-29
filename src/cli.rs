@@ -13,6 +13,9 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Args {
     pub script: String,
+    /// When set (`-f`), the pipeline is read from this file and `script` is
+    /// empty; the resolution (file I/O) happens in `main`.
+    pub script_file: Option<String>,
     pub in_file: Option<String>,
     pub out_file: Option<String>,
     pub threads: usize,
@@ -57,13 +60,14 @@ fn parse_size(s: &str, what: &str) -> Result<i64, String> {
 }
 
 pub const USAGE: &str = "\
-usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
-            [--print-engine] SCRIPT [INPUT]
+usage: csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
+            [--print-engine] [SCRIPT] [INPUT]
 
-  SCRIPT             pipe-syntax pipeline (required)
+  SCRIPT             pipe-syntax pipeline (required unless -f is given)
   INPUT              input CSV file (default: stdin; '-' is stdin)
   -o, --output OUT   output CSV file (default: stdout)
   -n, --threads N    worker threads (default: 1; <=0 means 1)
+  -f, --file FILE    read the pipeline from FILE (then SCRIPT is omitted)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
   --chunk-size SIZE  input chunk size; K/M/G suffix ok (default: 1000000)
   --sort-buffer SIZE in-memory budget before sort spills to temp files;
@@ -94,6 +98,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut sort_buffer = DEFAULT_SORT_BUFFER;
     let mut print_engine = false;
     let mut color = ColorWhen::default();
+    let mut script_file = None;
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -114,6 +119,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                         .map_err(|_| format!("invalid threads value: {v}"))?,
                 );
             }
+            "-f" | "--file" => script_file = Some(value!()),
             "-t" | "--temp-dir" => temp_dir = Some(PathBuf::from(value!())),
             "--chunk-size" => {
                 let n = parse_size(&value!(), "--chunk-size")?;
@@ -148,16 +154,21 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         }
     }
 
-    // Positionals are `SCRIPT [INPUT]` (awk-style): the script is required, the
-    // input file optional (default stdin). A bare `-` falls through here too, so
-    // `csvm SCRIPT -` is an explicit stdin.
+    // Positionals are `SCRIPT [INPUT]` (awk-style): the script is the first
+    // positional and required, the input file optional (default stdin); a bare
+    // `-` input is stdin. With `-f FILE` the script comes from the file, so every
+    // positional is an input instead.
     let mut positionals = positionals.into_iter();
-    let Some(script) = positionals.next() else {
-        return Err("no script given".to_string());
+    let script = if script_file.is_some() {
+        String::new()
+    } else {
+        positionals
+            .next()
+            .ok_or_else(|| "no script given".to_string())?
     };
     let in_file = positionals.next();
     if positionals.next().is_some() {
-        return Err("too many arguments (expected SCRIPT [INPUT])".to_string());
+        return Err("too many arguments (expected [SCRIPT] [INPUT])".to_string());
     }
 
     // Default to single-threaded (like csvm): the parallel path only pays off
@@ -170,6 +181,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
 
     Ok(Parsed::Run(Box::new(Args {
         script,
+        script_file,
         in_file,
         out_file,
         threads,
@@ -294,7 +306,19 @@ mod tests {
         assert!(parse(std::iter::empty()).is_err()); // no script
         // A third positional beyond SCRIPT and INPUT is an error.
         assert!(parse(["s".to_string(), "in.csv".to_string(), "extra".to_string()]).is_err());
-        // `-f` is no longer a flag; input is positional now.
-        assert!(parse(["-f".to_string(), "in.csv".to_string(), "s".to_string()]).is_err());
+    }
+
+    #[test]
+    fn script_file_flag() {
+        // With -f, the script comes from the file and positionals are inputs.
+        let a = args(&["-f", "prog.csvm", "data.csv"]).unwrap();
+        assert_eq!(a.script_file.as_deref(), Some("prog.csvm"));
+        assert_eq!(a.in_file.as_deref(), Some("data.csv"));
+        assert_eq!(a.script, "");
+        // -f with no input -> stdin.
+        let a = args(&["--file", "prog.csvm"]).unwrap();
+        assert_eq!(a.in_file, None);
+        // Without -f, a script is still required.
+        assert!(parse(std::iter::empty()).is_err());
     }
 }

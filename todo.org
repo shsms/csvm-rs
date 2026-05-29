@@ -26,7 +26,6 @@ pluggable formats (parking lot).
 
 ** TODO Implementing now (straightforward, additive)
 - Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).
-- =-f FILE= / =--file=: read the pipeline from a file (awk-style; dodges shell quoting).
 
 ** TODO Larger / needs a decision (deferred)
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
