@@ -36,9 +36,9 @@ pluggable formats (parking lot).
 
 ** TODO Larger / needs a decision (deferred)
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
-  bare columns, no numeric literal). Decide: default ordering (=< > <= >=) to
-  numeric when neither side is typed, or add a =num()= coercion. (Surfacing it in
-  =--print-engine= above is the cheap first step.)
+  bare columns, no numeric literal). =--print-engine= now tags each compare
+  =:num=/=:str= so it's visible; still to decide: default ordering (=< > <= >=) to
+  numeric when neither side is typed, or add a =num()= coercion.
 - Delimiter support =-d= / =--delim= (TSV) — a narrower near-term step toward the
   Source/Sink roadmap; touches the scanner + writer.
 - Column ranges/indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).

@@ -1203,11 +1203,15 @@ fn fmt_expr(e: &BoolExpr) -> String {
         BoolExpr::And(es) => format!("(and {})", fmt_list(es)),
         BoolExpr::Or(es) => format!("(or {})", fmt_list(es)),
         BoolExpr::Not(e) => format!("(not {})", fmt_expr(e)),
+        // The `:num`/`:str` tag exposes whether the comparison coerces to a
+        // number or compares text — so a surprise lexical compare (e.g. two bare
+        // columns, with no numeric literal to trigger numeric mode) is visible.
         BoolExpr::Cmp(c) => format!(
-            "({} {} {})",
+            "({} {} {} :{})",
             cmp_symbol(c.op),
             fmt_operand(&c.lhs),
-            fmt_operand(&c.rhs)
+            fmt_operand(&c.rhs),
+            if c.numeric { "num" } else { "str" }
         ),
         BoolExpr::Match { col, negate, .. } => {
             let op = if *negate { "!~" } else { "=~" };
@@ -1396,6 +1400,18 @@ mod tests {
     #[test]
     fn missing_column_is_an_error() {
         assert!(matches!(run_str("cols nope", INPUT), Err(Error::Column(_))));
+    }
+
+    #[test]
+    fn describe_annotates_compare_mode_and_affix() {
+        // Two bare columns compare as text (the footgun, now visible as :str);
+        // a numeric literal forces :num; affix renders with its operator.
+        let mut plan = parse("select fieldA > id && countZ > 0 && fieldA ^= 't'").unwrap();
+        let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("(> fieldA[1] id[0] :str)"), "{d}");
+        assert!(d.contains("(> countZ[2] 0 :num)"), "{d}");
+        assert!(d.contains("(^= fieldA[1] \"t\")"), "{d}");
     }
 
     #[test]
