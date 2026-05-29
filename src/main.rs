@@ -70,13 +70,23 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-/// Whether to emit ANSI colour. `always`/`never` are absolute; `auto` colours
-/// only when writing to a terminal (stdout, not a `-o` file).
+/// Whether to emit ANSI colour. An explicit `--color always`/`never` wins. For
+/// `auto`, honor the de-facto env conventions — `NO_COLOR` (set & non-empty)
+/// disables, `CLICOLOR_FORCE` (set & not `0`) forces — then fall back to: write
+/// to a terminal (stdout, not a `-o` file).
 fn color_enabled(when: cli::ColorWhen, out_file: Option<&str>) -> bool {
     match when {
         cli::ColorWhen::Always => true,
         cli::ColorWhen::Never => false,
-        cli::ColorWhen::Auto => out_file.is_none_or(|p| p == "-") && io::stdout().is_terminal(),
+        cli::ColorWhen::Auto => {
+            if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+                return false;
+            }
+            if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
+                return true;
+            }
+            out_file.is_none_or(|p| p == "-") && io::stdout().is_terminal()
+        }
     }
 }
 
