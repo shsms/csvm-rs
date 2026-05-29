@@ -99,6 +99,40 @@ impl ColStats {
         }
     }
 
+    /// Fold another partial accumulator into this one. Associative, so parallel
+    /// shards can each build a partial over their slice of the input and the
+    /// merged result is identical to a single pass — see [`Self::update`].
+    pub fn merge(&mut self, other: &ColStats) {
+        self.count += other.count;
+        self.empty += other.empty;
+        // Numeric only if every shard saw the column as numeric.
+        self.numeric = self.numeric && other.numeric;
+        // Lexical min/max.
+        if let Some(o) = &other.smin
+            && self.smin.as_deref().is_none_or(|m| o.as_str() < m)
+        {
+            self.smin = Some(o.clone());
+        }
+        if let Some(o) = &other.smax
+            && self.smax.as_deref().is_none_or(|m| o.as_str() > m)
+        {
+            self.smax = Some(o.clone());
+        }
+        // Numeric min/max — the ±∞ identities make an empty partner a no-op.
+        self.nmin = self.nmin.min(other.nmin);
+        self.nmax = self.nmax.max(other.nmax);
+        self.sum += other.sum;
+        // Welford parallel combine (Chan et al.) over the finite-value counts.
+        if other.nnum > 0 {
+            let (na, nb) = (self.nnum as f64, other.nnum as f64);
+            let n = na + nb;
+            let delta = other.mean - self.mean;
+            self.mean += delta * nb / n;
+            self.m2 += other.m2 + delta * delta * na * nb / n;
+            self.nnum += other.nnum;
+        }
+    }
+
     /// Render this column's profile row: `field_name` followed by the
     /// [`STATS_SCHEMA`] columns. Numeric stats are blank for a text or all-empty
     /// column.
@@ -140,15 +174,19 @@ fn opt_str(s: &Option<String>) -> Field<'static> {
 mod tests {
     use super::*;
 
+    fn cells(c: &ColStats) -> Vec<String> {
+        c.to_row("x")
+            .iter()
+            .map(|f| f.as_str().into_owned())
+            .collect()
+    }
+
     fn profile(vals: &[&str]) -> Vec<String> {
         let mut c = ColStats::new();
         for v in vals {
             c.update(&Field::Str(v));
         }
-        c.to_row("x")
-            .iter()
-            .map(|f| f.as_str().into_owned())
-            .collect()
+        cells(&c)
     }
 
     #[test]
@@ -183,6 +221,41 @@ mod tests {
         assert_eq!(cells[3], "1"); // lexical min
         assert_eq!(cells[4], "oops"); // lexical max
         assert_eq!(cells[5], ""); // sum blank
+    }
+
+    #[test]
+    fn merge_matches_single_pass() {
+        // Building partials and merging them must equal a single pass, at every
+        // split point (covers the Welford combine, count/empty, and min/max).
+        let vals = ["3", "1", "", "5", "9", "2", "8", "4"];
+        let whole = {
+            let mut c = ColStats::new();
+            vals.iter().for_each(|v| c.update(&Field::Str(v)));
+            cells(&c)
+        };
+        for split in 0..=vals.len() {
+            let mut a = ColStats::new();
+            vals[..split].iter().for_each(|v| a.update(&Field::Str(v)));
+            let mut b = ColStats::new();
+            vals[split..].iter().for_each(|v| b.update(&Field::Str(v)));
+            a.merge(&b);
+            assert_eq!(cells(&a), whole, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn merge_propagates_text_and_lexical_minmax() {
+        // A non-numeric cell in either partial makes the merged column text.
+        let mut a = ColStats::new();
+        ["5", "2"].iter().for_each(|v| a.update(&Field::Str(v)));
+        let mut b = ColStats::new();
+        ["oops", "9"].iter().for_each(|v| b.update(&Field::Str(v)));
+        a.merge(&b);
+        let cells = cells(&a);
+        assert_eq!(cells[1], "4"); // count
+        assert_eq!(cells[3], "2"); // lexical min over {5,2,oops,9}
+        assert_eq!(cells[4], "oops"); // lexical max
+        assert_eq!(cells[5], ""); // sum blank (text column)
     }
 
     #[test]

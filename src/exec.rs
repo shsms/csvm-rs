@@ -356,6 +356,22 @@ pub fn run_file<W: Write + Send>(
         return run_sharded(stmts, opts.threads, path, data_start, file_len, output);
     }
 
+    // `stats` reduces associatively, so shard it over the file too.
+    if opts.threads > 1
+        && let Some((pre, stats, post)) = stats_shape(plan)
+    {
+        let merged = run_stats_sharded(
+            pre,
+            &stats.positions,
+            opts.threads,
+            path,
+            data_start,
+            file_len,
+        )?;
+        let rows = apply_stages_over_rows(post, profile_rows(stats, &merged))?;
+        return write_rows(output, &rows);
+    }
+
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(data_start))?;
     let mut reader = BufReader::new(file);
@@ -618,6 +634,86 @@ fn process_range(stmts: &[Stmt], path: &Path, start: u64, end: u64) -> Result<St
         Some(e) => Err(e),
         None => Ok(out),
     }
+}
+
+/// Accumulate partial per-column [`ColStats`] over one shard's byte range,
+/// applying the pre-stats statements. The partials merge associatively, so the
+/// profile is identical regardless of how the file was split.
+fn stats_over_range(
+    pre: &[Stmt],
+    positions: &[usize],
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<Vec<ColStats>, Error> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut bytes)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+
+    let mut accs: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
+    let mut scratch: Vec<Field> = Vec::new();
+    let mut err: Option<Error> = None;
+    csv::parse_chunk(text, |row| {
+        if err.is_some() {
+            return;
+        }
+        match apply_stmts(pre, row, &mut scratch) {
+            Ok(true) => accumulate(&mut accs, positions, row),
+            Ok(false) => {}
+            Err(e) => err = Some(e),
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(accs),
+    }
+}
+
+/// Sharded `stats` over a seekable file: each shard computes partial `ColStats`
+/// over its line-aligned byte range, then the partials merge. Returns the merged
+/// per-column accumulators; the caller renders the profile and runs any
+/// post-stats stages. The reduce mirror of [`run_sharded`].
+///
+/// Counts, `min`, and `max` are order-independent and so identical to the
+/// single-threaded result; floating `sum`/`mean`/`stddev` may differ by ~1 ULP,
+/// since a sharded (pairwise) reduction sums in a different order — inherent to
+/// any parallel reduction.
+fn run_stats_sharded(
+    pre: &[Stmt],
+    positions: &[usize],
+    threads: usize,
+    path: &Path,
+    data_start: u64,
+    file_len: u64,
+) -> Result<Vec<ColStats>, Error> {
+    let mut merged: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
+    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    if !ranges.is_empty() {
+        let partials: Vec<Result<Vec<ColStats>, Error>> = thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .into_iter()
+                .map(|(start, end)| {
+                    scope.spawn(move || stats_over_range(pre, positions, path, start, end))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::Other("stats shard worker panicked".into())))
+                })
+                .collect()
+        });
+        for part in partials {
+            for (m, p) in merged.iter_mut().zip(&part?) {
+                m.merge(p);
+            }
+        }
+    }
+    Ok(merged)
 }
 
 /// Run a plan that contains a `sort`. The common case — exactly one sort —
@@ -1326,6 +1422,82 @@ mod tests {
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[1].starts_with("countZ,"));
+    }
+
+    #[test]
+    fn stats_sharded_matches_serial() {
+        // A CSV with fractional numbers + text + empties, enough rows to split
+        // into several shards. Profile it single-threaded (streaming path) and
+        // multi-threaded (sharded path). Counts/min/max are order-independent and
+        // must match exactly; floating sum/mean/stddev may differ by ~1 ULP (the
+        // sharded reduce sums in a different order), so compare those within a
+        // tiny relative tolerance.
+        let mut csv = String::from("price,region\n");
+        for i in 0..600 {
+            let price = if i % 7 == 0 {
+                String::new()
+            } else {
+                format!("{:.2}", (i % 250) as f64 * 1.13)
+            };
+            let region = ["EU", "US", "APAC"][i % 3];
+            csv.push_str(&format!("{price},{region}\n"));
+        }
+        let path =
+            std::env::temp_dir().join(format!("csvm-stats-shard-{}.csv", std::process::id()));
+        std::fs::write(&path, &csv).unwrap();
+
+        let run_threads = |threads: usize| -> String {
+            let mut plan = parse("stats").unwrap();
+            let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
+            let out_header = plan.resolve(&header).unwrap();
+            let opts = RunOpts {
+                chunk_size: 256,
+                threads,
+                temp_dir: std::env::temp_dir(),
+                sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            };
+            let mut out = Vec::new();
+            run_file(
+                &plan,
+                &out_header,
+                &opts,
+                &path,
+                data_start,
+                file_len,
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let serial = run_threads(1); // reader/streaming path
+        let parallel = run_threads(8); // sharded path
+        std::fs::remove_file(&path).ok();
+
+        // Compare cell by cell: numbers within tolerance, text exactly. (The test
+        // data has no quoted/comma cells, so a plain split is fine here.)
+        let rows = |s: &str| -> Vec<Vec<String>> {
+            s.lines()
+                .map(|l| l.split(',').map(str::to_string).collect())
+                .collect()
+        };
+        let (sr, pr) = (rows(&serial), rows(&parallel));
+        assert_eq!(sr.len(), pr.len(), "row count differs");
+        for (a, b) in sr.iter().zip(&pr) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(xv), Ok(yv)) => {
+                        assert!(
+                            (xv - yv).abs() <= 1e-9 * xv.abs().max(1.0),
+                            "numeric cell differs: {x} vs {y}"
+                        );
+                    }
+                    _ => assert_eq!(x, y, "text cell differs"),
+                }
+            }
+        }
+        assert!(serial.contains("\nprice,") && serial.contains("\nregion,"));
     }
 
     #[test]

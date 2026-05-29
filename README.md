@@ -115,7 +115,9 @@ the named columns.
 
 A column counts as numeric when every non-empty cell parses as a number. `stats`
 is a blocking, reducing stage, so it composes: filter first, then sort/limit the
-profile after it.
+profile after it. Over a file with `-n` threads it is computed in parallel and
+merged; `count`/`min`/`max` are exact, while floating `sum`/`mean`/`stddev` may
+differ from a single-threaded run in the last digit (parallel-reduction order).
 
 ```sh
 csvm 'stats | fmt' data.csv                          # profile every column, aligned

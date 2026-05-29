@@ -9,9 +9,6 @@ From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
 refs are approximate.
 
 ** TODO Minor / edge
-- =stats= never uses =-n= threads (a stats plan isn't a lone transform, so
-  =run_file= won't shard it; =run_stats_streaming= is single-threaded). Partials
-  merge associatively — a parallel shard-merge is straightforward later.
 - sort: in-memory budget is *soft* — N workers can each =fetch_add= before any
   spills, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
   And a string sort key containing a literal =\0= (rare in CSV) sorts slightly

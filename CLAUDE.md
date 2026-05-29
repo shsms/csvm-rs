@@ -58,6 +58,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   but are skipped from the aggregates (still counted as non-empty) so they don't
   poison sum/mean/stddev; `select`/`sort`/`to-num` still accept them. `ColStats`
   is deliberately presentation-free so `fmt`'s value-colouring can reuse it.
+  Over a **seekable file with `-n>1`**, `stats` shards: each worker builds a
+  partial `ColStats` over its byte range and `ColStats::merge` (Welford parallel
+  combine) folds them. Counts/`min`/`max` are exact; floating `sum`/`mean`/
+  `stddev` may differ from the `-n1` result by ~1 ULP (parallel reduction sums
+  in a different order). stdin / `-n1` use the single-pass streaming path.
 - **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
   mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COL RAMP [LO HI]`
   a value gradient. Predicate rules reuse the `select` expression parser; rules
