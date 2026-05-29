@@ -854,8 +854,12 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> 
     for rule in rules {
         match rule {
             ColorRule::Predicate { scope, style, expr } => {
+                // Reuse one row buffer across all rows (cells borrow from `rows`,
+                // so it just holds &str views — one alloc per rule, not per row).
+                let mut frow: Vec<Field> = Vec::new();
                 for (ri, row) in rows.iter().enumerate().skip(1) {
-                    let frow: Vec<Field> = row.iter().map(|s| Field::Str(s)).collect();
+                    frow.clear();
+                    frow.extend(row.iter().map(|s| Field::Str(s)));
                     if !matches!(expr.eval(&frow), Ok(true)) {
                         continue;
                     }
