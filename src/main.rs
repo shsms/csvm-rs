@@ -31,6 +31,10 @@ fn run() -> Result<(), String> {
             println!("{}", cli::USAGE);
             return Ok(());
         }
+        Ok(Parsed::Version) => {
+            println!("csvm {}", csvm::VERSION);
+            return Ok(());
+        }
         Err(e) => return Err(format!("{e}\n\n{}", cli::USAGE)),
     };
 

@@ -52,14 +52,16 @@ usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
   --print-engine     print the compiled execution plan and exit
   --color WHEN       colour `color` rules: auto (TTY only), always, never
   -h, --help         show this help
+  -V, --version      print version and exit
 
 SCRIPT is a pipe-syntax pipeline, e.g.:
   csvm 'select fieldA == \"t\" && countZ > 0 | cols -v fieldA' input.csv";
 
-/// Outcome of parsing: either run with `Args`, or print help/usage and exit.
+/// Outcome of parsing: run with `Args`, or print help / version and exit.
 pub enum Parsed {
     Run(Box<Args>),
     Help,
+    Version,
 }
 
 /// Parse arguments (excluding argv[0]). Returns an error message suitable for
@@ -84,6 +86,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         }
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
+            "-V" | "--version" => return Ok(Parsed::Version),
             "-o" => out_file = Some(value!()),
             "-n" => {
                 let v = value!();
@@ -170,7 +173,17 @@ mod tests {
         match parse(parts.iter().map(|s| s.to_string()))? {
             Parsed::Run(a) => Ok(*a),
             Parsed::Help => Err("help".into()),
+            Parsed::Version => Err("version".into()),
         }
+    }
+
+    #[test]
+    fn version_flag() {
+        assert!(matches!(parse(["-V".to_string()]), Ok(Parsed::Version)));
+        assert!(matches!(
+            parse(["--version".to_string()]),
+            Ok(Parsed::Version)
+        ));
     }
 
     #[test]
