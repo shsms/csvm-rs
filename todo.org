@@ -19,6 +19,39 @@ refs are approximate.
   (not cheaply mergeable — need buffering or t-digest/HLL).
 - =tail N=, =head -n -N= (all-but-last), and a =uniq=/=dedup= verb.
 
+* Interface review (2026-05-29)
+A UX pass over the CLI and command language. Items tracked elsewhere aren't
+repeated: =tail=/=uniq= (Review findings), the colour palette (=color: future=),
+pluggable formats (parking lot).
+
+** TODO Implementing now (straightforward, additive)
+- =--version= / =-V= (=VERSION= already exists in =lib.rs=, unused).
+- Long-form flags: =--output= (=-o=), =--threads= (=-n=); keep the short forms.
+- Honor =NO_COLOR= / =CLICOLOR_FORCE= env vars in the colour gate.
+- Size suffixes (K/M/G, binary) for =--chunk-size= / =--sort-buffer=.
+- Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).
+- =-f FILE= / =--file=: read the pipeline from a file (awk-style; dodges shell quoting).
+- Comments: =#= to end-of-line in scripts (quote-aware), useful with =-f=.
+- Command aliases: =where=/=filter= -> select, =cut= -> cols.
+- String affix operators: =^== begins-with, =*== contains, =$== ends-with
+  (symbolic, so no reserved words; faster + escape-free vs =~).
+- Surface numeric-vs-string in =--print-engine= (=describe= omits the compare mode).
+
+** TODO Larger / needs a decision (deferred)
+- Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
+  bare columns, no numeric literal). Decide: default ordering (=< > <= >=) to
+  numeric when neither side is typed, or add a =num()= coercion. (Surfacing it in
+  =--print-engine= above is the cheap first step.)
+- Delimiter support =-d= / =--delim= (TSV) — a narrower near-term step toward the
+  Source/Sink roadmap; touches the scanner + writer.
+- Column ranges/indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
+- =--no-header= flag (auto-name =c1,c2,...=); keep =hdr= for naming.
+- Multiple input files: =csvm SCRIPT a.csv b.csv= (concat; precursor to =join=).
+- Unify quoting: backticks work in =select=/=color= but not =cols=/=sort=/=rename=.
+- =sort col:flags= instead of =col=flags= to de-overload =-= (breaks compat).
+- =select -v EXPR= for symmetry with =cols -v= (adds a 2nd way to negate).
+- Friendlier errors: did-you-mean for an unknown command/column; list columns on a miss.
+
 * TODO computed column: =add NAME EXPR=
 Append a new column =NAME= computed per row from a value expression over the
 existing columns. If =NAME= already exists, replace it in place (so
