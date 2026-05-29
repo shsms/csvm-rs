@@ -25,7 +25,6 @@ repeated: =tail=/=uniq= (Review findings), the colour palette (=color: future=),
 pluggable formats (parking lot).
 
 ** TODO Implementing now (straightforward, additive)
-- Long-form flags: =--output= (=-o=), =--threads= (=-n=); keep the short forms.
 - Honor =NO_COLOR= / =CLICOLOR_FORCE= env vars in the colour gate.
 - Size suffixes (K/M/G, binary) for =--chunk-size= / =--sort-buffer=.
 - Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).

@@ -43,8 +43,8 @@ usage: csvm [-o OUT] [-n THREADS] [-t TEMPDIR] [--chunk-size BYTES]
 
   SCRIPT             pipe-syntax pipeline (required)
   INPUT              input CSV file (default: stdin; '-' is stdin)
-  -o OUT             output CSV file (default: stdout)
-  -n THREADS         worker threads (default: 1; <=0 means 1)
+  -o, --output OUT   output CSV file (default: stdout)
+  -n, --threads N    worker threads (default: 1; <=0 means 1)
   -t, --temp-dir DIR directory for sort spill files (default: system temp)
   --chunk-size BYTES input chunk size in bytes (default: 1000000)
   --sort-buffer BYTES in-memory budget before sort spills to temp files
@@ -87,10 +87,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         match arg.as_str() {
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
-            "-o" => out_file = Some(value!()),
-            "-n" => {
+            "-o" | "--output" => out_file = Some(value!()),
+            "-n" | "--threads" => {
                 let v = value!();
-                threads = Some(v.parse().map_err(|_| format!("invalid -n value: {v}"))?);
+                threads = Some(
+                    v.parse()
+                        .map_err(|_| format!("invalid threads value: {v}"))?,
+                );
             }
             "-t" | "--temp-dir" => temp_dir = Some(PathBuf::from(value!())),
             "--chunk-size" => {
@@ -222,6 +225,15 @@ mod tests {
             args(&["cols a", "-"]).unwrap().in_file.as_deref(),
             Some("-")
         );
+    }
+
+    #[test]
+    fn long_form_flags() {
+        let a = args(&["--threads", "3", "--output", "o.csv", "cols a", "in.csv"]).unwrap();
+        assert_eq!(a.threads, 3);
+        assert_eq!(a.out_file.as_deref(), Some("o.csv"));
+        assert_eq!(a.script, "cols a");
+        assert_eq!(a.in_file.as_deref(), Some("in.csv"));
     }
 
     #[test]
