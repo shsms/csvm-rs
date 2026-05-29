@@ -1213,6 +1213,9 @@ fn fmt_expr(e: &BoolExpr) -> String {
             let op = if *negate { "!~" } else { "=~" };
             format!("({op} {}[{}] /regex/)", col.name, col.pos)
         }
+        BoolExpr::Affix { col, needle, kind } => {
+            format!("({} {}[{}] {needle:?})", kind.symbol(), col.name, col.pos)
+        }
     }
 }
 

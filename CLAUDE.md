@@ -36,7 +36,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`cols`** keeps/reorders the named columns; **`cols -v`** keeps everything
   *except* them (like `cut --complement`).
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
-  `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
+  `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
+  `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
   words). Operands: bare identifiers are columns (backtick-quote a name that
   isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers are numeric
   literals, `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`

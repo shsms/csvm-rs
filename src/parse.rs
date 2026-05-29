@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand, OutputFormat, Plan,
-    ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt,
+    AffixKind, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand,
+    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -554,6 +554,11 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             },
             '&' if cs.get(i + 1) == Some(&'&') => push2(&mut toks, "&&", &mut i),
             '|' if cs.get(i + 1) == Some(&'|') => push2(&mut toks, "||", &mut i),
+            // Affix operators: begins-with / contains / ends-with. A lone
+            // `^`/`$`/`*` is reserved (no arithmetic yet), so it errors.
+            '^' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "^=", &mut i),
+            '$' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "$=", &mut i),
+            '*' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "*=", &mut i),
             '-' | '+' if cs.get(i + 1).is_some_and(|d| d.is_ascii_digit()) => {
                 lex_number(&cs, &mut i, &mut toks)?;
             }
@@ -688,6 +693,22 @@ impl ExprParser<'_> {
                 regex,
                 negate: op == "!~",
             });
+        }
+        let affix = match op {
+            "^=" => Some(AffixKind::StartsWith),
+            "*=" => Some(AffixKind::Contains),
+            "$=" => Some(AffixKind::EndsWith),
+            _ => None,
+        };
+        if let Some(kind) = affix {
+            let Operand::Col(col) = lhs else {
+                return Err(err(format!("left side of {op} must be a column")));
+            };
+            let needle = match self.parse_operand()? {
+                Operand::Str(s) => s,
+                _ => return Err(err(format!("{op} needs a string literal on the right"))),
+            };
+            return Ok(BoolExpr::Affix { col, needle, kind });
         }
         let cmp_op = match op {
             "==" => CmpOp::Eq,
@@ -842,6 +863,34 @@ mod tests {
             &stmts[0],
             Stmt::Select(BoolExpr::Match { negate: false, .. })
         ));
+    }
+
+    #[test]
+    fn affix_operators() {
+        for (src, want) in [
+            ("select name ^= 'foo'", AffixKind::StartsWith),
+            ("select name *= 'oo'", AffixKind::Contains),
+            ("select path $= '.csv'", AffixKind::EndsWith),
+        ] {
+            let plan = parse(src).unwrap();
+            let Stage::Transform(stmts) = &plan.stages[0] else {
+                panic!()
+            };
+            let Stmt::Select(BoolExpr::Affix { kind, needle, .. }) = &stmts[0] else {
+                panic!("{src}")
+            };
+            assert_eq!(*kind, want);
+            assert!(!needle.is_empty());
+        }
+        // Negation composes through `!`.
+        assert!(matches!(
+            parse("select !(name ^= 'foo')").unwrap().stages[0],
+            Stage::Transform(ref s) if matches!(s[0], Stmt::Select(BoolExpr::Not(_)))
+        ));
+        // RHS must be a string literal; a lone `^`/`*`/`$` is reserved.
+        assert!(parse("select name ^= other").is_err());
+        assert!(parse("select name ^ 'x'").is_err());
+        assert!(parse("select 5 *= 'x'").is_err()); // LHS must be a column
     }
 
     #[test]

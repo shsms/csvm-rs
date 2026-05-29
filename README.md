@@ -78,6 +78,8 @@ backticks, or spaces.
 - **Literals**: numbers (`0`, `3.14`, `-5`); strings in single or double quotes
   (`'t'`).
 - **Comparisons**: `==` (or `=`), `!=`, `<`, `>`, `<=`, `>=`.
+- **Substring**: `col ^= 'pre'` (begins with), `col *= 'mid'` (contains),
+  `col $= 'suf'` (ends with) — literal, so no regex escaping; negate with `!(…)`.
 - **Regex**: `col =~ 'pattern'`, `col !~ 'pattern'` (Rust `regex` syntax).
 - **Logic**: `&&`, `||`, `!`, and parentheses. `&&`/`||` short-circuit. `||` is
   *not* mistaken for a stage `|`.

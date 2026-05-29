@@ -33,9 +33,6 @@ pluggable formats (parking lot).
 - =-f FILE= / =--file=: read the pipeline from a file (awk-style; dodges shell quoting).
 - Comments: =#= to end-of-line in scripts (quote-aware), useful with =-f=.
 - Command aliases: =where=/=filter= -> select, =cut= -> cols.
-- String affix operators: =^== begins-with, =*== contains, =$== ends-with
-  (symbolic, so no reserved words; faster + escape-free vs =~).
-- Surface numeric-vs-string in =--print-engine= (=describe= omits the compare mode).
 
 ** TODO Larger / needs a decision (deferred)
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are

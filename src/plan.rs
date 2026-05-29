@@ -62,6 +62,28 @@ pub struct Cmp {
     pub numeric: bool,
 }
 
+/// Which end of the cell a substring test anchors to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AffixKind {
+    /// `^=` — the cell begins with the needle.
+    StartsWith,
+    /// `*=` — the cell contains the needle.
+    Contains,
+    /// `$=` — the cell ends with the needle.
+    EndsWith,
+}
+
+impl AffixKind {
+    /// The operator spelling, for `--print-engine`.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            AffixKind::StartsWith => "^=",
+            AffixKind::Contains => "*=",
+            AffixKind::EndsWith => "$=",
+        }
+    }
+}
+
 /// A boolean expression tree for `select`. `And`/`Or` are n-ary and
 /// short-circuit.
 #[derive(Clone, Debug)]
@@ -74,6 +96,13 @@ pub enum BoolExpr {
         col: ColRef,
         regex: Regex,
         negate: bool,
+    },
+    /// A literal substring test (`^=` / `*=` / `$=`): faster and escape-free
+    /// versus a regex. Negate with `!` around it.
+    Affix {
+        col: ColRef,
+        needle: String,
+        kind: AffixKind,
     },
 }
 
@@ -315,6 +344,14 @@ impl BoolExpr {
             BoolExpr::Match { col, regex, negate } => {
                 Ok(regex.is_match(&cell_str(row, col.pos)) ^ negate)
             }
+            BoolExpr::Affix { col, needle, kind } => {
+                let cell = cell_str(row, col.pos);
+                Ok(match kind {
+                    AffixKind::StartsWith => cell.starts_with(needle.as_str()),
+                    AffixKind::Contains => cell.contains(needle.as_str()),
+                    AffixKind::EndsWith => cell.ends_with(needle.as_str()),
+                })
+            }
         }
     }
 
@@ -331,6 +368,7 @@ impl BoolExpr {
                 c.rhs.resolve(header)?;
             }
             BoolExpr::Match { col, .. } => col.resolve(header)?,
+            BoolExpr::Affix { col, .. } => col.resolve(header)?,
         }
         Ok(())
     }
