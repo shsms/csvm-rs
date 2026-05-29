@@ -27,8 +27,9 @@ use crate::plan::{
 
 /// Compile a pipe script into an executable [`Plan`].
 pub fn parse(script: &str) -> Result<Plan, Error> {
+    let script = strip_comments(script);
     let mut builder = Builder::default();
-    for stage in split_stages(script) {
+    for stage in split_stages(&script) {
         let stage = stage.trim();
         if stage.is_empty() {
             return Err(err("empty pipeline stage (stray '|'?)"));
@@ -400,6 +401,43 @@ fn head_count_text(rest: &str) -> &str {
 }
 
 // --- stage / word splitting -------------------------------------------------
+
+/// Remove `#`-to-end-of-line comments, respecting string and backtick quoting (a
+/// `#` inside `'…'`, `"…"`, or `` `…` `` is data, not a comment). Newlines are
+/// kept so stage splitting and trimming are unchanged. Mainly for multi-line
+/// scripts read via `-f`, but works inline too.
+fn strip_comments(script: &str) -> String {
+    let mut out = String::with_capacity(script.len());
+    let mut quote: Option<char> = None;
+    let mut chars = script.chars();
+    while let Some(c) = chars.next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' | '`' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                '#' => {
+                    // Drop through end of line, keeping the newline itself.
+                    for d in chars.by_ref() {
+                        if d == '\n' {
+                            out.push('\n');
+                            break;
+                        }
+                    }
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+    out
+}
 
 /// Split a script into stages on a lone, unquoted `|`. A `||` (the *or*
 /// operator) and a `|` inside a string literal are left intact, so `select`
@@ -863,6 +901,27 @@ mod tests {
             &stmts[0],
             Stmt::Select(BoolExpr::Match { negate: false, .. })
         ));
+    }
+
+    #[test]
+    fn comments_stripped_quote_aware() {
+        // A full-line and a trailing comment are removed; a multi-line script
+        // (as from -f) still parses to the same stages.
+        let plan = parse("select a > 0   # positives\n| cols a  # project\n").unwrap();
+        assert_eq!(plan.stages.len(), 1); // select + cols => one transform
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        assert!(matches!(stmts[0], Stmt::Select(_)) && matches!(stmts[1], Stmt::Cols(_)));
+        // A `#` inside a string literal is data, not a comment.
+        let plan = parse("select tag == '#urgent'").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[0] else {
+            panic!()
+        };
+        assert!(matches!(&c.rhs, Operand::Str(s) if s == "#urgent"));
     }
 
     #[test]

@@ -31,7 +31,6 @@ pluggable formats (parking lot).
 - Size suffixes (K/M/G, binary) for =--chunk-size= / =--sort-buffer=.
 - Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).
 - =-f FILE= / =--file=: read the pipeline from a file (awk-style; dodges shell quoting).
-- Comments: =#= to end-of-line in scripts (quote-aware), useful with =-f=.
 
 ** TODO Larger / needs a decision (deferred)
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are

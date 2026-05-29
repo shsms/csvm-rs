@@ -82,9 +82,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
-- `split_stages` splits on a lone unquoted `|`; a `||` (or) and a `|` inside a
-  string literal are left intact, so the bare `select` expression needs no
-  quoting of its own. `parse.rs` is a hand-written tokenizer plus a
+- `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
+  protect a literal `#`), then `split_stages` splits on a lone unquoted `|`; a
+  `||` (or) and a `|` inside a string literal are left intact, so the bare
+  `select` expression needs no quoting of its own. `parse.rs` is a hand-written tokenizer plus a
   recursive-descent expression parser producing the `BoolExpr`/`Cmp` IR.
 
 ## Implicit conversions (`to_num`/`to_str` are implicit)
