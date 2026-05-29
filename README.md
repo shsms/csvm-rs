@@ -23,23 +23,26 @@ No external services or path dependencies; just `cargo build`.
 ## Usage
 
 ```
-csvm [-o OUT] [-n THREADS] [-t TEMPDIR]
-     [--chunk-size BYTES] [--sort-buffer BYTES] [--print-engine] SCRIPT [INPUT]
+csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
+     [--sort-buffer SIZE] [--color WHEN] [--print-engine] [SCRIPT] [INPUT]
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
 `csvm 'select x > 1' data.csv`. Omit it (or pass `-`) to read stdin.
 
-| Argument / flag  | Meaning                                                       |
-|------------------|---------------------------------------------------------------|
-| `SCRIPT`         | the pipeline (required, first positional)                     |
-| `INPUT`          | input file (optional second positional; default stdin, `-` ⇒ stdin) |
-| `-o OUT`         | output file (default: stdout)                                 |
-| `-n THREADS`     | worker threads (default: 1; `<=0` ⇒ 1)                        |
-| `-t, --temp-dir` | directory for sort spill files (default: system temp)         |
-| `--chunk-size`   | input chunk size in bytes (default: 1 000 000)                |
-| `--sort-buffer`  | in-memory budget before `sort` spills to disk (default 256 MiB) |
-| `--print-engine` | print the compiled plan and exit                              |
+| Argument / flag    | Meaning                                                     |
+|--------------------|-------------------------------------------------------------|
+| `SCRIPT`           | the pipeline (first positional; required unless `-f`)       |
+| `INPUT`            | input file (optional next positional; default stdin, `-` ⇒ stdin) |
+| `-o, --output OUT` | output file (default: stdout)                               |
+| `-n, --threads N`  | worker threads (default: 1; `<=0` ⇒ 1)                      |
+| `-f, --file FILE`  | read the pipeline from `FILE` (awk-style; then `SCRIPT` is omitted) |
+| `-t, --temp-dir`   | directory for sort spill files (default: system temp)       |
+| `--chunk-size SIZE`| input chunk size; `K`/`M`/`G` suffix ok (default: 1 000 000) |
+| `--sort-buffer SIZE`| in-memory budget before `sort` spills; `K`/`M`/`G` ok (default 256 MiB) |
+| `--color WHEN`     | `auto` (TTY only), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE` |
+| `--print-engine`   | print the compiled plan and exit                            |
+| `-V, --version`    | print version and exit                                      |
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, `-n N` shards the work across N threads. A streaming input

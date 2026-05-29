@@ -77,8 +77,24 @@ usage: csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
   -h, --help         show this help
   -V, --version      print version and exit
 
-SCRIPT is a pipe-syntax pipeline, e.g.:
-  csvm 'select fieldA == \"t\" && countZ > 0 | cols -v fieldA' input.csv";
+Commands (chain with |):
+  cols A,B,C | cols -v A   keep / drop columns          (alias: cut)
+  select EXPR              keep matching rows            (alias: where, filter)
+  sort COL[=nr] ...        sort: n numeric, r reverse
+  head [N]                 first N rows (default 10)
+  stats [COLS]             per-column count/min/max/sum/mean/stddev
+  color ... | fmt          colourise / whitespace-align output
+  rename OLD=NEW ...       rename columns
+  hdr A,B,C                name columns of headerless input (must be first)
+  to-num / to-str COLS     force column type (usually implicit)
+
+select EXPR operators:
+  == != < > <= >=   ^= *= $= (begins/contains/ends)   =~ !~ (regex)
+  && || ! ()   numbers 3.14   strings 'txt'   `col-with-dashes`   # comment
+
+examples:
+  csvm 'select flag == 't' && amount > 1000 | cols id,amount' data.csv
+  csvm 'sort score=nr | head 5 | fmt' data.csv";
 
 /// Outcome of parsing: run with `Args`, or print help / version and exit.
 pub enum Parsed {

@@ -24,9 +24,6 @@ A UX pass over the CLI and command language. Items tracked elsewhere aren't
 repeated: =tail=/=uniq= (Review findings), the colour palette (=color: future=),
 pluggable formats (parking lot).
 
-** TODO Implementing now (straightforward, additive)
-- Expand =--help= with a command cheatsheet (the DSL is undiscoverable today).
-
 ** TODO Larger / needs a decision (deferred)
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
   bare columns, no numeric literal). =--print-engine= now tags each compare
