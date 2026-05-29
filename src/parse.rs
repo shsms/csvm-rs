@@ -117,8 +117,8 @@ impl Builder {
     fn parse_stage(&mut self, stage: &str) -> Result<(), Error> {
         let (cmd, rest) = split_first_word(stage);
         match cmd {
-            "cols" => self.parse_cols(rest),
-            "select" => self.parse_select(rest),
+            "cols" | "cut" => self.parse_cols(rest),
+            "select" | "where" | "filter" => self.parse_select(rest),
             "sort" => self.parse_sort(rest),
             "to-num" | "to_num" => self.parse_conv(rest, true),
             "to-str" | "to_str" => self.parse_conv(rest, false),
@@ -863,6 +863,24 @@ mod tests {
             &stmts[0],
             Stmt::Select(BoolExpr::Match { negate: false, .. })
         ));
+    }
+
+    #[test]
+    fn command_aliases() {
+        // where/filter alias select; cut aliases cols.
+        for s in ["select a > 0", "where a > 0", "filter a > 0"] {
+            let plan = parse(s).unwrap();
+            let Stage::Transform(stmts) = &plan.stages[0] else {
+                panic!()
+            };
+            assert!(matches!(stmts[0], Stmt::Select(_)), "{s}");
+        }
+        let plan = parse("cut a,b").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Cols(p) = &stmts[0] else { panic!() };
+        assert_eq!(p.names, ["a", "b"]);
     }
 
     #[test]

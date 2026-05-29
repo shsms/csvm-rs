@@ -65,7 +65,8 @@ comma- or space-separated arguments:
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
-`to_num`/`to_str` (underscore) are accepted too.
+`to_num`/`to_str` (underscore) are accepted too. `where`/`filter` are aliases for
+`select`, and `cut` for `cols`.
 
 ### `select` expressions
 
