@@ -54,8 +54,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   header to the profile schema, so `sort`/`head`/`fmt` compose after it. Type
   detection is lenient (a non-numeric cell ⇒ text column; unlike `to-num` it
   never aborts); min/max are numeric for numeric columns, lexical for text;
-  sample stddev via Welford. `ColStats` is deliberately presentation-free so
-  `fmt`'s value-colouring reuses it (`num_range`).
+  sample stddev via Welford. Non-finite values (`NaN`/`inf`) parse as numbers
+  but are skipped from the aggregates (still counted as non-empty) so they don't
+  poison sum/mean/stddev; `select`/`sort`/`to-num` still accept them. `ColStats`
+  is deliberately presentation-free so `fmt`'s value-colouring can reuse it.
 - **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
   mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COL RAMP [LO HI]`
   a value gradient. Predicate rules reuse the `select` expression parser; rules

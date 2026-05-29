@@ -8,12 +8,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
 refs are approximate.
 
-** TODO Numeric parsing accepts NaN/inf
-=field::parse_num= uses =f64::parse=, which accepts ="NaN"/"inf"/"infinity"=. One
-such cell poisons =stats= (=sum/mean/stddev= become NaN) and sorts oddly (NaN
-orders past +inf via =total_cmp=). Decide whether to reject non-finite as
-non-numeric. Low priority (rare in real CSV) but surprising.
-
 ** TODO Minor / edge
 - =color -g COL LO HI= with =LO>HI= (reversed) silently yields a flat hi-less
   ramp (=Ramp::at= sets =t=0= when =!(hi>lo)=), rather than an inverted gradient
