@@ -4,6 +4,68 @@
 Roadmap and design notes for features not yet implemented. Done items live in
 git history; this file is the "what next / what was decided" scratchpad.
 
+* Review findings (2026-05-29)
+From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
+refs are approximate.
+
+** TODO BUG: gradient default bounds collapse on a mixed-numeric column
+=color -g COL= with no explicit bounds calls =column_minmax= (=exec.rs:880=),
+which uses =ColStats::num_range=. That returns =None= if *any* cell in the column
+is non-numeric, so the bounds fall back to =(0.0, 1.0)= and every real value
+clamps to the *hi* colour. Verified: =amount=[10, NA, 30]= paints both 10 and 30
+red instead of 10 green / 30 red.
+- Inconsistent within one render: the gradient *value* parse (=exec.rs:865=)
+  skips non-numeric cells gracefully, but the *bounds* are computed strictly.
+- Also: =ColStats= stops updating =nmin/nmax= once a non-numeric cell flips
+  =numeric=false= (=stats.rs= =update=, the =if self.numeric= guard), so even its
+  min/max is incomplete for mixed columns.
+- Fix: compute default bounds as the min/max over the *parseable* cells directly
+  (independent of column purity), rather than via =num_range=. Cheap, local.
+
+** TODO Predicate colour rules abort on a non-numeric cell
+=color red amount > 20= over =amount=[10, NA, 30]= aborts the whole run with
+"non-numeric value 'NA'" (=compute_styles= propagates =BoolExpr::eval='s error,
+=exec.rs:845=). Consistent with =select='s strictness, but colour is a *cosmetic*
+overlay — a single bad cell shouldn't kill the output. Meanwhile =fmt= and the
+=-g= gradient both degrade gracefully on the same data.
+- Decision: make predicate rules best-effort (a cell that errors the predicate
+  is simply left unpainted) instead of aborting. Lean best-effort for colour.
+
+** TODO fmt alignment counts chars, not display width
+=align_and_write= (=exec.rs:913,941=) pads by =field.chars().count()=. CJK/wide
+glyphs (width 2) under-pad and combining marks (width 0) over-pad, so non-ASCII
+tables misalign. Pre-existing (predates colour). Fix: measure with the
+=unicode-width= crate. (The ANSI-escape part of "visible width" is already
+handled — escapes carry no chars.)
+
+** TODO Numeric parsing accepts NaN/inf
+=field::parse_num= uses =f64::parse=, which accepts ="NaN"/"inf"/"infinity"=. One
+such cell poisons =stats= (=sum/mean/stddev= become NaN) and sorts oddly (NaN
+orders past +inf via =total_cmp=). Decide whether to reject non-finite as
+non-numeric. Low priority (rare in real CSV) but surprising.
+
+** TODO Minor / edge
+- =color -g COL LO HI= with =LO>HI= (reversed) silently yields a flat hi-less
+  ramp (=Ramp::at= sets =t=0= when =!(hi>lo)=), rather than an inverted gradient
+  or an error. Decide: error, or support reversed as inverted.
+- =--print-engine= prints colour rules via =Style='s =Debug= (=exec.rs:1029=),
+  e.g. =Style { fg: Some(Rgb(205, 0, 0)), .. }= — verbose. Add a terse Display.
+- =compute_styles= rebuilds a =Vec<Field>= per row per predicate rule
+  (=exec.rs:844=). Fine for terminal-sized output, wasteful for =--color always=
+  piped to a pager over a big file. Reuse a scratch row.
+- =stats= never uses =-n= threads (a stats plan isn't a lone transform, so
+  =run_file= won't shard it; =run_stats_streaming= is single-threaded). Partials
+  merge associatively — a parallel shard-merge is straightforward later.
+- sort: in-memory budget is *soft* — N workers can each =fetch_add= before any
+  spills, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
+  And a string sort key containing a literal =\0= (rare in CSV) sorts slightly
+  off (documented in CLAUDE.md).
+
+** TODO Feature gaps surfaced
+- =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
+  (not cheaply mergeable — need buffering or t-digest/HLL).
+- =tail N=, =head -n -N= (all-but-last), and a =uniq=/=dedup= verb.
+
 * TODO computed column: =add NAME EXPR=
 Append a new column =NAME= computed per row from a value expression over the
 existing columns. If =NAME= already exists, replace it in place (so
@@ -67,89 +129,20 @@ Arithmetic + comparison/ternary + the function set above + string =++=, with
 =add= replacing an existing name. Covers the bulk and reuses the expression
 parser. =split= / regex / date functions are a follow-up.
 
-* TODO conditional colours when formatting
-Colourize =fmt= output (and maybe plain output to a TTY) based on per-row /
-per-cell conditions — like a spreadsheet's conditional formatting, or what
-tools like =tidy-viewer= / =csvlens= do.
-
-** Command syntax (pinned)
-A separate =color= command appends a rule to the plan (like =fmt= sets the
-output mode); position in the pipe doesn't change semantics, but write it just
-before =fmt=. Multiple =color= commands stack. Rules render with or without
-=fmt=; =--color auto|always|never= gates emission (auto = only when stdout is a
-TTY). Two rule kinds, switched by the =-g= flag:
-
-*** Conditional (predicate) — solid colour
-#+begin_src sh
-color COLOUR EXPR            # paint the whole row when EXPR is true
-color -c COL COLOUR EXPR     # paint only COL's cell
-#+end_src
-=COLOUR= comes first (a single token, so it splits cleanly), then a bare
-=select=-style expression — reuses the expression parser and backtick column
-quoting, no new grammar. Examples:
-#+begin_src sh
-color red amount < 0
-color bold+bg:red status == 'error'
-color -c amount yellow amount > 1000
-#+end_src
-
-*** Gradient (heatmap) — value-based
-#+begin_src sh
-color -g COL [RAMP] [LO HI]   # colour COL's cells by where they fall in a range
-#+end_src
-=RAMP= is =locolour:hicolour= (e.g. =green:red=), interpolated in truecolour, and
-defaults to =green:red= when omitted. =LO HI= are optional numeric bounds;
-default the column's min/max (from =ColStats=), and values outside the range
-clamp to the endpoint colours. (A ramp token always has a =:=, so it's never
-confused with a numeric bound.)
-#+begin_src sh
-color -g amount                    # default green:red, bounds = column min/max
-color -g amount blue:yellow        # custom ramp
-color -g amount green:red 0 5000   # explicit bounds, solid outside
-#+end_src
-
-*** Colour vocabulary
-- fg: the 8 ANSI names (=red green yellow blue magenta cyan white black=), =gray=.
-- bg: =bg:NAME=.
-- attrs: =bold=, =dim=, =underline=.
-- combine with =+=: =bold+red=, =white+bg:red=.
-- (=bright-*= / 256 / truecolour names are a later extension; =RAMP= already
-  lerps truecolour.)
-
-*** Layering [decision — can flip]
-Rules apply in order; each sets only the attributes it names, later rules layer
-on top (so =color red … | color bg:yellow …= ⇒ red-on-yellow when both match,
-and a =-g= foreground composes with a predicate =bg:=). Alternative is
-first-match-wins per cell; pinned to *layering, last wins per attribute*.
-
-** Implementation notes
-- Rules evaluate against the *output* rows at render time, so column refs
-  resolve against the output header (after =cols=/=rename=), not the input.
-- ANSI escapes must NOT count toward =fmt='s column-width alignment — pad by
-  *visible* width, not byte length. (=format_aligned= pads by =chars().count()=;
-  it must measure the uncoloured text.)
-- =--color auto|always|never=: default =auto= (colour only when stdout is a
-  TTY), so piping to a file or another tool stays clean. Needs an isatty check.
-- A =color= rule is plan-level metadata (a =Vec<ColorRule>=, like =output=), not
-  a row-processing stage; =parse= validates the colour/ramp and compiles the
-  predicate to a =BoolExpr=.
-
-** Value-based (heatmap) colouring — reuses =stats='s =ColStats=
-The =color -g= form above. The per-column min/max/mean/stddev already exist as
-=ColStats= (=src/stats.rs=), the accumulator behind =stats=. =fmt= computes its
-*own* =ColStats= over the rows it renders — it never receives them from a =stats=
-stage (in =stats | fmt= the rows *are* the profile), so the reuse is at the
-*type* level, not a shared instance.
-- Mechanics: =t = clamp((v-lo)/(hi-lo), 0, 1)=, then lerp =RAMP='s endpoints; the
-  clamp yields the solid-outside behaviour for free. Bounds default to =ColStats=
-  min/max, =LO HI= overrides.
-- =mean=/=stddev= ride along in =ColStats=, so z-score / diverging colouring (a
-  3-stop =lo:mid:hi= ramp centred on the mean) reuses the same struct.
-- Put the mapping in a small =color= module (=value, lo, hi, ramp -> ANSI=),
-  shared with the predicate rules; both need fmt to pad by *visible* width.
-- Keep =ColStats= presentation-free (compute only) so =stats= and =fmt= both use it.
+* TODO color: future extensions
+The =color= command (predicate + =-g= gradient, =--color auto|always|never=) is
+implemented (=src/color.rs=, =exec::render=). Still open:
+- Palette: =bright-*= and 256/named-extended colours, and explicit =#rrggbb= /
+  =rgb(r,g,b)= so a ramp isn't limited to the 8 base names.
+- 3-stop diverging ramp =lo:mid:hi= centred on a value (default the column mean
+  from =ColStats=), for z-score-style heatmaps.
+- A =color= rule referencing a column other than the one painted (=color -c qty
+  red amount < 0= already works; document the cell-vs-predicate-column split).
 
 * Other ideas (parking lot)
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
 - =join= across files (sub-pipeline as the right side; Plan becomes a DAG).
-- Parallelise the final sort merge; multi-level is already done.
+- group-by aggregation (=agg sum(amount) by region=) reusing =ColStats= per
+  group — the sibling of the =stats= profiler.
+- Parallelise the final sort merge; run generation + intermediate merges are
+  already parallel + multi-level.
