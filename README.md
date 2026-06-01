@@ -60,7 +60,7 @@ comma- or space-separated arguments:
 | `cols -v a,b`      | keep everything *except* these columns                     |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
-| `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
+| `head [N]`         | keep the first `N` rows (default 10; `head -n N`, `head -N`; `head -n -N` keeps all *but* the last N) |
 | `tail [N]`         | keep the last `N` rows (default 10; blocking — buffers the tail) |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row, or by key `cols`; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |

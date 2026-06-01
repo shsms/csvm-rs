@@ -68,6 +68,7 @@ enum Item {
     Sort(SortStmt),
     Head(usize),
     Tail(usize),
+    DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
 }
@@ -112,6 +113,10 @@ impl Builder {
                 Item::Tail(n) => {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Tail(n));
+                }
+                Item::DropLast(n) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::DropLast(n));
                 }
                 Item::Stats(s) => {
                     flush(&mut transform, &mut stages);
@@ -174,16 +179,23 @@ impl Builder {
     }
 
     fn parse_head(&mut self, rest: &str) -> Result<(), Error> {
-        let n = parse_row_count(rest, "head")?;
-        self.items.push(Item::Head(n));
+        // A positive count keeps the first N rows; a negative one (`head -n -N`)
+        // keeps all but the last N (coreutils' behaviour).
+        match parse_count(rest, "head")? {
+            n if n >= 0 => self.items.push(Item::Head(n as usize)),
+            n => self.items.push(Item::DropLast(n.unsigned_abs() as usize)),
+        }
         Ok(())
     }
 
     /// `tail [N]` keeps the last N rows reaching it (a blocking stage; default
-    /// 10). Same count spellings as `head`.
+    /// 10). Same count spellings as `head`, but no negative form.
     fn parse_tail(&mut self, rest: &str) -> Result<(), Error> {
-        let n = parse_row_count(rest, "tail")?;
-        self.items.push(Item::Tail(n));
+        let n = parse_count(rest, "tail")?;
+        if n < 0 {
+            return Err(err("tail doesn't support a negative count"));
+        }
+        self.items.push(Item::Tail(n as usize));
         Ok(())
     }
 
@@ -418,26 +430,19 @@ impl Builder {
 /// Rows kept by `head`/`tail` when no count is given (bash defaults to 10).
 const DEFAULT_ROWS: usize = 10;
 
-/// Parse the row count shared by `head` and `tail`: no argument ⇒ 10; a bare
-/// count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the
-/// obsolete `-N` (`head -20`). Byte mode (`-c`) and negative counts (all but
-/// last N) are not supported. `verb` names the command in errors.
-fn parse_row_count(rest: &str, verb: &str) -> Result<usize, Error> {
+/// Parse the (possibly negative) row count shared by `head`/`tail`: no argument
+/// ⇒ +10; a bare count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`,
+/// `--lines=20`), or the obsolete `-N` (`head -20`, positive). A reduced text
+/// that itself starts with `-` (i.e. `-n -N` / `--lines=-N`) is *negative* —
+/// `head` reads that as "all but the last N"; `tail` rejects it. Byte mode
+/// (`-c`) is not supported. `verb` names the command in errors.
+fn parse_count(rest: &str, verb: &str) -> Result<i64, Error> {
     let rest = rest.trim();
     if rest.is_empty() {
-        return Ok(DEFAULT_ROWS);
+        return Ok(DEFAULT_ROWS as i64);
     }
-    let count = head_count_text(rest);
-    if let Some(digits) = count.strip_prefix('-')
-        && !digits.is_empty()
-        && digits.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(err(format!(
-            "{verb} doesn't support a negative count (all-but-last-N)"
-        )));
-    }
-    count
-        .parse()
+    head_count_text(rest)
+        .parse::<i64>()
         .map_err(|_| err(format!("{verb} expects a row count, got '{rest}'")))
 }
 
@@ -1020,6 +1025,21 @@ mod tests {
     }
 
     #[test]
+    fn head_negative_is_drop_last() {
+        // `head -n -N` keeps all but the last N -> a DropLast stage.
+        let plan = parse("head -n -3").unwrap();
+        assert!(matches!(plan.stages[0], Stage::DropLast(3)));
+        // Positive forms still mean "first N", including the obsolete `-N`.
+        assert!(matches!(parse("head 3").unwrap().stages[0], Stage::Head(3)));
+        assert!(matches!(
+            parse("head -3").unwrap().stages[0],
+            Stage::Head(3)
+        ));
+        // tail has no negative form.
+        assert!(parse("tail -n -3").is_err());
+    }
+
+    #[test]
     fn uniq_parses_whole_row_and_keys() {
         let plan = parse("uniq").unwrap();
         let Stage::Uniq(u) = &plan.stages[0] else {
@@ -1186,8 +1206,8 @@ mod tests {
             });
             assert_eq!(got, Some(want), "script: {script}");
         }
-        // negative (all-but-last) is out of scope; a non-integer still errors.
-        assert!(parse("head -n -3").is_err());
+        // A non-integer count still errors (the negative form is tested in
+        // head_negative_is_drop_last).
         assert!(parse("head -3.5").is_err());
     }
 

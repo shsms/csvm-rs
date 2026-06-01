@@ -162,7 +162,7 @@ fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
     if plan.stages.iter().any(|s| {
         matches!(
             s,
-            Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_) | Stage::Uniq(_)
+            Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_)
         )
     }) {
         return None;
@@ -735,11 +735,13 @@ fn run_staged<R: BufRead, W: Write>(
         .count();
     let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
     let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
-    let has_tail = plan.stages.iter().any(|s| matches!(s, Stage::Tail(_)));
-    let has_uniq = plan.stages.iter().any(|s| matches!(s, Stage::Uniq(_)));
-    // The streaming sort path handles exactly one sort and no head/tail/stats/
-    // uniq; anything else materializes and runs stage by stage.
-    if sort_count != 1 || has_head || has_tail || has_stats || has_uniq {
+    let has_buffered = plan
+        .stages
+        .iter()
+        .any(|s| matches!(s, Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_)));
+    // The streaming sort path handles exactly one sort and no head/stats/
+    // tail/drop-last/uniq; anything else materializes and runs stage by stage.
+    if sort_count != 1 || has_head || has_stats || has_buffered {
         return run_staged_in_memory(plan, opts.chunk_size, input, output);
     }
 
@@ -860,6 +862,7 @@ fn apply_stages_over_rows(
                 let drop = rows.len().saturating_sub(*n);
                 rows.drain(..drop);
             }
+            Stage::DropLast(n) => rows.truncate(rows.len().saturating_sub(*n)),
             Stage::Uniq(u) => dedup_rows(&mut rows, &u.positions),
             Stage::Stats(s) => {
                 let accs = build_colstats(&s.positions, &rows);
@@ -1162,6 +1165,11 @@ pub fn describe(plan: &Plan) -> String {
             Stage::Tail(limit) => {
                 out.push_str(&format!("stage {n} (tail):\n  {n}.1 tail {limit}\n"));
             }
+            Stage::DropLast(limit) => {
+                out.push_str(&format!(
+                    "stage {n} (drop-last):\n  {n}.1 drop last {limit} (head -n -{limit})\n"
+                ));
+            }
             Stage::Uniq(u) => {
                 out.push_str(&format!("stage {n} (uniq):\n"));
                 let by = if u.positions.is_empty() {
@@ -1439,6 +1447,17 @@ mod tests {
         assert_eq!(serial, parallel);
         // Spot-check ordering: first data rows are 1, 3, 5, ...
         assert!(parallel.starts_with("id,keep\n1,1\n3,1\n5,1\n"));
+    }
+
+    #[test]
+    fn head_negative_keeps_all_but_last() {
+        // INPUT has ids 1..4; `head -n -1` drops the last row.
+        assert_eq!(
+            run_str("head -n -1", INPUT).unwrap(),
+            "id,fieldA,countZ\n1,t,5\n2,f,0\n3,t,0\n"
+        );
+        // Dropping more than present yields just the header.
+        assert_eq!(run_str("head -n -9", INPUT).unwrap(), "id,fieldA,countZ\n");
     }
 
     #[test]

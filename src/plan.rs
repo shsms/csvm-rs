@@ -186,14 +186,17 @@ pub enum Stmt {
 }
 
 /// A pipeline stage. Transforms run streaming; a sort blocks on all its rows;
-/// head keeps the first `n` rows reaching it; tail keeps the last `n` (so it
-/// blocks); stats reduces to a profile.
+/// head keeps the first `n` rows reaching it; tail keeps the last `n` and
+/// drop-last keeps all but the last `n` (both block); stats reduces to a
+/// profile.
 #[derive(Clone, Debug)]
 pub enum Stage {
     Transform(Vec<Stmt>),
     Sort(SortStmt),
     Head(usize),
     Tail(usize),
+    /// Keep all but the last `n` rows (`head -n -N`).
+    DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
 }
@@ -595,7 +598,7 @@ impl Plan {
                     }
                 }
                 Stage::Sort(s) => s.resolve(&header)?,
-                Stage::Head(_) | Stage::Tail(_) => {} // no columns to resolve
+                Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) => {} // no columns to resolve
                 Stage::Stats(s) => s.resolve(&mut header)?,
                 Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
             }

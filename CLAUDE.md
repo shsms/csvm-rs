@@ -47,7 +47,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort, else truncates in the materialized
-  path. (Negative `-n -N` and byte mode `-c` are not supported.)
+  path. A *negative* count (`head -n -N`) keeps all but the last N — a separate
+  `Stage::DropLast` on the blocking in-memory path. (Byte mode `-c` isn't
+  supported.)
 - **`tail [N]`** keeps the last N rows (default 10; same count spellings as
   `head`, via the shared `parse_row_count`). Blocking — it can't stream/stop
   early, so any plan with `tail` takes the in-memory path (`Stage::Tail`,
