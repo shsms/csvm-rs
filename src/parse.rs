@@ -50,6 +50,12 @@ fn err(msg: impl Into<String>) -> Error {
     Error::Compile(msg.into())
 }
 
+/// Known command names, for the "did you mean …?" hint on an unknown verb.
+const COMMANDS: &[&str] = &[
+    "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
+    "stats", "uniq", "color", "rename", "fmt", "hdr",
+];
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColType {
     Str,
@@ -129,7 +135,10 @@ impl Builder {
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
-            other => Err(err(format!("unknown command: {other}"))),
+            other => Err(err(match crate::error::did_you_mean(other, COMMANDS) {
+                Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
+                None => format!("unknown command: {other}"),
+            })),
         }
     }
 
@@ -945,6 +954,18 @@ mod tests {
             panic!()
         };
         assert!(matches!(&c.rhs, Operand::Str(s) if s == "#urgent"));
+    }
+
+    #[test]
+    fn unknown_command_suggests_closest() {
+        let e = parse("selct a > 0").unwrap_err().to_string();
+        assert!(e.contains("did you mean `select`"), "{e}");
+        // No suggestion when nothing is close.
+        let e = parse("frobnicate a").unwrap_err().to_string();
+        assert!(
+            e.contains("unknown command") && !e.contains("did you mean"),
+            "{e}"
+        );
     }
 
     #[test]

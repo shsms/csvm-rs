@@ -1399,7 +1399,10 @@ mod tests {
 
     #[test]
     fn missing_column_is_an_error() {
-        assert!(matches!(run_str("cols nope", INPUT), Err(Error::Column(_))));
+        assert!(matches!(
+            run_str("cols nope", INPUT),
+            Err(Error::Column { .. })
+        ));
     }
 
     #[test]

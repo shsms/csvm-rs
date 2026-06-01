@@ -242,7 +242,10 @@ fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
     header
         .iter()
         .position(|h| h == name)
-        .ok_or_else(|| Error::Column(name.to_owned()))
+        .ok_or_else(|| Error::Column {
+            name: name.to_owned(),
+            available: header.to_vec(),
+        })
 }
 
 /// View a row cell as text, treating an out-of-range index as empty (rows can
@@ -726,7 +729,7 @@ mod tests {
             colors: Vec::new(),
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
-        assert!(matches!(err, Error::Column(n) if n == "nope"));
+        assert!(matches!(err, Error::Column { name, .. } if name == "nope"));
     }
 
     #[test]
