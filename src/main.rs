@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -105,14 +105,19 @@ fn open_source(
 ) -> Result<(Source, Vec<String>), String> {
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
-            let (header, data_start, file_len) = match input_header {
-                Some(h) => {
-                    let len = std::fs::metadata(path)
-                        .map_err(|e| format!("cannot stat '{path}': {e}"))?
-                        .len();
-                    (h.to_vec(), 0, len)
-                }
-                None => exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?,
+            let (header, data_start, file_len) = if let Some(h) = input_header {
+                let len = std::fs::metadata(path)
+                    .map_err(|e| format!("cannot stat '{path}': {e}"))?
+                    .len();
+                (h.to_vec(), 0, len)
+            } else if args.no_header {
+                // Peek the first line only to count columns; it is data, so the
+                // data region starts at byte 0.
+                let (first, _data_start, file_len) =
+                    exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
+                (auto_header(first.len()), 0, file_len)
+            } else {
+                exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?
             };
             let source = Source::File {
                 path: PathBuf::from(path),
@@ -123,13 +128,32 @@ fn open_source(
         }
         None => {
             let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin()));
-            let header = match input_header {
-                Some(h) => h.to_vec(),
-                None => exec::read_header(&mut reader).map_err(|e| e.to_string())?,
-            };
+            if let Some(h) = input_header {
+                return Ok((Source::Stream(reader), h.to_vec()));
+            }
+            if args.no_header {
+                // Read the first line to count columns, then chain it back in
+                // front of the rest so the whole stream is processed as data.
+                let mut first = Vec::new();
+                reader
+                    .read_until(b'\n', &mut first)
+                    .map_err(|e| e.to_string())?;
+                let line = std::str::from_utf8(&first)
+                    .map_err(|e| format!("input is not valid UTF-8: {e}"))?;
+                let n = csvm::csv::parse_header(line.strip_suffix('\n').unwrap_or(line)).len();
+                let chained: Box<dyn BufRead> =
+                    Box::new(BufReader::new(Cursor::new(first).chain(reader)));
+                return Ok((Source::Stream(chained), auto_header(n)));
+            }
+            let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
             Ok((Source::Stream(reader), header))
         }
     }
+}
+
+/// Auto-generated column names for `--no-header`: `c1, c2, …, cn`.
+fn auto_header(n: usize) -> Vec<String> {
+    (1..=n).map(|i| format!("c{i}")).collect()
 }
 
 fn run_into<W: Write + Send>(

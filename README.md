@@ -40,6 +40,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `-t, --temp-dir`   | directory for sort spill files (default: system temp)       |
 | `--chunk-size SIZE`| input chunk size; `K`/`M`/`G` suffix ok (default: 1 000 000) |
 | `--sort-buffer SIZE`| in-memory budget before `sort` spills; `K`/`M`/`G` ok (default 256 MiB) |
+| `--no-header`      | input has no header row; columns are named `c1, c2, …`      |
 | `--color WHEN`     | `auto` (TTY only), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE` |
 | `--print-engine`   | print the compiled plan and exit                            |
 | `-V, --version`    | print version and exit                                      |
@@ -173,7 +174,13 @@ output. It is plan-level metadata, so it must be the first command.
 csvm 'hdr id,name,amount | select amount > 1000 | cols id,amount' raw.csv
 ```
 
-Without `hdr`, the first input line is taken as the header (the default).
+Without `hdr`, the first input line is taken as the header (the default). If you
+don't want to name the columns, the `--no-header` flag treats the whole input as
+data and auto-names the columns `c1, c2, …` (referenced like any other name):
+
+```sh
+csvm --no-header 'select c3 > 1000 | cols c1,c3' raw.csv
+```
 
 ### Conversions are implicit
 

@@ -158,8 +158,11 @@ lifetime, so there is one `apply` implementation.
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
 is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and every
 positional is an input. `--chunk-size`/`--sort-buffer` accept K/M/G (binary)
-suffixes. `--color` honors `NO_COLOR`/`CLICOLOR_FORCE` under `auto`. `--help`
-prints a command + operator cheatsheet. Defaults: stdin/stdout, threads = 1,
+suffixes. `--no-header` treats the input as headerless and auto-names columns
+`c1,c2,…` (main peeks the first line to count them — for stdin it reads the line
+and chains it back; `hdr` wins if both are given). `--color` honors
+`NO_COLOR`/`CLICOLOR_FORCE` under `auto`. `--help` prints a command + operator
+cheatsheet. Defaults: stdin/stdout, threads = 1,
 chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)

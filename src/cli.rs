@@ -24,6 +24,9 @@ pub struct Args {
     pub sort_buffer: usize,
     pub print_engine: bool,
     pub color: ColorWhen,
+    /// `--no-header`: the input has no header line; columns are auto-named
+    /// `c1, c2, …`. Ignored if a `hdr` command supplies names instead.
+    pub no_header: bool,
 }
 
 /// When to emit ANSI colour for `color` rules.
@@ -72,6 +75,7 @@ usage: csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
   --chunk-size SIZE  input chunk size; K/M/G suffix ok (default: 1000000)
   --sort-buffer SIZE in-memory budget before sort spills to temp files;
                      K/M/G suffix ok (default: 256 MiB)
+  --no-header        input has no header row; columns are named c1, c2, ...
   --print-engine     print the compiled execution plan and exit
   --color WHEN       colour `color` rules: auto (TTY only), always, never
   -h, --help         show this help
@@ -115,6 +119,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut print_engine = false;
     let mut color = ColorWhen::default();
     let mut script_file = None;
+    let mut no_header = false;
 
     let mut it = args.into_iter();
     while let Some(arg) = it.next() {
@@ -154,6 +159,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--print-engine" => print_engine = true,
+            "--no-header" => no_header = true,
             "--color" => {
                 let v = value!();
                 color = match v.as_str() {
@@ -206,6 +212,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         sort_buffer,
         print_engine,
         color,
+        no_header,
     })))
 }
 
@@ -299,6 +306,12 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn no_header_flag() {
+        assert!(!args(&["cols a"]).unwrap().no_header);
+        assert!(args(&["--no-header", "cols c1"]).unwrap().no_header);
     }
 
     #[test]
