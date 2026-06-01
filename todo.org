@@ -35,7 +35,6 @@ pluggable formats (parking lot).
 - =--no-header= flag (auto-name =c1,c2,...=); keep =hdr= for naming.
 - Multiple input files: =csvm SCRIPT a.csv b.csv= (concat; precursor to =join=).
 - Unify quoting: backticks work in =select=/=color= but not =cols=/=sort=/=rename=.
-- =sort col:flags= instead of =col=flags= to de-overload =-= (breaks compat).
 - Friendlier errors: did-you-mean for an unknown command/column; list columns on a miss.
 
 * TODO computed column: =add NAME EXPR=

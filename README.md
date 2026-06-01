@@ -102,7 +102,8 @@ keeps only rows where neither holds.
 
 ### `sort` specs
 
-Each spec is a bare column or `col=flags`, where flags combine:
+Each spec is a bare column or `col=flags` (`col:flags` also works), where flags
+combine:
 
 - `r` — reverse (descending).
 - `n` — compare numerically rather than lexically.
