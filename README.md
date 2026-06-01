@@ -61,6 +61,7 @@ comma- or space-separated arguments:
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
 | `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
+| `tail [N]`         | keep the last `N` rows (default 10; blocking — buffers the tail) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |

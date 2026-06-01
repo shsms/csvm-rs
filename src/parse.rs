@@ -66,6 +66,7 @@ enum Item {
     Stmt(Stmt),
     Sort(SortStmt),
     Head(usize),
+    Tail(usize),
     Stats(StatsStmt),
 }
 
@@ -106,6 +107,10 @@ impl Builder {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Head(n));
                 }
+                Item::Tail(n) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Tail(n));
+                }
                 Item::Stats(s) => {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Stats(s));
@@ -130,6 +135,7 @@ impl Builder {
             "to-num" | "to_num" => self.parse_conv(rest, true),
             "to-str" | "to_str" => self.parse_conv(rest, false),
             "head" => self.parse_head(rest),
+            "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
@@ -161,28 +167,16 @@ impl Builder {
     }
 
     fn parse_head(&mut self, rest: &str) -> Result<(), Error> {
-        // Bash-like: no argument means 10 rows; the count may be bare (`head 20`),
-        // via `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the obsolete
-        // `-N` form (`head -20`). Byte mode (`-c`) and negative counts (all but
-        // last N) are not supported.
-        let rest = rest.trim();
-        if rest.is_empty() {
-            self.items.push(Item::Head(DEFAULT_HEAD_ROWS));
-            return Ok(());
-        }
-        let count = head_count_text(rest);
-        if let Some(digits) = count.strip_prefix('-')
-            && !digits.is_empty()
-            && digits.bytes().all(|b| b.is_ascii_digit())
-        {
-            return Err(err(
-                "head doesn't support a negative count (all-but-last-N)",
-            ));
-        }
-        let n: usize = count
-            .parse()
-            .map_err(|_| err(format!("head expects a row count, got '{rest}'")))?;
+        let n = parse_row_count(rest, "head")?;
         self.items.push(Item::Head(n));
+        Ok(())
+    }
+
+    /// `tail [N]` keeps the last N rows reaching it (a blocking stage; default
+    /// 10). Same count spellings as `head`.
+    fn parse_tail(&mut self, rest: &str) -> Result<(), Error> {
+        let n = parse_row_count(rest, "tail")?;
+        self.items.push(Item::Tail(n));
         Ok(())
     }
 
@@ -403,8 +397,31 @@ impl Builder {
     }
 }
 
-/// Rows kept by `head` when no count is given (bash `head` defaults to 10).
-const DEFAULT_HEAD_ROWS: usize = 10;
+/// Rows kept by `head`/`tail` when no count is given (bash defaults to 10).
+const DEFAULT_ROWS: usize = 10;
+
+/// Parse the row count shared by `head` and `tail`: no argument ⇒ 10; a bare
+/// count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the
+/// obsolete `-N` (`head -20`). Byte mode (`-c`) and negative counts (all but
+/// last N) are not supported. `verb` names the command in errors.
+fn parse_row_count(rest: &str, verb: &str) -> Result<usize, Error> {
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(DEFAULT_ROWS);
+    }
+    let count = head_count_text(rest);
+    if let Some(digits) = count.strip_prefix('-')
+        && !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(err(format!(
+            "{verb} doesn't support a negative count (all-but-last-N)"
+        )));
+    }
+    count
+        .parse()
+        .map_err(|_| err(format!("{verb} expects a row count, got '{rest}'")))
+}
 
 /// Reduce a `head` argument to its numeric text, accepting bash's spellings:
 /// `-n N` / `-nN`, `--lines N` / `--lines=N`, and the obsolete `-N`. A bare

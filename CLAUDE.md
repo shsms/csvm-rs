@@ -48,6 +48,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort, else truncates in the materialized
   path. (Negative `-n -N` and byte mode `-c` are not supported.)
+- **`tail [N]`** keeps the last N rows (default 10; same count spellings as
+  `head`, via the shared `parse_row_count`). Blocking — it can't stream/stop
+  early, so any plan with `tail` takes the in-memory path (`Stage::Tail`,
+  applied as a drain in `apply_stages_over_rows`).
 - **`stats [cols]`** reduces the input to one summary row per column
   (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
   column. A blocking, *reducing* stage: it streams the input through per-column

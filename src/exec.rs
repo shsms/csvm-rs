@@ -162,7 +162,7 @@ fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
     if plan
         .stages
         .iter()
-        .any(|s| matches!(s, Stage::Sort(_) | Stage::Stats(_)))
+        .any(|s| matches!(s, Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_)))
     {
         return None;
     }
@@ -734,9 +734,10 @@ fn run_staged<R: BufRead, W: Write>(
         .count();
     let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
     let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
-    // The streaming sort path handles exactly one sort and no head/stats;
-    // anything else (head, stats, or multiple sorts) materializes.
-    if sort_count != 1 || has_head || has_stats {
+    let has_tail = plan.stages.iter().any(|s| matches!(s, Stage::Tail(_)));
+    // The streaming sort path handles exactly one sort and no head/tail/stats;
+    // anything else materializes and runs stage by stage.
+    if sort_count != 1 || has_head || has_tail || has_stats {
         return run_staged_in_memory(plan, opts.chunk_size, input, output);
     }
 
@@ -853,6 +854,10 @@ fn apply_stages_over_rows(
             }
             Stage::Sort(sort) => sort_rows(sort, &mut rows)?,
             Stage::Head(n) => rows.truncate(*n),
+            Stage::Tail(n) => {
+                let drop = rows.len().saturating_sub(*n);
+                rows.drain(..drop);
+            }
             Stage::Stats(s) => {
                 let accs = build_colstats(&s.positions, &rows);
                 rows = profile_rows(s, &accs);
@@ -1127,6 +1132,9 @@ pub fn describe(plan: &Plan) -> String {
             Stage::Head(limit) => {
                 out.push_str(&format!("stage {n} (head):\n  {n}.1 head {limit}\n"));
             }
+            Stage::Tail(limit) => {
+                out.push_str(&format!("stage {n} (tail):\n  {n}.1 tail {limit}\n"));
+            }
             Stage::Stats(s) => {
                 out.push_str(&format!("stage {n} (stats):\n"));
                 out.push_str(&format!(
@@ -1395,6 +1403,22 @@ mod tests {
         assert_eq!(serial, parallel);
         // Spot-check ordering: first data rows are 1, 3, 5, ...
         assert!(parallel.starts_with("id,keep\n1,1\n3,1\n5,1\n"));
+    }
+
+    #[test]
+    fn tail_keeps_last_rows() {
+        // INPUT has 4 data rows (ids 1..4); tail 2 keeps the last two.
+        assert_eq!(
+            run_str("tail 2", INPUT).unwrap(),
+            "id,fieldA,countZ\n3,t,0\n4,t,9\n"
+        );
+        // Composes after a filter (fieldA == 't' -> ids 1,3,4; last one).
+        assert_eq!(
+            run_str("select fieldA == 't' | tail 1", INPUT).unwrap(),
+            "id,fieldA,countZ\n4,t,9\n"
+        );
+        // Asking for more than present keeps them all.
+        assert_eq!(run_str("tail 99", INPUT).unwrap(), INPUT);
     }
 
     #[test]

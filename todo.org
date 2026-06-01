@@ -17,7 +17,7 @@ refs are approximate.
 ** TODO Feature gaps surfaced
 - =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
   (not cheaply mergeable — need buffering or t-digest/HLL).
-- =tail N=, =head -n -N= (all-but-last), and a =uniq=/=dedup= verb.
+- =head -n -N= (all-but-last) — the negative-count form `head` currently rejects.
 
 * Interface review (2026-05-29)
 A UX pass over the CLI and command language. Items tracked elsewhere aren't
