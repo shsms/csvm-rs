@@ -52,6 +52,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `head`, via the shared `parse_row_count`). Blocking — it can't stream/stop
   early, so any plan with `tail` takes the in-memory path (`Stage::Tail`,
   applied as a drain in `apply_stages_over_rows`).
+- **`uniq [cols]`** (alias `dedup`) drops duplicate rows keeping the first, by
+  the whole row or the named key columns. Global (not Unix-adjacent), so no
+  pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is
+  the CSV-encoded cells (`dedup_rows` in `exec.rs`, a `HashSet`).
 - **`stats [cols]`** reduces the input to one summary row per column
   (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
   column. A blocking, *reducing* stage: it streams the input through per-column

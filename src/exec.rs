@@ -6,7 +6,7 @@
 //! runs stage by stage. Parallelism and external-merge sort are layered on in
 //! later modules.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -159,11 +159,12 @@ fn run_body<R: BufRead, W: Write + Send>(
 /// If the plan is `[Transform?, Head(n), Transform?]` with no sort, return the
 /// pre-head statements, the limit, and the post-head statements.
 fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
-    if plan
-        .stages
-        .iter()
-        .any(|s| matches!(s, Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_)))
-    {
+    if plan.stages.iter().any(|s| {
+        matches!(
+            s,
+            Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_) | Stage::Uniq(_)
+        )
+    }) {
         return None;
     }
     let heads: Vec<usize> = plan
@@ -735,9 +736,10 @@ fn run_staged<R: BufRead, W: Write>(
     let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
     let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
     let has_tail = plan.stages.iter().any(|s| matches!(s, Stage::Tail(_)));
-    // The streaming sort path handles exactly one sort and no head/tail/stats;
-    // anything else materializes and runs stage by stage.
-    if sort_count != 1 || has_head || has_tail || has_stats {
+    let has_uniq = plan.stages.iter().any(|s| matches!(s, Stage::Uniq(_)));
+    // The streaming sort path handles exactly one sort and no head/tail/stats/
+    // uniq; anything else materializes and runs stage by stage.
+    if sort_count != 1 || has_head || has_tail || has_stats || has_uniq {
         return run_staged_in_memory(plan, opts.chunk_size, input, output);
     }
 
@@ -858,6 +860,7 @@ fn apply_stages_over_rows(
                 let drop = rows.len().saturating_sub(*n);
                 rows.drain(..drop);
             }
+            Stage::Uniq(u) => dedup_rows(&mut rows, &u.positions),
             Stage::Stats(s) => {
                 let accs = build_colstats(&s.positions, &rows);
                 rows = profile_rows(s, &accs);
@@ -865,6 +868,30 @@ fn apply_stages_over_rows(
         }
     }
     Ok(rows)
+}
+
+/// Drop duplicate rows in place, keeping the first occurrence. The dedup key is
+/// the whole row when `positions` is empty, else those columns' cells; either
+/// way it is built by CSV-encoding the cells so commas/quotes can't collide.
+fn dedup_rows(rows: &mut Vec<OwnedRow>, positions: &[usize]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut key = String::new();
+    let mut sel: Vec<Field> = Vec::new();
+    rows.retain(|row| {
+        key.clear();
+        if positions.is_empty() {
+            csv::write_row(&mut key, row);
+        } else {
+            sel.clear();
+            sel.extend(
+                positions
+                    .iter()
+                    .map(|&p| row.get(p).cloned().unwrap_or(Field::Str(""))),
+            );
+            csv::write_row(&mut key, &sel);
+        }
+        seen.insert(std::mem::take(&mut key))
+    });
 }
 
 /// Read all input rows as owned values.
@@ -1135,6 +1162,15 @@ pub fn describe(plan: &Plan) -> String {
             Stage::Tail(limit) => {
                 out.push_str(&format!("stage {n} (tail):\n  {n}.1 tail {limit}\n"));
             }
+            Stage::Uniq(u) => {
+                out.push_str(&format!("stage {n} (uniq):\n"));
+                let by = if u.positions.is_empty() {
+                    "whole row".to_string()
+                } else {
+                    format!("{:?} (positions {:?})", u.cols, u.positions)
+                };
+                out.push_str(&format!("  {n}.1 uniq by {by}\n"));
+            }
             Stage::Stats(s) => {
                 out.push_str(&format!("stage {n} (stats):\n"));
                 out.push_str(&format!(
@@ -1403,6 +1439,15 @@ mod tests {
         assert_eq!(serial, parallel);
         // Spot-check ordering: first data rows are 1, 3, 5, ...
         assert!(parallel.starts_with("id,keep\n1,1\n3,1\n5,1\n"));
+    }
+
+    #[test]
+    fn uniq_dedups_keeping_first() {
+        let input = "g,v\na,1\nb,2\na,3\na,1\nb,9\n";
+        // Whole-row dedup keeps the first of each distinct row (a,1 appears twice).
+        assert_eq!(run_str("uniq", input).unwrap(), "g,v\na,1\nb,2\na,3\nb,9\n");
+        // By a key column: first row per distinct g.
+        assert_eq!(run_str("uniq g", input).unwrap(), "g,v\na,1\nb,2\n");
     }
 
     #[test]

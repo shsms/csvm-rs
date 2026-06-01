@@ -154,6 +154,27 @@ pub struct RenameStmt {
     pub pairs: Vec<(String, String)>,
 }
 
+/// `uniq [cols]`: drop duplicate rows, keeping the first occurrence, comparing
+/// either the whole row (empty `cols`) or just the named key columns. Global
+/// (not adjacent-only like Unix `uniq`), so the input needn't be pre-sorted.
+#[derive(Clone, Debug)]
+pub struct UniqStmt {
+    pub cols: Vec<String>,
+    pub positions: Vec<usize>,
+}
+
+impl UniqStmt {
+    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+        // Empty `cols` ⇒ empty positions ⇒ dedup on the whole row.
+        self.positions = self
+            .cols
+            .iter()
+            .map(|n| resolve_col(n, header))
+            .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+}
+
 /// A row-by-row statement.
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -174,6 +195,7 @@ pub enum Stage {
     Head(usize),
     Tail(usize),
     Stats(StatsStmt),
+    Uniq(UniqStmt),
 }
 
 /// How the final output is rendered.
@@ -575,6 +597,7 @@ impl Plan {
                 Stage::Sort(s) => s.resolve(&header)?,
                 Stage::Head(_) | Stage::Tail(_) => {} // no columns to resolve
                 Stage::Stats(s) => s.resolve(&mut header)?,
+                Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
             }
         }
         // Colour rules render the output, so resolve them against the final header.

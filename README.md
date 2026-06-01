@@ -62,6 +62,7 @@ comma- or space-separated arguments:
 | `sort SPEC...`     | sort rows (stable, multi-key)                              |
 | `head [N]`         | keep the first `N` rows reaching it (default 10; also `head -n N`, `head -N`) |
 | `tail [N]`         | keep the last `N` rows (default 10; blocking — buffers the tail) |
+| `uniq [cols]`      | drop duplicate rows, keeping the first (whole row, or by key `cols`; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
@@ -71,7 +72,7 @@ comma- or space-separated arguments:
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 `to_num`/`to_str` (underscore) are accepted too. `where`/`filter` are aliases for
-`select`, and `cut` for `cols`. A `#` outside quotes starts a comment to end of
+`select`, `cut` for `cols`, and `dedup` for `uniq`. A `#` outside quotes starts a comment to end of
 line (handy in a `-f` script file). A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age `` — as in `select`.
 

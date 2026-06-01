@@ -23,6 +23,7 @@ use crate::error::Error;
 use crate::plan::{
     AffixKind, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand,
     OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt,
+    UniqStmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -68,6 +69,7 @@ enum Item {
     Head(usize),
     Tail(usize),
     Stats(StatsStmt),
+    Uniq(UniqStmt),
 }
 
 #[derive(Default)]
@@ -115,6 +117,10 @@ impl Builder {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Stats(s));
                 }
+                Item::Uniq(u) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Uniq(u));
+                }
             }
         }
         flush(&mut transform, &mut stages);
@@ -137,6 +143,7 @@ impl Builder {
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
+            "uniq" | "dedup" => self.parse_uniq(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
@@ -177,6 +184,17 @@ impl Builder {
     fn parse_tail(&mut self, rest: &str) -> Result<(), Error> {
         let n = parse_row_count(rest, "tail")?;
         self.items.push(Item::Tail(n));
+        Ok(())
+    }
+
+    /// `uniq [cols]` (alias `dedup`) drops duplicate rows, keeping the first —
+    /// by the whole row, or by the named key columns. Global (not adjacent), so
+    /// no pre-sort is required.
+    fn parse_uniq(&mut self, rest: &str) -> Result<(), Error> {
+        self.items.push(Item::Uniq(UniqStmt {
+            cols: split_list(rest),
+            positions: Vec::new(),
+        }));
         Ok(())
     }
 
@@ -999,6 +1017,21 @@ mod tests {
             panic!()
         };
         assert!(matches!(stmts[0], Stmt::Select(BoolExpr::Or(_))));
+    }
+
+    #[test]
+    fn uniq_parses_whole_row_and_keys() {
+        let plan = parse("uniq").unwrap();
+        let Stage::Uniq(u) = &plan.stages[0] else {
+            panic!()
+        };
+        assert!(u.cols.is_empty()); // whole-row
+
+        let plan = parse("dedup a,b").unwrap(); // alias
+        let Stage::Uniq(u) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(u.cols, ["a", "b"]);
     }
 
     #[test]
