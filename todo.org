@@ -36,7 +36,6 @@ pluggable formats (parking lot).
 - Multiple input files: =csvm SCRIPT a.csv b.csv= (concat; precursor to =join=).
 - Unify quoting: backticks work in =select=/=color= but not =cols=/=sort=/=rename=.
 - =sort col:flags= instead of =col=flags= to de-overload =-= (breaks compat).
-- =select -v EXPR= for symmetry with =cols -v= (adds a 2nd way to negate).
 - Friendlier errors: did-you-mean for an unknown command/column; list columns on a miss.
 
 * TODO computed column: =add NAME EXPR=

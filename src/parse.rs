@@ -364,8 +364,14 @@ impl Builder {
     fn parse_select(&mut self, rest: &str) -> Result<(), Error> {
         // The expression is bare (not wrapped in quotes); string *literals*
         // inside still use quotes. `||` and `&&` are handled by the lexer, and
-        // `||` survives the stage split (see `split_stages`).
-        let expr_src = rest.trim();
+        // `||` survives the stage split (see `split_stages`). A leading `-v`
+        // (like `cols -v`) negates the *whole* expression — `select -v EXPR`
+        // drops the matching rows — which is `!(EXPR)`, sidestepping the De
+        // Morgan trap of negating each operator.
+        let (negate, expr_src) = match rest.trim().strip_prefix("-v") {
+            Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim()),
+            _ => (false, rest.trim()),
+        };
         if expr_src.is_empty() {
             return Err(err("select expects an expression"));
         }
@@ -376,6 +382,11 @@ impl Builder {
             types: &self.col_types,
         };
         let expr = parser.parse()?;
+        let expr = if negate {
+            BoolExpr::Not(Box::new(expr))
+        } else {
+            expr
+        };
         self.items.push(Item::Stmt(Stmt::Select(expr)));
         Ok(())
     }
@@ -922,6 +933,22 @@ mod tests {
             panic!()
         };
         assert!(matches!(&c.rhs, Operand::Str(s) if s == "#urgent"));
+    }
+
+    #[test]
+    fn select_v_negates_whole_expression() {
+        // `select -v EXPR` == `select !(EXPR)` — drop the matching rows.
+        let plan = parse("select -v a > 0 || b > 0").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        assert!(matches!(stmts[0], Stmt::Select(BoolExpr::Not(_))));
+        // Without -v, the same expression is kept as-is (an Or here).
+        let plan = parse("select a > 0 || b > 0").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        assert!(matches!(stmts[0], Stmt::Select(BoolExpr::Or(_))));
     }
 
     #[test]

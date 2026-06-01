@@ -96,6 +96,10 @@ select fieldA == 't' && (countZ > 0 || countA > 0)
 Two handy consequences: a parenthesized expression is just `select (…)`, and
 chaining `select`s ANDs them — `select a > 0 | select b == 't'`.
 
+A leading `-v` negates the **whole** expression (like `cols -v`): `select -v EXPR`
+*drops* the rows matching `EXPR` — i.e. `!(EXPR)`, so `select -v a > 0 || b > 0`
+keeps only rows where neither holds.
+
 ### `sort` specs
 
 Each spec is a bare column or `col=flags`, where flags combine:
