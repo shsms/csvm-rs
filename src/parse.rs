@@ -499,7 +499,9 @@ fn split_first_word(stage: &str) -> (&str, &str) {
 }
 
 /// Split an argument string into items on commas and whitespace, respecting
-/// quotes; surrounding quotes are stripped from each item.
+/// quotes; surrounding quotes are stripped from each item. Single quotes, double
+/// quotes, and backticks all quote, so a column name with a comma/space (or just
+/// for consistency with `select`'s backticks) can be written `` `odd, name` ``.
 fn split_list(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -509,7 +511,7 @@ fn split_list(s: &str) -> Vec<String> {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => cur.push(c),
-            None if c == '"' || c == '\'' => {
+            None if c == '"' || c == '\'' || c == '`' => {
                 quote = Some(c);
                 in_item = true;
             }
@@ -1028,6 +1030,24 @@ mod tests {
     fn backtick_errors() {
         assert!(parse("select `unterminated == 'x'").is_err());
         assert!(parse("select `` == 'x'").is_err()); // empty name
+    }
+
+    #[test]
+    fn backtick_quoting_in_arg_lists() {
+        // A comma inside a backtick-quoted name keeps it one column.
+        let plan = parse("cols `first,last`,age").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Cols(p) = &stmts[0] else { panic!() };
+        assert_eq!(p.names, ["first,last", "age"]);
+        // rename can quote a hyphenated source name (backtick stripped).
+        let plan = parse("rename `a-b`=clean").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Rename(r) = &stmts[0] else { panic!() };
+        assert_eq!(r.pairs, [("a-b".to_string(), "clean".to_string())]);
     }
 
     #[test]

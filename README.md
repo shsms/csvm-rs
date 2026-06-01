@@ -70,7 +70,8 @@ comma- or space-separated arguments:
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 `to_num`/`to_str` (underscore) are accepted too. `where`/`filter` are aliases for
 `select`, and `cut` for `cols`. A `#` outside quotes starts a comment to end of
-line (handy in a `-f` script file).
+line (handy in a `-f` script file). A column name with a comma or space can be
+backtick-quoted in any command — `` cols `first, last`,age `` — as in `select`.
 
 ### `select` expressions
 
