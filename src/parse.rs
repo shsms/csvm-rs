@@ -371,11 +371,21 @@ impl Builder {
 
     fn parse_color_gradient(&mut self, s: &str) -> Result<(), Error> {
         let mut it = s.split_whitespace().peekable();
-        let col = it
-            .next()
-            .ok_or_else(|| err("color -g expects a column name"))?;
-        // The ramp is optional (defaults to green:red). A ramp token always
-        // contains ':', which tells it apart from a numeric bound.
+        // One or more leading column names, then the optional ramp and bounds.
+        // A ramp token contains ':' and a bound parses as a number, so columns
+        // are the leading tokens that are neither.
+        let mut cols = Vec::new();
+        while let Some(t) = it.peek() {
+            if t.contains(':') || t.parse::<f64>().is_ok() {
+                break;
+            }
+            cols.push(it.next().unwrap().to_string());
+        }
+        if cols.is_empty() {
+            return Err(err("color -g expects a column name"));
+        }
+        // The ramp is optional (defaults to green:red); when present it applies
+        // to every listed column, as do the bounds.
         let ramp = match it.peek() {
             Some(t) if t.contains(':') => parse_ramp(it.next().unwrap()).map_err(err)?,
             _ => Ramp::default(),
@@ -393,11 +403,13 @@ impl Builder {
         if it.next().is_some() {
             return Err(err("color -g: too many arguments"));
         }
-        self.colors.push(ColorRule::Gradient {
-            col: ColRef::new(col.to_string()),
-            ramp,
-            bounds,
-        });
+        for col in cols {
+            self.colors.push(ColorRule::Gradient {
+                col: ColRef::new(col),
+                ramp,
+                bounds,
+            });
+        }
         Ok(())
     }
 
@@ -1967,5 +1979,19 @@ mod tests {
         assert_eq!(a.name, "a_change");
         assert!(parse("delta").is_err()); // no columns
         assert!(parse("delta -s").is_err()); // suffix flag, no suffix
+    }
+
+    #[test]
+    fn color_gradient_multiple_columns() {
+        // One gradient rule per column, sharing the ramp/bounds.
+        let plan = parse("color -g a b c 0 10").unwrap();
+        assert_eq!(plan.colors.len(), 3);
+        for (rule, name) in plan.colors.iter().zip(["a", "b", "c"]) {
+            let ColorRule::Gradient { col, bounds, .. } = rule else {
+                panic!("expected a gradient");
+            };
+            assert_eq!(col.name, name);
+            assert_eq!(*bounds, Some((0.0, 10.0)));
+        }
     }
 }

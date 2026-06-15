@@ -325,7 +325,7 @@ prepended on output. (The CLI's --no-header instead auto-names columns c1, c2, â
         synopsis: &[
             "color COLOUR EXPR            paint the whole row where EXPR is true",
             "color -c COL COLOUR EXPR     paint only COL's cell",
-            "color -g COL [RAMP] [LO HI]  gradient COL by value (RAMP is lo:hi)",
+            "color -g COLS [RAMP] [LO HI] gradient each COL by value (RAMP is lo:hi)",
         ],
         detail: "Rules render when output is a terminal (or with --color always); most useful \
 with fmt. The predicate forms take a full colour spec (bg:, attributes, + to combine). A \

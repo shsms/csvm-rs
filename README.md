@@ -253,10 +253,14 @@ terminal (or with `--color always`), and are most useful alongside `fmt`. Two
 forms:
 
 ```sh
-color COLOUR EXPR            # paint the whole row where EXPR holds
-color -c COL COLOUR EXPR     # paint only COL's cell
-color -g COL [RAMP] [LO HI]  # gradient COL by value (RAMP is lo:hi; defaults to green:red)
+color COLOUR EXPR             # paint the whole row where EXPR holds
+color -c COL COLOUR EXPR      # paint only COL's cell
+color -g COLS [RAMP] [LO HI]  # gradient each COL by value (RAMP is lo:hi; defaults to green:red)
 ```
+
+`color -g` accepts several columns at once, applying the same ramp and bounds to
+each (`color -g a b c` is three gradient rules), so you don't repeat the stage
+per column.
 
 Colours are the eight ANSI names (plus `gray`), `bg:NAME` backgrounds, and the
 `bold`/`dim`/`underline` attributes, combined with `+` (e.g. `bold+bg:red`).

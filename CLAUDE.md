@@ -92,8 +92,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   groups make `split_stages` paren-aware so the sub-pipeline's `|` doesn't split
   the outer pipeline.
 - **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
-  mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COL RAMP [LO HI]`
-  a value gradient. Predicate rules reuse the `select` expression parser; rules
+  mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COLS RAMP [LO HI]`
+  a value gradient (`-g` takes several columns, emitting one `Gradient` rule each
+  with the shared ramp/bounds). Predicate rules reuse the `select` expression parser; rules
   resolve against the *output* header and render in `exec::render`, which pads by
   *visible* width so ANSI escapes don't break alignment. Gradients reuse
   `ColStats::num_range` for default bounds. Colours are truecolour SGR
