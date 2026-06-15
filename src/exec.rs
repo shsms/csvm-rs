@@ -2451,6 +2451,17 @@ mod tests {
     }
 
     #[test]
+    fn color_rule_for_a_dropped_column_is_skipped_not_fatal() {
+        // A colour rule on countZ, then countZ dropped by `cols`: the rule is
+        // inert (its column isn't in the output), so the run succeeds.
+        let out = render_str("color red countZ == '0' | cols id,fieldA", INPUT, true);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "id,fieldA");
+        assert_eq!(lines.len(), 5); // header + 4 rows, no error
+        assert!(!out.contains('\x1b')); // nothing painted (the column is gone)
+    }
+
+    #[test]
     fn color_predicate_paints_matching_rows() {
         // countZ is 5,0,0,9 — paint rows where countZ == 0.
         let out = render_str("color red countZ == '0' | fmt", INPUT, true);

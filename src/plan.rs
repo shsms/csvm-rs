@@ -1223,10 +1223,11 @@ impl Plan {
                 Stage::Join(j) => j.resolve(&mut header)?,
             }
         }
-        // Colour rules render the output, so resolve them against the final header.
-        for rule in &mut self.colors {
-            rule.resolve(&header)?;
-        }
+        // Colour is cosmetic and resolves against the *output* header, so a rule
+        // naming a column that didn't survive to the output (e.g. dropped by a
+        // later `cols`) is simply inert — skip it rather than aborting the run.
+        // (Row-level colour errors are already ignored in `compute_styles`.)
+        self.colors.retain_mut(|rule| rule.resolve(&header).is_ok());
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
             for c in &mut g.cols {
