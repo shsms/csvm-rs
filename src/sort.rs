@@ -356,7 +356,12 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
         if err.is_some() {
             return;
         }
-        match apply_stmts(&ctx.pre, row, &mut scratch) {
+        match apply_stmts(
+            &ctx.pre,
+            row,
+            &mut scratch,
+            &crate::plan::EvalCtx::default(),
+        ) {
             Ok(true) => {
                 key_buf.clear();
                 if let Err(e) = encode_key(row, &ctx.sort, &mut key_buf) {

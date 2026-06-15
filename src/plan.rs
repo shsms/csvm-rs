@@ -106,6 +106,133 @@ pub enum BoolExpr {
     },
 }
 
+/// A binary arithmetic operator for a value expression (`add`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+}
+
+impl ArithOp {
+    /// The operator spelling, for `--print-engine`.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            ArithOp::Add => "+",
+            ArithOp::Sub => "-",
+            ArithOp::Mul => "*",
+            ArithOp::Div => "/",
+            ArithOp::Mod => "%",
+        }
+    }
+}
+
+/// A built-in function callable from a value expression. The starter set; string
+/// extraction (`split`/regex) and date helpers are deferred (see `todo.org`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Func {
+    Round,
+    Floor,
+    Ceil,
+    Abs,
+    Int,
+    Min,
+    Max,
+    Len,
+    Upper,
+    Lower,
+    Trim,
+    Coalesce,
+}
+
+impl Func {
+    /// The function name as written in a script.
+    pub fn name(self) -> &'static str {
+        match self {
+            Func::Round => "round",
+            Func::Floor => "floor",
+            Func::Ceil => "ceil",
+            Func::Abs => "abs",
+            Func::Int => "int",
+            Func::Min => "min",
+            Func::Max => "max",
+            Func::Len => "len",
+            Func::Upper => "upper",
+            Func::Lower => "lower",
+            Func::Trim => "trim",
+            Func::Coalesce => "coalesce",
+        }
+    }
+
+    /// Resolve a name to a function, for the parser.
+    pub fn from_name(name: &str) -> Option<Func> {
+        Some(match name {
+            "round" => Func::Round,
+            "floor" => Func::Floor,
+            "ceil" => Func::Ceil,
+            "abs" => Func::Abs,
+            "int" => Func::Int,
+            "min" => Func::Min,
+            "max" => Func::Max,
+            "len" => Func::Len,
+            "upper" => Func::Upper,
+            "lower" => Func::Lower,
+            "trim" => Func::Trim,
+            "coalesce" => Func::Coalesce,
+            _ => return None,
+        })
+    }
+
+    /// Every function name, for the "did you mean …?" hint on a typo.
+    pub const NAMES: &'static [&'static str] = &[
+        "round", "floor", "ceil", "abs", "int", "min", "max", "len", "upper", "lower", "trim",
+        "coalesce",
+    ];
+}
+
+/// A value-producing expression for `add` (yields a number or a string). Like
+/// [`BoolExpr`], it is parsed once and evaluated per row with no interpreter —
+/// column refs are indices, operators monomorphic. Arithmetic coerces operands
+/// to numbers (csvm's implicit `to-num`); `++` and the string functions coerce
+/// to text.
+#[derive(Clone, Debug)]
+pub enum ValExpr {
+    /// A column's cell value.
+    Col(ColRef),
+    Num(f64),
+    Str(String),
+    /// Unary minus.
+    Neg(Box<ValExpr>),
+    /// Binary arithmetic (numeric; div/mod by zero aborts the run).
+    Arith {
+        op: ArithOp,
+        lhs: Box<ValExpr>,
+        rhs: Box<ValExpr>,
+    },
+    /// `a ++ b ++ …` — string concatenation (deliberately not `+`, so `+` is
+    /// always numeric and unambiguous).
+    Concat(Vec<ValExpr>),
+    /// A built-in function call.
+    Func(Func, Vec<ValExpr>),
+    /// A boolean expression used as a value (`add ok amount > 0`); renders
+    /// csvm-style `t`/`f`.
+    Bool(Box<BoolExpr>),
+    /// `test ? then : else` — reuses the `select` boolean expression for `test`.
+    Cond {
+        test: Box<BoolExpr>,
+        then_: Box<ValExpr>,
+        else_: Box<ValExpr>,
+    },
+    /// `prev(col)` — the cell of `col` in the *previous* row (the current row's
+    /// own cell on the first row, so a delta is 0 there). Stateful: forces the
+    /// in-memory ordered execution path.
+    Prev(ColRef),
+    /// `rownum()` — the 1-based index of the current row. Stateful (as above).
+    Rownum,
+}
+
 /// `cols(...)` (`keep`) or `drop-cols(...)` (`exclude`): both project the row to
 /// a resolved list of positions; they differ only in how the positions are
 /// computed from the header.
@@ -171,6 +298,36 @@ impl UniqStmt {
             .iter()
             .map(|n| resolve_col(n, header))
             .collect::<Result<_, _>>()?;
+        Ok(())
+    }
+}
+
+/// `add NAME EXPR`: append (or, if `NAME` already exists, replace in place) a
+/// column computed per row from `expr`. After resolution `pos` is `Some(i)` to
+/// replace column `i`, or `None` to append; `stateful` flags an `expr` that
+/// reads `prev()`/`rownum()` (which routes the plan to the in-memory ordered
+/// path so row order is well-defined).
+#[derive(Clone, Debug)]
+pub struct AddStmt {
+    pub name: String,
+    pub expr: ValExpr,
+    pub pos: Option<usize>,
+    pub stateful: bool,
+}
+
+impl AddStmt {
+    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+        // Resolve the expression against the *current* header first, so a
+        // replacing `add price price * 1.1` sees the old `price`, and an
+        // appending `add total amount * qty` can't reference itself.
+        self.expr.resolve(header)?;
+        match header.iter().position(|h| h == &self.name) {
+            Some(i) => self.pos = Some(i),
+            None => {
+                self.pos = None;
+                header.push(self.name.clone());
+            }
+        }
         Ok(())
     }
 }
@@ -324,6 +481,8 @@ pub enum Stmt {
     ToNum(ConvStmt),
     ToStr(ConvStmt),
     Rename(RenameStmt),
+    /// Append or replace a computed column (`add NAME EXPR`).
+    Add(AddStmt),
 }
 
 /// A pipeline stage. Transforms run streaming; a sort blocks on all its rows;
@@ -548,6 +707,183 @@ impl BoolExpr {
     }
 }
 
+/// Per-row context for the stateful leaves of a value expression (`prev()`,
+/// `rownum()`). [`Default`] is empty — a pure expression never reads it, so the
+/// streaming/sharded paths pass the default; the in-memory ordered path fills it.
+#[derive(Default)]
+pub struct EvalCtx<'a> {
+    /// The previous row (`None` on the first row, where `prev()` reads the
+    /// current cell instead).
+    pub prev_row: Option<&'a [Field<'a>]>,
+    /// The 1-based index of the current row.
+    pub rownum: u64,
+}
+
+/// A cell's value, detached so it can be appended to a row (`add` produces new
+/// values rather than borrowing from the input).
+#[inline]
+fn cell_field(row: &[Field], pos: usize) -> Field<'static> {
+    match row.get(pos) {
+        Some(f) => f.clone().into_owned(),
+        None => Field::Owned(String::new()),
+    }
+}
+
+impl ValExpr {
+    /// Evaluate to a value for the current `row`. Returns an owned field (numbers
+    /// and computed strings never borrow the input).
+    pub fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<Field<'static>, Error> {
+        Ok(match self {
+            ValExpr::Col(c) => cell_field(row, c.pos),
+            ValExpr::Num(n) => Field::Num(*n),
+            ValExpr::Str(s) => Field::Owned(s.clone()),
+            ValExpr::Neg(e) => Field::Num(-e.eval(row, ctx)?.coerce_num()?),
+            ValExpr::Arith { op, lhs, rhs } => {
+                let l = lhs.eval(row, ctx)?.coerce_num()?;
+                let r = rhs.eval(row, ctx)?.coerce_num()?;
+                let v = match op {
+                    ArithOp::Add => l + r,
+                    ArithOp::Sub => l - r,
+                    ArithOp::Mul => l * r,
+                    ArithOp::Div => {
+                        if r == 0.0 {
+                            return Err(Error::Other("division by zero in add expression".into()));
+                        }
+                        l / r
+                    }
+                    ArithOp::Mod => {
+                        if r == 0.0 {
+                            return Err(Error::Other("modulo by zero in add expression".into()));
+                        }
+                        l % r
+                    }
+                };
+                Field::Num(v)
+            }
+            ValExpr::Concat(parts) => {
+                let mut s = String::new();
+                for p in parts {
+                    s.push_str(&p.eval(row, ctx)?.as_str());
+                }
+                Field::Owned(s)
+            }
+            ValExpr::Func(f, args) => eval_func(*f, args, row, ctx)?,
+            ValExpr::Bool(b) => Field::Str(if b.eval(row)? { "t" } else { "f" }),
+            ValExpr::Cond { test, then_, else_ } => {
+                if test.eval(row)? {
+                    then_.eval(row, ctx)?
+                } else {
+                    else_.eval(row, ctx)?
+                }
+            }
+            ValExpr::Prev(c) => {
+                // On the first row there is no previous row; read the current
+                // cell so a `col - prev(col)` delta is 0 rather than `col`.
+                let src = ctx.prev_row.unwrap_or(row);
+                cell_field(src, c.pos)
+            }
+            ValExpr::Rownum => Field::Num(ctx.rownum as f64),
+        })
+    }
+
+    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+        match self {
+            ValExpr::Col(c) | ValExpr::Prev(c) => c.resolve(header)?,
+            ValExpr::Num(_) | ValExpr::Str(_) | ValExpr::Rownum => {}
+            ValExpr::Neg(e) => e.resolve(header)?,
+            ValExpr::Arith { lhs, rhs, .. } => {
+                lhs.resolve(header)?;
+                rhs.resolve(header)?;
+            }
+            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+                for p in parts {
+                    p.resolve(header)?;
+                }
+            }
+            ValExpr::Bool(b) => b.resolve(header)?,
+            ValExpr::Cond { test, then_, else_ } => {
+                test.resolve(header)?;
+                then_.resolve(header)?;
+                else_.resolve(header)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the expression reads cross-row state (`prev()`/`rownum()`), which
+    /// makes it order-dependent (not shardable).
+    pub fn is_stateful(&self) -> bool {
+        match self {
+            ValExpr::Prev(_) | ValExpr::Rownum => true,
+            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Str(_) | ValExpr::Bool(_) => false,
+            ValExpr::Neg(e) => e.is_stateful(),
+            ValExpr::Arith { lhs, rhs, .. } => lhs.is_stateful() || rhs.is_stateful(),
+            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+                parts.iter().any(ValExpr::is_stateful)
+            }
+            ValExpr::Cond { then_, else_, .. } => then_.is_stateful() || else_.is_stateful(),
+        }
+    }
+
+    /// A best-effort static type, used by the parser to mark the new column
+    /// numeric/text for later implicit comparisons. `None` when it depends on
+    /// the data (a bare column, `prev`, or a `?:`).
+    pub fn static_numeric(&self) -> Option<bool> {
+        match self {
+            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
+                Some(true)
+            }
+            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(false),
+            ValExpr::Func(f, _) => Some(!matches!(f, Func::Upper | Func::Lower | Func::Trim)),
+            ValExpr::Col(_) | ValExpr::Prev(_) | ValExpr::Cond { .. } => None,
+        }
+    }
+}
+
+/// Evaluate a built-in function call.
+fn eval_func(
+    f: Func,
+    args: &[ValExpr],
+    row: &[Field],
+    ctx: &EvalCtx,
+) -> Result<Field<'static>, Error> {
+    let num = |e: &ValExpr| -> Result<f64, Error> { Ok(e.eval(row, ctx)?.coerce_num()?) };
+    Ok(match f {
+        Func::Round => Field::Num(num(&args[0])?.round()),
+        Func::Floor => Field::Num(num(&args[0])?.floor()),
+        Func::Ceil => Field::Num(num(&args[0])?.ceil()),
+        Func::Abs => Field::Num(num(&args[0])?.abs()),
+        Func::Int => Field::Num(num(&args[0])?.trunc()),
+        Func::Len => Field::Num(args[0].eval(row, ctx)?.as_str().chars().count() as f64),
+        Func::Upper => Field::Owned(args[0].eval(row, ctx)?.as_str().to_uppercase()),
+        Func::Lower => Field::Owned(args[0].eval(row, ctx)?.as_str().to_lowercase()),
+        Func::Trim => Field::Owned(args[0].eval(row, ctx)?.as_str().trim().to_owned()),
+        Func::Min | Func::Max => {
+            let mut acc = num(&args[0])?;
+            for a in &args[1..] {
+                let v = num(a)?;
+                acc = if matches!(f, Func::Min) {
+                    acc.min(v)
+                } else {
+                    acc.max(v)
+                };
+            }
+            Field::Num(acc)
+        }
+        Func::Coalesce => {
+            let mut chosen: Option<Field<'static>> = None;
+            for a in args {
+                let v = a.eval(row, ctx)?;
+                if !v.as_str().is_empty() {
+                    chosen = Some(v);
+                    break;
+                }
+            }
+            chosen.unwrap_or(Field::Owned(String::new()))
+        }
+    })
+}
+
 /// Project a row to `positions` using a reusable `scratch` buffer (swapped in,
 /// so no per-row allocation). Positions may repeat (duplicating a column) or
 /// skip; an out-of-range position yields an empty field rather than panicking.
@@ -570,6 +906,7 @@ impl Stmt {
         &self,
         row: &mut Vec<Field<'a>>,
         scratch: &mut Vec<Field<'a>>,
+        ctx: &EvalCtx,
     ) -> Result<bool, Error> {
         match self {
             Stmt::Cols(p) => {
@@ -577,6 +914,20 @@ impl Stmt {
                 Ok(true)
             }
             Stmt::Select(expr) => expr.eval(row),
+            Stmt::Add(a) => {
+                let value = a.expr.eval(row, ctx)?;
+                match a.pos {
+                    // Replace in place; pad with empties if the row is short.
+                    Some(i) => {
+                        if i >= row.len() {
+                            row.resize(i + 1, Field::Str(""));
+                        }
+                        row[i] = value;
+                    }
+                    None => row.push(value),
+                }
+                Ok(true)
+            }
             Stmt::ToNum(c) => {
                 for &p in &c.positions {
                     if let Some(f) = row.get_mut(p) {
@@ -614,7 +965,14 @@ impl Stmt {
                 }
                 Ok(())
             }
+            Stmt::Add(a) => a.resolve(header),
         }
+    }
+
+    /// Whether this statement reads cross-row state (only a stateful `add`),
+    /// which routes the plan to the in-memory ordered execution path.
+    pub fn is_stateful(&self) -> bool {
+        matches!(self, Stmt::Add(a) if a.stateful)
     }
 }
 
@@ -720,9 +1078,10 @@ pub fn apply_stmts<'a>(
     stmts: &[Stmt],
     row: &mut Vec<Field<'a>>,
     scratch: &mut Vec<Field<'a>>,
+    ctx: &EvalCtx,
 ) -> Result<bool, Error> {
     for s in stmts {
-        if !s.apply(row, scratch)? {
+        if !s.apply(row, scratch, ctx)? {
             return Ok(false);
         }
     }

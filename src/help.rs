@@ -259,6 +259,22 @@ the left columns plus the right's non-key columns; a clashing right name is suff
         examples: &["csvm 'rename qty=quantity,amt=amount' data.csv"],
     },
     CmdHelp {
+        name: "add",
+        aliases: &[],
+        summary: "append a computed column",
+        synopsis: &["add NAME EXPR   append (or, if NAME exists, replace) a column = EXPR"],
+        detail: "EXPR is a value expression over the row: arithmetic (+ - * / %, parens), \
+string concat with ++, the functions round/floor/ceil/abs/int/min/max/len/upper/lower/trim/\
+coalesce, a ternary TEST ? A : B, and constants. prev(col) is col's value in the previous row \
+(the current cell on the first row, so a delta is 0 there) and rownum() is the 1-based row \
+index — both make the run single-threaded and in input order. A bare comparison yields t/f. \
+Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm help expr`.",
+        examples: &[
+            "csvm 'add rate amount - prev(amount)' data.csv",
+            "csvm 'add total price * qty | add tier total > 1000 ? \"big\" : \"small\"' data.csv",
+        ],
+    },
+    CmdHelp {
         name: "to-num",
         aliases: &[],
         summary: "force columns to numeric",
@@ -341,6 +357,25 @@ lo:hi`) is narrower: lo and hi are two plain colour names (no +, bg, or \
 attributes) and it colours the foreground only; the ramp defaults to green:red.\n\n\
 Emission is gated by --color auto|always|never (auto = only when stdout is a TTY); \
 NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
+    },
+    Topic {
+        name: "expr",
+        summary: "value expressions for `add`",
+        body: "  arithmetic:  + - * / %  and parens   (numeric; coerces operands)\n  \
+unary minus: -x\n  \
+concat:      a ++ b ++ c        (string; never use + for text)\n  \
+ternary:     TEST ? A : B        (TEST is a select-style comparison)\n  \
+boolean:     a bare comparison yields t / f\n  \
+functions:   round floor ceil abs int   (numeric, 1 arg)\n               \
+min max         (numeric, 1+ args)\n               \
+len             (length of text)\n               \
+upper lower trim (text, 1 arg)\n               \
+coalesce        (first non-empty, 1+ args)\n  \
+cross-row:   prev(col)   col in the previous row (current cell on row 1)\n               \
+rownum()    1-based row index\n\n\
+prev() / rownum() make the run single-threaded and in input order. \
+Divide/modulo by zero, or arithmetic on a non-number, aborts the run. \
+If NAME already exists, add replaces it in place; otherwise it is appended.",
     },
     Topic {
         name: "types",

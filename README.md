@@ -74,6 +74,7 @@ comma- or space-separated arguments:
 | `join [(SUB)] FILE on KEYS` | merge a right-side file in by key (inner/left/right/full) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
+| `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
@@ -123,6 +124,55 @@ combine:
 ```sh
 sort fieldA fieldB=r countZ=nr      # by fieldA asc, fieldB desc, countZ numeric desc
 ```
+
+### `add`
+
+`add NAME EXPR` appends a column computed per row from `EXPR`, a *value*
+expression over the other columns. If `NAME` already exists it is replaced in
+place (so `add price price * 1.1` works); otherwise it is appended at the end
+(reorder afterwards with `cols`). Types are implicit, as in `select`: arithmetic
+yields a number, string ops yield text, and column refs coerce by context.
+
+```sh
+csvm 'add total amount * qty' data.csv          # arithmetic
+csvm 'add margin (price - cost) / price * 100' data.csv
+csvm 'add full first ++ " " ++ last' data.csv   # ++ concatenates (never +)
+csvm 'add tier amount > 1000 ? "big" : "small"' data.csv   # ternary
+csvm 'add ok amount > 0' data.csv               # a bare comparison yields t/f
+```
+
+The expression grammar (loosest to tightest precedence): `?:` ternary, `++`
+concat, `+ -`, `* / %`, unary `-`, then atoms — a column, a number, a quoted
+string, a parenthesised expression, or a function call.
+
+- **Functions**: `round floor ceil abs int` (numeric, one arg), `min max`
+  (numeric, one or more), `len` (text length), `upper lower trim` (text),
+  `coalesce` (first non-empty). `split`/regex/date functions are not yet
+  implemented.
+- **Errors**: arithmetic on a non-number, or divide/modulo by zero, aborts the
+  run (like `to-num`) rather than emitting a blank.
+
+#### Row-to-row values (`prev`, `rownum`)
+
+Two functions reach beyond the current row:
+
+- `prev(col)` — `col`'s value in the **previous** row (the current row's own
+  cell on the first row, so a step delta is `0` there rather than the full
+  value).
+- `rownum()` — the **1-based** index of the current row.
+
+So the difference between successive rows of a column — the rate of change at
+each step — is just:
+
+```sh
+csvm 'add rate amount - prev(amount)' data.csv
+```
+
+Because they depend on row order, an `add` using `prev()`/`rownum()` runs
+**single-threaded and in input order** (it can't be sharded), so its output is
+identical at any `-n`. `rownum()` reflects input order even before a later
+`sort`. A pure `add` (no `prev`/`rownum`) still shards and streams like any other
+transform.
 
 ### `stats`
 
@@ -349,10 +399,10 @@ and alignment — reporting per-operation throughput.
 
 ## Roadmap
 
-The pipe language is built to grow. Planned: a computed `add` column,
-conditional colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait
-(Parquet, TSV), and group-by aggregation. See `todo.org` for design notes.
-(`join` is implemented — see above.)
+The pipe language is built to grow. Planned: conditional colouring for `fmt`,
+pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and group-by
+aggregation. See `todo.org` for design notes. (`join` and the computed `add`
+column are implemented — see above.)
 
 ## License
 

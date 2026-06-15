@@ -100,6 +100,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (`src/color.rs`); `--color auto|always|never` gates emission (auto = TTY).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
+- **`add NAME EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`
+  in place if it already exists (`AddStmt.pos`). `EXPR` is a *value* expression
+  (`ValExpr` in `plan.rs`): arithmetic (`+ - * / %`), `++` concat, the function
+  set (`round/floor/.../coalesce`), a `?:` ternary (reusing `BoolExpr` for the
+  test), constants, and `prev(col)`/`rownum()`. It reuses the `select` tokenizer
+  (`lex_expr`, extended with arithmetic operators + context-sensitive sign) and a
+  sibling recursive-descent parser (`ExprParser::parse_value`). `eval` takes an
+  `EvalCtx { prev_row, rownum }` and returns an owned `Field`. A pure `add` is
+  per-row and **shardable** (rides every path); an `add` reading `prev`/`rownum`
+  is `is_stateful()` and routes to the **in-memory ordered path** (the guard
+  `plan_has_stateful_add` in `exec::run_body`/`run_file`, mirroring the
+  `tail`/`uniq`/`join` fallback), so its output is `-n`-independent.
 - **`hdr a,b,c`** supplies column names for headerless input: it sets
   `Plan.input_header` (plan-level metadata, must be the first command), so the
   whole input is data and `main`/the test harness skip reading a header line
@@ -113,7 +125,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`; a
   `||` (or) and a `|` inside a string literal are left intact, so the bare
   `select` expression needs no quoting of its own. `parse.rs` is a hand-written tokenizer plus a
-  recursive-descent expression parser producing the `BoolExpr`/`Cmp` IR.
+  recursive-descent expression parser producing the `BoolExpr`/`Cmp` IR (and the
+  `ValExpr` value IR for `add`).
 
 ## Implicit conversions (`to_num`/`to_str` are implicit)
 
@@ -226,8 +239,10 @@ serial merge just copy line bytes.
 
 The pipe language is deliberately built to grow: new verbs are a parse arm plus
 a `Stmt`/`Stage`. `join` is implemented (`Stage::Join`, a sub-`Plan` right side —
-the `Plan` is now a small DAG). Planned (see `todo.org` for design notes): a
-computed `add` column, conditional colouring for `fmt`, pluggable formats via a
+the `Plan` is now a small DAG). The computed `add` column is implemented
+(`Stmt::Add`, the `ValExpr` value engine; `prev`/`rownum` take the ordered
+in-memory path). Planned (see `todo.org` for design notes):
+conditional colouring for `fmt`, pluggable formats via a
 `Source`/`Sink` trait (Parquet, TSV), and group-by aggregation.
 
 ## Conventions

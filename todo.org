@@ -28,7 +28,21 @@ git history; this file is the "what next / what was decided" scratchpad.
 - =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
   — not cheaply mergeable, so they need buffering or t-digest/HLL.
 
-* TODO computed column: =add NAME EXPR=
+* DONE computed column: =add NAME EXPR=
+Implemented: =Stmt::Add= + the =ValExpr= value engine (=plan.rs=), parsed by a
+sibling recursive-descent parser sharing =select='s tokenizer (=parse.rs=). The
+starter scope below shipped — arithmetic, =++= concat, ternary, a bare
+comparison as a =t=/=f= value, the function set, replace-in-place, and abort on
+divide-by-zero / non-numeric. Cross-row =prev(col)= and =rownum()= are included
+(chosen over a separate Miller-style =step= verb): an =add= reading them is
+order-dependent, so it routes to the in-memory ordered path (like =tail=/=uniq=),
+keeping output =-n=-independent; a pure =add= still shards. =prev(col)= on the
+first row reads the current cell, so =amount - prev(amount)= is 0 there.
+
+Still deferred (follow-ups): =split=, regex =match=, and date functions; grouped
+=prev=/delta (=… by g=) once group-by lands.
+
+Original design notes (kept for the deferred parts):
 Append a new column =NAME= computed per row from a value expression over the
 existing columns. If =NAME= already exists, replace it in place (so
 =add price round(price * 1.1)= works). Appends at the end otherwise; reorder

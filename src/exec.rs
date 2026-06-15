@@ -20,8 +20,8 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{
-    BoolExpr, CmpOp, ColorRule, ColorScope, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage,
-    StatsStmt, Stmt, apply_stmts,
+    BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, JoinStmt, Operand, OutputFormat, Plan,
+    SortStmt, Stage, StatsStmt, Stmt, ValExpr, apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -138,6 +138,12 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
+    // A stateful `add` (`prev()`/`rownum()`) is order-dependent: it can't shard
+    // or stream chunk-parallel. Materialize and run the ordered in-memory path
+    // (the same fallback `tail`/`uniq`/`join` use).
+    if plan_has_stateful_add(plan) {
+        return run_staged_in_memory(plan, opts, input, output);
+    }
     // `head` with no sort streams single-threaded and stops early.
     if let Some((pre, n, post)) = head_only_shape(plan) {
         return stream_head(pre, n, post, opts.chunk_size, input, output);
@@ -215,10 +221,10 @@ fn stream_head<R: BufRead, W: Write>(
             if err.is_some() || taken >= n {
                 return;
             }
-            match apply_stmts(pre, row, &mut scratch) {
+            match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
                 Ok(true) => {
                     taken += 1;
-                    match apply_stmts(post, row, &mut scratch) {
+                    match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
                         Ok(true) => csv::write_row(&mut out_buf, row),
                         Ok(false) => {}
                         Err(e) => err = Some(e),
@@ -281,7 +287,7 @@ fn run_stats_streaming<R: BufRead, W: Write>(
             if err.is_some() {
                 return;
             }
-            match apply_stmts(pre, row, &mut scratch) {
+            match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
                 Ok(true) => accumulate(&mut accs, &stats.positions, row),
                 Ok(false) => {}
                 Err(e) => err = Some(e),
@@ -356,14 +362,20 @@ pub fn run_file<W: Write + Send>(
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
+    // A stateful `add` forces the ordered in-memory path (see `run_body`); skip
+    // all sharded fast paths and let the reader path route it there.
+    let stateful = plan_has_stateful_add(plan);
+
     if let [Stage::Transform(stmts)] = plan.stages.as_slice()
         && opts.threads > 1
+        && !stateful
     {
         return run_sharded(stmts, opts.threads, path, data_start, file_len, output);
     }
 
     // `stats` reduces associatively, so shard it over the file too.
     if opts.threads > 1
+        && !stateful
         && let Some((pre, stats, post)) = stats_shape(plan)
     {
         let merged = run_stats_sharded(
@@ -410,7 +422,7 @@ fn stream_transform<R: BufRead, W: Write>(
             if err.is_some() {
                 return;
             }
-            match apply_stmts(stmts, row, &mut scratch) {
+            match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
                 Ok(true) => csv::write_row(&mut out_buf, row),
                 Ok(false) => {}
                 Err(e) => err = Some(e),
@@ -453,7 +465,7 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
                         if err.is_some() {
                             return;
                         }
-                        match apply_stmts(stmts, row, &mut scratch) {
+                        match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
                             Ok(true) => csv::write_row(&mut out_buf, row),
                             Ok(false) => {}
                             Err(e) => err = Some(e),
@@ -630,7 +642,7 @@ fn process_range(stmts: &[Stmt], path: &Path, start: u64, end: u64) -> Result<St
         if err.is_some() {
             return;
         }
-        match apply_stmts(stmts, row, &mut scratch) {
+        match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
             Ok(true) => csv::write_row(&mut out, row),
             Ok(false) => {}
             Err(e) => err = Some(e),
@@ -666,7 +678,7 @@ fn stats_over_range(
         if err.is_some() {
             return;
         }
-        match apply_stmts(pre, row, &mut scratch) {
+        match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
             Ok(true) => accumulate(&mut accs, positions, row),
             Ok(false) => {}
             Err(e) => err = Some(e),
@@ -810,7 +822,7 @@ fn apply_post_to_line(post: &[Stmt], line: &[u8], out: &mut Vec<u8>) -> Result<(
         if err.is_some() {
             return;
         }
-        match apply_stmts(post, row, &mut scratch) {
+        match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
             Ok(true) => {
                 buf.clear();
                 csv::write_row(&mut buf, row);
@@ -821,6 +833,15 @@ fn apply_post_to_line(post: &[Stmt], line: &[u8], out: &mut Vec<u8>) -> Result<(
         }
     });
     err.map_or(Ok(()), Err)
+}
+
+/// Whether any transform stage holds a stateful `add` (`prev()`/`rownum()`),
+/// which is order-dependent and so can't shard or stream chunk-parallel.
+fn plan_has_stateful_add(plan: &Plan) -> bool {
+    plan.stages.iter().any(|s| match s {
+        Stage::Transform(stmts) => stmts.iter().any(Stmt::is_stateful),
+        _ => false,
+    })
 }
 
 /// The statements of an optional single transform stage (empty otherwise).
@@ -857,9 +878,50 @@ fn apply_stages_over_rows(
             Stage::Transform(stmts) => {
                 let mut kept = Vec::with_capacity(rows.len());
                 let mut scratch: Vec<Field> = Vec::new();
-                for mut row in rows.drain(..) {
-                    if apply_stmts(stmts, &mut row, &mut scratch)? {
-                        kept.push(row);
+                if stmts.iter().any(Stmt::is_stateful) {
+                    // A stateful `add` (`prev()`/`rownum()`) needs rows in input
+                    // order with the previous row available. `prev(C)` resolves
+                    // C's position against the header *as that add sees it* —
+                    // after any earlier `cols`/`rename`/`add` in the same stage,
+                    // but before any later one. So the previous row must be
+                    // snapshotted at each stateful add's own point in the stage;
+                    // `prev_rows[k]` holds it for the add at statement index `k`.
+                    // `prev` thus tracks the previous row that reached that add
+                    // (independent of a later `select`), and `rownum` counts
+                    // every entering row, 1-based.
+                    let mut prev_rows: Vec<Option<OwnedRow>> = vec![None; stmts.len()];
+                    for (i, row) in rows.drain(..).enumerate() {
+                        let mut row = row;
+                        let mut keep = true;
+                        for (k, stmt) in stmts.iter().enumerate() {
+                            let survived = if stmt.is_stateful() {
+                                let snapshot = row.clone(); // this add's input layout
+                                let r = {
+                                    let ctx = EvalCtx {
+                                        prev_row: prev_rows[k].as_deref(),
+                                        rownum: i as u64 + 1,
+                                    };
+                                    stmt.apply(&mut row, &mut scratch, &ctx)?
+                                };
+                                prev_rows[k] = Some(snapshot); // for the next row
+                                r
+                            } else {
+                                stmt.apply(&mut row, &mut scratch, &EvalCtx::default())?
+                            };
+                            if !survived {
+                                keep = false;
+                                break;
+                            }
+                        }
+                        if keep {
+                            kept.push(row);
+                        }
+                    }
+                } else {
+                    for mut row in rows.drain(..) {
+                        if apply_stmts(stmts, &mut row, &mut scratch, &EvalCtx::default())? {
+                            kept.push(row);
+                        }
                     }
                 }
                 rows = kept;
@@ -1409,7 +1471,46 @@ fn describe_stmt(stmt: &Stmt) -> String {
         Stmt::ToNum(c) => format!("to-num {:?} (positions {:?})", c.names, c.positions),
         Stmt::ToStr(c) => format!("to-str {:?} (positions {:?})", c.names, c.positions),
         Stmt::Rename(r) => format!("rename {:?}", r.pairs),
+        Stmt::Add(a) => {
+            let target = match a.pos {
+                Some(i) => format!("{}[{i}]", a.name),
+                None => format!("{} (append)", a.name),
+            };
+            format!("add {target} = {}", fmt_valexpr(&a.expr))
+        }
     }
+}
+
+fn fmt_valexpr(e: &ValExpr) -> String {
+    match e {
+        ValExpr::Col(c) => format!("{}[{}]", c.name, c.pos),
+        ValExpr::Num(n) => n.to_string(),
+        ValExpr::Str(s) => format!("{s:?}"),
+        ValExpr::Neg(e) => format!("(neg {})", fmt_valexpr(e)),
+        ValExpr::Arith { op, lhs, rhs } => {
+            format!(
+                "({} {} {})",
+                op.symbol(),
+                fmt_valexpr(lhs),
+                fmt_valexpr(rhs)
+            )
+        }
+        ValExpr::Concat(parts) => format!("(++ {})", fmt_valexpr_list(parts)),
+        ValExpr::Func(f, args) => format!("({} {})", f.name(), fmt_valexpr_list(args)),
+        ValExpr::Bool(b) => format!("(bool {})", fmt_expr(b)),
+        ValExpr::Cond { test, then_, else_ } => format!(
+            "(if {} {} {})",
+            fmt_expr(test),
+            fmt_valexpr(then_),
+            fmt_valexpr(else_)
+        ),
+        ValExpr::Prev(c) => format!("(prev {}[{}])", c.name, c.pos),
+        ValExpr::Rownum => "(rownum)".to_string(),
+    }
+}
+
+fn fmt_valexpr_list(es: &[ValExpr]) -> String {
+    es.iter().map(fmt_valexpr).collect::<Vec<_>>().join(" ")
 }
 
 fn describe_sort(sort: &SortStmt) -> String {

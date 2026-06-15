@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AffixKind, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, JoinStmt, JoinType,
-    Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
-    Stmt, UniqStmt,
+    AddStmt, AffixKind, ArithOp, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt,
+    Func, JoinStmt, JoinType, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey,
+    SortStmt, Stage, StatsStmt, Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -55,7 +55,7 @@ fn err(msg: impl Into<String>) -> Error {
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
-    "stats", "uniq", "color", "rename", "fmt", "hdr", "join",
+    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -158,6 +158,7 @@ impl Builder {
             "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
+            "add" => self.parse_add(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
             other => Err(err(match crate::error::did_you_mean(other, COMMANDS) {
@@ -463,6 +464,50 @@ impl Builder {
         Ok(())
     }
 
+    /// `add NAME EXPR` — append (or replace, if `NAME` exists) a computed
+    /// column. The expression is the value-expression grammar (arithmetic,
+    /// `++` concat, functions, `?:`, `prev()`/`rownum()`). A backtick-quoted
+    /// `NAME` may contain spaces.
+    fn parse_add(&mut self, rest: &str) -> Result<(), Error> {
+        let (name, expr_src) = split_add_name(rest)?;
+        if name.is_empty() {
+            return Err(err(
+                "add expects a column name, e.g. add total amount * qty",
+            ));
+        }
+        if expr_src.trim().is_empty() {
+            return Err(err("add expects an expression after the column name"));
+        }
+        let toks = lex_expr(expr_src.trim())?;
+        let mut parser = ExprParser {
+            toks,
+            pos: 0,
+            types: &self.col_types,
+        };
+        let expr = parser.parse_value_top()?;
+        let stateful = expr.is_stateful();
+        // Track the new column's type so later comparisons can go numeric
+        // implicitly (a data-dependent expression leaves it untyped).
+        match expr.static_numeric() {
+            Some(true) => {
+                self.col_types.insert(name.clone(), ColType::Num);
+            }
+            Some(false) => {
+                self.col_types.insert(name.clone(), ColType::Str);
+            }
+            None => {
+                self.col_types.remove(&name);
+            }
+        }
+        self.items.push(Item::Stmt(Stmt::Add(AddStmt {
+            name,
+            expr,
+            pos: None,
+            stateful,
+        })));
+        Ok(())
+    }
+
     fn parse_sort(&mut self, rest: &str) -> Result<(), Error> {
         let mut keys = Vec::new();
         for spec in split_list(rest) {
@@ -733,6 +778,24 @@ fn split_first_word(stage: &str) -> (&str, &str) {
     }
 }
 
+/// Split `add`'s target column name from the rest (its expression). A
+/// backtick-quoted name may contain spaces; otherwise it's the first word.
+fn split_add_name(rest: &str) -> Result<(String, &str), Error> {
+    let rest = rest.trim_start();
+    if let Some(after_tick) = rest.strip_prefix('`') {
+        match after_tick.find('`') {
+            Some(end) => Ok((
+                after_tick[..end].to_string(),
+                after_tick[end + 1..].trim_start(),
+            )),
+            None => Err(err("unterminated backtick column name in add")),
+        }
+    } else {
+        let (name, expr) = split_first_word(rest);
+        Ok((name.to_string(), expr))
+    }
+}
+
 /// Split an argument string into items on commas and whitespace, respecting
 /// quotes; surrounding quotes are stripped from each item. Single quotes, double
 /// quotes, and backticks all quote, so a column name with a comma/space (or just
@@ -843,13 +906,30 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             '&' if cs.get(i + 1) == Some(&'&') => push2(&mut toks, "&&", &mut i),
             '|' if cs.get(i + 1) == Some(&'|') => push2(&mut toks, "||", &mut i),
             // Affix operators: begins-with / contains / ends-with. A lone
-            // `^`/`$`/`*` is reserved (no arithmetic yet), so it errors.
+            // `^`/`$` is reserved (no exponent operator), so it errors.
             '^' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "^=", &mut i),
             '$' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "$=", &mut i),
             '*' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "*=", &mut i),
-            '-' | '+' if cs.get(i + 1).is_some_and(|d| d.is_ascii_digit()) => {
+            // `++` is string concat (for `add`); kept distinct from `+`.
+            '+' if cs.get(i + 1) == Some(&'+') => push2(&mut toks, "++", &mut i),
+            // A leading `+`/`-` is part of a numeric literal only in *unary*
+            // position (expression start, or right after an operator/`(`). After
+            // a value it is the binary add/subtract operator — so `amount - 5`
+            // subtracts, while `a > -5` compares against negative five.
+            '-' | '+'
+                if !ends_value(&toks) && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit()) =>
+            {
                 lex_number(&cs, &mut i, &mut toks)?;
             }
+            // Arithmetic / value-expression operators (used by `add`).
+            '+' => push_sym(&mut toks, "+", &mut i),
+            '-' => push_sym(&mut toks, "-", &mut i),
+            '*' => push_sym(&mut toks, "*", &mut i),
+            '/' => push_sym(&mut toks, "/", &mut i),
+            '%' => push_sym(&mut toks, "%", &mut i),
+            '?' => push_sym(&mut toks, "?", &mut i),
+            ':' => push_sym(&mut toks, ":", &mut i),
+            ',' => push_sym(&mut toks, ",", &mut i),
             c if c.is_ascii_digit() => lex_number(&cs, &mut i, &mut toks)?,
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
@@ -862,6 +942,15 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
         }
     }
     Ok(toks)
+}
+
+/// Whether the last lexed token completes a value (a literal, a column, or a
+/// closing paren). A following `+`/`-` is then a binary operator, not a sign.
+fn ends_value(toks: &[ETok]) -> bool {
+    matches!(
+        toks.last(),
+        Some(ETok::Num(_) | ETok::Ident(_) | ETok::Str(_) | ETok::Sym(")"))
+    )
 }
 
 fn push_sym(toks: &mut Vec<ETok>, s: &'static str, i: &mut usize) {
@@ -1048,6 +1137,200 @@ impl ExprParser<'_> {
             Operand::Col(c) => self.types.get(&c.name) == Some(&ColType::Num),
             Operand::Str(_) => false,
         }
+    }
+
+    // --- value expressions (for `add`) --------------------------------------
+
+    /// Parse a complete value expression, erroring on trailing tokens.
+    fn parse_value_top(&mut self) -> Result<ValExpr, Error> {
+        let expr = self.parse_value()?;
+        if self.pos != self.toks.len() {
+            return Err(err("trailing tokens in add expression"));
+        }
+        Ok(expr)
+    }
+
+    /// A value expression. Precedence (loosest first): `?:` ternary, `++`
+    /// concat, `+ -`, `* / %`, unary `-`, then atoms. A purely boolean
+    /// expression (a bare comparison, e.g. `add ok amount > 0`) yields `t`/`f`.
+    fn parse_value(&mut self) -> Result<ValExpr, Error> {
+        // A leading boolean form is either a ternary condition or, on its own, a
+        // boolean-valued column. Try it first and backtrack if it isn't one (an
+        // arithmetic value like `a * b` isn't a comparison and fails fast here).
+        let start = self.pos;
+        if let Ok(test) = self.parse_or() {
+            if self.eat("?") {
+                let then_ = self.parse_value()?;
+                if !self.eat(":") {
+                    return Err(err("expected ':' in ?: expression"));
+                }
+                let else_ = self.parse_value()?;
+                return Ok(ValExpr::Cond {
+                    test: Box::new(test),
+                    then_: Box::new(then_),
+                    else_: Box::new(else_),
+                });
+            }
+            if self.pos == self.toks.len() {
+                return Ok(ValExpr::Bool(Box::new(test)));
+            }
+        }
+        self.pos = start;
+        self.parse_concat()
+    }
+
+    fn parse_concat(&mut self) -> Result<ValExpr, Error> {
+        let mut parts = vec![self.parse_additive()?];
+        while self.eat("++") {
+            parts.push(self.parse_additive()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.pop().unwrap()
+        } else {
+            ValExpr::Concat(parts)
+        })
+    }
+
+    fn parse_additive(&mut self) -> Result<ValExpr, Error> {
+        let mut e = self.parse_mul()?;
+        loop {
+            let op = if self.eat("+") {
+                ArithOp::Add
+            } else if self.eat("-") {
+                ArithOp::Sub
+            } else {
+                break;
+            };
+            let rhs = self.parse_mul()?;
+            e = ValExpr::Arith {
+                op,
+                lhs: Box::new(e),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(e)
+    }
+
+    fn parse_mul(&mut self) -> Result<ValExpr, Error> {
+        let mut e = self.parse_unary()?;
+        loop {
+            let op = if self.eat("*") {
+                ArithOp::Mul
+            } else if self.eat("/") {
+                ArithOp::Div
+            } else if self.eat("%") {
+                ArithOp::Mod
+            } else {
+                break;
+            };
+            let rhs = self.parse_unary()?;
+            e = ValExpr::Arith {
+                op,
+                lhs: Box::new(e),
+                rhs: Box::new(rhs),
+            };
+        }
+        Ok(e)
+    }
+
+    fn parse_unary(&mut self) -> Result<ValExpr, Error> {
+        if self.eat("-") {
+            Ok(ValExpr::Neg(Box::new(self.parse_unary()?)))
+        } else if self.eat("+") {
+            self.parse_unary()
+        } else {
+            self.parse_atom()
+        }
+    }
+
+    fn parse_atom(&mut self) -> Result<ValExpr, Error> {
+        if self.eat("(") {
+            let e = self.parse_value()?;
+            if !self.eat(")") {
+                return Err(err("expected ')' in add expression"));
+            }
+            return Ok(e);
+        }
+        match self.toks.get(self.pos).cloned() {
+            Some(ETok::Num(n)) => {
+                self.pos += 1;
+                Ok(ValExpr::Num(n))
+            }
+            Some(ETok::Str(s)) => {
+                self.pos += 1;
+                Ok(ValExpr::Str(s))
+            }
+            Some(ETok::Ident(name)) => {
+                self.pos += 1;
+                // A name directly followed by `(` is a function/`prev`/`rownum`
+                // call; otherwise it is a column reference.
+                if self.eat("(") {
+                    self.parse_call(&name)
+                } else {
+                    Ok(ValExpr::Col(ColRef::new(name)))
+                }
+            }
+            _ => Err(err(
+                "expected a column, number, string, or function in add expression",
+            )),
+        }
+    }
+
+    /// Parse a call `name(...)` — the opening `(` already consumed.
+    fn parse_call(&mut self, name: &str) -> Result<ValExpr, Error> {
+        if name == "rownum" {
+            if !self.eat(")") {
+                return Err(err("rownum() takes no arguments"));
+            }
+            return Ok(ValExpr::Rownum);
+        }
+        let args = self.parse_args()?;
+        if name == "prev" {
+            let [ValExpr::Col(c)] = &args[..] else {
+                return Err(err("prev() takes a single column, e.g. prev(amount)"));
+            };
+            return Ok(ValExpr::Prev(c.clone()));
+        }
+        let func = Func::from_name(name).ok_or_else(|| {
+            err(match crate::error::did_you_mean(name, Func::NAMES) {
+                Some(s) => format!("unknown function: {name} (did you mean `{s}`?)"),
+                None => format!("unknown function: {name}"),
+            })
+        })?;
+        check_arity(func, args.len())?;
+        Ok(ValExpr::Func(func, args))
+    }
+
+    /// Parse a comma-separated argument list up to and including the closing `)`.
+    fn parse_args(&mut self) -> Result<Vec<ValExpr>, Error> {
+        let mut args = Vec::new();
+        if self.eat(")") {
+            return Ok(args);
+        }
+        loop {
+            args.push(self.parse_value()?);
+            if self.eat(")") {
+                break;
+            }
+            if !self.eat(",") {
+                return Err(err("expected ',' or ')' in function arguments"));
+            }
+        }
+        Ok(args)
+    }
+}
+
+/// Reject a function call with the wrong number of arguments.
+fn check_arity(func: Func, n: usize) -> Result<(), Error> {
+    let ok = match func {
+        Func::Min | Func::Max | Func::Coalesce => n >= 1,
+        // The rest are unary.
+        _ => n == 1,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(err(format!("{}() got {n} argument(s)", func.name())))
     }
 }
 
@@ -1519,5 +1802,91 @@ mod tests {
         };
         assert_eq!(j.lsuffix.as_deref(), Some("_l"));
         assert_eq!(j.rsuffix.as_deref(), Some("_r"));
+    }
+
+    /// The single `add`'s expression, for assertions.
+    fn add_expr(script: &str) -> ValExpr {
+        let plan = parse(script).unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!("expected a transform stage");
+        };
+        let Stmt::Add(a) = &stmts[0] else {
+            panic!("expected an add statement, got {:?}", stmts[0]);
+        };
+        a.expr.clone()
+    }
+
+    #[test]
+    fn add_arithmetic_precedence() {
+        // a + b * c parses as a + (b * c).
+        let ValExpr::Arith {
+            op: ArithOp::Add,
+            rhs,
+            ..
+        } = add_expr("add v a + b * c")
+        else {
+            panic!("expected a top-level +");
+        };
+        assert!(matches!(
+            *rhs,
+            ValExpr::Arith {
+                op: ArithOp::Mul,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_binary_minus_is_not_a_negative_literal() {
+        // `amount - prev(amount)` must lex `-` as subtraction, not a sign on a
+        // number — the case that makes a step delta expressible.
+        assert!(matches!(
+            add_expr("add d amount - prev(amount)"),
+            ValExpr::Arith {
+                op: ArithOp::Sub,
+                ..
+            }
+        ));
+        // But in unary position a signed number is still a literal.
+        assert!(matches!(add_expr("add d -5"), ValExpr::Num(n) if n == -5.0));
+    }
+
+    #[test]
+    fn add_prev_and_rownum_are_stateful() {
+        for script in ["add d a - prev(a)", "add n rownum()"] {
+            let plan = parse(script).unwrap();
+            let Stage::Transform(stmts) = &plan.stages[0] else {
+                panic!();
+            };
+            assert!(stmts[0].is_stateful(), "{script} should be stateful");
+        }
+        // Pure arithmetic is not stateful (it can shard).
+        let plan = parse("add t a * 2").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!();
+        };
+        assert!(!stmts[0].is_stateful());
+    }
+
+    #[test]
+    fn add_ternary_and_concat() {
+        assert!(matches!(
+            add_expr("add tier a > 1 ? 'big' : 'small'"),
+            ValExpr::Cond { .. }
+        ));
+        assert!(matches!(
+            add_expr("add full a ++ ' ' ++ b"),
+            ValExpr::Concat(parts) if parts.len() == 3
+        ));
+    }
+
+    #[test]
+    fn add_rejects_bad_input() {
+        assert!(parse("add").is_err()); // no name
+        assert!(parse("add x").is_err()); // no expression
+        assert!(parse("add x a +").is_err()); // dangling operator
+        assert!(parse("add x bogus(a)").is_err()); // unknown function
+        assert!(parse("add x prev(a + 1)").is_err()); // prev needs a bare column
+        assert!(parse("add x round(a, b)").is_err()); // wrong arity
     }
 }
