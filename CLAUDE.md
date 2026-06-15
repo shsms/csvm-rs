@@ -183,8 +183,10 @@ lifetime, so there is one `apply` implementation.
 [--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--print-engine]
 [-V/--version] [SCRIPT] [INPUT]`. The script is the first positional; the input
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
-is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and every
-positional is an input. `--chunk-size`/`--sort-buffer` accept K/M/G (binary)
+is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the
+single positional is the input. At most one input is accepted (a second
+positional is an error). Long options take `--flag VALUE` or `--flag=VALUE`.
+`--chunk-size`/`--sort-buffer` accept K/M/G (binary)
 suffixes. `--no-header` treats the input as headerless and auto-names columns
 `c1,c2,…` (main peeks the first line to count them — for stdin it reads the line
 and chains it back; `hdr` wins if both are given). `--color` honors

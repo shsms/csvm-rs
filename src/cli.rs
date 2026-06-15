@@ -2,10 +2,11 @@
 //!
 //! The script is the first positional and the input file an optional second
 //! positional (`csvm SCRIPT [INPUT]`, like `awk 'prog' file`); input defaults to
-//! stdin, and a bare `-` is also stdin. `-o` sets the output file (default
-//! stdout), `-n` the worker count, `-t`/`--temp-dir` the sort spill directory,
-//! `--chunk-size` the input chunk size, and `--print-engine` dumps the compiled
-//! plan and exits.
+//! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
+//! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
+//! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
+//! `--no-header`, `--color`, and `--print-engine`. Long options take their value
+//! as `--flag VALUE` or `--flag=VALUE`. See [`USAGE`] for the full help.
 
 use std::path::PathBuf;
 
@@ -63,43 +64,48 @@ fn parse_size(s: &str, what: &str) -> Result<i64, String> {
 }
 
 pub const USAGE: &str = "\
-usage: csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
-            [--print-engine] [SCRIPT] [INPUT]
+usage: csvm [OPTIONS] SCRIPT [INPUT]
+       csvm [OPTIONS] -f FILE [INPUT]
 
-  SCRIPT             pipe-syntax pipeline (required unless -f is given)
-  INPUT              input CSV file (default: stdin; '-' is stdin)
-  -o, --output OUT   output CSV file (default: stdout)
-  -n, --threads N    worker threads (default: 1; <=0 means 1)
-  -f, --file FILE    read the pipeline from FILE (then SCRIPT is omitted)
-  -t, --temp-dir DIR directory for sort spill files (default: system temp)
-  --chunk-size SIZE  input chunk size; K/M/G suffix ok (default: 1000000)
-  --sort-buffer SIZE in-memory budget before sort spills to temp files;
-                     K/M/G suffix ok (default: 256 MiB)
-  --no-header        input has no header row; columns are named c1, c2, ...
-  --print-engine     print the compiled execution plan and exit
-  --color WHEN       colour `color` rules: auto (TTY only), always, never
-  -h, --help         show this help
-  -V, --version      print version and exit
+  SCRIPT   pipe-syntax pipeline; quote it so the shell keeps | > and spaces
+  INPUT    input CSV (default: stdin; '-' is stdin); first line is the header
 
-Commands (chain with |):
-  cols A,B,C | cols -v A   keep / drop columns          (alias: cut)
-  select EXPR              keep matching rows            (alias: where, filter)
-  sort COL[=nr] ...        sort: n numeric, r reverse
-  head [N]                 first N rows (default 10)
-  stats [COLS]             per-column count/min/max/sum/mean/stddev
-  join [(SUB)] FILE on K   merge a right file by key (-l/-r/-F: left/right/full)
-  color ... | fmt          colourise / whitespace-align output
-  rename OLD=NEW ...       rename columns
-  hdr A,B,C                name columns of headerless input (must be first)
-  to-num / to-str COLS     force column type (usually implicit)
+options (--flag VALUE or --flag=VALUE):
+  -o, --output FILE    write to FILE (default: stdout)
+  -f, --file FILE      read the pipeline from FILE instead of SCRIPT
+      --no-header      input has no header; name columns c1, c2, ...
+  -n, --threads N      worker threads for a seekable file (default: 1)
+  -t, --temp-dir DIR   directory for sort spill files (default: system temp)
+      --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
+      --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M)
+      --color WHEN     auto (TTY only) | always | never
+      --print-engine   print the compiled plan and exit
+  -h, --help           show this help
+  -V, --version        print version and exit
 
-select EXPR operators:
+commands (chain with |):
+  cols A,B,C | -v A     keep / drop columns                  (alias: cut)
+  select EXPR | -v EXPR keep / drop matching rows     (alias: where, filter)
+  sort COL[=nr] ...     multi-key sort; n numeric, r reverse
+  head [N]              first N rows (default 10; -n -N keeps all but last N)
+  tail [N]              last N rows (default 10)
+  uniq [COLS]           drop duplicate rows, keep first      (alias: dedup)
+  stats [COLS]          per-column count/min/max/sum/mean/stddev
+  join [(SUB)] FILE on K  merge a right file by key (-l/-r/-F left/right/full)
+  rename OLD=NEW ...    rename columns
+  to-num / to-str COLS  force column type (usually implicit)
+  hdr A,B,C             name columns of headerless input (must be first)
+  color ... | fmt       colourise / whitespace-align output
+
+select operators:
   == != < > <= >=   ^= *= $= (begins/contains/ends)   =~ !~ (regex)
-  && || ! ()   numbers 3.14   strings 'txt'   `col-with-dashes`   # comment
+  && || ! ()   number 3.14   string 'txt'   backtick col-with-dashes   # comment
 
 examples:
-  csvm 'select flag == 't' && amount > 1000 | cols id,amount' data.csv
-  csvm 'sort score=nr | head 5 | fmt' data.csv";
+  csvm 'select flag == \"t\" && amount > 1000 | cols id,amount' data.csv
+  csvm 'sort score=nr | head 5 | fmt' data.csv
+  csvm 'stats | sort mean=nr | fmt' data.csv
+  csvm 'join prices.csv on sku | select qty > 0' sales.csv";
 
 /// Outcome of parsing: run with `Args`, or print help / version and exit.
 pub enum Parsed {
@@ -191,8 +197,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
 
     // Positionals are `SCRIPT [INPUT]` (awk-style): the script is the first
     // positional and required, the input file optional (default stdin); a bare
-    // `-` input is stdin. With `-f FILE` the script comes from the file, so every
-    // positional is an input instead.
+    // `-` input is stdin. With `-f FILE` the script comes from the file, so the
+    // single positional is the input instead. (At most one input either way; a
+    // second positional is an error.)
     let mut positionals = positionals.into_iter();
     let script = if script_file.is_some() {
         String::new()
@@ -252,8 +259,8 @@ mod tests {
 
     #[test]
     fn defaults_and_script() {
-        let a = args(&["(cols a)"]).unwrap();
-        assert_eq!(a.script, "(cols a)");
+        let a = args(&["cols a"]).unwrap();
+        assert_eq!(a.script, "cols a");
         assert_eq!(a.in_file, None);
         assert_eq!(a.threads, 1);
         assert_eq!(a.chunk_size, DEFAULT_CHUNK_SIZE);
@@ -262,37 +269,31 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let a = args(&["-o", "out.csv", "-n", "4", "--print-engine", "(sort-by x)"]).unwrap();
+        let a = args(&["-o", "out.csv", "-n", "4", "--print-engine", "sort x"]).unwrap();
         assert_eq!(a.out_file.as_deref(), Some("out.csv"));
         assert_eq!(a.threads, 4);
         assert!(a.print_engine);
-        assert_eq!(a.script, "(sort-by x)");
+        assert_eq!(a.script, "sort x");
         assert_eq!(a.in_file, None); // no input positional -> stdin
     }
 
     #[test]
     fn long_flag_equals_value() {
         // GNU `--flag=value` form, alongside `--flag value`.
-        let a = args(&[
-            "--threads=3",
-            "--color=always",
-            "--output=o.csv",
-            "(cols a)",
-        ])
-        .unwrap();
+        let a = args(&["--threads=3", "--color=always", "--output=o.csv", "cols a"]).unwrap();
         assert_eq!(a.threads, 3);
         assert_eq!(a.color, ColorWhen::Always);
         assert_eq!(a.out_file.as_deref(), Some("o.csv"));
         // The value keeps any further `=` (split on the first only).
         assert_eq!(
-            args(&["--output=a=b.csv", "(cols a)"])
+            args(&["--output=a=b.csv", "cols a"])
                 .unwrap()
                 .out_file
                 .as_deref(),
             Some("a=b.csv")
         );
         // A bad value still errors through the same path.
-        assert!(parse(["--color=bogus".to_string(), "(cols a)".to_string()]).is_err());
+        assert!(parse(["--color=bogus".to_string(), "cols a".to_string()]).is_err());
     }
 
     #[test]
@@ -363,13 +364,13 @@ mod tests {
 
     #[test]
     fn non_positive_threads_clamp_to_one() {
-        assert_eq!(args(&["-n", "0", "(cols a)"]).unwrap().threads, 1);
-        assert_eq!(args(&["-n", "-3", "(cols a)"]).unwrap().threads, 1);
+        assert_eq!(args(&["-n", "0", "cols a"]).unwrap().threads, 1);
+        assert_eq!(args(&["-n", "-3", "cols a"]).unwrap().threads, 1);
     }
 
     #[test]
     fn errors() {
-        assert!(parse(["--nope".to_string(), "(cols a)".to_string()]).is_err()); // unknown option
+        assert!(parse(["--nope".to_string(), "cols a".to_string()]).is_err()); // unknown option
         assert!(parse(std::iter::empty()).is_err()); // no script
         // A third positional beyond SCRIPT and INPUT is an error.
         assert!(parse(["s".to_string(), "in.csv".to_string(), "extra".to_string()]).is_err());
@@ -377,7 +378,7 @@ mod tests {
 
     #[test]
     fn script_file_flag() {
-        // With -f, the script comes from the file and positionals are inputs.
+        // With -f, the script comes from the file and the positional is the input.
         let a = args(&["-f", "prog.csvm", "data.csv"]).unwrap();
         assert_eq!(a.script_file.as_deref(), Some("prog.csvm"));
         assert_eq!(a.in_file.as_deref(), Some("data.csv"));
