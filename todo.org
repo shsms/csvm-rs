@@ -105,6 +105,19 @@ implemented (=src/color.rs=, =exec::render=). Still open:
   from =ColStats=), for z-score-style heatmaps.
 - A =color= rule referencing a column other than the one painted (=color -c qty
   red amount < 0= already works; document the cell-vs-predicate-column split).
+- Combinable gradients (=-g=). Today a ramp is two *plain* names and paints the
+  *foreground only* (=parse_ramp= → names; =Ramp::at= sets just =fg=); the
+  =+=/=bg:=/attribute combining works only in the predicate forms. Lift this so a
+  gradient can carry a uniform style:
+  - background gradient (heatmap): interpolate the =bg= channel instead of =fg=.
+  - attributes on every gradient cell (=bold=/=dim=/=underline=).
+  - optional flat second channel (e.g. fg gradient over a fixed =bg:gray=).
+  Endpoints stay plain names (interpolation needs RGB, and the attributes are
+  uniform across the ramp anyway). Proposed spelling: trailing bare modifiers
+  after the ramp/bounds, =color -g amount green:red 0 100 bg+bold=, reusing the
+  gradient parser's token-peeking (=:=-token = ramp, two numbers = bounds, else a
+  modifier). =Ramp= grows a fixed =Style= + an fg/bg target; =Ramp::at= ORs them
+  in. Pairs naturally with the =#rrggbb= and 3-stop-ramp items above.
 
 * Other ideas (parking lot)
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
