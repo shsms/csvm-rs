@@ -17,6 +17,10 @@ const VBLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '�
 /// dropped and reported rather than flooding the screen ("no silent caps").
 pub const MAX_BARS: usize = 50;
 
+/// Cap on the *default* chart width, so an absurd `$COLUMNS` can't make a chart
+/// megabytes wide. An explicit `--width` overrides it (the user's choice).
+const MAX_W: usize = 80;
+
 /// Terminal width in columns, from `$COLUMNS` or the conventional 80 fallback
 /// (the design's 80×24 default — no ioctl dependency).
 fn term_cols() -> usize {
@@ -93,7 +97,8 @@ impl Histogram {
         let axis_w = edges.iter().map(String::len).max().unwrap_or(1);
 
         let max_count = self.counts.iter().copied().max().unwrap_or(0);
-        let bars = bar_width.unwrap_or_else(|| term_cols().saturating_sub(axis_w + 12).max(10));
+        let bars =
+            bar_width.unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(axis_w + 12).max(10));
 
         let mut out = String::new();
         out.push_str(title);
@@ -146,7 +151,8 @@ pub fn render_bars(
         hi = hi.max(*v);
     }
     let span = hi - lo;
-    let w = bar_width.unwrap_or_else(|| term_cols().saturating_sub(label_w + 14).max(10));
+    let w =
+        bar_width.unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(label_w + 14).max(10));
     let zero = pos_in(0.0, lo, span, w);
 
     let mut out = String::new();
@@ -190,7 +196,7 @@ pub fn render_spark(title: &str, values: &[f64], width: Option<usize>, skipped: 
     if values.is_empty() {
         return format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n");
     }
-    let cols = width.unwrap_or_else(|| term_cols().min(80)).max(1);
+    let cols = width.unwrap_or_else(|| term_cols().min(MAX_W)).max(1);
     // Bucket-average so a long series collapses to one cell per column.
     let buckets: Vec<f64> = if values.len() <= cols {
         values.to_vec()
@@ -372,7 +378,7 @@ pub fn render_xy(
     let ylo_s = format_num(ylo);
     let gutter = yhi_s.len().max(ylo_s.len());
     let wcells = width
-        .unwrap_or_else(|| term_cols().saturating_sub(gutter + 3).min(80))
+        .unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(gutter + 3))
         .max(4);
     let hcells = height.unwrap_or(15).max(2);
 
