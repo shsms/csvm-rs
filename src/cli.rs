@@ -123,11 +123,23 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut no_header = false;
 
     let mut it = args.into_iter();
-    while let Some(arg) = it.next() {
+    while let Some(raw) = it.next() {
+        // Accept the GNU `--flag=value` form alongside `--flag value`: split a
+        // long option on its first `=` and use the right side as the value.
+        let (arg, inline) = match raw.split_once('=') {
+            Some((flag, val)) if flag.starts_with("--") => {
+                (flag.to_string(), Some(val.to_string()))
+            }
+            _ => (raw, None),
+        };
         macro_rules! value {
             () => {
-                it.next()
-                    .ok_or_else(|| format!("missing value for {arg}"))?
+                match inline {
+                    Some(v) => v,
+                    None => it
+                        .next()
+                        .ok_or_else(|| format!("missing value for {arg}"))?,
+                }
             };
         }
         match arg.as_str() {
@@ -256,6 +268,31 @@ mod tests {
         assert!(a.print_engine);
         assert_eq!(a.script, "(sort-by x)");
         assert_eq!(a.in_file, None); // no input positional -> stdin
+    }
+
+    #[test]
+    fn long_flag_equals_value() {
+        // GNU `--flag=value` form, alongside `--flag value`.
+        let a = args(&[
+            "--threads=3",
+            "--color=always",
+            "--output=o.csv",
+            "(cols a)",
+        ])
+        .unwrap();
+        assert_eq!(a.threads, 3);
+        assert_eq!(a.color, ColorWhen::Always);
+        assert_eq!(a.out_file.as_deref(), Some("o.csv"));
+        // The value keeps any further `=` (split on the first only).
+        assert_eq!(
+            args(&["--output=a=b.csv", "(cols a)"])
+                .unwrap()
+                .out_file
+                .as_deref(),
+            Some("a=b.csv")
+        );
+        // A bad value still errors through the same path.
+        assert!(parse(["--color=bogus".to_string(), "(cols a)".to_string()]).is_err());
     }
 
     #[test]
