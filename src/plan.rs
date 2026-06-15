@@ -630,6 +630,34 @@ impl ColorRule {
     }
 }
 
+/// What kind of chart `graph` draws. Only `Hist` so far; bar/scatter/line/spark
+/// are the planned follow-ups (see `todo.org`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphKind {
+    /// `graph hist COL`: distribution of one numeric column as binned bars.
+    Hist,
+}
+
+/// Presentation options shared across chart kinds; an absent field falls back to
+/// a sensible default (bin count from the data, width from the terminal).
+#[derive(Clone, Debug, Default)]
+pub struct GraphOpts {
+    pub bins: Option<usize>,
+    pub width: Option<usize>,
+    pub title: Option<String>,
+}
+
+/// A `graph` sink: draw a terminal chart from the columns reaching it instead of
+/// emitting CSV. Plan metadata (like `colors`) and the *last* command — it
+/// terminates the pipe, so it renders from the buffered output (see
+/// `exec::render`), reusing the whole executor upstream.
+#[derive(Clone, Debug)]
+pub struct GraphSpec {
+    pub kind: GraphKind,
+    pub cols: Vec<ColRef>,
+    pub opts: GraphOpts,
+}
+
 /// A fully compiled pipeline.
 #[derive(Clone, Debug)]
 pub struct Plan {
@@ -640,6 +668,8 @@ pub struct Plan {
     pub input_header: Option<Vec<String>>,
     /// Colour rules, applied to the output rows at render time.
     pub colors: Vec<ColorRule>,
+    /// A terminal chart to draw instead of emitting CSV (the `graph` sink).
+    pub graph: Option<GraphSpec>,
 }
 
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
@@ -1186,6 +1216,12 @@ impl Plan {
         for rule in &mut self.colors {
             rule.resolve(&header)?;
         }
+        // The graph sink draws from the final columns; resolve its references too.
+        if let Some(g) = &mut self.graph {
+            for c in &mut g.cols {
+                c.resolve(&header)?;
+            }
+        }
         Ok(header)
     }
 }
@@ -1292,6 +1328,7 @@ mod tests {
             output: OutputFormat::Csv,
             input_header: None,
             colors: Vec::new(),
+            graph: None,
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -1334,6 +1371,7 @@ mod tests {
             output: OutputFormat::Csv,
             input_header: None,
             colors: Vec::new(),
+            graph: None,
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column { name, .. } if name == "nope"));

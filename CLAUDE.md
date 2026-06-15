@@ -138,6 +138,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
+- **`graph KIND COL [flags]`** (alias `plot`) is a terminal-chart **sink**: it
+  draws from the columns reaching it instead of emitting CSV, so it must be the
+  *last* command (the parser rejects anything after it). Plan metadata
+  (`Plan.graph`, `GraphSpec` in `plan.rs`), not a stage — like `fmt`/`color` it
+  renders in `exec::render` from the buffered output, reusing the whole executor
+  upstream. So far only `graph hist COL` (`--bins N`, `--width W`, `--title T`):
+  `exec::render_graph` pulls the column's values, drops non-numeric/empty cells
+  *loudly* (counted and reported below the chart — the "strict and loud" policy),
+  and `graph::Histogram` (in `src/graph.rs`) bins them (Sturges' default, capped
+  at 50) and draws Unicode block bars with an eighth-block fractional tail. Width
+  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). Bar/scatter/line/
+  spark and colour ramps are the planned follow-ups (`todo.org`).
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
@@ -262,10 +274,11 @@ a `Stmt`/`Stage`. `join` is implemented (`Stage::Join`, a sub-`Plan` right side 
 the `Plan` is now a small DAG). The computed `add` column is implemented
 (`Stmt::Add`, the `ValExpr` value engine; `prev`/`rownum` take the ordered
 in-memory path). Group-by aggregation is implemented (`Stage::Group`,
-`group … | agg …`). Planned (see `todo.org` for design notes):
+`group … | agg …`), as is terminal-native graphing's first chart
+(`graph hist`, `src/graph.rs`). Planned (see `todo.org` for design notes):
 conditional colouring for `fmt`, pluggable formats via a
-`Source`/`Sink` trait (Parquet, TSV), and terminal-native graphing
-(`graph hist/bar/scatter`, building on group-by).
+`Source`/`Sink` trait (Parquet, TSV), and the rest of `graph`
+(bar/scatter/line/spark + colour ramps).
 
 ## Conventions
 

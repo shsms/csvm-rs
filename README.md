@@ -78,6 +78,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `delta [-s SUF] a,b` | append `col_delta = col - prev(col)` per column (shorthand) |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
+| `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
@@ -160,6 +161,9 @@ csvm 'stats | fmt' input.csv
 # group-by: total and mean amount per region, biggest first
 csvm 'group region | agg sum(amount),mean(amount) | sort amount_sum=nr | fmt' sales.csv
 
+# terminal histogram of a column's distribution (after a filter)
+csvm 'select region == "EU" | graph hist amount --bins 12' sales.csv
+
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
 ```
@@ -227,9 +231,9 @@ and alignment — reporting per-operation throughput.
 ## Roadmap
 
 The pipe language is built to grow. Planned: conditional colouring for `fmt`,
-pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and terminal-native
-graphing (`graph hist/bar/scatter`, building on group-by). See `todo.org` for
-design notes.
+pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and more
+terminal-native charts (`graph bar/scatter/line/spark`; `graph hist` ships
+today). See `todo.org` for design notes.
 
 ## License
 

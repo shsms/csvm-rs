@@ -22,8 +22,9 @@ use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpOp, ColRef, ColorRule,
-    ColorScope, ConvStmt, Func, GroupStmt, JoinStmt, JoinType, Operand, OutputFormat, Plan,
-    ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt, UniqStmt, ValExpr,
+    ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
+    Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
+    Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -43,6 +44,7 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
         && builder.output == OutputFormat::Csv
         && builder.header.is_none()
         && builder.colors.is_empty()
+        && builder.graph.is_none()
     {
         return Err(err("empty script"));
     }
@@ -58,6 +60,7 @@ fn err(msg: impl Into<String>) -> Error {
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
     "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg",
+    "graph",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -87,6 +90,8 @@ struct Builder {
     header: Option<Vec<String>>,
     /// Colour rules from `color` commands (plan metadata, not stages).
     colors: Vec<ColorRule>,
+    /// A `graph` sink (plan metadata; the last command, terminates the pipe).
+    graph: Option<GraphSpec>,
 }
 
 impl Builder {
@@ -147,10 +152,16 @@ impl Builder {
             output: self.output,
             input_header: self.header.take(),
             colors: std::mem::take(&mut self.colors),
+            graph: self.graph.take(),
         }
     }
 
     fn parse_stage(&mut self, stage: &str) -> Result<(), Error> {
+        // `graph` is a terminal sink: it emits a chart, not rows, so nothing may
+        // follow it in the pipeline.
+        if self.graph.is_some() {
+            return Err(err("graph must be the last command in the pipeline"));
+        }
         let (cmd, rest) = split_first_word(stage);
         match cmd {
             "cols" | "cut" => self.parse_cols(rest),
@@ -163,6 +174,7 @@ impl Builder {
             "stats" => self.parse_stats(rest),
             "group" => self.parse_group(rest),
             "agg" => self.parse_agg(rest),
+            "graph" | "plot" => self.parse_graph(rest),
             "uniq" | "dedup" => self.parse_uniq(rest),
             "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
@@ -384,6 +396,65 @@ impl Builder {
             key_positions: Vec::new(),
             aggs,
         }));
+        Ok(())
+    }
+
+    /// `graph hist COL [--bins N] [--width W] [--title T]` — a terminal-chart
+    /// sink. Draws from the columns reaching it instead of emitting CSV, so it
+    /// must be the last command. Only the histogram is implemented so far.
+    fn parse_graph(&mut self, rest: &str) -> Result<(), Error> {
+        let (kind_word, rest) = split_first_word(rest.trim());
+        let kind = match kind_word {
+            "hist" | "histogram" => GraphKind::Hist,
+            "" => return Err(err("graph expects a chart type, e.g. graph hist amount")),
+            other => {
+                return Err(err(format!(
+                    "graph: unknown chart type `{other}` (try: hist)"
+                )));
+            }
+        };
+        let mut opts = GraphOpts::default();
+        let mut positional = String::new();
+        let mut s = rest.trim();
+        while !s.is_empty() {
+            let (word, after) = split_first_word(s);
+            if let Some(v) = flag_value(word, after, "--bins") {
+                let (val, tail) = v?;
+                opts.bins = Some(parse_positive(&val, "--bins")?);
+                s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, "--width") {
+                let (val, tail) = v?;
+                opts.width = Some(parse_positive(&val, "--width")?);
+                s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, "--title") {
+                let (val, tail) = v?;
+                opts.title = Some(val);
+                s = tail.trim_start();
+            } else if word.starts_with('-') && word != "-" {
+                return Err(err(format!("graph: unknown flag `{word}`")));
+            } else {
+                if !positional.is_empty() {
+                    positional.push(' ');
+                }
+                positional.push_str(word);
+                s = after;
+            }
+        }
+        let cols = split_list(&positional);
+        match kind {
+            GraphKind::Hist => {
+                if cols.len() != 1 {
+                    return Err(err(
+                        "graph hist expects exactly one column, e.g. graph hist amount",
+                    ));
+                }
+            }
+        }
+        self.graph = Some(GraphSpec {
+            kind,
+            cols: cols.into_iter().map(ColRef::new).collect(),
+            opts,
+        });
         Ok(())
     }
 
@@ -827,6 +898,7 @@ fn identity_plan() -> Plan {
         output: OutputFormat::Csv,
         input_header: None,
         colors: Vec::new(),
+        graph: None,
     }
 }
 
@@ -950,6 +1022,14 @@ fn split_list(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// Parse a positive-integer flag value (`--bins`, `--width`).
+fn parse_positive(s: &str, name: &str) -> Result<usize, Error> {
+    s.parse::<usize>()
+        .ok()
+        .filter(|&n| n >= 1)
+        .ok_or_else(|| err(format!("{name} expects a positive integer, got `{s}`")))
 }
 
 /// The default `count` aggregate (counts rows) `group` uses when no `agg` follows.
@@ -1769,6 +1849,28 @@ mod tests {
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
         assert!(parse("group").is_err()); // no keys
+    }
+
+    #[test]
+    fn graph_parses_kind_column_and_flags() {
+        let plan = parse("graph hist amount --bins 12 --title Spread").unwrap();
+        let g = plan.graph.expect("graph metadata");
+        assert_eq!(g.kind, GraphKind::Hist);
+        assert_eq!(g.cols.len(), 1);
+        assert_eq!(g.cols[0].name, "amount");
+        assert_eq!(g.opts.bins, Some(12));
+        assert_eq!(g.opts.title.as_deref(), Some("Spread"));
+        assert!(parse("plot hist x").unwrap().graph.is_some()); // `plot` alias
+    }
+
+    #[test]
+    fn graph_must_be_last_and_well_formed() {
+        assert!(parse("graph hist x | sort x").is_err()); // nothing may follow a sink
+        assert!(parse("graph").is_err()); // missing chart type
+        assert!(parse("graph pie x").is_err()); // unknown chart type
+        assert!(parse("graph hist a b").is_err()); // hist takes exactly one column
+        assert!(parse("graph hist x --bins 0").is_err()); // bins must be positive
+        assert!(parse("graph hist x --frob 1").is_err()); // unknown flag
     }
 
     #[test]

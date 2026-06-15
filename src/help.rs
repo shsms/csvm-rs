@@ -261,6 +261,19 @@ named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-
         ],
     },
     CmdHelp {
+        name: "graph",
+        aliases: &["plot"],
+        summary: "draw a terminal chart (sink)",
+        synopsis: &[
+            "graph hist COL [--bins N] [--width W] [--title T]",
+            "  distribution of one numeric column as block bars",
+        ],
+        detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
+it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
+Width defaults to the terminal ($COLUMNS, else 80); bins to Sturges' rule.",
+        examples: &["csvm 'select region == \"EU\" | graph hist amount' sales.csv"],
+    },
+    CmdHelp {
         name: "join",
         aliases: &[],
         summary: "merge a second CSV by key",

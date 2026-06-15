@@ -128,7 +128,15 @@ implemented (=src/color.rs=, =exec::render=). Still open:
   modifier). =Ramp= grows a fixed =Style= + an fg/bg target; =Ramp::at= ORs them
   in. Pairs naturally with the =#rrggbb= and 3-stop-ramp items above.
 
-* TODO group-by aggregation =group COLS | agg FNS=
+* DONE group-by aggregation =group COLS | agg FNS=
+Implemented: =Stage::Group= (=GroupStmt=/=AggSpec=/=AggFunc= in =plan.rs=), the
+=Grouper= reducer in =exec.rs= folding rows into a =HashMap<key, GroupAcc>= in
+first-seen order, reusing one =ColStats= per distinct aggregated column. Both
+spellings ship (=group COLS | agg FNS=, fused; =agg FNS by COLS=; bare =agg= ⇒
+one global row). Funcs: =count/sum/min/max/mean/stddev= (bare =count= = rows,
+=count(col)= = non-empty). Still on the *in-memory path* — the streaming +
+sharded fast path (mirroring =stats=) is the follow-up below. Original notes:
+
 Prerequisite for =graph bar= (categorical charts), and useful on its own — the
 sibling of the =stats= profiler, which already reduces to one row *globally*;
 group-by reduces to one row *per key*.
@@ -213,12 +221,23 @@ empty cells, drop them from the plot, and print =(skipped 12 non-numeric rows)=
 below the chart rather than coercing to 0. Settle this before the binning code.
 
 ** Rollout (each phase shippable)
-1. group-by aggregation (above) — the =graph bar= prerequisite, useful alone.
-2. =graph hist= + the braille/block render core + terminal sizing — smallest
-   thing that proves the sink-stage + blocking + render path end to end.
+1. [X] group-by aggregation (above) — the =graph bar= prerequisite, useful alone.
+2. [X] =graph hist= + the block render core (=src/graph.rs=) + terminal sizing
+   (=$COLUMNS=) — proved the sink-stage (=Plan.graph=, =exec::render_graph=) +
+   blocking + render path end to end. (Used horizontal block bars, not braille —
+   braille is for scatter/line in phase 4.)
 3. =graph bar= (now that group-by exists) + =graph spark=.
 4. =graph scatter= / =line= on the braille canvas + multi-series + color ramps.
 5. (optional, feature-gated) SVG/PNG export.
+
+** Follow-ups now open
+- Streaming + sharded group-by (the =stats= mirror): group is on the in-memory
+  path; add a =group_shape= streaming fast path and an =-n>1= sharded path
+  (per-shard =HashMap=, merge unioning key sets, =ColStats::merge= per group).
+- Histogram polish: bin-edge labels show full =format_num= precision
+  (=16.688889=); round edges to a sensible step-derived precision.
+- =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=),
+  arriving with the phase-4 colour work.
 
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.

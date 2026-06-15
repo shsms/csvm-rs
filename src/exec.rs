@@ -19,9 +19,11 @@ use crate::color::Style;
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
+use crate::graph::Histogram;
 use crate::plan::{
-    AggFunc, AggSpec, BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, GroupStmt, JoinStmt,
-    Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr, apply_stmts,
+    AggFunc, AggSpec, BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphSpec,
+    GroupStmt, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
+    apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -1299,6 +1301,11 @@ pub fn render<W: Write>(
     color: bool,
     output: &mut W,
 ) -> Result<(), Error> {
+    // The graph sink draws a chart from the buffered output instead of emitting
+    // rows; it takes precedence over alignment/colour (which become no-ops).
+    if let Some(g) = &plan.graph {
+        return render_graph(bytes, g, output);
+    }
     let aligned = plan.output == OutputFormat::Aligned;
     let want_color = color && !plan.colors.is_empty();
     if !aligned && !want_color {
@@ -1324,6 +1331,47 @@ pub fn render<W: Write>(
     } else {
         write_csv_colored(&rows, styles.as_deref(), output)
     }
+}
+
+/// Draw the `graph` sink's chart from the buffered CSV output. The plan ran
+/// normally to produce rows (header + data); this pulls the charted column's
+/// values, dropping non-numeric/empty cells loudly (counted and reported), and
+/// renders the chart text. The header (row 0) is skipped.
+fn render_graph<W: Write>(bytes: &[u8], g: &GraphSpec, output: &mut W) -> Result<(), Error> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
+    let pos = g.cols[0].pos;
+    let mut values: Vec<f64> = Vec::new();
+    let mut skipped = 0u64;
+    let mut first = true;
+    csv::parse_chunk(text, |r| {
+        if first {
+            first = false; // header row
+            return;
+        }
+        match r.get(pos).map(|f| f.as_str()) {
+            // Empty and non-numeric cells are both excluded from the plot and
+            // counted, rather than coerced to 0 (the "strict and loud" policy).
+            Some(s) => match s.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => values.push(v),
+                _ => skipped += 1,
+            },
+            None => skipped += 1,
+        }
+    });
+    let title = g
+        .opts
+        .title
+        .clone()
+        .unwrap_or_else(|| g.cols[0].name.clone());
+    let chart = match g.kind {
+        GraphKind::Hist => match Histogram::build(&values, g.opts.bins, skipped) {
+            Some(h) => h.render(&title, g.opts.width),
+            None => format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n"),
+        },
+    };
+    output.write_all(chart.as_bytes())?;
+    Ok(())
 }
 
 /// The per-cell [`Style`] grid (`[row][col]`) for the colour rules over `rows`.
@@ -1594,6 +1642,17 @@ pub fn describe(plan: &Plan) -> String {
     }
     for rule in &plan.colors {
         out.push_str(&describe_color(rule));
+    }
+    if let Some(g) = &plan.graph {
+        let kind = match g.kind {
+            GraphKind::Hist => "hist",
+        };
+        let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
+        out.push_str(&format!("graph: {kind} {cols:?}"));
+        if let Some(b) = g.opts.bins {
+            out.push_str(&format!(" bins={b}"));
+        }
+        out.push('\n');
     }
     out
 }
@@ -2118,6 +2177,39 @@ mod tests {
         // f,0 sorts after t,14 when descending by the aggregate.
         assert_eq!(lines[1], "t,14");
         assert_eq!(lines[2], "f,0");
+    }
+
+    #[test]
+    fn graph_hist_renders_chart_from_a_column() {
+        // countZ is 5,0,0,9 over 4 rows; a histogram bins those values.
+        let out = render_str("graph hist countZ --bins 2", INPUT, false);
+        assert!(out.starts_with("countZ\n"), "{out}");
+        assert!(out.contains("n=4"));
+        assert!(out.contains("min=0"));
+        assert!(out.contains("max=9"));
+        assert!(out.contains("bins=2"));
+        assert!(out.contains('█')); // something was drawn
+    }
+
+    #[test]
+    fn graph_hist_composes_after_a_filter() {
+        // Only fieldA == 't' rows reach the graph: countZ 5,0,9.
+        let out = render_str("select fieldA == 't' | graph hist countZ", INPUT, false);
+        assert!(out.contains("n=3"), "{out}");
+    }
+
+    #[test]
+    fn graph_hist_reports_non_numeric_cells() {
+        // fieldA is text, so every value is skipped and nothing is plotted.
+        let out = render_str("graph hist fieldA", INPUT, false);
+        assert!(out.contains("no numeric values to plot"), "{out}");
+        assert!(out.contains("skipped 4 non-numeric"), "{out}");
+    }
+
+    #[test]
+    fn graph_title_overrides_the_column_name() {
+        let out = render_str("graph hist countZ --title Counts", INPUT, false);
+        assert!(out.starts_with("Counts\n"), "{out}");
     }
 
     #[test]

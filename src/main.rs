@@ -71,9 +71,13 @@ fn run() -> Result<(), String> {
 
     let color_on = color_enabled(args.color, args.out_file.as_deref());
     let mut output = open_output(&args)?;
-    // Aligning needs all rows (for column widths) and colouring needs all rows
-    // (for gradient ranges), so either one buffers first, then renders.
-    if plan.output == OutputFormat::Aligned || (color_on && !plan.colors.is_empty()) {
+    // Aligning needs all rows (for column widths), colouring needs all rows (for
+    // gradient ranges), and a graph draws from the whole output — so each of
+    // these buffers the run first, then renders.
+    if plan.output == OutputFormat::Aligned
+        || plan.graph.is_some()
+        || (color_on && !plan.colors.is_empty())
+    {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
         exec::render(&buf, &plan, color_on, &mut output).map_err(|e| e.to_string())?;
