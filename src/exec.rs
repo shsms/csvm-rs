@@ -358,6 +358,10 @@ struct Grouper<'a> {
     agg_slot: Vec<Option<usize>>,
     index: HashMap<String, usize>,
     groups: Vec<GroupAcc>,
+    /// Per-row scratch reused across rows (cleared, not reallocated) — the key
+    /// cells and their CSV encoding; only cloned into a group on first sight.
+    keysel: OwnedRow,
+    keybuf: String,
 }
 
 impl<'a> Grouper<'a> {
@@ -384,25 +388,28 @@ impl<'a> Grouper<'a> {
             agg_slot,
             index: HashMap::new(),
             groups: Vec::new(),
+            keysel: Vec::new(),
+            keybuf: String::new(),
         }
     }
 
     fn update(&mut self, row: &[Field]) {
-        let key: OwnedRow = self
-            .g
-            .key_positions
-            .iter()
-            .map(|&p| row.get(p).cloned().unwrap_or(Field::Str("")).into_owned())
-            .collect();
-        let mut keybuf = String::new();
-        csv::write_row(&mut keybuf, &key);
-        let idx = match self.index.get(&keybuf) {
+        // Build the key cells + their encoding in the reused scratch buffers.
+        self.keysel.clear();
+        self.keybuf.clear();
+        for &p in &self.g.key_positions {
+            self.keysel
+                .push(row.get(p).cloned().unwrap_or(Field::Str("")).into_owned());
+        }
+        csv::write_row(&mut self.keybuf, &self.keysel);
+        let idx = match self.index.get(&self.keybuf) {
             Some(&i) => i,
             None => {
                 let i = self.groups.len();
-                self.index.insert(keybuf, i);
+                // First sight of this key: take ownership of the scratch copies.
+                self.index.insert(self.keybuf.clone(), i);
                 self.groups.push(GroupAcc {
-                    key,
+                    key: self.keysel.clone(),
                     rows: 0,
                     stats: self
                         .stat_positions
