@@ -1392,22 +1392,22 @@ fn render_graph<W: Write>(
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
-            let (series, skipped, xlabels) = collect_xy(text, g.cols[0].pos, &ypos);
+            let XyData {
+                series,
+                skipped,
+                xends,
+                even_spacing,
+            } = collect_xy(text, g.cols[0].pos, &ypos);
             let connect = g.kind == GraphKind::Line;
-            // A non-numeric x plots against row order, but the axis still shows
-            // the real first/last x values — so just flag that spacing is by row.
-            let xnote = if xlabels.is_some() {
-                "even row spacing"
-            } else {
-                ""
-            };
+            // Only the row-index fallback distorts spacing; a temporal axis is true.
+            let xnote = if even_spacing { "even row spacing" } else { "" };
             if g.opts.svg {
                 let note = [skipped_note(skipped, 0), xnote.to_string()]
                     .into_iter()
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("  ");
-                crate::svg::xy(&title, &ynames, &series, connect, &note, xlabels)
+                crate::svg::xy(&title, &ynames, &series, connect, &note, xends)
             } else {
                 let title = if xnote.is_empty() {
                     title
@@ -1415,7 +1415,7 @@ fn render_graph<W: Write>(
                     format!("{title}  ({xnote})")
                 };
                 crate::graph::render_xy(
-                    &title, &ynames, &series, &g.opts, color, connect, skipped, xlabels,
+                    &title, &ynames, &series, &g.opts, color, connect, skipped, xends,
                 )
             }
         }
@@ -1424,27 +1424,35 @@ fn render_graph<W: Write>(
     Ok(())
 }
 
+/// The result of collecting `graph scatter`/`line` data: the points per
+/// y-series, the dropped-point count, an optional axis-end label override, and
+/// whether positions are by row (the even-spacing caveat).
+struct XyData {
+    series: XySeries,
+    skipped: u64,
+    /// Override for the bottom-axis end labels (`None` ⇒ format the numeric range).
+    xends: Option<(String, String)>,
+    /// True only for the row-index fallback, where spacing isn't the real x.
+    even_spacing: bool,
+}
+
 /// Collect `(x, y)` points per y-series from the buffered output (header
 /// skipped). A non-numeric y drops just that series' point (counted in
-/// `skipped`). The third return is the *row-index fallback* labels: if the x
-/// column is entirely non-numeric (e.g. timestamps), x becomes the 1-based row
-/// ordinal so an ordered series still charts, and this is `Some((first, last))`
-/// — the raw x-cell text of the first and last rows, so the axis can show the
-/// real range instead of `1`/`N`. `None` means a numeric x (no fallback); a row
-/// with a non-numeric x then contributes no points (counted in `skipped`).
-fn collect_xy(
-    text: &str,
-    xpos: usize,
-    ypos: &[usize],
-) -> (XySeries, u64, Option<(String, String)>) {
+/// `skipped`). The x column is handled in three modes:
+/// - **numeric** — plotted as-is, numeric axis labels;
+/// - **temporal** — if no value is numeric but every one parses as a timestamp,
+///   plot at true epoch positions and label the axis with formatted dates;
+/// - **row-index fallback** — otherwise (e.g. categories) plot against the
+///   1-based row ordinal, label the axis with the first/last raw cells, and flag
+///   even spacing.
+fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
     let num = |r: &[Field], p: usize| -> Option<f64> {
         r.get(p)
             .and_then(|f| f.as_str().trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
     };
-    let mut parsed: Vec<(Option<f64>, Vec<Option<f64>>)> = Vec::new();
-    let mut xfirst: Option<String> = None;
-    let mut xlast = String::new();
+    // (numeric x, raw x text, y values) per data row.
+    let mut rows: Vec<(Option<f64>, String, Vec<Option<f64>>)> = Vec::new();
     let mut first = true;
     csv::parse_chunk(text, |r| {
         if first {
@@ -1455,36 +1463,76 @@ fn collect_xy(
             .get(xpos)
             .map(|f| f.as_str().into_owned())
             .unwrap_or_default();
-        if xfirst.is_none() {
-            xfirst = Some(xcell.clone());
-        }
-        xlast = xcell;
         let x = num(r, xpos);
         let ys = ypos.iter().map(|&p| num(r, p)).collect();
-        parsed.push((x, ys));
+        rows.push((x, xcell, ys));
     });
 
-    // Fall back to the row index only when no x value parsed at all — a
-    // partially-numeric x keeps the strict behaviour (drop the bad rows).
-    let fallback = !parsed.is_empty() && parsed.iter().all(|(x, _)| x.is_none());
     let mut series: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ypos.len()];
     let mut skipped = 0u64;
-    for (idx, (x, ys)) in parsed.into_iter().enumerate() {
-        let xv = if fallback { Some((idx + 1) as f64) } else { x };
-        match xv {
-            None => skipped += ys.len() as u64,
-            Some(xv) => {
-                for (i, y) in ys.into_iter().enumerate() {
-                    match y {
-                        Some(y) => series[i].push((xv, y)),
-                        None => skipped += 1,
-                    }
-                }
+    let push_row = |series: &mut XySeries, skipped: &mut u64, xv, ys: Vec<Option<f64>>| {
+        for (i, y) in ys.into_iter().enumerate() {
+            match y {
+                Some(y) => series[i].push((xv, y)),
+                None => *skipped += 1,
             }
         }
+    };
+
+    // Numeric x: plot as-is; rows with a non-numeric x are dropped.
+    if rows.iter().any(|(x, _, _)| x.is_some()) {
+        for (x, _, ys) in rows {
+            match x {
+                Some(xv) => push_row(&mut series, &mut skipped, xv, ys),
+                None => skipped += ys.len() as u64,
+            }
+        }
+        return XyData {
+            series,
+            skipped,
+            xends: None,
+            even_spacing: false,
+        };
     }
-    let labels = fallback.then(|| (xfirst.unwrap_or_default(), xlast));
-    (series, skipped, labels)
+
+    // No numeric x — does every cell parse as a timestamp? Then use a true time
+    // axis (real spacing, formatted date labels).
+    let epochs: Vec<Option<f64>> = rows
+        .iter()
+        .map(|(_, raw, _)| crate::datetime::parse_epoch(raw))
+        .collect();
+    if !rows.is_empty() && epochs.iter().all(Option::is_some) {
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for ((_, _, ys), e) in rows.into_iter().zip(&epochs) {
+            let xv = e.unwrap();
+            lo = lo.min(xv);
+            hi = hi.max(xv);
+            push_row(&mut series, &mut skipped, xv, ys);
+        }
+        return XyData {
+            series,
+            skipped,
+            xends: Some((
+                crate::datetime::format_epoch(lo),
+                crate::datetime::format_epoch(hi),
+            )),
+            even_spacing: false,
+        };
+    }
+
+    // Row-index fallback: plot against the 1-based ordinal, label with the raw
+    // first/last cells.
+    let xfirst = rows.first().map(|(_, r, _)| r.clone()).unwrap_or_default();
+    let xlast = rows.last().map(|(_, r, _)| r.clone()).unwrap_or_default();
+    for (idx, (_, _, ys)) in rows.into_iter().enumerate() {
+        push_row(&mut series, &mut skipped, (idx + 1) as f64, ys);
+    }
+    XyData {
+        series,
+        skipped,
+        xends: Some((xfirst, xlast)),
+        even_spacing: true,
+    }
 }
 
 /// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
@@ -2457,6 +2505,20 @@ mod tests {
         // Axis ends are the real x cells, not synthetic 1/4 indices.
         let axis = out.lines().rev().nth(1).unwrap_or("");
         assert!(axis.trim_start().starts_with('t'), "{out}");
+    }
+
+    #[test]
+    fn graph_xy_uses_a_true_time_axis_for_timestamps() {
+        // A string timestamp x is parsed to epoch: real spacing (no even-row
+        // caveat) and the axis shows formatted dates.
+        let input = "t,v\n2024-01-01T00:00:00Z,1\n2024-01-01T01:00:00Z,5\n2024-01-01T02:00:00Z,3\n";
+        let out = render_str("graph line t v --height 4", input, false);
+        assert!(out.contains("points=3"), "{out}");
+        assert!(!out.contains("even row spacing"), "{out}"); // true axis, not fallback
+        assert!(
+            out.contains("2024-01-01 00:00:00") && out.contains("2024-01-01 02:00:00"),
+            "{out}"
+        );
     }
 
     #[test]

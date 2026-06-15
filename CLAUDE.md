@@ -156,13 +156,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   - `graph scatter X Y[,Y2…]` / `graph line X Y[,Y2…]` — points (line: Bresenham
     segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple y-series
     get distinct colours (`render_xy`, when `--color`) with a legend; one braille
-    canvas per series, first-series-wins per shared cell. If the X column is
-    *entirely* non-numeric (e.g. timestamps), `collect_xy` falls back to the
-    1-based row order as X but the axis still shows the real first/last X cell
-    text (so a timestamp range reads correctly); the title flags `even row
-    spacing` (a partially-numeric X keeps the strict drop-bad-rows behaviour).
-    True timestamp *parsing* (so spacing reflects irregular sampling) is a
-    follow-up (`todo.org`).
+    canvas per series, first-series-wins per shared cell. `collect_xy` picks the
+    X mode: numeric (plotted as-is); else **temporal** — if every X cell parses
+    as a timestamp (`crate::datetime::parse_epoch`, no dep), plot at true epoch
+    positions with formatted-date axis labels; else the **row-index fallback**
+    (categories) — plot against the 1-based ordinal, label with the first/last
+    raw cells, and flag `even row spacing`. A partially-numeric X keeps the
+    strict drop-bad-rows behaviour.
   Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
   defaults to the terminal (`$COLUMNS`, else `MAX_W`=120 — `$COLUMNS` is usually
   not exported to children, so 120 is the common default; no ioctl dep). `--svg` emits a

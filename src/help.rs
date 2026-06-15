@@ -275,9 +275,9 @@ named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-
         detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
 it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
 Width defaults to the terminal ($COLUMNS, else 120); hist bins to Sturges' rule; bar is capped at \
-50 rows; scatter/line take multiple y-series, coloured with --color. A non-numeric x (e.g. \
-timestamps) plots by row order, with the axis still showing the real first/last values. --svg \
-emits an SVG document to the output instead of a terminal chart.",
+50 rows; scatter/line take multiple y-series, coloured with --color. A timestamp x is plotted on \
+a true time axis; any other non-numeric x plots by row order. --svg emits an SVG document to the \
+output instead of a terminal chart.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
             "csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv",
