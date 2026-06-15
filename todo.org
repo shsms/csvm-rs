@@ -226,7 +226,8 @@ below the chart rather than coercing to 0. Settle this before the binning code.
    (=$COLUMNS=) — proved the sink-stage (=Plan.graph=, =exec::render_graph=) +
    blocking + render path end to end. (Used horizontal block bars, not braille —
    braille is for scatter/line in phase 4.)
-3. =graph bar= (now that group-by exists) + =graph spark=.
+3. [X] =graph bar= (diverging, zero-baseline, capped at =MAX_BARS=) + =graph
+   spark= (eighth-height blocks, bucket-averaged to width).
 4. =graph scatter= / =line= on the braille canvas + multi-series + color ramps.
 5. (optional, feature-gated) SVG/PNG export.
 

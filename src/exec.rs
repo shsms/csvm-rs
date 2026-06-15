@@ -1334,24 +1334,63 @@ pub fn render<W: Write>(
 }
 
 /// Draw the `graph` sink's chart from the buffered CSV output. The plan ran
-/// normally to produce rows (header + data); this pulls the charted column's
-/// values, dropping non-numeric/empty cells loudly (counted and reported), and
-/// renders the chart text. The header (row 0) is skipped.
+/// normally to produce rows (header + data); this pulls the charted columns,
+/// dropping non-numeric/empty cells loudly (counted and reported), and renders
+/// the chart text. The header (row 0) is skipped.
 fn render_graph<W: Write>(bytes: &[u8], g: &GraphSpec, output: &mut W) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
-    let pos = g.cols[0].pos;
-    let mut values: Vec<f64> = Vec::new();
+    // The default title names the value column (the second one for a bar chart).
+    let value_col = if g.kind == GraphKind::Bar {
+        &g.cols[1]
+    } else {
+        &g.cols[0]
+    };
+    let title = g
+        .opts
+        .title
+        .clone()
+        .unwrap_or_else(|| value_col.name.clone());
+
+    let chart = match g.kind {
+        GraphKind::Hist => {
+            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            match Histogram::build(&values, g.opts.bins, skipped) {
+                Some(h) => h.render(&title, g.opts.width),
+                None => {
+                    format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n")
+                }
+            }
+        }
+        GraphKind::Spark => {
+            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            crate::graph::render_spark(&title, &values, g.opts.width, skipped)
+        }
+        GraphKind::Bar => {
+            let (rows, skipped, truncated) =
+                collect_label_value(text, g.cols[0].pos, g.cols[1].pos, crate::graph::MAX_BARS);
+            crate::graph::render_bars(&title, &rows, g.opts.width, skipped, truncated)
+        }
+        GraphKind::Scatter | GraphKind::Line => {
+            unreachable!("scatter/line are not wired into the parser yet")
+        }
+    };
+    output.write_all(chart.as_bytes())?;
+    Ok(())
+}
+
+/// Collect one column's finite numeric values from the buffered output (header
+/// skipped), counting non-numeric/empty cells as `skipped`.
+fn collect_numeric(text: &str, pos: usize) -> (Vec<f64>, u64) {
+    let mut values = Vec::new();
     let mut skipped = 0u64;
     let mut first = true;
     csv::parse_chunk(text, |r| {
         if first {
-            first = false; // header row
+            first = false;
             return;
         }
         match r.get(pos).map(|f| f.as_str()) {
-            // Empty and non-numeric cells are both excluded from the plot and
-            // counted, rather than coerced to 0 (the "strict and loud" policy).
             Some(s) => match s.trim().parse::<f64>() {
                 Ok(v) if v.is_finite() => values.push(v),
                 _ => skipped += 1,
@@ -1359,19 +1398,43 @@ fn render_graph<W: Write>(bytes: &[u8], g: &GraphSpec, output: &mut W) -> Result
             None => skipped += 1,
         }
     });
-    let title = g
-        .opts
-        .title
-        .clone()
-        .unwrap_or_else(|| g.cols[0].name.clone());
-    let chart = match g.kind {
-        GraphKind::Hist => match Histogram::build(&values, g.opts.bins, skipped) {
-            Some(h) => h.render(&title, g.opts.width),
-            None => format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n"),
-        },
-    };
-    output.write_all(chart.as_bytes())?;
-    Ok(())
+    (values, skipped)
+}
+
+/// Collect `(label, value)` pairs for a bar chart (header skipped). Rows past
+/// `cap` numeric pairs are counted as `truncated` rather than drawn; non-numeric
+/// values are counted as `skipped`.
+fn collect_label_value(
+    text: &str,
+    label_pos: usize,
+    value_pos: usize,
+    cap: usize,
+) -> (Vec<(String, f64)>, u64, usize) {
+    let mut rows = Vec::new();
+    let mut skipped = 0u64;
+    let mut truncated = 0usize;
+    let mut first = true;
+    csv::parse_chunk(text, |r| {
+        if first {
+            first = false;
+            return;
+        }
+        match r.get(value_pos).map(|f| f.as_str()) {
+            Some(s) => match s.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() => {
+                    if rows.len() < cap {
+                        let label = r.get(label_pos).map(|f| f.as_str().into_owned());
+                        rows.push((label.unwrap_or_default(), v));
+                    } else {
+                        truncated += 1;
+                    }
+                }
+                _ => skipped += 1,
+            },
+            None => skipped += 1,
+        }
+    });
+    (rows, skipped, truncated)
 }
 
 /// The per-cell [`Style`] grid (`[row][col]`) for the colour rules over `rows`.
@@ -1646,6 +1709,10 @@ pub fn describe(plan: &Plan) -> String {
     if let Some(g) = &plan.graph {
         let kind = match g.kind {
             GraphKind::Hist => "hist",
+            GraphKind::Bar => "bar",
+            GraphKind::Spark => "spark",
+            GraphKind::Scatter => "scatter",
+            GraphKind::Line => "line",
         };
         let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
         out.push_str(&format!("graph: {kind} {cols:?}"));
@@ -2210,6 +2277,24 @@ mod tests {
     fn graph_title_overrides_the_column_name() {
         let out = render_str("graph hist countZ --title Counts", INPUT, false);
         assert!(out.starts_with("Counts\n"), "{out}");
+    }
+
+    #[test]
+    fn graph_bar_draws_one_bar_per_row_after_group() {
+        // group fieldA: t (3 rows), f (1 row); bar the counts.
+        let out = render_str("group fieldA | graph bar fieldA count", INPUT, false);
+        // Title defaults to the value column.
+        assert!(out.starts_with("count\n"), "{out}");
+        assert!(out.contains("t │"), "{out}");
+        assert!(out.contains("f │"), "{out}");
+        assert!(out.contains("bars=2"), "{out}");
+    }
+
+    #[test]
+    fn graph_spark_is_a_single_line() {
+        let out = render_str("graph spark countZ --width 4", INPUT, false);
+        assert!(out.starts_with("countZ\n"), "{out}");
+        assert!(out.contains("min=0") && out.contains("max=9"), "{out}");
     }
 
     #[test]

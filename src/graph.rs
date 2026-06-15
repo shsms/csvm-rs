@@ -1,12 +1,20 @@
 //! Terminal-native charts (the `graph` sink). Draws with Unicode block glyphs
 //! straight to the terminal — no plotting dependency, matching csvm's
-//! point-it-at-a-CSV-and-get-an-answer flow. Only the histogram is implemented
-//! so far; bar/scatter/line/spark are the planned follow-ups (see `todo.org`).
+//! point-it-at-a-CSV-and-get-an-answer flow. Histogram, horizontal bar, and
+//! sparkline so far; scatter/line on a braille canvas are the follow-ups (see
+//! `todo.org`).
 
 use crate::field::format_num;
 
 /// Eighth-width block glyphs, 1/8…8/8, for sub-character bar lengths.
 const BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+
+/// Eighth-height block glyphs, 1/8…8/8, for sparkline levels.
+const VBLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// Default cap on the number of bars drawn (one terminal line each); excess is
+/// dropped and reported rather than flooding the screen ("no silent caps").
+pub const MAX_BARS: usize = 50;
 
 /// Terminal width in columns, from `$COLUMNS` or the conventional 80 fallback
 /// (the design's 80×24 default — no ioctl dependency).
@@ -110,6 +118,118 @@ impl Histogram {
     }
 }
 
+/// Draw one labelled horizontal bar per `(label, value)` row, anchored at a zero
+/// baseline so negative values extend left (a diverging bar chart). Labels are
+/// right-aligned to a common width. `skipped`/`truncated` are reported in the
+/// summary. Best used after group-by, where there are few rows.
+pub fn render_bars(
+    title: &str,
+    rows: &[(String, f64)],
+    bar_width: Option<usize>,
+    skipped: u64,
+    truncated: usize,
+) -> String {
+    if rows.is_empty() {
+        return format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n");
+    }
+    let label_w = rows
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    // The baseline is always 0, so a column of positive values bars from the left.
+    let mut lo = 0.0f64;
+    let mut hi = 0.0f64;
+    for (_, v) in rows {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    let span = hi - lo;
+    let w = bar_width.unwrap_or_else(|| term_cols().saturating_sub(label_w + 14).max(10));
+    let zero = pos_in(0.0, lo, span, w);
+
+    let mut out = String::new();
+    out.push_str(title);
+    out.push('\n');
+    for (label, v) in rows {
+        let p = pos_in(*v, lo, span, w);
+        let (a, b) = (zero.min(p), zero.max(p));
+        let mut field = vec![' '; w];
+        for cell in field.iter_mut().take(b).skip(a) {
+            *cell = '█';
+        }
+        let bar: String = field.into_iter().collect();
+        out.push_str(&format!("{label:>label_w$} │{bar} {}\n", format_num(*v)));
+    }
+    out.push_str(&format!("bars={}", rows.len()));
+    if truncated > 0 {
+        out.push_str(&format!("  (+{truncated} more not shown)"));
+    }
+    if skipped > 0 {
+        out.push_str(&format!("  (skipped {skipped} non-numeric)"));
+    }
+    out.push('\n');
+    out
+}
+
+/// Column position of `v` within a `width`-wide field spanning `[lo, lo+span]`.
+fn pos_in(v: f64, lo: f64, span: f64, width: usize) -> usize {
+    if span > 0.0 {
+        (((v - lo) / span) * width as f64).round() as usize
+    } else {
+        0
+    }
+    .min(width)
+}
+
+/// Render a one-line sparkline of `values` (downsampled to `width` by bucket
+/// averaging), with a title and a min/max summary. Each cell is an eighth-height
+/// block scaled to the value range.
+pub fn render_spark(title: &str, values: &[f64], width: Option<usize>, skipped: u64) -> String {
+    if values.is_empty() {
+        return format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n");
+    }
+    let cols = width.unwrap_or_else(|| term_cols().min(80)).max(1);
+    // Bucket-average so a long series collapses to one cell per column.
+    let buckets: Vec<f64> = if values.len() <= cols {
+        values.to_vec()
+    } else {
+        (0..cols)
+            .map(|i| {
+                let start = i * values.len() / cols;
+                let end = ((i + 1) * values.len() / cols).max(start + 1);
+                let slice = &values[start..end.min(values.len())];
+                slice.iter().sum::<f64>() / slice.len() as f64
+            })
+            .collect()
+    };
+    let lo = buckets.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = buckets.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = hi - lo;
+    let line: String = buckets
+        .iter()
+        .map(|&v| {
+            // A flat series sits mid-height; otherwise scale into the 8 levels.
+            let level = if span > 0.0 {
+                (((v - lo) / span) * 7.0).round() as usize
+            } else {
+                3
+            };
+            VBLOCKS[level.min(7)]
+        })
+        .collect();
+    let mut out = format!(
+        "{title}\n{line}\nmin={}  max={}",
+        format_num(lo),
+        format_num(hi)
+    );
+    if skipped > 0 {
+        out.push_str(&format!("  (skipped {skipped} non-numeric)"));
+    }
+    out.push('\n');
+    out
+}
+
 /// A horizontal block bar `count/max` of the full width, with an eighth-block
 /// fractional tail so short bars stay distinguishable.
 fn bar(count: u64, max: u64, width: usize) -> String {
@@ -162,6 +282,54 @@ mod tests {
         assert!(s.contains("min=1"));
         assert!(s.contains("max=3"));
         assert!(s.contains("(skipped 2 non-numeric)"));
+    }
+
+    #[test]
+    fn bars_anchor_positive_at_left_edge() {
+        let rows = [("a".to_string(), 2.0), ("b".to_string(), 4.0)];
+        let s = render_bars("v", &rows, Some(10), 0, 0);
+        assert!(s.starts_with("v\n"));
+        // All-positive: the zero baseline is the left edge, so bars start there.
+        let a_line = s.lines().nth(1).unwrap();
+        assert!(a_line.contains("│█"), "{a_line}");
+        assert!(s.contains("bars=2"));
+    }
+
+    #[test]
+    fn bars_diverge_around_zero_for_negatives() {
+        let rows = [("pos".to_string(), 5.0), ("neg".to_string(), -5.0)];
+        let s = render_bars("d", &rows, Some(10), 0, 0);
+        let pos = s.lines().find(|l| l.contains("pos")).unwrap();
+        let neg = s.lines().find(|l| l.contains("neg")).unwrap();
+        // The negative bar starts left of where the positive bar starts.
+        let bar_start = |l: &str| l.find('█').unwrap();
+        assert!(bar_start(neg) < bar_start(pos), "neg={neg} pos={pos}");
+    }
+
+    #[test]
+    fn bars_report_skipped_and_truncated() {
+        let rows = [("a".to_string(), 1.0)];
+        let s = render_bars("v", &rows, Some(8), 3, 2);
+        assert!(s.contains("(+2 more not shown)"), "{s}");
+        assert!(s.contains("(skipped 3 non-numeric)"), "{s}");
+    }
+
+    #[test]
+    fn spark_is_one_line_scaled_to_width() {
+        let s = render_spark("v", &[1.0, 2.0, 3.0, 4.0], Some(4), 0);
+        let line = s.lines().nth(1).unwrap();
+        assert_eq!(line.chars().count(), 4);
+        // Ascending values ⇒ the last cell is the tallest block.
+        assert_eq!(line.chars().last().unwrap(), '█');
+        assert_eq!(line.chars().next().unwrap(), '▁');
+        assert!(s.contains("min=1") && s.contains("max=4"));
+    }
+
+    #[test]
+    fn spark_downsamples_long_series() {
+        let vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
+        let s = render_spark("v", &vals, Some(10), 0);
+        assert_eq!(s.lines().nth(1).unwrap().chars().count(), 10);
     }
 
     #[test]

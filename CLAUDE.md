@@ -143,13 +143,19 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   *last* command (the parser rejects anything after it). Plan metadata
   (`Plan.graph`, `GraphSpec` in `plan.rs`), not a stage — like `fmt`/`color` it
   renders in `exec::render` from the buffered output, reusing the whole executor
-  upstream. So far only `graph hist COL` (`--bins N`, `--width W`, `--title T`):
-  `exec::render_graph` pulls the column's values, drops non-numeric/empty cells
-  *loudly* (counted and reported below the chart — the "strict and loud" policy),
-  and `graph::Histogram` (in `src/graph.rs`) bins them (Sturges' default, capped
-  at 50) and draws Unicode block bars with an eighth-block fractional tail. Width
-  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). Bar/scatter/line/
-  spark and colour ramps are the planned follow-ups (`todo.org`).
+  upstream. `exec::render_graph` pulls the charted columns and drops
+  non-numeric/empty cells *loudly* (counted and reported below the chart — the
+  "strict and loud" policy); the drawing lives in `src/graph.rs`. Charts:
+  - `graph hist COL` — `Histogram` bins values (Sturges' default, capped at 50)
+    into horizontal block bars with an eighth-block fractional tail.
+  - `graph bar LABEL VALUE` — one diverging bar per row anchored at a zero
+    baseline (negatives extend left); capped at `MAX_BARS=50` rows, overflow
+    reported. Use after group-by.
+  - `graph spark COL` — a one-line sparkline (eighth-height blocks), a long
+    series bucket-averaged down to the width.
+  Flags: `--bins N` (hist), `--width W`, `--title T`. Width defaults to the
+  terminal (`$COLUMNS`, else 80; no ioctl dep). `scatter`/`line` on a braille
+  canvas + colour ramps are the planned follow-ups (`todo.org`).
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`

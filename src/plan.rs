@@ -630,12 +630,19 @@ impl ColorRule {
     }
 }
 
-/// What kind of chart `graph` draws. Only `Hist` so far; bar/scatter/line/spark
-/// are the planned follow-ups (see `todo.org`).
+/// What kind of chart `graph` draws.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GraphKind {
     /// `graph hist COL`: distribution of one numeric column as binned bars.
     Hist,
+    /// `graph bar LABEL VALUE`: one horizontal bar per row (use after group-by).
+    Bar,
+    /// `graph spark COL`: a one-line sparkline of a column's values.
+    Spark,
+    /// `graph scatter X Y`: points on a braille canvas.
+    Scatter,
+    /// `graph line X Y`: points connected on a braille canvas.
+    Line,
 }
 
 /// Presentation options shared across chart kinds; an absent field falls back to

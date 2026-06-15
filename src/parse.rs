@@ -399,17 +399,20 @@ impl Builder {
         Ok(())
     }
 
-    /// `graph hist COL [--bins N] [--width W] [--title T]` — a terminal-chart
+    /// `graph KIND COLS [--bins N] [--width W] [--title T]` — a terminal-chart
     /// sink. Draws from the columns reaching it instead of emitting CSV, so it
-    /// must be the last command. Only the histogram is implemented so far.
+    /// must be the last command. `hist COL`, `spark COL`, `bar LABEL VALUE`,
+    /// `scatter X Y`, `line X Y`.
     fn parse_graph(&mut self, rest: &str) -> Result<(), Error> {
         let (kind_word, rest) = split_first_word(rest.trim());
         let kind = match kind_word {
             "hist" | "histogram" => GraphKind::Hist,
+            "bar" => GraphKind::Bar,
+            "spark" | "sparkline" => GraphKind::Spark,
             "" => return Err(err("graph expects a chart type, e.g. graph hist amount")),
             other => {
                 return Err(err(format!(
-                    "graph: unknown chart type `{other}` (try: hist)"
+                    "graph: unknown chart type `{other}` (try: hist, bar, spark)"
                 )));
             }
         };
@@ -441,14 +444,13 @@ impl Builder {
             }
         }
         let cols = split_list(&positional);
-        match kind {
-            GraphKind::Hist => {
-                if cols.len() != 1 {
-                    return Err(err(
-                        "graph hist expects exactly one column, e.g. graph hist amount",
-                    ));
-                }
-            }
+        let want = graph_arity(kind);
+        if cols.len() != want {
+            return Err(err(format!(
+                "graph {kind_word} expects {want} column{}, got {}",
+                if want == 1 { "" } else { "s" },
+                cols.len()
+            )));
         }
         self.graph = Some(GraphSpec {
             kind,
@@ -1022,6 +1024,14 @@ fn split_list(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// How many columns each chart type plots.
+fn graph_arity(kind: GraphKind) -> usize {
+    match kind {
+        GraphKind::Hist | GraphKind::Spark => 1,
+        GraphKind::Bar | GraphKind::Scatter | GraphKind::Line => 2,
+    }
 }
 
 /// Parse a positive-integer flag value (`--bins`, `--width`).
@@ -1871,6 +1881,17 @@ mod tests {
         assert!(parse("graph hist a b").is_err()); // hist takes exactly one column
         assert!(parse("graph hist x --bins 0").is_err()); // bins must be positive
         assert!(parse("graph hist x --frob 1").is_err()); // unknown flag
+    }
+
+    #[test]
+    fn graph_bar_and_spark_arities() {
+        let bar = parse("graph bar region total").unwrap().graph.unwrap();
+        assert_eq!(bar.kind, GraphKind::Bar);
+        assert_eq!(bar.cols.len(), 2);
+        let spark = parse("graph spark value").unwrap().graph.unwrap();
+        assert_eq!(spark.kind, GraphKind::Spark);
+        assert!(parse("graph bar region").is_err()); // bar needs label + value
+        assert!(parse("graph spark a b").is_err()); // spark takes one column
     }
 
     #[test]

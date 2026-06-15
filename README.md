@@ -79,6 +79,8 @@ Each stage is a command with comma- or space-separated arguments:
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
+| `graph bar LABEL VALUE` | one horizontal bar per row (sink; use after group-by) |
+| `graph spark COL`  | one-line sparkline of a column (sink)                       |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
@@ -163,6 +165,9 @@ csvm 'group region | agg sum(amount),mean(amount) | sort amount_sum=nr | fmt' sa
 
 # terminal histogram of a column's distribution (after a filter)
 csvm 'select region == "EU" | graph hist amount --bins 12' sales.csv
+
+# horizontal bar chart of a total per group
+csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv
 
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
