@@ -295,8 +295,9 @@ prepended on output. (The CLI's --no-header instead auto-names columns c1, c2, â
             "color -g COL [RAMP] [LO HI]  gradient COL by value (RAMP is lo:hi)",
         ],
         detail: "Rules render when output is a terminal (or with --color always); most useful \
-with fmt. A gradient's RAMP defaults to green:red and its range to the column's min/max. See \
-`csvm help colors` for colour names and attributes.",
+with fmt. The predicate forms take a full colour spec (bg:, attributes, + to combine). A \
+gradient is narrower: RAMP is two plain colour names, it paints the foreground only, defaults \
+to green:red, and its range defaults to the column's min/max. See `csvm help colors`.",
         examples: &[
             "csvm 'color red amount < 0 | fmt' data.csv",
             "csvm 'color -g amount green:red 0 5000 | fmt' data.csv",
@@ -329,11 +330,15 @@ A comparison against a number literal is numeric; against a string literal, lexi
     Topic {
         name: "colors",
         summary: "colour names and attributes for `color`",
-        body: "  names:       black red green yellow blue magenta cyan white gray\n  \
-background:  bg:NAME      (e.g. bg:red)\n  \
+        body: "  names:       black red green yellow blue magenta cyan white gray (grey)\n  \
+foreground:  NAME              e.g. red\n  \
+background:  bg:NAME           e.g. bg:red\n  \
 attributes:  bold  dim  underline\n  \
-combine:     join with +  (e.g. bold+bg:red, underline+yellow)\n  \
-gradient:    RAMP is lo:hi using two names (default green:red)\n\n\
+combine:     join parts with +  e.g. bold+red, white+bg:red, underline+bg:blue\n\n\
+The combine / bg / attribute forms above are for the PREDICATE rules â€” \
+`color COLOUR EXPR` and `color -c COL COLOUR EXPR`. A GRADIENT (`color -g COL \
+lo:hi`) is narrower: lo and hi are two plain colour names (no +, bg, or \
+attributes) and it colours the foreground only; the ramp defaults to green:red.\n\n\
 Emission is gated by --color auto|always|never (auto = only when stdout is a TTY); \
 NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
     },
