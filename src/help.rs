@@ -265,18 +265,21 @@ named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-
         aliases: &["plot"],
         summary: "draw a terminal chart (sink)",
         synopsis: &[
-            "graph hist COL          distribution of a numeric column",
-            "graph bar LABEL VALUE   one bar per row (use after group-by)",
-            "graph spark COL         one-line sparkline of a column",
-            "  flags: --bins N (hist)  --width W  --title T",
+            "graph hist COL              distribution of a numeric column",
+            "graph bar LABEL VALUE       one bar per row (use after group-by)",
+            "graph spark COL             one-line sparkline of a column",
+            "graph scatter X Y[,Y2…]     points on a braille canvas",
+            "graph line X Y[,Y2…]        connected points (multi-series)",
+            "  flags: --bins N (hist)  --width W  --height H (xy)  --title T",
         ],
         detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
 it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
 Width defaults to the terminal ($COLUMNS, else 80); hist bins to Sturges' rule; bar is capped at \
-50 rows.",
+50 rows; scatter/line take multiple y-series, coloured with --color.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
             "csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv",
+            "csvm 'graph line ts open,close --height 12' prices.csv",
         ],
     },
     CmdHelp {

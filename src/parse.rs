@@ -409,10 +409,12 @@ impl Builder {
             "hist" | "histogram" => GraphKind::Hist,
             "bar" => GraphKind::Bar,
             "spark" | "sparkline" => GraphKind::Spark,
+            "scatter" => GraphKind::Scatter,
+            "line" => GraphKind::Line,
             "" => return Err(err("graph expects a chart type, e.g. graph hist amount")),
             other => {
                 return Err(err(format!(
-                    "graph: unknown chart type `{other}` (try: hist, bar, spark)"
+                    "graph: unknown chart type `{other}` (try: hist, bar, spark, scatter, line)"
                 )));
             }
         };
@@ -429,6 +431,10 @@ impl Builder {
                 let (val, tail) = v?;
                 opts.width = Some(parse_positive(&val, "--width")?);
                 s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, "--height") {
+                let (val, tail) = v?;
+                opts.height = Some(parse_positive(&val, "--height")?);
+                s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, "--title") {
                 let (val, tail) = v?;
                 opts.title = Some(val);
@@ -444,14 +450,7 @@ impl Builder {
             }
         }
         let cols = split_list(&positional);
-        let want = graph_arity(kind);
-        if cols.len() != want {
-            return Err(err(format!(
-                "graph {kind_word} expects {want} column{}, got {}",
-                if want == 1 { "" } else { "s" },
-                cols.len()
-            )));
-        }
+        check_graph_arity(kind, kind_word, cols.len())?;
         self.graph = Some(GraphSpec {
             kind,
             cols: cols.into_iter().map(ColRef::new).collect(),
@@ -1026,12 +1025,23 @@ fn split_list(s: &str) -> Vec<String> {
     out
 }
 
-/// How many columns each chart type plots.
-fn graph_arity(kind: GraphKind) -> usize {
-    match kind {
-        GraphKind::Hist | GraphKind::Spark => 1,
-        GraphKind::Bar | GraphKind::Scatter | GraphKind::Line => 2,
+/// Validate the column count for a chart type: hist/spark take one, bar takes
+/// two, scatter/line take an x plus one or more y-series.
+fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error> {
+    let ok = match kind {
+        GraphKind::Hist | GraphKind::Spark => n == 1,
+        GraphKind::Bar => n == 2,
+        GraphKind::Scatter | GraphKind::Line => n >= 2,
+    };
+    if ok {
+        return Ok(());
     }
+    let want = match kind {
+        GraphKind::Hist | GraphKind::Spark => "one column",
+        GraphKind::Bar => "two columns (label value)",
+        GraphKind::Scatter | GraphKind::Line => "an x column and one or more y columns",
+    };
+    Err(err(format!("graph {word} expects {want}, got {n}")))
 }
 
 /// Parse a positive-integer flag value (`--bins`, `--width`).
@@ -1892,6 +1902,22 @@ mod tests {
         assert_eq!(spark.kind, GraphKind::Spark);
         assert!(parse("graph bar region").is_err()); // bar needs label + value
         assert!(parse("graph spark a b").is_err()); // spark takes one column
+    }
+
+    #[test]
+    fn graph_scatter_and_line_accept_multiple_y_columns() {
+        let g = parse("graph line t a,b,c --height 20")
+            .unwrap()
+            .graph
+            .unwrap();
+        assert_eq!(g.kind, GraphKind::Line);
+        assert_eq!(g.cols.len(), 4); // x + 3 series
+        assert_eq!(g.opts.height, Some(20));
+        assert_eq!(
+            parse("graph scatter x y").unwrap().graph.unwrap().kind,
+            GraphKind::Scatter
+        );
+        assert!(parse("graph scatter x").is_err()); // needs x + at least one y
     }
 
     #[test]

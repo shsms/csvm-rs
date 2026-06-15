@@ -1304,7 +1304,7 @@ pub fn render<W: Write>(
     // The graph sink draws a chart from the buffered output instead of emitting
     // rows; it takes precedence over alignment/colour (which become no-ops).
     if let Some(g) = &plan.graph {
-        return render_graph(bytes, g, output);
+        return render_graph(bytes, g, color, output);
     }
     let aligned = plan.output == OutputFormat::Aligned;
     let want_color = color && !plan.colors.is_empty();
@@ -1337,20 +1337,23 @@ pub fn render<W: Write>(
 /// normally to produce rows (header + data); this pulls the charted columns,
 /// dropping non-numeric/empty cells loudly (counted and reported), and renders
 /// the chart text. The header (row 0) is skipped.
-fn render_graph<W: Write>(bytes: &[u8], g: &GraphSpec, output: &mut W) -> Result<(), Error> {
+fn render_graph<W: Write>(
+    bytes: &[u8],
+    g: &GraphSpec,
+    color: bool,
+    output: &mut W,
+) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
-    // The default title names the value column (the second one for a bar chart).
-    let value_col = if g.kind == GraphKind::Bar {
-        &g.cols[1]
-    } else {
-        &g.cols[0]
-    };
-    let title = g
-        .opts
-        .title
-        .clone()
-        .unwrap_or_else(|| value_col.name.clone());
+    // Default title: the value column, or "y vs x" for a single-series xy chart.
+    let title = g.opts.title.clone().unwrap_or_else(|| match g.kind {
+        GraphKind::Bar => g.cols[1].name.clone(),
+        GraphKind::Scatter | GraphKind::Line if g.cols.len() == 2 => {
+            format!("{} vs {}", g.cols[1].name, g.cols[0].name)
+        }
+        GraphKind::Scatter | GraphKind::Line => format!("vs {}", g.cols[0].name),
+        GraphKind::Hist | GraphKind::Spark => g.cols[0].name.clone(),
+    });
 
     let chart = match g.kind {
         GraphKind::Hist => {
@@ -1372,11 +1375,54 @@ fn render_graph<W: Write>(bytes: &[u8], g: &GraphSpec, output: &mut W) -> Result
             crate::graph::render_bars(&title, &rows, g.opts.width, skipped, truncated)
         }
         GraphKind::Scatter | GraphKind::Line => {
-            unreachable!("scatter/line are not wired into the parser yet")
+            let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
+            let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
+            let (series, skipped) = collect_xy(text, g.cols[0].pos, &ypos);
+            crate::graph::render_xy(
+                &title,
+                &ynames,
+                &series,
+                &g.opts,
+                color,
+                g.kind == GraphKind::Line,
+                skipped,
+            )
         }
     };
     output.write_all(chart.as_bytes())?;
     Ok(())
+}
+
+/// Collect `(x, y)` points per y-series from the buffered output (header
+/// skipped). A row with a non-numeric x contributes no points; a non-numeric y
+/// drops just that series' point. Both count toward `skipped`.
+fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>, u64) {
+    let mut series: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ypos.len()];
+    let mut skipped = 0u64;
+    let mut first = true;
+    let num = |r: &[Field], p: usize| -> Option<f64> {
+        r.get(p)
+            .and_then(|f| f.as_str().trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+    };
+    csv::parse_chunk(text, |r| {
+        if first {
+            first = false;
+            return;
+        }
+        match num(r, xpos) {
+            None => skipped += ypos.len() as u64,
+            Some(x) => {
+                for (i, &yp) in ypos.iter().enumerate() {
+                    match num(r, yp) {
+                        Some(y) => series[i].push((x, y)),
+                        None => skipped += 1,
+                    }
+                }
+            }
+        }
+    });
+    (series, skipped)
 }
 
 /// Collect one column's finite numeric values from the buffered output (header
@@ -2295,6 +2341,23 @@ mod tests {
         let out = render_str("graph spark countZ --width 4", INPUT, false);
         assert!(out.starts_with("countZ\n"), "{out}");
         assert!(out.contains("min=0") && out.contains("max=9"), "{out}");
+    }
+
+    #[test]
+    fn graph_scatter_plots_xy_on_a_braille_frame() {
+        let out = render_str("graph scatter id countZ --height 4", INPUT, false);
+        assert!(out.starts_with("countZ vs id\n"), "{out}");
+        assert!(out.contains('┤') && out.contains('└'), "{out}");
+        assert!(out.contains("points=4"), "{out}");
+    }
+
+    #[test]
+    fn graph_line_multi_series_is_coloured_with_a_legend() {
+        let out = render_str("graph line id fieldA,countZ --height 4", INPUT, true);
+        // fieldA is text ⇒ its points are skipped; countZ contributes 4.
+        assert!(out.contains("points=4"), "{out}");
+        assert!(out.contains('\x1b'), "expected colour escapes");
+        assert!(out.contains('●'), "expected a legend");
     }
 
     #[test]

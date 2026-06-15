@@ -651,6 +651,8 @@ pub enum GraphKind {
 pub struct GraphOpts {
     pub bins: Option<usize>,
     pub width: Option<usize>,
+    /// Canvas height in terminal rows (scatter/line only).
+    pub height: Option<usize>,
     pub title: Option<String>,
 }
 

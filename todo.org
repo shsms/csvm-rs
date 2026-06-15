@@ -228,7 +228,9 @@ below the chart rather than coercing to 0. Settle this before the binning code.
    braille is for scatter/line in phase 4.)
 3. [X] =graph bar= (diverging, zero-baseline, capped at =MAX_BARS=) + =graph
    spark= (eighth-height blocks, bucket-averaged to width).
-4. =graph scatter= / =line= on the braille canvas + multi-series + color ramps.
+4. [X] =graph scatter= / =line= on a 2x4 braille canvas (=Braille=, Bresenham
+   for line), multi-series via =X Y1,Y2= with distinct per-series colours +
+   legend. (Density colour *ramps* for a single scatter still open — see below.)
 5. (optional, feature-gated) SVG/PNG export.
 
 ** Follow-ups now open
@@ -237,8 +239,10 @@ below the chart rather than coercing to 0. Settle this before the binning code.
   (per-shard =HashMap=, merge unioning key sets, =ColStats::merge= per group).
 - Histogram polish: bin-edge labels show full =format_num= precision
   (=16.688889=); round edges to a sensible step-derived precision.
-- =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=),
-  arriving with the phase-4 colour work.
+- =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=).
+- =graph scatter= density colour ramp: colour a single-series scatter by point
+  density / a third value column (reuse =color.rs= =Ramp=); multi-series already
+  gets distinct per-series colours.
 
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.

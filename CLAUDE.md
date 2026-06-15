@@ -153,9 +153,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     reported. Use after group-by.
   - `graph spark COL` — a one-line sparkline (eighth-height blocks), a long
     series bucket-averaged down to the width.
-  Flags: `--bins N` (hist), `--width W`, `--title T`. Width defaults to the
-  terminal (`$COLUMNS`, else 80; no ioctl dep). `scatter`/`line` on a braille
-  canvas + colour ramps are the planned follow-ups (`todo.org`).
+  - `graph scatter X Y[,Y2…]` / `graph line X Y[,Y2…]` — points (line: Bresenham
+    segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple y-series
+    get distinct colours (`render_xy`, when `--color`) with a legend; one braille
+    canvas per series, first-series-wins per shared cell.
+  Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
+  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). Colour density
+  ramps for scatter and SVG export are the remaining follow-ups (`todo.org`).
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
