@@ -27,15 +27,21 @@ enum Source {
 fn run() -> Result<(), String> {
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Run(args)) => *args,
-        Ok(Parsed::Help) => {
-            println!("{}", cli::USAGE);
+        Ok(Parsed::Help(topic)) => {
+            println!("{}", csvm::help::render(topic.as_deref())?);
             return Ok(());
         }
         Ok(Parsed::Version) => {
             println!("csvm {}", csvm::VERSION);
             return Ok(());
         }
-        Err(e) => return Err(format!("{e}\n\n{}", cli::USAGE)),
+        // On a usage error show the brief synopsis, not the whole manual.
+        Err(e) => {
+            return Err(format!(
+                "{e}\n\n{}\nrun `csvm --help` for options, `csvm help CMD` for a command",
+                csvm::help::usage_line()
+            ));
+        }
     };
 
     // The pipeline is either the SCRIPT positional or, with `-f`, a file.

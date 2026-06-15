@@ -51,8 +51,9 @@ fn err(msg: impl Into<String>) -> Error {
     Error::Compile(msg.into())
 }
 
-/// Known command names, for the "did you mean …?" hint on an unknown verb.
-const COMMANDS: &[&str] = &[
+/// Known command names, for the "did you mean …?" hint on an unknown verb and
+/// the help registry's drift check (see `crate::help`).
+pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
     "stats", "uniq", "color", "rename", "fmt", "hdr", "join",
 ];

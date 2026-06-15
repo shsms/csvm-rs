@@ -63,54 +63,11 @@ fn parse_size(s: &str, what: &str) -> Result<i64, String> {
         .ok_or_else(|| format!("invalid {what} value: {s}"))
 }
 
-pub const USAGE: &str = "\
-usage: csvm [OPTIONS] SCRIPT [INPUT]
-       csvm [OPTIONS] -f FILE [INPUT]
-
-  SCRIPT   pipe-syntax pipeline; quote it so the shell keeps | > and spaces
-  INPUT    input CSV (default: stdin; '-' is stdin); first line is the header
-
-options (--flag VALUE or --flag=VALUE):
-  -o, --output FILE    write to FILE (default: stdout)
-  -f, --file FILE      read the pipeline from FILE instead of SCRIPT
-      --no-header      input has no header; name columns c1, c2, ...
-  -n, --threads N      worker threads for a seekable file (default: 1)
-  -t, --temp-dir DIR   directory for sort spill files (default: system temp)
-      --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
-      --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M)
-      --color WHEN     auto (TTY only) | always | never
-      --print-engine   print the compiled plan and exit
-  -h, --help           show this help
-  -V, --version        print version and exit
-
-commands (chain with |):
-  cols A,B,C | -v A     keep / drop columns                  (alias: cut)
-  select EXPR | -v EXPR keep / drop matching rows     (alias: where, filter)
-  sort COL[=nr] ...     multi-key sort; n numeric, r reverse
-  head [N]              first N rows (default 10; -n -N keeps all but last N)
-  tail [N]              last N rows (default 10)
-  uniq [COLS]           drop duplicate rows, keep first      (alias: dedup)
-  stats [COLS]          per-column count/min/max/sum/mean/stddev
-  join [(SUB)] FILE on K  merge a right file by key (-l/-r/-F left/right/full)
-  rename OLD=NEW ...    rename columns
-  to-num / to-str COLS  force column type (usually implicit)
-  hdr A,B,C             name columns of headerless input (must be first)
-  color ... | fmt       colourise / whitespace-align output
-
-select operators:
-  == != < > <= >=   ^= *= $= (begins/contains/ends)   =~ !~ (regex)
-  && || ! ()   number 3.14   string 'txt'   backtick col-with-dashes   # comment
-
-examples:
-  csvm 'select flag == \"t\" && amount > 1000 | cols id,amount' data.csv
-  csvm 'sort score=nr | head 5 | fmt' data.csv
-  csvm 'stats | sort mean=nr | fmt' data.csv
-  csvm 'join prices.csv on sku | select qty > 0' sales.csv";
-
-/// Outcome of parsing: run with `Args`, or print help / version and exit.
+/// Outcome of parsing: run with `Args`, or print help / version and exit. `Help`
+/// carries an optional topic (`csvm help CMD`); `None` is the overview.
 pub enum Parsed {
     Run(Box<Args>),
-    Help,
+    Help(Option<String>),
     Version,
 }
 
@@ -149,7 +106,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             };
         }
         match arg.as_str() {
-            "-h" | "--help" => return Ok(Parsed::Help),
+            "-h" | "--help" => return Ok(Parsed::Help(None)),
             "-V" | "--version" => return Ok(Parsed::Version),
             "-o" | "--output" => out_file = Some(value!()),
             "-n" | "--threads" => {
@@ -193,6 +150,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             _ => positionals.push(arg),
         }
+    }
+
+    // `csvm help [TOPIC]` (without -f) prints help and exits, like a subcommand.
+    // A bare `help` isn't a valid script, so this can't shadow a real pipeline.
+    if script_file.is_none() && positionals.first().is_some_and(|p| p == "help") {
+        if positionals.len() > 2 {
+            return Err("usage: csvm help [COMMAND|TOPIC]".to_string());
+        }
+        return Ok(Parsed::Help(positionals.into_iter().nth(1)));
     }
 
     // Positionals are `SCRIPT [INPUT]` (awk-style): the script is the first
@@ -243,7 +209,7 @@ mod tests {
     fn args(parts: &[&str]) -> Result<Args, String> {
         match parse(parts.iter().map(|s| s.to_string()))? {
             Parsed::Run(a) => Ok(*a),
-            Parsed::Help => Err("help".into()),
+            Parsed::Help(_) => Err("help".into()),
             Parsed::Version => Err("version".into()),
         }
     }

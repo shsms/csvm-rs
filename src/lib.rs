@@ -11,6 +11,7 @@ pub mod csv;
 pub mod error;
 pub mod exec;
 pub mod field;
+pub mod help;
 pub mod parse;
 pub mod plan;
 pub mod sort;
