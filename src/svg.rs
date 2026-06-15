@@ -86,19 +86,11 @@ fn ylabels(lo: f64, hi: f64) -> String {
 /// interpolated ticks for a numeric/time axis, or the two end cells for a
 /// category axis. Ticks anchor start/middle/end so they don't run off the frame.
 fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
-    let labels: Vec<(f64, String)> = match xaxis {
-        XAxis::Ends(lo, hi) => vec![(0.0, lo.clone()), (1.0, hi.clone())],
-        // Round 1/2/5 numeric ticks (shared with the terminal renderer).
-        XAxis::Numeric => crate::graph::nice_ticks(xlo, xhi, tick_target(xlo, xhi, format_num)),
-        // Drop the date from time labels when every tick is the same day.
-        XAxis::Time => {
-            if crate::datetime::same_day(xlo, xhi) {
-                svg_ticks(xlo, xhi, crate::datetime::format_time)
-            } else {
-                svg_ticks(xlo, xhi, crate::datetime::format_epoch)
-            }
-        }
-    };
+    // Tick count from the plot width and the axis's label size (~7px per char);
+    // the labels themselves come from the shared `graph::axis_ticks`.
+    let label_px = crate::graph::axis_label_width(xaxis, xlo, xhi) as f64 * 7.0 + 12.0;
+    let target = ((pw() / label_px) as usize).clamp(2, 7);
+    let labels = crate::graph::axis_ticks(xaxis, xlo, xhi, target);
     let y = T + ph() + 16.0;
     labels
         .iter()
@@ -116,23 +108,6 @@ fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
                 "<text x=\"{x:.1}\" y=\"{y}\" text-anchor=\"{anchor}\">{}</text>\n",
                 esc(lab)
             )
-        })
-        .collect()
-}
-
-/// Tick count for the plot width given a `fmt`'s label size (~7px per char).
-fn tick_target(lo: f64, hi: f64, fmt: impl Fn(f64) -> String) -> usize {
-    let label_px = fmt(hi).len().max(fmt(lo).len()) as f64 * 7.0 + 12.0;
-    ((pw() / label_px) as usize).clamp(2, 7)
-}
-
-/// Evenly-spaced `(fraction, label)` ticks, the count chosen so labels fit.
-fn svg_ticks(lo: f64, hi: f64, fmt: impl Fn(f64) -> String) -> Vec<(f64, String)> {
-    let k = tick_target(lo, hi, &fmt);
-    (0..k)
-        .map(|i| {
-            let t = i as f64 / (k - 1) as f64;
-            (t, fmt(lo + (hi - lo) * t))
         })
         .collect()
 }

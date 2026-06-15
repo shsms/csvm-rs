@@ -362,7 +362,7 @@ fn ticks(lo: f64, hi: f64, k: usize, fmt: impl Fn(f64) -> String) -> Vec<(f64, S
 
 /// "Nice" numeric ticks at round multiples of a 1/2/5×10ⁿ step (so labels read
 /// 0, 50, 100, … not 49.166667), as `(fraction, label)` pairs over `[lo, hi]`.
-pub(crate) fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<(f64, String)> {
+fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<(f64, String)> {
     let span = hi - lo;
     if span <= 0.0 || target == 0 {
         return vec![(0.0, format_num(lo))];
@@ -437,26 +437,42 @@ fn place_ticks(width: usize, labels: &[(f64, String)], force_ends: bool) -> Stri
     s.trim_end().to_string()
 }
 
+/// Labelled axis ticks for `xaxis` over `[xlo, xhi]`, aiming for `target` ticks:
+/// round 1/2/5×10ⁿ numbers (numeric), interpolated timestamps with the date
+/// dropped when every tick is the same day (time), or the two end cells
+/// (category). Shared by the terminal and SVG renderers so they can't drift.
+pub(crate) fn axis_ticks(xaxis: &XAxis, xlo: f64, xhi: f64, target: usize) -> Vec<(f64, String)> {
+    match xaxis {
+        XAxis::Ends(lo, hi) => vec![(0.0, lo.clone()), (1.0, hi.clone())],
+        XAxis::Numeric => nice_ticks(xlo, xhi, target),
+        XAxis::Time => {
+            let fmt: fn(f64) -> String = if crate::datetime::same_day(xlo, xhi) {
+                crate::datetime::format_time // HH:MM:SS
+            } else {
+                crate::datetime::format_epoch // yyyy-mm-dd HH:MM:SS
+            };
+            ticks(xlo, xhi, target, fmt)
+        }
+    }
+}
+
+/// A representative axis label width in chars, for choosing how many ticks fit.
+pub(crate) fn axis_label_width(xaxis: &XAxis, xlo: f64, xhi: f64) -> usize {
+    match xaxis {
+        XAxis::Ends(lo, hi) => lo.chars().count().max(hi.chars().count()),
+        XAxis::Numeric => format_num(xlo).len().max(format_num(xhi).len()),
+        XAxis::Time if crate::datetime::same_day(xlo, xhi) => 8,
+        XAxis::Time => 19,
+    }
+}
+
 /// Build the x-axis label row (without the gutter prefix) for `xaxis` over the
 /// data range `[xlo, xhi]` and a `width`-wide canvas.
 fn x_label_row(xaxis: &XAxis, xlo: f64, xhi: f64, width: usize) -> String {
-    let (labels, force_ends) = match xaxis {
-        XAxis::Ends(lo, hi) => (vec![(0.0, lo.clone()), (1.0, hi.clone())], true),
-        // Round 1/2/5 ticks at their true positions (ends aren't forced).
-        XAxis::Numeric => {
-            let lw = format_num(xlo).len().max(format_num(xhi).len());
-            (nice_ticks(xlo, xhi, tick_count(width, lw)), false)
-        }
-        // Drop the date from time labels when every tick is the same day.
-        XAxis::Time => {
-            let (fmt, lw): (fn(f64) -> String, usize) = if crate::datetime::same_day(xlo, xhi) {
-                (crate::datetime::format_time, 8) // HH:MM:SS
-            } else {
-                (crate::datetime::format_epoch, 19) // yyyy-mm-dd HH:MM:SS
-            };
-            (ticks(xlo, xhi, tick_count(width, lw), fmt), true)
-        }
-    };
+    let target = tick_count(width, axis_label_width(xaxis, xlo, xhi));
+    let labels = axis_ticks(xaxis, xlo, xhi, target);
+    // Numeric (nice) ticks sit at their true positions; time/category ends pin.
+    let force_ends = !matches!(xaxis, XAxis::Numeric);
     place_ticks(width, &labels, force_ends)
 }
 
