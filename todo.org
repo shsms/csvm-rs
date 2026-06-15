@@ -245,6 +245,22 @@ below the chart rather than coercing to 0. Settle this before the binning code.
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
   gets distinct per-series colours.
 
+Surfaced by the graphing branch review (known limitations, not bugs):
+- Chart data fidelity is capped at =format_num='s 6 decimals because charts
+  re-parse the serialized output (the same buffer reuse =fmt=/=color= use), so a
+  column of sub-1e-6 values collapses to 0. A faithful fix means feeding the
+  charts the raw =Field::Num= values instead of re-parsing — a bigger change than
+  the current sink design.
+- =group … | agg …= fusion only fires when =agg= *immediately* follows =group=;
+  an intervening stage (=select=/=head=) breaks it (then errors, or silently
+  becomes a global aggregate). Either generalise fusion or reject the in-between
+  case with a clear message.
+- =Grouper::update= allocates a fresh key =Vec= + =String= per row even on a
+  group cache hit; hoist-and-=clear()= reusable buffers like =dedup_rows= does.
+- Duplication to consolidate: the series colour palette (=graph.rs= =Rgb= vs
+  =svg.rs= hex), the min/max range fold (5+ copies), and the three =collect_*=
+  header-skip + numeric-parse helpers in =exec.rs=.
+
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
