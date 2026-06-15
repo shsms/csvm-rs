@@ -64,6 +64,7 @@ comma- or space-separated arguments:
 | `tail [N]`         | keep the last `N` rows (default 10; blocking — buffers the tail) |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row, or by key `cols`; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
+| `join [(SUB)] FILE on KEYS` | merge a right-side file in by key (inner/left/right/full) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
@@ -140,6 +141,40 @@ csvm 'stats | fmt' data.csv                          # profile every column, ali
 csvm 'select region == "EU" | stats amount' data.csv # one column, after a filter
 csvm 'stats | sort mean=nr | head 5 | fmt' data.csv  # the 5 columns with the largest mean
 ```
+
+### `join`
+
+`join [FLAGS] [(SUBPIPELINE)] FILE on KEYS` merges a second CSV (the **right**
+side) into the stream by matching key columns. The main input is the **left**
+side and keeps streaming; the right `FILE` is loaded fully into a hash table (so
+make it the smaller of the two). It's an ordinary stage, so more stages can
+follow it.
+
+```sh
+csvm 'join prices.csv on sku' sales.csv                  # inner join on `sku`
+csvm 'join prices.csv on sku=item_id' sales.csv          # keys named differently
+csvm 'join prices.csv on region,sku' sales.csv           # composite key
+csvm 'join prices.csv on sku | sort price=nr | head' sales.csv  # ops after the join
+```
+
+- **Join type** (default inner): `-l`/`--left` keeps every left row, `-r`/`--right`
+  every right row, `-F`/`--full` both; unmatched cells are filled empty (an
+  unmatched right row carries the key value in the left key column).
+- **Keys** (`on …`): a comma/space list; each entry is `name` (same on both
+  sides) or `lname=rname` (different names). One-to-many matches fan out (a left
+  row matching N right rows yields N output rows).
+- **Output columns**: the left columns, then the right's non-key columns. The
+  right key columns are dropped (redundant). A non-key name that clashes is
+  auto-suffixed `_r` (`price` → `price_r`).
+- **Suffixes**: `--lsuffix S` / `--rsuffix S` set the suffix applied to *clashing*
+  names on each side (default: left none, right `_r`); non-clashing names are
+  untouched. Or pre-`rename` either side for full control.
+- **Right sub-pipeline**: an optional parenthesized csvm pipeline run over the
+  right file before joining — `join (cols sku,price | select price > 0) prices.csv
+  on sku`. It's the full language (filter, project, rename, even a nested join),
+  so the right side can be shaped without a temp file.
+- Key matching is exact string equality on the key cells (empty matches empty;
+  `"1"` ≠ `"1.0"`). The right side must be a named file, not stdin.
 
 ### Colouring (`color`)
 
@@ -305,8 +340,8 @@ and alignment — reporting per-operation throughput.
 
 The pipe language is built to grow. Planned: a computed `add` column,
 conditional colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait
-(Parquet, TSV), and `join` across multiple files. See `todo.org` for design
-notes.
+(Parquet, TSV), and group-by aggregation. See `todo.org` for design notes.
+(`join` is implemented — see above.)
 
 ## License
 

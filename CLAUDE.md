@@ -74,6 +74,23 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   combine) folds them. Counts/`min`/`max` are exact; floating `sum`/`mean`/
   `stddev` may differ from the `-n1` result by ~1 ULP (parallel reduction sums
   in a different order). stdin / `-n1` use the single-pass streaming path.
+- **`join [FLAGS] [(SUBPIPELINE)] FILE on KEYS`** merges a right-side CSV in by
+  key. A blocking stage: the right `FILE` is run through its optional
+  parenthesized sub-`Plan` (a full recursive pipeline — this is the "DAG" node),
+  materialized, and built into a `HashMap<key, Vec<right_row_idx>>`; the left rows
+  probe it. Type flags `-l/--left`, `-r/--right`, `-F/--full` (inner default);
+  unmatched cells pad empty (an unmatched right row coalesces the key value into
+  the left key column). `on` keys are `name` or `lname=rname`, composite via a
+  list; matching is exact string equality on the CSV-encoded key cells (like
+  `uniq`). Output = left cols ++ right non-key cols; a clashing right name is
+  suffixed `_r` (configurable per side with `--lsuffix`/`--rsuffix` — only
+  *clashing* names are touched). `exec::prepare_joins` reads each right file's
+  header and resolves its sub-plan *before* the pure `Plan::resolve` (which needs
+  the right header to compute the joined schema); `main` calls it between parse
+  and resolve. Any plan with a `join` takes the in-memory path (`Stage::Join` in
+  `apply_stages_over_rows`). The right side must be a file (never stdin). Paren
+  groups make `split_stages` paren-aware so the sub-pipeline's `|` doesn't split
+  the outer pipeline.
 - **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
   mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COL RAMP [LO HI]`
   a value gradient. Predicate rules reuse the `select` expression parser; rules
@@ -201,10 +218,10 @@ serial merge just copy line bytes.
 ## Roadmap
 
 The pipe language is deliberately built to grow: new verbs are a parse arm plus
-a `Stmt`/`Stage`. Planned (see `todo.org` for design notes): a computed `add`
-column, conditional colouring for `fmt`, pluggable formats via a `Source`/`Sink`
-trait (Parquet, TSV), and `join` over multiple files (a sub-pipeline as the
-right side; the `Plan` grows a join node and becomes a small DAG).
+a `Stmt`/`Stage`. `join` is implemented (`Stage::Join`, a sub-`Plan` right side —
+the `Plan` is now a small DAG). Planned (see `todo.org` for design notes): a
+computed `add` column, conditional colouring for `fmt`, pluggable formats via a
+`Source`/`Sink` trait (Parquet, TSV), and group-by aggregation.
 
 ## Conventions
 

@@ -108,7 +108,10 @@ implemented (=src/color.rs=, =exec::render=). Still open:
 
 * Other ideas (parking lot)
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
-- =join= across files (sub-pipeline as the right side; Plan becomes a DAG).
+- =join= follow-ups (the core is implemented — =Stage::Join=, sub-pipeline right
+  side): stream the left side / shard-probe with a shared =Arc= build table
+  instead of forcing the in-memory path; numeric-key normalization; build the
+  smaller side automatically.
 - group-by aggregation (=agg sum(amount) by region=) reusing =ColStats= per
   group — the sibling of the =stats= profiler.
 - Parallelise the final sort merge; run generation + intermediate merges are
