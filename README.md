@@ -16,9 +16,12 @@ path runs that plan with **no interpreter involved**.
 ```sh
 cargo build --release        # binary at target/release/csvm
 cargo test                   # unit + integration tests
+make install                 # build --release, then install to your user bin dir
 ```
 
-No external services or path dependencies; just `cargo build`.
+No external services or path dependencies; just `cargo build`. `make install`
+builds the release binary and copies it to your XDG user-binaries directory
+(`systemd-path user-binaries`, typically `~/.local/bin`).
 
 ## Usage
 
