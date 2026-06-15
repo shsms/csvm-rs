@@ -57,7 +57,7 @@ pub fn read_header<R: BufRead>(input: &mut R) -> Result<Vec<String>, Error> {
     let mut line = Vec::new();
     input.read_until(b'\n', &mut line)?;
     if line.is_empty() {
-        return Err(Error::Other("could not read header (empty input)".into()));
+        return Err(Error::Other("input is empty (no header line)".into()));
     }
     let text = std::str::from_utf8(&line)
         .map_err(|e| Error::Other(format!("header is not valid UTF-8: {e}")))?;
@@ -483,7 +483,7 @@ pub fn read_header_from_path(path: &Path) -> Result<(Vec<String>, u64, u64), Err
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line)?;
     if line.is_empty() {
-        return Err(Error::Other("could not read header (empty input)".into()));
+        return Err(Error::Other("input is empty (no header line)".into()));
     }
     let data_start = line.len() as u64; // bytes consumed including the newline
     let text = std::str::from_utf8(&line)

@@ -1194,7 +1194,7 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
                     i += 1;
                 }
                 if i >= cs.len() {
-                    return Err(err("unterminated string in select expression"));
+                    return Err(err("unterminated string literal in expression"));
                 }
                 i += 1; // closing quote
                 toks.push(ETok::Str(lit));
@@ -1319,10 +1319,24 @@ struct ExprParser<'a> {
 }
 
 impl ExprParser<'_> {
+    /// The token at the cursor, quoted, for an error message — or "end of
+    /// expression" when the cursor is past the last token.
+    fn here(&self) -> String {
+        match self.toks.get(self.pos) {
+            Some(ETok::Ident(s)) | Some(ETok::Str(s)) => format!("'{s}'"),
+            Some(ETok::Num(n)) => format!("'{}'", crate::field::format_num(*n)),
+            Some(ETok::Sym(s)) => format!("'{s}'"),
+            None => "end of expression".to_string(),
+        }
+    }
+
     fn parse(&mut self) -> Result<BoolExpr, Error> {
         let expr = self.parse_or()?;
         if self.pos != self.toks.len() {
-            return Err(err("trailing tokens in select expression"));
+            return Err(err(format!(
+                "unexpected {} after the expression",
+                self.here()
+            )));
         }
         Ok(expr)
     }
@@ -1372,7 +1386,7 @@ impl ExprParser<'_> {
         if self.eat("(") {
             let expr = self.parse_or()?;
             if !self.eat(")") {
-                return Err(err("expected ')' in select expression"));
+                return Err(err(format!("expected ')', found {}", self.here())));
             }
             Ok(expr)
         } else {
@@ -1384,7 +1398,12 @@ impl ExprParser<'_> {
         let lhs = self.parse_operand()?;
         let op = match self.toks.get(self.pos) {
             Some(ETok::Sym(s)) => *s,
-            _ => return Err(err("expected a comparison operator in select expression")),
+            _ => {
+                return Err(err(format!(
+                    "expected a comparison operator (==, !=, <, >, <=, >=, =~, ^=, *=, $=), found {}",
+                    self.here()
+                )));
+            }
         };
         self.pos += 1;
         if op == "=~" || op == "!~" {
@@ -1457,9 +1476,10 @@ impl ExprParser<'_> {
                 self.pos += 1;
                 Ok(Operand::Str(s))
             }
-            _ => Err(err(
-                "expected a column, number, or string in select expression",
-            )),
+            _ => Err(err(format!(
+                "expected a column, number, or string, found {}",
+                self.here()
+            ))),
         }
     }
 
@@ -1477,7 +1497,10 @@ impl ExprParser<'_> {
     fn parse_value_top(&mut self) -> Result<ValExpr, Error> {
         let expr = self.parse_value()?;
         if self.pos != self.toks.len() {
-            return Err(err("trailing tokens in add expression"));
+            return Err(err(format!(
+                "unexpected {} after the expression",
+                self.here()
+            )));
         }
         Ok(expr)
     }
@@ -1579,7 +1602,7 @@ impl ExprParser<'_> {
         if self.eat("(") {
             let e = self.parse_value()?;
             if !self.eat(")") {
-                return Err(err("expected ')' in add expression"));
+                return Err(err(format!("expected ')', found {}", self.here())));
             }
             return Ok(e);
         }
@@ -1602,9 +1625,10 @@ impl ExprParser<'_> {
                     Ok(ValExpr::Col(ColRef::new(name)))
                 }
             }
-            _ => Err(err(
-                "expected a column, number, string, or function in add expression",
-            )),
+            _ => Err(err(format!(
+                "expected a column, number, string, or function, found {}",
+                self.here()
+            ))),
         }
     }
 
@@ -2192,6 +2216,34 @@ mod tests {
         assert!(parse("join r.csv on").is_err()); // empty key list
         assert!(parse("join --bogus r.csv on sku").is_err()); // unknown flag
         assert!(parse("join r.csv on a=").is_err()); // malformed key pair
+    }
+
+    #[test]
+    fn expression_errors_name_the_offending_token() {
+        let msg = |s: &str| parse(s).unwrap_err().to_string();
+        // Trailing junk after a complete expression names the stray token.
+        assert!(
+            msg("select a > 0 b").contains("unexpected 'b'"),
+            "{}",
+            msg("select a > 0 b")
+        );
+        assert!(msg("add x a + b c").contains("unexpected 'c'"));
+        // A missing operator lists the valid ones and says what it found.
+        let m = msg("select a");
+        assert!(
+            m.contains("comparison operator") && m.contains("end of expression"),
+            "{m}"
+        );
+        // Missing operand / close paren report what was found.
+        assert!(msg("select a >").contains("found end of expression"));
+        assert!(msg("select (a > 0").contains("expected ')'"));
+        assert!(msg("add x )").contains("found ')'"));
+        // The shared lexer message no longer hardcodes "select".
+        let u = msg("color red a == 'x");
+        assert!(
+            u.contains("unterminated string literal") && !u.contains("select"),
+            "{u}"
+        );
     }
 
     #[test]
