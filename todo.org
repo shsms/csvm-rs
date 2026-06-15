@@ -244,6 +244,10 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 - =graph scatter= density colour ramp: colour a single-series scatter by point
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
   gets distinct per-series colours.
+- Timestamp x-axis for =graph scatter=/=line=: a non-numeric x currently falls
+  back to row order (loud). Parse =yyyy-mm-dd HH:MM:SS[+ZZ]= / ISO-8601 to epoch
+  so the axis reflects true (possibly irregular) spacing — likely a general date
+  helper (the deferred =add= date functions), reused by the chart collectors.
 
 Surfaced by the graphing branch review (known limitations, not bugs):
 - Chart data fidelity is capped at =format_num='s 6 decimals because charts

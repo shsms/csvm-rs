@@ -156,7 +156,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   - `graph scatter X Y[,Y2…]` / `graph line X Y[,Y2…]` — points (line: Bresenham
     segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple y-series
     get distinct colours (`render_xy`, when `--color`) with a legend; one braille
-    canvas per series, first-series-wins per shared cell.
+    canvas per series, first-series-wins per shared cell. If the X column is
+    *entirely* non-numeric (e.g. timestamps), `collect_xy` falls back to the
+    1-based row order as X and says so in the title (a partially-numeric X keeps
+    the strict drop-bad-rows behaviour). True timestamp-axis parsing is a
+    follow-up (`todo.org`).
   Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
   defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). `--svg` emits a
   standalone SVG document to the normal output instead of the terminal chart

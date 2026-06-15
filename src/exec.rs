@@ -1389,11 +1389,28 @@ fn render_graph<W: Write>(
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
-            let (series, skipped) = collect_xy(text, g.cols[0].pos, &ypos);
+            let (series, skipped, fallback) = collect_xy(text, g.cols[0].pos, &ypos);
             let connect = g.kind == GraphKind::Line;
-            if g.opts.svg {
-                crate::svg::xy(&title, &ynames, &series, connect, &skipped_note(skipped, 0))
+            // When x was non-numeric we plotted against row order; say so loudly.
+            let xnote = if fallback {
+                format!("x: row order; '{}' non-numeric", g.cols[0].name)
             } else {
+                String::new()
+            };
+            if g.opts.svg {
+                let note = [skipped_note(skipped, 0), xnote]
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                crate::svg::xy(&title, &ynames, &series, connect, &note)
+            } else {
+                let title = if xnote.is_empty() {
+                    title
+                } else {
+                    format!("{title}  ({xnote})")
+                };
                 crate::graph::render_xy(&title, &ynames, &series, &g.opts, color, connect, skipped)
             }
         }
@@ -1403,35 +1420,49 @@ fn render_graph<W: Write>(
 }
 
 /// Collect `(x, y)` points per y-series from the buffered output (header
-/// skipped). A row with a non-numeric x contributes no points; a non-numeric y
-/// drops just that series' point. Both count toward `skipped`.
-fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>, u64) {
-    let mut series: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ypos.len()];
-    let mut skipped = 0u64;
-    let mut first = true;
+/// skipped). A non-numeric y drops just that series' point (counted in
+/// `skipped`). The returned bool is the *row-index fallback*: if the x column is
+/// entirely non-numeric (e.g. timestamps), x becomes the 1-based row ordinal so
+/// an ordered series still charts; otherwise a row with a non-numeric x
+/// contributes no points (counted in `skipped`).
+fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>, u64, bool) {
     let num = |r: &[Field], p: usize| -> Option<f64> {
         r.get(p)
             .and_then(|f| f.as_str().trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
     };
+    let mut parsed: Vec<(Option<f64>, Vec<Option<f64>>)> = Vec::new();
+    let mut first = true;
     csv::parse_chunk(text, |r| {
         if first {
             first = false;
             return;
         }
-        match num(r, xpos) {
-            None => skipped += ypos.len() as u64,
-            Some(x) => {
-                for (i, &yp) in ypos.iter().enumerate() {
-                    match num(r, yp) {
-                        Some(y) => series[i].push((x, y)),
+        let x = num(r, xpos);
+        let ys = ypos.iter().map(|&p| num(r, p)).collect();
+        parsed.push((x, ys));
+    });
+
+    // Fall back to the row index only when no x value parsed at all — a
+    // partially-numeric x keeps the strict behaviour (drop the bad rows).
+    let fallback = !parsed.is_empty() && parsed.iter().all(|(x, _)| x.is_none());
+    let mut series: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ypos.len()];
+    let mut skipped = 0u64;
+    for (idx, (x, ys)) in parsed.into_iter().enumerate() {
+        let xv = if fallback { Some((idx + 1) as f64) } else { x };
+        match xv {
+            None => skipped += ys.len() as u64,
+            Some(xv) => {
+                for (i, y) in ys.into_iter().enumerate() {
+                    match y {
+                        Some(y) => series[i].push((xv, y)),
                         None => skipped += 1,
                     }
                 }
             }
         }
-    });
-    (series, skipped)
+    }
+    (series, skipped, fallback)
 }
 
 /// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
@@ -2391,6 +2422,23 @@ mod tests {
         assert!(out.starts_with("<svg"), "{out}");
         assert!(out.trim_end().ends_with("</svg>"), "{out}");
         assert!(out.contains("skipped 4 non-numeric"), "{out}");
+    }
+
+    #[test]
+    fn graph_xy_falls_back_to_row_index_for_non_numeric_x() {
+        // fieldA (x) is text, so x plots against the 1-based row order; countZ
+        // (5,0,0,9) all chart. The fallback is reported in the title.
+        let out = render_str("graph line fieldA countZ --height 4", INPUT, false);
+        assert!(out.contains("x: row order; 'fieldA' non-numeric"), "{out}");
+        assert!(out.contains("points=4"), "{out}");
+    }
+
+    #[test]
+    fn graph_xy_partial_numeric_x_stays_strict() {
+        // id is fully numeric, so no fallback and no rows dropped.
+        let out = render_str("graph scatter id countZ --height 4", INPUT, false);
+        assert!(!out.contains("row order"), "{out}");
+        assert!(out.contains("points=4"), "{out}");
     }
 
     #[test]
