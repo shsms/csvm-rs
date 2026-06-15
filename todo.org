@@ -128,6 +128,98 @@ implemented (=src/color.rs=, =exec::render=). Still open:
   modifier). =Ramp= grows a fixed =Style= + an fg/bg target; =Ramp::at= ORs them
   in. Pairs naturally with the =#rrggbb= and 3-stop-ramp items above.
 
+* TODO group-by aggregation =group COLS | agg FNS=
+Prerequisite for =graph bar= (categorical charts), and useful on its own — the
+sibling of the =stats= profiler, which already reduces to one row *globally*;
+group-by reduces to one row *per key*.
+
+Spelling (decide): one verb =agg sum(amount),mean(price) by region= (Miller-ish),
+or two stages =group region | agg sum(amount)=. Lean two stages — it reuses the
+=cols=-style key parser for =group= and keeps =agg='s function list orthogonal,
+and a bare =group region= with no following =agg= can default to a count.
+
+Mechanics: a blocking, *reducing* stage like =stats=. Hold a
+=HashMap<key, Vec<ColStats>>= (one =ColStats= per aggregated column per group),
+streaming each row into its group's accumulators — O(groups x aggregated-cols)
+memory, not O(rows). Output schema = key cols ++ one column per requested
+aggregate (=region,amount_sum,price_mean=). Emit groups in first-seen order
+(stable) or sorted by key — pick first-seen, =sort= composes after.
+
+Aggregates from =ColStats= for free: =count/sum/min/max/mean/stddev= (and
+=empty=). =median=/quantiles/=distinct= are the same not-cheaply-mergeable
+problem flagged for =stats --full= (t-digest/HLL) — defer identically.
+
+Parallelism: like =stats= over a seekable file with =-n>1=, each worker builds a
+partial =HashMap= over its byte range and a merge folds them (=ColStats::merge=
+already does the Welford combine per group; just union the key sets). stdin/=-n1=
+stream single-pass. Same ~1-ULP float caveat as sharded =stats=.
+
+* TODO graph: terminal-native charts
+A render-time *sink* stage that consumes the pipeline and draws a chart to the
+terminal — the visual sibling of =fmt=. Decided design (2026-06-15):
+
+** Why terminal-native (not PNG/SVG)
+csvm is a one-shot Unix-pipe CLI with no rendering deps beyond ANSI. Draw with
+Unicode block / *braille* (=U+2800=, 2x4 sub-cell pixels) straight to the
+terminal, reusing =color.rs='s truecolour SGR + =Ramp=. Keeps the "point it at a
+CSV, get an answer" flow and the lean dep tree. PNG/SVG export stays a *later*,
+feature-gated =--svg out.svg= — not the default.
+
+** =graph= is a blocking terminal sink
+Structurally a sibling of =fmt= (=Plan.output= mode / render-time metadata), but
+it *terminates* the pipe: it emits a chart, not CSV, so anything after =graph= is
+an error. Like =fmt=/=tail= it can't stream the final draw, but bin/raster
+accumulators keep it O(canvas), *not* O(rows) — preserving the past-RAM promise.
+Do the data work upstream; =graph= just consumes:
+#+begin_src sh
+csvm 'select region == "EU" | graph hist amount' sales.csv
+csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv
+csvm 'graph scatter price qty' sales.csv
+#+end_src
+
+** Chart types, ranked by memory fit (= ship order)
+The deciding axis is memory, because csvm's bragging right is "scales past RAM".
+- =graph hist COL [--bins N] [--log]= — O(bins), streaming. *Best fit, ship
+  first.* Auto-bin (Freedman-Diaconis / Sturges); bounds from =ColStats=.
+- =graph spark COL= — one-line inline chart, downsample to width. Trivial.
+- =graph bar LABEL VALUE= — O(categories). Needs group-by upstream. Horizontal
+  bars scaled to terminal width; the chart people actually ask for.
+- =graph scatter X Y= / =graph line X Y= — a fixed braille canvas *is* a
+  streaming accumulator: set pixels, don't store points, so O(canvas). line
+  needs x binning/sorting to bound memory.
+
+** Features it needs
+- Terminal-size aware: query =$COLUMNS=/=$LINES= (ioctl), fall back 80x24,
+  =--width=/=--height= overrides. Reuse =unicode-width= for visible-width
+  accounting (as =fmt= does).
+- Axis auto-scale + override (=--xrange lo:hi=, =--yrange=, =--log=); bounds from
+  =ColStats=. Axis ticks, title (=--title=), the unglamorous readability 60%.
+- Color via =color.rs= ramps for free: gradient bars / scatter-density color.
+- Multi-series (=graph line x y1,y2=) — design the column grammar for it from day
+  one even if single-series ships first.
+- =--ascii= / =--color never= fallback: degrade braille -> ASCII (=* # -=) for
+  dumb terminals and when piped to a file, mirroring =--color auto|always|never=.
+
+** Non-goals
+- No interactive TUI / ratatui / zoom-pan (that's a different tool; csvm is
+  one-shot). No new expression syntax — =graph= consumes columns the existing
+  language already produces; pipe =add=/=select=/=group= upstream. No plotting
+  crate as a hard dep (a braille renderer is ~200-300 LOC we control).
+
+** Sharp edge to settle early
+The numeric-vs-string footgun bites here: a "mostly numeric with one =N/A=="
+column wrecks an axis. =graph= must be *strict and loud* — count non-numeric /
+empty cells, drop them from the plot, and print =(skipped 12 non-numeric rows)=
+below the chart rather than coercing to 0. Settle this before the binning code.
+
+** Rollout (each phase shippable)
+1. group-by aggregation (above) — the =graph bar= prerequisite, useful alone.
+2. =graph hist= + the braille/block render core + terminal sizing — smallest
+   thing that proves the sink-stage + blocking + render path end to end.
+3. =graph bar= (now that group-by exists) + =graph spark=.
+4. =graph scatter= / =line= on the braille canvas + multi-series + color ramps.
+5. (optional, feature-gated) SVG/PNG export.
+
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
@@ -135,7 +227,5 @@ Bigger or vaguer ideas, not yet scoped.
   stream / shard-probe the left side with a shared =Arc= build table instead of
   forcing the in-memory path; numeric-key normalization; auto-pick the smaller
   build side.
-- Group-by aggregation (=agg sum(amount) by region=) reusing =ColStats= per
-  group — the sibling of the =stats= profiler.
 - Parallelise the final sort merge (run generation + intermediate merges are
   already parallel + multi-level).
