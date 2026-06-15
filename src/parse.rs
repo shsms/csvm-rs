@@ -32,8 +32,10 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
     let mut builder = Builder::default();
     for stage in split_stages(&script) {
         let stage = stage.trim();
+        // Skip blank stages: a blank or comment-only line in a multi-line `-f`
+        // script, or a trailing `|`. A wholly empty script is caught below.
         if stage.is_empty() {
-            return Err(err("empty pipeline stage (stray '|'?)"));
+            continue;
         }
         builder.parse_stage(stage)?;
     }
@@ -701,9 +703,11 @@ fn strip_comments(script: &str) -> String {
     out
 }
 
-/// Split a script into stages on a lone, unquoted `|`. A `||` (the *or*
-/// operator) and a `|` inside a string literal are left intact, so `select`
-/// expressions need no quoting of their own.
+/// Split a script into stages on a lone, unquoted `|` **or a newline** — so a
+/// multi-line `-f` script can write one stage per line without trailing `|`s. A
+/// `||` (the *or* operator) and a `|`/newline inside a string literal or a
+/// `join (…)` group are left intact, so `select` expressions need no quoting of
+/// their own. Blank stages (blank or comment-only lines) are dropped by `parse`.
 fn split_stages(script: &str) -> Vec<&str> {
     let mut stages = Vec::new();
     let bytes = script.as_bytes();
@@ -742,6 +746,13 @@ fn split_stages(script: &str) -> Vec<&str> {
                     start = i + 1;
                     i += 1;
                 }
+            }
+            // A newline separates stages too (for multi-line `-f` scripts), but
+            // not inside a `join (…)` group, whose own stages split on their own.
+            None if c == b'\n' && depth == 0 => {
+                stages.push(&script[start..i]);
+                start = i + 1;
+                i += 1;
             }
             None => i += 1,
         }
@@ -1993,5 +2004,23 @@ mod tests {
             assert_eq!(col.name, name);
             assert_eq!(*bounds, Some((0.0, 10.0)));
         }
+    }
+
+    #[test]
+    fn newlines_separate_stages_and_blank_lines_are_skipped() {
+        // A multi-line `-f`-style script: newlines split stages, and blank or
+        // comment-only lines are dropped.
+        let script = "# header comment\nselect a > 0\n\nadd b a * 2   # trailing comment\nfmt";
+        let plan = parse(script).unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!();
+        };
+        assert!(matches!(stmts[0], Stmt::Select(_)));
+        assert!(matches!(&stmts[1], Stmt::Add(a) if a.name == "b"));
+        assert_eq!(plan.output, OutputFormat::Aligned);
+
+        // A newline inside a `join (…)` group doesn't split the outer pipeline.
+        let plan = parse("rename value=a\njoin (\n rename value=b\n) r.csv on key\nfmt").unwrap();
+        assert!(plan.stages.iter().any(|s| matches!(s, Stage::Join(_))));
     }
 }

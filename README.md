@@ -86,6 +86,30 @@ Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 line (handy in a `-f` script file). A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age `` — as in `select`.
 
+### Long pipelines: script files
+
+A long pipeline is hard to read as one quoted string. Stages split on a newline
+just as they do on `|`, and `#` starts a comment, so put the pipeline in a file
+and run it with `-f` (the input is then the positional argument — no `cat … |`):
+
+```sh
+csvm -f pipeline.csvm data.csv
+```
+
+```text
+# pipeline.csvm — one stage per line, comments allowed
+rename value=a
+select a > 1000
+join (rename value=b) b.csv on key
+delta a b                  # a_delta, b_delta
+color -g a b a_delta b_delta
+cols key a a_delta b b_delta
+fmt
+```
+
+A trailing `|` at the end of a line is optional — a newline alone separates
+stages (it doesn't inside a `join (…)` group, whose own stages split normally).
+
 ### `select` expressions
 
 A bare infix expression (no surrounding quotes — only string *literals* are

@@ -126,11 +126,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   numeric are right-justified (digits line up); text columns are left-justified.
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
-  protect a literal `#`), then `split_stages` splits on a lone unquoted `|`; a
-  `||` (or) and a `|` inside a string literal are left intact, so the bare
-  `select` expression needs no quoting of its own. `parse.rs` is a hand-written tokenizer plus a
-  recursive-descent expression parser producing the `BoolExpr`/`Cmp` IR (and the
-  `ValExpr` value IR for `add`).
+  protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
+  **or a newline** (so a multi-line `-f` script is one stage per line, no
+  trailing `|`s); a `||` (or) and a `|`/newline inside a string literal or a
+  `join (…)` group are left intact, and blank/comment-only stages are dropped.
+  `parse.rs` is a hand-written tokenizer plus a recursive-descent expression
+  parser producing the `BoolExpr`/`Cmp` IR (and the `ValExpr` value IR for
+  `add`).
 
 ## Implicit conversions (`to_num`/`to_str` are implicit)
 
