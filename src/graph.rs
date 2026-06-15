@@ -17,18 +17,20 @@ const VBLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '�
 /// dropped and reported rather than flooding the screen ("no silent caps").
 pub const MAX_BARS: usize = 50;
 
-/// Cap on the *default* chart width, so an absurd `$COLUMNS` can't make a chart
+/// Default chart width, also the cap so an absurd `$COLUMNS` can't make a chart
 /// megabytes wide. An explicit `--width` overrides it (the user's choice).
-const MAX_W: usize = 80;
+const MAX_W: usize = 120;
 
-/// Terminal width in columns, from `$COLUMNS` or the conventional 80 fallback
-/// (the design's 80×24 default — no ioctl dependency).
+/// Terminal width in columns. `$COLUMNS` is usually *not* exported to child
+/// processes, so the fallback is the common case — default to [`MAX_W`] there
+/// (no ioctl dependency). A genuinely narrower terminal that does export
+/// `$COLUMNS` is still respected (callers cap with `.min(MAX_W)`).
 fn term_cols() -> usize {
     std::env::var("COLUMNS")
         .ok()
         .and_then(|c| c.parse::<usize>().ok())
         .filter(|&c| c > 0)
-        .unwrap_or(80)
+        .unwrap_or(MAX_W)
 }
 
 /// A finished histogram: `bins` equal-width buckets spanning `[lo, hi]`, the last
@@ -340,11 +342,27 @@ fn braille_char(bits: u8) -> char {
     char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
 }
 
+/// Fit two end-of-axis labels into `width`, truncating each to half the width
+/// (keeping a one-column gap) when the pair would otherwise overflow — long
+/// timestamp strings would otherwise collide or break alignment.
+fn fit_ends(lo: &str, hi: &str, width: usize) -> (String, String) {
+    let budget = width.saturating_sub(1);
+    if lo.chars().count() + hi.chars().count() <= budget {
+        return (lo.to_string(), hi.to_string());
+    }
+    let each = (budget / 2).max(1);
+    let cut = |s: &str| s.chars().take(each).collect::<String>();
+    (cut(lo), cut(hi))
+}
+
 /// Render a scatter (`connect=false`) or line (`connect=true`) chart of one or
 /// more y-series against a shared x, on a braille canvas with a labelled frame.
 /// Multiple series get distinct colours (when `colors`); on a shared cell the
 /// first series wins the glyph (overlap is approximate, as in other terminal
-/// plotters). `skipped` counts dropped non-numeric points.
+/// plotters). `skipped` counts dropped non-numeric points. `xlabels` overrides
+/// the bottom axis ends (used by the row-index fallback to show the real
+/// first/last x values, e.g. timestamps, instead of `1`/`N`).
+#[allow(clippy::too_many_arguments)] // a chart has many independent display inputs
 pub fn render_xy(
     title: &str,
     names: &[String],
@@ -353,6 +371,7 @@ pub fn render_xy(
     colors: bool,
     connect: bool,
     skipped: u64,
+    xlabels: Option<(String, String)>,
 ) -> String {
     let (width, height) = (opts.width, opts.height);
     let total: usize = series.iter().map(Vec::len).sum();
@@ -458,11 +477,14 @@ pub fn render_xy(
         }
         out.push('\n');
     }
-    // Bottom axis and x-range labels.
+    // Bottom axis and x-range labels — the real first/last x values when the
+    // caller overrode them (row-index fallback), else the numeric range.
     out.push_str(&format!("{:>gutter$} └{}\n", "", "─".repeat(wcells)));
-    let xlo_s = format_num(xlo);
-    let xhi_s = format_num(xhi);
-    let pad = wcells.saturating_sub(xlo_s.len() + xhi_s.len());
+    let (xlo_s, xhi_s) = match &xlabels {
+        Some((lo, hi)) => fit_ends(lo, hi, wcells),
+        None => (format_num(xlo), format_num(xhi)),
+    };
+    let pad = wcells.saturating_sub(xlo_s.len() + xhi_s.len()).max(1);
     out.push_str(&format!(
         "{:>gutter$}  {xlo_s}{}{xhi_s}\n",
         "",
@@ -608,6 +630,7 @@ mod tests {
             false,
             false,
             0,
+            None,
         );
         assert!(s.starts_with("y vs x\n"));
         assert!(s.contains('┤')); // y-axis border
@@ -615,6 +638,24 @@ mod tests {
         assert!(s.contains("points=3"));
         // The axis labels span the data range.
         assert!(s.contains('0') && s.contains('2'));
+    }
+
+    #[test]
+    fn render_xy_uses_override_labels_for_the_x_axis() {
+        // Row-index fallback: positions are 1,2,3 but the axis shows real ends.
+        let pts = vec![vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]];
+        let ends = Some(("2024-01-01".to_string(), "2024-01-03".to_string()));
+        let s = render_xy(
+            "y vs t",
+            &["y".into()],
+            &pts,
+            &xy_opts(40, 4),
+            false,
+            true,
+            0,
+            ends,
+        );
+        assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
     }
 
     #[test]
@@ -627,6 +668,7 @@ mod tests {
             false,
             false,
             5,
+            None,
         );
         assert!(s.contains("no numeric points to plot"));
         assert!(s.contains("skipped 5"));
@@ -636,7 +678,7 @@ mod tests {
     fn render_xy_multi_series_adds_a_legend_when_coloured() {
         let series = vec![vec![(0.0, 0.0)], vec![(0.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = render_xy("t", &names, &series, &xy_opts(8, 4), true, false, 0);
+        let s = render_xy("t", &names, &series, &xy_opts(8, 4), true, false, 0, None);
         assert!(s.contains('\x1b')); // coloured glyphs
         assert!(s.contains('●')); // legend markers
     }

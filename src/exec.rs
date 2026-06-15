@@ -42,6 +42,9 @@ fn vis_width(s: &str) -> usize {
 /// multi-sort fallback).
 type OwnedRow = Vec<Field<'static>>;
 
+/// `(x, y)` points per y-series, for `graph scatter`/`line` (see `collect_xy`).
+type XySeries = Vec<Vec<(f64, f64)>>;
+
 /// Knobs for a run: chunk size, worker count, and where sort spills its temp
 /// files.
 #[derive(Clone, Debug)]
@@ -1389,29 +1392,31 @@ fn render_graph<W: Write>(
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
-            let (series, skipped, fallback) = collect_xy(text, g.cols[0].pos, &ypos);
+            let (series, skipped, xlabels) = collect_xy(text, g.cols[0].pos, &ypos);
             let connect = g.kind == GraphKind::Line;
-            // When x was non-numeric we plotted against row order; say so loudly.
-            let xnote = if fallback {
-                format!("x: row order; '{}' non-numeric", g.cols[0].name)
+            // A non-numeric x plots against row order, but the axis still shows
+            // the real first/last x values — so just flag that spacing is by row.
+            let xnote = if xlabels.is_some() {
+                "even row spacing"
             } else {
-                String::new()
+                ""
             };
             if g.opts.svg {
-                let note = [skipped_note(skipped, 0), xnote]
-                    .iter()
+                let note = [skipped_note(skipped, 0), xnote.to_string()]
+                    .into_iter()
                     .filter(|s| !s.is_empty())
-                    .cloned()
                     .collect::<Vec<_>>()
                     .join("  ");
-                crate::svg::xy(&title, &ynames, &series, connect, &note)
+                crate::svg::xy(&title, &ynames, &series, connect, &note, xlabels)
             } else {
                 let title = if xnote.is_empty() {
                     title
                 } else {
                     format!("{title}  ({xnote})")
                 };
-                crate::graph::render_xy(&title, &ynames, &series, &g.opts, color, connect, skipped)
+                crate::graph::render_xy(
+                    &title, &ynames, &series, &g.opts, color, connect, skipped, xlabels,
+                )
             }
         }
     };
@@ -1421,23 +1426,39 @@ fn render_graph<W: Write>(
 
 /// Collect `(x, y)` points per y-series from the buffered output (header
 /// skipped). A non-numeric y drops just that series' point (counted in
-/// `skipped`). The returned bool is the *row-index fallback*: if the x column is
-/// entirely non-numeric (e.g. timestamps), x becomes the 1-based row ordinal so
-/// an ordered series still charts; otherwise a row with a non-numeric x
-/// contributes no points (counted in `skipped`).
-fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>, u64, bool) {
+/// `skipped`). The third return is the *row-index fallback* labels: if the x
+/// column is entirely non-numeric (e.g. timestamps), x becomes the 1-based row
+/// ordinal so an ordered series still charts, and this is `Some((first, last))`
+/// — the raw x-cell text of the first and last rows, so the axis can show the
+/// real range instead of `1`/`N`. `None` means a numeric x (no fallback); a row
+/// with a non-numeric x then contributes no points (counted in `skipped`).
+fn collect_xy(
+    text: &str,
+    xpos: usize,
+    ypos: &[usize],
+) -> (XySeries, u64, Option<(String, String)>) {
     let num = |r: &[Field], p: usize| -> Option<f64> {
         r.get(p)
             .and_then(|f| f.as_str().trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
     };
     let mut parsed: Vec<(Option<f64>, Vec<Option<f64>>)> = Vec::new();
+    let mut xfirst: Option<String> = None;
+    let mut xlast = String::new();
     let mut first = true;
     csv::parse_chunk(text, |r| {
         if first {
             first = false;
             return;
         }
+        let xcell = r
+            .get(xpos)
+            .map(|f| f.as_str().into_owned())
+            .unwrap_or_default();
+        if xfirst.is_none() {
+            xfirst = Some(xcell.clone());
+        }
+        xlast = xcell;
         let x = num(r, xpos);
         let ys = ypos.iter().map(|&p| num(r, p)).collect();
         parsed.push((x, ys));
@@ -1462,7 +1483,8 @@ fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>,
             }
         }
     }
-    (series, skipped, fallback)
+    let labels = fallback.then(|| (xfirst.unwrap_or_default(), xlast));
+    (series, skipped, labels)
 }
 
 /// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
@@ -2427,10 +2449,14 @@ mod tests {
     #[test]
     fn graph_xy_falls_back_to_row_index_for_non_numeric_x() {
         // fieldA (x) is text, so x plots against the 1-based row order; countZ
-        // (5,0,0,9) all chart. The fallback is reported in the title.
+        // (5,0,0,9) all chart. The fallback flags even spacing and the axis
+        // shows the real first/last x values (fieldA is t,f,t,t → "t" … "t").
         let out = render_str("graph line fieldA countZ --height 4", INPUT, false);
-        assert!(out.contains("x: row order; 'fieldA' non-numeric"), "{out}");
+        assert!(out.contains("even row spacing"), "{out}");
         assert!(out.contains("points=4"), "{out}");
+        // Axis ends are the real x cells, not synthetic 1/4 indices.
+        let axis = out.lines().rev().nth(1).unwrap_or("");
+        assert!(axis.trim_start().starts_with('t'), "{out}");
     }
 
     #[test]

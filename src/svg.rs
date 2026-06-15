@@ -83,13 +83,19 @@ fn ylabels(lo: f64, hi: f64) -> String {
 
 /// x-axis labels at the left (lo) and right (hi) ends.
 fn xlabels(lo: f64, hi: f64) -> String {
+    xlabels_text(&format_num(lo), &format_num(hi))
+}
+
+/// x-axis end labels from pre-formatted strings (used for the row-index
+/// fallback's real first/last x values, e.g. timestamps).
+fn xlabels_text(lo: &str, hi: &str) -> String {
     let y = T + ph() + 16.0;
     format!(
         "<text x=\"{L}\" y=\"{y}\">{lo}</text>\n\
 <text x=\"{rx}\" y=\"{y}\" text-anchor=\"end\">{hi}</text>\n",
         rx = L + pw(),
-        lo = format_num(lo),
-        hi = format_num(hi),
+        lo = esc(lo),
+        hi = esc(hi),
     )
 }
 
@@ -177,6 +183,7 @@ pub fn xy(
     series: &[Vec<(f64, f64)>],
     connect: bool,
     note: &str,
+    x_ends: Option<(String, String)>,
 ) -> String {
     let mut xlo = f64::INFINITY;
     let mut xhi = f64::NEG_INFINITY;
@@ -203,7 +210,10 @@ pub fn xy(
 
     let mut body = axes();
     body.push_str(&ylabels(ylo, yhi));
-    body.push_str(&xlabels(xlo, xhi));
+    body.push_str(&match &x_ends {
+        Some((lo, hi)) => xlabels_text(lo, hi),
+        None => xlabels(xlo, xhi),
+    });
     for (si, pts) in series.iter().enumerate() {
         let color = SERIES[si % SERIES.len()];
         if connect {
@@ -261,17 +271,26 @@ mod tests {
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
         let series = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
         let names = ["y".to_string()];
-        assert!(xy("s", &names, &series, false, "").contains("<circle"));
-        assert!(xy("s", &names, &series, true, "").contains("<polyline"));
+        assert!(xy("s", &names, &series, false, "", None).contains("<circle"));
+        assert!(xy("s", &names, &series, true, "", None).contains("<polyline"));
     }
 
     #[test]
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
         let series = vec![vec![(0.0, 0.0)], vec![(1.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = xy("m", &names, &series, false, "");
+        let s = xy("m", &names, &series, false, "", None);
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
+    }
+
+    #[test]
+    fn xy_override_labels_appear_on_the_axis() {
+        let series = vec![vec![(1.0, 0.0), (2.0, 1.0)]];
+        let names = ["y".to_string()];
+        let ends = Some(("t0".to_string(), "t9".to_string()));
+        let s = xy("y vs t", &names, &series, true, "", ends);
+        assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
 
     #[test]

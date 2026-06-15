@@ -158,11 +158,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     get distinct colours (`render_xy`, when `--color`) with a legend; one braille
     canvas per series, first-series-wins per shared cell. If the X column is
     *entirely* non-numeric (e.g. timestamps), `collect_xy` falls back to the
-    1-based row order as X and says so in the title (a partially-numeric X keeps
-    the strict drop-bad-rows behaviour). True timestamp-axis parsing is a
+    1-based row order as X but the axis still shows the real first/last X cell
+    text (so a timestamp range reads correctly); the title flags `even row
+    spacing` (a partially-numeric X keeps the strict drop-bad-rows behaviour).
+    True timestamp *parsing* (so spacing reflects irregular sampling) is a
     follow-up (`todo.org`).
   Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
-  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). `--svg` emits a
+  defaults to the terminal (`$COLUMNS`, else `MAX_W`=120 — `$COLUMNS` is usually
+  not exported to children, so 120 is the common default; no ioctl dep). `--svg` emits a
   standalone SVG document to the normal output instead of the terminal chart
   (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
   (needs a raster dep) and a scatter density colour ramp are the remaining
