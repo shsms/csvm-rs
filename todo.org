@@ -162,7 +162,9 @@ partial =HashMap= over its byte range and a merge folds them (=ColStats::merge=
 already does the Welford combine per group; just union the key sets). stdin/=-n1=
 stream single-pass. Same ~1-ULP float caveat as sharded =stats=.
 
-* TODO graph: terminal-native charts
+* DONE graph: terminal-native charts
+All rollout phases shipped (hist/bar/spark/scatter/line + SVG); see the
+follow-ups subsection for what remains. Original design notes kept below.
 A render-time *sink* stage that consumes the pipeline and draws a chart to the
 terminal — the visual sibling of =fmt=. Decided design (2026-06-15):
 
@@ -244,12 +246,14 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 - =graph scatter= density colour ramp: colour a single-series scatter by point
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
   gets distinct per-series colours.
-- [X] Timestamp x-axis for =graph scatter=/=line=: a timestamp x now parses to
-  epoch (=src/datetime.rs=, =yyyy-mm-dd[ T]HH:MM:SS[.fff][Z|±HH:MM]=, no dep) and
-  plots on a true time axis with formatted-date labels; other non-numeric x
-  still falls back to row order. Remaining polish: intermediate axis ticks (only
-  first/last shown); expose =datetime= via an =add= =epoch()=/date function;
-  honour the source offset in axis labels (currently formatted as UTC).
+- [X] Timestamp x-axis for =graph scatter=/=line=: a timestamp x parses to epoch
+  (=src/datetime.rs=, =yyyy-mm-dd[ T]HH:MM:SS[.fff][Z|±HH:MM]=, no dep) and plots
+  on a true time axis; other non-numeric x falls back to row order. Remaining
+  polish: expose =datetime= via an =add= =epoch()=/date function; honour the
+  source offset in axis labels (currently formatted as UTC).
+- [X] Graduated axis ticks: numeric uses round 1/2/5x10^n values, time drops the
+  date to =HH:MM:SS= within one day, tick count adapts to width. Shared between
+  the terminal and SVG renderers (=graph::axis_ticks=/=axis_label_width=).
 
 Surfaced by the graphing branch review (known limitations, not bugs):
 - Chart data fidelity is capped at =format_num='s 6 decimals because charts
