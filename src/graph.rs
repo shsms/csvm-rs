@@ -21,6 +21,10 @@ pub const MAX_BARS: usize = 50;
 /// megabytes wide. An explicit `--width` overrides it (the user's choice).
 const MAX_W: usize = 120;
 
+/// Default scatter/line canvas height in terminal rows (`--height` overrides).
+/// Chosen to look less flat against the 120-wide default.
+const XY_HEIGHT: usize = 22;
+
 /// Terminal width in columns. `$COLUMNS` is usually *not* exported to child
 /// processes, so the fallback is the common case — default to [`MAX_W`] there
 /// (no ioctl dependency). A genuinely narrower terminal that does export
@@ -399,7 +403,7 @@ pub fn render_xy(
     let wcells = width
         .unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(gutter + 3))
         .max(4);
-    let hcells = height.unwrap_or(15).max(2);
+    let hcells = height.unwrap_or(XY_HEIGHT).max(2);
 
     let map = |x: f64, y: f64, b: &Braille| {
         let px = if xspan > 0.0 {
