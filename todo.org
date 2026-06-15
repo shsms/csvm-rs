@@ -4,34 +4,29 @@
 Roadmap and design notes for features not yet implemented. Done items live in
 git history; this file is the "what next / what was decided" scratchpad.
 
-* Review findings (2026-05-29)
-From an exhaustive read of =src/=. Correctness first, then edges/perf. File:line
-refs are approximate.
+* Open items
 
-** TODO Minor / edge
-- sort: in-memory budget is *soft* — N workers can each =fetch_add= before any
-  spills, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
-  And a string sort key containing a literal =\0= (rare in CSV) sorts slightly
-  off (documented in CLAUDE.md).
+** TODO Correctness / edges
+- sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
+  spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
+  A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
+  (documented in CLAUDE.md).
 
-** TODO Feature gaps surfaced
-- =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
-  (not cheaply mergeable — need buffering or t-digest/HLL).
-
-* Interface review (2026-05-29)
-A UX pass over the CLI and command language. Items tracked elsewhere aren't
-repeated: =tail=/=uniq= (Review findings), the colour palette (=color: future=),
-pluggable formats (parking lot).
-
-** TODO Larger / needs a decision (deferred)
+** TODO Decisions to make
 - Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
-  bare columns, no numeric literal). =--print-engine= now tags each compare
-  =:num=/=:str= so it's visible; still to decide: default ordering (=< > <= >=) to
-  numeric when neither side is typed, or add a =num()= coercion.
-- Delimiter support =-d= / =--delim= (TSV) — a narrower near-term step toward the
+  bare columns, no numeric literal). =--print-engine= tags each compare
+  =:num=/=:str= so it's visible; still to decide: default the orderings
+  (=< > <= >=) to numeric when neither side is typed, or add a =num()= coercion.
+
+** TODO Smaller features
+- Delimiter support =-d= / =--delim= (TSV) — a narrow near-term step toward the
   Source/Sink roadmap; touches the scanner + writer.
-- Column ranges/indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
-- Multiple input files: =csvm SCRIPT a.csv b.csv= (concat; precursor to =join=).
+- Column ranges / indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
+- Multiple input files: =csvm SCRIPT a.csv b.csv= — concatenate inputs sharing a
+  header (currently only one input is accepted; =join= already covers keyed
+  merges).
+- =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
+  — not cheaply mergeable, so they need buffering or t-digest/HLL.
 
 * TODO computed column: =add NAME EXPR=
 Append a new column =NAME= computed per row from a value expression over the
@@ -72,7 +67,7 @@ add area  match(phone, '(\d{3})')   # regex capture group
 add tier  amount > 1000 ? 'big' : 'small'
 add sign  amount < 0 ? 'debit' : 'credit'
 #+end_src
-*** Constants & metadata (tags; useful before a future join/concat)
+*** Constants & metadata (tags; useful before a concat)
 #+begin_src sh
 add source  'january.csv'    # constant column
 add rownum  rownum()         # 1-based row index
@@ -119,13 +114,14 @@ implemented (=src/color.rs=, =exec::render=). Still open:
   modifier). =Ramp= grows a fixed =Style= + an fg/bg target; =Ramp::at= ORs them
   in. Pairs naturally with the =#rrggbb= and 3-stop-ramp items above.
 
-* Other ideas (parking lot)
+* Parking lot
+Bigger or vaguer ideas, not yet scoped.
 - Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
-- =join= follow-ups (the core is implemented — =Stage::Join=, sub-pipeline right
-  side): stream the left side / shard-probe with a shared =Arc= build table
-  instead of forcing the in-memory path; numeric-key normalization; build the
-  smaller side automatically.
-- group-by aggregation (=agg sum(amount) by region=) reusing =ColStats= per
+- =join= follow-ups (core implemented — =Stage::Join=, sub-pipeline right side):
+  stream / shard-probe the left side with a shared =Arc= build table instead of
+  forcing the in-memory path; numeric-key normalization; auto-pick the smaller
+  build side.
+- Group-by aggregation (=agg sum(amount) by region=) reusing =ColStats= per
   group — the sibling of the =stats= profiler.
-- Parallelise the final sort merge; run generation + intermediate merges are
-  already parallel + multi-level.
+- Parallelise the final sort merge (run generation + intermediate merges are
+  already parallel + multi-level).
