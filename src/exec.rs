@@ -1358,13 +1358,15 @@ fn render_graph<W: Write>(
         GraphKind::Hist | GraphKind::Spark => g.cols[0].name.clone(),
     });
 
+    // One scale factor sets both chart dimensions.
+    let (width, height) = crate::graph::chart_size(g.opts.scale);
     let chart = match g.kind {
         GraphKind::Hist => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
             let note = skipped_note(skipped, 0);
             match Histogram::build(&values, g.opts.bins, skipped) {
                 Some(h) if g.opts.svg => crate::svg::hist(&title, h.lo, h.hi, &h.counts, &note),
-                Some(h) => h.render(&title, g.opts.width),
+                Some(h) => h.render(&title, width),
                 // Keep the --svg contract even with nothing to plot: an empty SVG.
                 None if g.opts.svg => crate::svg::hist(&title, 0.0, 0.0, &[], &note),
                 None => {
@@ -1377,7 +1379,7 @@ fn render_graph<W: Write>(
             if g.opts.svg {
                 crate::svg::spark(&title, &values, &skipped_note(skipped, 0))
             } else {
-                crate::graph::render_spark(&title, &values, g.opts.width, skipped)
+                crate::graph::render_spark(&title, &values, width, skipped)
             }
         }
         GraphKind::Bar => {
@@ -1386,7 +1388,7 @@ fn render_graph<W: Write>(
             if g.opts.svg {
                 crate::svg::bars(&title, &rows, &skipped_note(skipped, truncated))
             } else {
-                crate::graph::render_bars(&title, &rows, g.opts.width, skipped, truncated)
+                crate::graph::render_bars(&title, &rows, width, skipped, truncated)
             }
         }
         GraphKind::Scatter | GraphKind::Line => {
@@ -1415,7 +1417,7 @@ fn render_graph<W: Write>(
                     format!("{title}  ({xnote})")
                 };
                 crate::graph::render_xy(
-                    &title, &ynames, &series, &g.opts, color, connect, skipped, xends,
+                    &title, &ynames, &series, width, height, color, connect, skipped, xends,
                 )
             }
         }
@@ -2461,14 +2463,14 @@ mod tests {
 
     #[test]
     fn graph_spark_is_a_single_line() {
-        let out = render_str("graph spark countZ --width 4", INPUT, false);
+        let out = render_str("graph spark countZ", INPUT, false);
         assert!(out.starts_with("countZ\n"), "{out}");
         assert!(out.contains("min=0") && out.contains("max=9"), "{out}");
     }
 
     #[test]
     fn graph_scatter_plots_xy_on_a_braille_frame() {
-        let out = render_str("graph scatter id countZ --height 4", INPUT, false);
+        let out = render_str("graph scatter id countZ", INPUT, false);
         assert!(out.starts_with("countZ vs id\n"), "{out}");
         assert!(out.contains('┤') && out.contains('└'), "{out}");
         assert!(out.contains("points=4"), "{out}");
@@ -2499,7 +2501,7 @@ mod tests {
         // fieldA (x) is text, so x plots against the 1-based row order; countZ
         // (5,0,0,9) all chart. The fallback flags even spacing and the axis
         // shows the real first/last x values (fieldA is t,f,t,t → "t" … "t").
-        let out = render_str("graph line fieldA countZ --height 4", INPUT, false);
+        let out = render_str("graph line fieldA countZ", INPUT, false);
         assert!(out.contains("even row spacing"), "{out}");
         assert!(out.contains("points=4"), "{out}");
         // Axis ends are the real x cells, not synthetic 1/4 indices.
@@ -2512,7 +2514,7 @@ mod tests {
         // A string timestamp x is parsed to epoch: real spacing (no even-row
         // caveat) and the axis shows formatted dates.
         let input = "t,v\n2024-01-01T00:00:00Z,1\n2024-01-01T01:00:00Z,5\n2024-01-01T02:00:00Z,3\n";
-        let out = render_str("graph line t v --height 4", input, false);
+        let out = render_str("graph line t v", input, false);
         assert!(out.contains("points=3"), "{out}");
         assert!(!out.contains("even row spacing"), "{out}"); // true axis, not fallback
         assert!(
@@ -2524,14 +2526,14 @@ mod tests {
     #[test]
     fn graph_xy_partial_numeric_x_stays_strict() {
         // id is fully numeric, so no fallback and no rows dropped.
-        let out = render_str("graph scatter id countZ --height 4", INPUT, false);
+        let out = render_str("graph scatter id countZ", INPUT, false);
         assert!(!out.contains("row order"), "{out}");
         assert!(out.contains("points=4"), "{out}");
     }
 
     #[test]
     fn graph_line_multi_series_is_coloured_with_a_legend() {
-        let out = render_str("graph line id fieldA,countZ --height 4", INPUT, true);
+        let out = render_str("graph line id fieldA,countZ", INPUT, true);
         // fieldA is text ⇒ its points are skipped; countZ contributes 4.
         assert!(out.contains("points=4"), "{out}");
         assert!(out.contains('\x1b'), "expected colour escapes");

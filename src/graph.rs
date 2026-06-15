@@ -5,7 +5,6 @@
 
 use crate::color::{Rgb, Style};
 use crate::field::format_num;
-use crate::plan::GraphOpts;
 
 /// Eighth-width block glyphs, 1/8…8/8, for sub-character bar lengths.
 const BLOCKS: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
@@ -17,24 +16,16 @@ const VBLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '�
 /// dropped and reported rather than flooding the screen ("no silent caps").
 pub const MAX_BARS: usize = 50;
 
-/// Default chart width, also the cap so an absurd `$COLUMNS` can't make a chart
-/// megabytes wide. An explicit `--width` overrides it (the user's choice).
-const MAX_W: usize = 120;
+/// Base chart dimensions at `scale = 1.0`: total width in columns and the
+/// scatter/line canvas height in rows. A single `--scale` multiplies both.
+const BASE_W: usize = 80;
+const BASE_H: usize = 15;
 
-/// Default scatter/line canvas height in terminal rows (`--height` overrides).
-/// Chosen to look less flat against the 120-wide default.
-const XY_HEIGHT: usize = 22;
-
-/// Terminal width in columns. `$COLUMNS` is usually *not* exported to child
-/// processes, so the fallback is the common case — default to [`MAX_W`] there
-/// (no ioctl dependency). A genuinely narrower terminal that does export
-/// `$COLUMNS` is still respected (callers cap with `.min(MAX_W)`).
-fn term_cols() -> usize {
-    std::env::var("COLUMNS")
-        .ok()
-        .and_then(|c| c.parse::<usize>().ok())
-        .filter(|&c| c > 0)
-        .unwrap_or(MAX_W)
+/// Resolve a `--scale` factor to a `(width, height)` in terminal cells, clamped
+/// so a tiny scale still leaves room to draw.
+pub fn chart_size(scale: f64) -> (usize, usize) {
+    let dim = |base: usize, min: usize| ((base as f64 * scale).round() as usize).max(min);
+    (dim(BASE_W, 16), dim(BASE_H, 2))
 }
 
 /// A finished histogram: `bins` equal-width buckets spanning `[lo, hi]`, the last
@@ -90,8 +81,9 @@ impl Histogram {
 
     /// Render to a multi-line string: a right-aligned bin-edge axis, a block bar
     /// per bin, and the count, followed by a summary line. `title` defaults to
-    /// the column name; `bar_width` defaults to the terminal width minus the axis.
-    pub fn render(&self, title: &str, bar_width: Option<usize>) -> String {
+    /// the column name; `width` is the total chart width (the bars fill what is
+    /// left after the axis).
+    pub fn render(&self, title: &str, width: usize) -> String {
         let nbins = self.counts.len();
         let span = self.hi - self.lo;
         let step = if nbins > 0 { span / nbins as f64 } else { 0.0 };
@@ -103,8 +95,7 @@ impl Histogram {
         let axis_w = edges.iter().map(String::len).max().unwrap_or(1);
 
         let max_count = self.counts.iter().copied().max().unwrap_or(0);
-        let bars =
-            bar_width.unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(axis_w + 12).max(10));
+        let bars = width.saturating_sub(axis_w + 12).max(10);
 
         let mut out = String::new();
         out.push_str(title);
@@ -137,7 +128,7 @@ impl Histogram {
 pub fn render_bars(
     title: &str,
     rows: &[(String, f64)],
-    bar_width: Option<usize>,
+    width: usize,
     skipped: u64,
     truncated: usize,
 ) -> String {
@@ -157,8 +148,7 @@ pub fn render_bars(
         hi = hi.max(*v);
     }
     let span = hi - lo;
-    let w =
-        bar_width.unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(label_w + 14).max(10));
+    let w = width.saturating_sub(label_w + 14).max(10);
     let zero = pos_in(0.0, lo, span, w);
 
     let mut out = String::new();
@@ -198,11 +188,11 @@ fn pos_in(v: f64, lo: f64, span: f64, width: usize) -> usize {
 /// Render a one-line sparkline of `values` (downsampled to `width` by bucket
 /// averaging), with a title and a min/max summary. Each cell is an eighth-height
 /// block scaled to the value range.
-pub fn render_spark(title: &str, values: &[f64], width: Option<usize>, skipped: u64) -> String {
+pub fn render_spark(title: &str, values: &[f64], width: usize, skipped: u64) -> String {
     if values.is_empty() {
         return format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n");
     }
-    let cols = width.unwrap_or_else(|| term_cols().min(MAX_W)).max(1);
+    let cols = width.max(1);
     // Bucket-average so a long series collapses to one cell per column.
     let buckets: Vec<f64> = if values.len() <= cols {
         values.to_vec()
@@ -363,21 +353,22 @@ fn fit_ends(lo: &str, hi: &str, width: usize) -> (String, String) {
 /// more y-series against a shared x, on a braille canvas with a labelled frame.
 /// Multiple series get distinct colours (when `colors`); on a shared cell the
 /// first series wins the glyph (overlap is approximate, as in other terminal
-/// plotters). `skipped` counts dropped non-numeric points. `xlabels` overrides
-/// the bottom axis ends (used by the row-index fallback to show the real
-/// first/last x values, e.g. timestamps, instead of `1`/`N`).
+/// plotters). `width`/`height` are the canvas size in terminal cells. `skipped`
+/// counts dropped non-numeric points. `xlabels` overrides the bottom axis ends
+/// (used by the temporal and row-index modes to show real x values, e.g.
+/// timestamps, instead of `1`/`N`).
 #[allow(clippy::too_many_arguments)] // a chart has many independent display inputs
 pub fn render_xy(
     title: &str,
     names: &[String],
     series: &[Vec<(f64, f64)>],
-    opts: &GraphOpts,
+    width: usize,
+    height: usize,
     colors: bool,
     connect: bool,
     skipped: u64,
     xlabels: Option<(String, String)>,
 ) -> String {
-    let (width, height) = (opts.width, opts.height);
     let total: usize = series.iter().map(Vec::len).sum();
     if total == 0 {
         return format!("{title}: no numeric points to plot (skipped {skipped} non-numeric)\n");
@@ -400,10 +391,8 @@ pub fn render_xy(
     let yhi_s = format_num(yhi);
     let ylo_s = format_num(ylo);
     let gutter = yhi_s.len().max(ylo_s.len());
-    let wcells = width
-        .unwrap_or_else(|| term_cols().min(MAX_W).saturating_sub(gutter + 3))
-        .max(4);
-    let hcells = height.unwrap_or(XY_HEIGHT).max(2);
+    let wcells = width.saturating_sub(gutter + 3).max(4);
+    let hcells = height.max(2);
 
     let map = |x: f64, y: f64, b: &Braille| {
         let px = if xspan > 0.0 {
@@ -547,7 +536,7 @@ mod tests {
     #[test]
     fn render_reports_skipped_and_summary() {
         let h = Histogram::build(&[1.0, 2.0, 3.0], Some(2), 2).unwrap();
-        let s = h.render("amount", Some(10));
+        let s = h.render("amount", 40);
         assert!(s.starts_with("amount\n"));
         assert!(s.contains("n=3"));
         assert!(s.contains("min=1"));
@@ -558,7 +547,7 @@ mod tests {
     #[test]
     fn bars_anchor_positive_at_left_edge() {
         let rows = [("a".to_string(), 2.0), ("b".to_string(), 4.0)];
-        let s = render_bars("v", &rows, Some(10), 0, 0);
+        let s = render_bars("v", &rows, 30, 0, 0);
         assert!(s.starts_with("v\n"));
         // All-positive: the zero baseline is the left edge, so bars start there.
         let a_line = s.lines().nth(1).unwrap();
@@ -569,7 +558,7 @@ mod tests {
     #[test]
     fn bars_diverge_around_zero_for_negatives() {
         let rows = [("pos".to_string(), 5.0), ("neg".to_string(), -5.0)];
-        let s = render_bars("d", &rows, Some(10), 0, 0);
+        let s = render_bars("d", &rows, 40, 0, 0);
         let pos = s.lines().find(|l| l.contains("pos")).unwrap();
         let neg = s.lines().find(|l| l.contains("neg")).unwrap();
         // The negative bar starts left of where the positive bar starts.
@@ -580,14 +569,14 @@ mod tests {
     #[test]
     fn bars_report_skipped_and_truncated() {
         let rows = [("a".to_string(), 1.0)];
-        let s = render_bars("v", &rows, Some(8), 3, 2);
+        let s = render_bars("v", &rows, 30, 3, 2);
         assert!(s.contains("(+2 more not shown)"), "{s}");
         assert!(s.contains("(skipped 3 non-numeric)"), "{s}");
     }
 
     #[test]
     fn spark_is_one_line_scaled_to_width() {
-        let s = render_spark("v", &[1.0, 2.0, 3.0, 4.0], Some(4), 0);
+        let s = render_spark("v", &[1.0, 2.0, 3.0, 4.0], 4, 0);
         let line = s.lines().nth(1).unwrap();
         assert_eq!(line.chars().count(), 4);
         // Ascending values ⇒ the last cell is the tallest block.
@@ -599,7 +588,7 @@ mod tests {
     #[test]
     fn spark_downsamples_long_series() {
         let vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
-        let s = render_spark("v", &vals, Some(10), 0);
+        let s = render_spark("v", &vals, 10, 0);
         assert_eq!(s.lines().nth(1).unwrap().chars().count(), 10);
     }
 
@@ -615,27 +604,10 @@ mod tests {
         assert_eq!(braille_char(0x01), '⠁');
     }
 
-    fn xy_opts(w: usize, h: usize) -> GraphOpts {
-        GraphOpts {
-            width: Some(w),
-            height: Some(h),
-            ..GraphOpts::default()
-        }
-    }
-
     #[test]
     fn render_xy_frames_a_scatter() {
         let pts = vec![vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]];
-        let s = render_xy(
-            "y vs x",
-            &["y".into()],
-            &pts,
-            &xy_opts(10, 4),
-            false,
-            false,
-            0,
-            None,
-        );
+        let s = render_xy("y vs x", &["y".into()], &pts, 10, 4, false, false, 0, None);
         assert!(s.starts_with("y vs x\n"));
         assert!(s.contains('┤')); // y-axis border
         assert!(s.contains('└')); // bottom axis
@@ -649,16 +621,7 @@ mod tests {
         // Row-index fallback: positions are 1,2,3 but the axis shows real ends.
         let pts = vec![vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]];
         let ends = Some(("2024-01-01".to_string(), "2024-01-03".to_string()));
-        let s = render_xy(
-            "y vs t",
-            &["y".into()],
-            &pts,
-            &xy_opts(40, 4),
-            false,
-            true,
-            0,
-            ends,
-        );
+        let s = render_xy("y vs t", &["y".into()], &pts, 40, 4, false, true, 0, ends);
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
     }
 
@@ -668,7 +631,8 @@ mod tests {
             "y vs x",
             &["y".into()],
             &[vec![]],
-            &GraphOpts::default(),
+            80,
+            15,
             false,
             false,
             5,
@@ -682,7 +646,7 @@ mod tests {
     fn render_xy_multi_series_adds_a_legend_when_coloured() {
         let series = vec![vec![(0.0, 0.0)], vec![(0.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = render_xy("t", &names, &series, &xy_opts(8, 4), true, false, 0, None);
+        let s = render_xy("t", &names, &series, 8, 4, true, false, 0, None);
         assert!(s.contains('\x1b')); // coloured glyphs
         assert!(s.contains('●')); // legend markers
     }

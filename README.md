@@ -171,7 +171,7 @@ csvm 'select region == "EU" | graph hist amount --bins 12' sales.csv
 csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv
 
 # braille line chart of two series over time
-csvm 'graph line ts open,close --height 12' prices.csv
+csvm 'graph line ts open,close --scale 1.5' prices.csv
 
 # write the chart as an SVG instead of drawing in the terminal
 csvm 'graph hist amount --svg' sales.csv -o amount.svg

@@ -399,10 +399,10 @@ impl Builder {
         Ok(())
     }
 
-    /// `graph KIND COLS [--bins N] [--width W] [--title T]` — a terminal-chart
-    /// sink. Draws from the columns reaching it instead of emitting CSV, so it
-    /// must be the last command. `hist COL`, `spark COL`, `bar LABEL VALUE`,
-    /// `scatter X Y`, `line X Y`.
+    /// `graph KIND COLS [--bins N] [--scale F] [--title T] [--svg]` — a
+    /// terminal-chart sink. Draws from the columns reaching it instead of
+    /// emitting CSV, so it must be the last command. `hist COL`, `spark COL`,
+    /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`.
     fn parse_graph(&mut self, rest: &str) -> Result<(), Error> {
         let (kind_word, rest) = split_first_word(rest.trim());
         let kind = match kind_word {
@@ -427,13 +427,9 @@ impl Builder {
                 let (val, tail) = v?;
                 opts.bins = Some(parse_positive(&val, "--bins")?);
                 s = tail.trim_start();
-            } else if let Some(v) = flag_value(word, after, "--width") {
+            } else if let Some(v) = flag_value(word, after, "--scale") {
                 let (val, tail) = v?;
-                opts.width = Some(parse_positive(&val, "--width")?);
-                s = tail.trim_start();
-            } else if let Some(v) = flag_value(word, after, "--height") {
-                let (val, tail) = v?;
-                opts.height = Some(parse_positive(&val, "--height")?);
+                opts.scale = parse_scale(&val)?;
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, "--title") {
                 let (val, tail) = v?;
@@ -1047,12 +1043,20 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
     Err(err(format!("graph {word} expects {want}, got {n}")))
 }
 
-/// Parse a positive-integer flag value (`--bins`, `--width`).
+/// Parse a positive-integer flag value (`--bins`).
 fn parse_positive(s: &str, name: &str) -> Result<usize, Error> {
     s.parse::<usize>()
         .ok()
         .filter(|&n| n >= 1)
         .ok_or_else(|| err(format!("{name} expects a positive integer, got `{s}`")))
+}
+
+/// Parse the `--scale` factor: a positive, finite number.
+fn parse_scale(s: &str) -> Result<f64, Error> {
+    s.parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| err(format!("--scale expects a positive number, got `{s}`")))
 }
 
 /// The default `count` aggregate (counts rows) `group` uses when no `agg` follows.
@@ -1933,13 +1937,13 @@ mod tests {
 
     #[test]
     fn graph_scatter_and_line_accept_multiple_y_columns() {
-        let g = parse("graph line t a,b,c --height 20")
+        let g = parse("graph line t a,b,c --scale 2")
             .unwrap()
             .graph
             .unwrap();
         assert_eq!(g.kind, GraphKind::Line);
         assert_eq!(g.cols.len(), 4); // x + 3 series
-        assert_eq!(g.opts.height, Some(20));
+        assert_eq!(g.opts.scale, 2.0);
         assert_eq!(
             parse("graph scatter x y").unwrap().graph.unwrap().kind,
             GraphKind::Scatter
@@ -1951,6 +1955,26 @@ mod tests {
     fn graph_svg_flag_sets_the_option() {
         assert!(parse("graph hist x --svg").unwrap().graph.unwrap().opts.svg);
         assert!(!parse("graph hist x").unwrap().graph.unwrap().opts.svg);
+    }
+
+    #[test]
+    fn graph_scale_parses_and_validates() {
+        assert_eq!(
+            parse("graph hist x").unwrap().graph.unwrap().opts.scale,
+            1.0
+        ); // default
+        assert_eq!(
+            parse("graph hist x --scale 1.5")
+                .unwrap()
+                .graph
+                .unwrap()
+                .opts
+                .scale,
+            1.5
+        );
+        assert!(parse("graph hist x --scale 0").is_err()); // must be positive
+        assert!(parse("graph hist x --scale -1").is_err());
+        assert!(parse("graph hist x --scale big").is_err());
     }
 
     #[test]

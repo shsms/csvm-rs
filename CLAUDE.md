@@ -163,9 +163,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     (categories) — plot against the 1-based ordinal, label with the first/last
     raw cells, and flag `even row spacing`. A partially-numeric X keeps the
     strict drop-bad-rows behaviour.
-  Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
-  defaults to the terminal (`$COLUMNS`, else `MAX_W`=120 — `$COLUMNS` is usually
-  not exported to children, so 120 is the common default; no ioctl dep). `--svg` emits a
+  Flags: `--bins N` (hist), `--scale F`, `--title T`, `--svg`. A single `--scale`
+  multiplies both base dimensions (`graph::chart_size`: `BASE_W`=80 cols,
+  `BASE_H`=15 rows; default 1.0) — there is no separate width/height knob and no
+  terminal probing. `--svg` emits a
   standalone SVG document to the normal output instead of the terminal chart
   (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
   (needs a raster dep) and a scatter density colour ramp are the remaining

@@ -645,17 +645,26 @@ pub enum GraphKind {
     Line,
 }
 
-/// Presentation options shared across chart kinds; an absent field falls back to
-/// a sensible default (bin count from the data, width from the terminal).
-#[derive(Clone, Debug, Default)]
+/// Presentation options shared across chart kinds.
+#[derive(Clone, Debug)]
 pub struct GraphOpts {
     pub bins: Option<usize>,
-    pub width: Option<usize>,
-    /// Canvas height in terminal rows (scatter/line only).
-    pub height: Option<usize>,
+    /// A single size multiplier over the base chart dimensions (1.0 = default).
+    pub scale: f64,
     pub title: Option<String>,
     /// Emit an SVG document (to the normal output) instead of a terminal chart.
     pub svg: bool,
+}
+
+impl Default for GraphOpts {
+    fn default() -> Self {
+        GraphOpts {
+            bins: None,
+            scale: 1.0,
+            title: None,
+            svg: false,
+        }
+    }
 }
 
 /// A `graph` sink: draw a terminal chart from the columns reaching it instead of
