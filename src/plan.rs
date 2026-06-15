@@ -175,6 +175,147 @@ impl UniqStmt {
     }
 }
 
+/// Which rows a `join` keeps when a side has no match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum JoinType {
+    /// Only rows that match on both sides.
+    #[default]
+    Inner,
+    /// Every left row; right columns empty when unmatched.
+    Left,
+    /// Every right row; left columns empty when unmatched.
+    Right,
+    /// Union of left and right (matched + both sides' unmatched rows).
+    Full,
+}
+
+impl JoinType {
+    /// Keep left rows that found no right match.
+    pub fn keeps_left_unmatched(self) -> bool {
+        matches!(self, JoinType::Left | JoinType::Full)
+    }
+    /// Keep right rows that found no left match.
+    pub fn keeps_right_unmatched(self) -> bool {
+        matches!(self, JoinType::Right | JoinType::Full)
+    }
+    /// The flag spelling, for `--print-engine`.
+    pub fn label(self) -> &'static str {
+        match self {
+            JoinType::Inner => "inner",
+            JoinType::Left => "left",
+            JoinType::Right => "right",
+            JoinType::Full => "full",
+        }
+    }
+}
+
+/// `join [(SUBPIPELINE)] FILE on KEYS`: merge a second (right) source into the
+/// stream by matching key columns. The right side is a full sub-[`Plan`] run over
+/// `file` and fully materialized (the build side); the left side (the main input)
+/// probes it. Output is the left columns plus the right's non-key columns, with
+/// clashing right names auto-suffixed `_r`.
+#[derive(Clone, Debug)]
+pub struct JoinStmt {
+    pub join_type: JoinType,
+    /// The right side's own pipeline (identity/empty if none was given).
+    pub right_plan: Box<Plan>,
+    /// Path to the right CSV file (never stdin).
+    pub file: String,
+    /// Key column name pairs `(left_name, right_name)`; equal names when the
+    /// `on` entry was a bare column.
+    pub keys: Vec<(String, String)>,
+    /// Suffixes applied to *clashing* column names from each side (`--lsuffix` /
+    /// `--rsuffix`). The left side is unsuffixed by default; the right side
+    /// defaults to `_r`. Only columns that would otherwise collide are suffixed.
+    pub lsuffix: Option<String>,
+    pub rsuffix: Option<String>,
+    /// The right sub-plan's *output* header, filled in before resolution by
+    /// `exec::prepare_joins` (it requires reading the right file).
+    pub right_header: Vec<String>,
+    // --- resolved (set by `resolve`) ---
+    /// Left key columns' positions in the left (incoming) header.
+    pub left_key_pos: Vec<usize>,
+    /// Right key columns' positions in `right_header`.
+    pub right_key_pos: Vec<usize>,
+    /// Right columns appended to the output (all of `right_header` bar the keys).
+    pub right_emit_pos: Vec<usize>,
+    /// Number of left columns at the join (the incoming header's length).
+    pub left_ncols: usize,
+}
+
+impl JoinStmt {
+    /// Resolve key columns against the left header (threaded in) and the
+    /// (already-set) right header, then reshape `header` to the joined schema.
+    ///
+    /// Columns whose names appear on *both* sides (the left header and the right's
+    /// emitted columns) are disambiguated: the left clashing column gets
+    /// `lsuffix` (none by default), the right one `rsuffix` (`_r` by default).
+    /// Non-clashing names are left untouched.
+    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+        self.left_ncols = header.len();
+        self.left_key_pos = self
+            .keys
+            .iter()
+            .map(|(l, _)| resolve_col(l, header))
+            .collect::<Result<_, _>>()?;
+        self.right_key_pos = self
+            .keys
+            .iter()
+            .map(|(_, r)| resolve_col(r, &self.right_header))
+            .collect::<Result<_, _>>()?;
+        // Emit every right column except the (redundant) key columns, in order.
+        self.right_emit_pos = (0..self.right_header.len())
+            .filter(|i| !self.right_key_pos.contains(i))
+            .collect();
+
+        let lsuf = self.lsuffix.as_deref().unwrap_or("");
+        let rsuf = self.rsuffix.as_deref().unwrap_or("_r");
+        let left_orig = header.clone();
+        let right_names: Vec<&String> = self
+            .right_emit_pos
+            .iter()
+            .map(|&p| &self.right_header[p])
+            .collect();
+
+        // Suffix clashing left columns (only when a left suffix is configured).
+        if !lsuf.is_empty() {
+            for h in header.iter_mut() {
+                if right_names.iter().any(|r| *r == h) {
+                    h.push_str(lsuf);
+                }
+            }
+        }
+        // Append right columns: clashing names get `rsuffix`; `disambiguate`
+        // resolves any residual collision so the header is never ambiguous.
+        for base in right_names {
+            let candidate = if left_orig.iter().any(|l| l == base) {
+                format!("{base}{rsuf}")
+            } else {
+                base.clone()
+            };
+            let name = disambiguate(&candidate, header);
+            header.push(name);
+        }
+        Ok(())
+    }
+}
+
+/// Return `name`, or `name` with a `_r` (then `_r2`, `_r3`, …) suffix if it
+/// already appears in `taken`, so appended right columns never collide.
+fn disambiguate(name: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|t| t == name) {
+        return name.to_owned();
+    }
+    let base = format!("{name}_r");
+    if !taken.iter().any(|t| t == &base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{name}_r{n}"))
+        .find(|c| !taken.iter().any(|t| t == c))
+        .unwrap()
+}
+
 /// A row-by-row statement.
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -199,6 +340,9 @@ pub enum Stage {
     DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
+    /// Merge a second (right) source in by key. Blocking: the right side is
+    /// materialized into a hash table that the left rows probe.
+    Join(JoinStmt),
 }
 
 /// How the final output is rendered.
@@ -601,6 +745,7 @@ impl Plan {
                 Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) => {} // no columns to resolve
                 Stage::Stats(s) => s.resolve(&mut header)?,
                 Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
+                Stage::Join(j) => j.resolve(&mut header)?,
             }
         }
         // Colour rules render the output, so resolve them against the final header.

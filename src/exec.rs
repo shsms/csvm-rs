@@ -20,7 +20,7 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{
-    BoolExpr, CmpOp, ColorRule, ColorScope, Operand, OutputFormat, Plan, SortStmt, Stage,
+    BoolExpr, CmpOp, ColorRule, ColorScope, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage,
     StatsStmt, Stmt, apply_stmts,
 };
 use crate::sort::Sorter;
@@ -145,7 +145,7 @@ fn run_body<R: BufRead, W: Write + Send>(
     // `stats` reduces the stream to a tiny profile; stream the input through it
     // (O(columns) memory) and run any following stages over that profile.
     if let Some((pre, stats, post)) = stats_shape(plan) {
-        return run_stats_streaming(pre, stats, post, opts.chunk_size, input, output);
+        return run_stats_streaming(pre, stats, post, opts, input, output);
     }
     match plan.stages.as_slice() {
         [Stage::Transform(stmts)] if opts.threads > 1 => {
@@ -162,7 +162,12 @@ fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
     if plan.stages.iter().any(|s| {
         matches!(
             s,
-            Stage::Sort(_) | Stage::Stats(_) | Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_)
+            Stage::Sort(_)
+                | Stage::Stats(_)
+                | Stage::Tail(_)
+                | Stage::DropLast(_)
+                | Stage::Uniq(_)
+                | Stage::Join(_)
         )
     }) {
         return None;
@@ -264,12 +269,12 @@ fn run_stats_streaming<R: BufRead, W: Write>(
     pre: &[Stmt],
     stats: &StatsStmt,
     post: &[Stage],
-    chunk_size: usize,
+    opts: &RunOpts,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
     let mut accs: Vec<ColStats> = stats.positions.iter().map(|_| ColStats::new()).collect();
-    while let Some(chunk) = next_chunk(input, chunk_size)? {
+    while let Some(chunk) = next_chunk(input, opts.chunk_size)? {
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
         csv::parse_chunk(&chunk, |row| {
@@ -286,7 +291,7 @@ fn run_stats_streaming<R: BufRead, W: Write>(
             return Err(e);
         }
     }
-    let rows = apply_stages_over_rows(post, profile_rows(stats, &accs))?;
+    let rows = apply_stages_over_rows(post, profile_rows(stats, &accs), opts)?;
     write_rows(output, &rows)
 }
 
@@ -369,7 +374,7 @@ pub fn run_file<W: Write + Send>(
             data_start,
             file_len,
         )?;
-        let rows = apply_stages_over_rows(post, profile_rows(stats, &merged))?;
+        let rows = apply_stages_over_rows(post, profile_rows(stats, &merged), opts)?;
         return write_rows(output, &rows);
     }
 
@@ -735,14 +740,16 @@ fn run_staged<R: BufRead, W: Write>(
         .count();
     let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
     let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
-    let has_buffered = plan
-        .stages
-        .iter()
-        .any(|s| matches!(s, Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_)));
+    let has_buffered = plan.stages.iter().any(|s| {
+        matches!(
+            s,
+            Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_) | Stage::Join(_)
+        )
+    });
     // The streaming sort path handles exactly one sort and no head/stats/
-    // tail/drop-last/uniq; anything else materializes and runs stage by stage.
+    // tail/drop-last/uniq/join; anything else materializes and runs stage by stage.
     if sort_count != 1 || has_head || has_stats || has_buffered {
-        return run_staged_in_memory(plan, opts.chunk_size, input, output);
+        return run_staged_in_memory(plan, opts, input, output);
     }
 
     let sort_idx = plan
@@ -828,12 +835,12 @@ fn transform_stmts(stages: &[Stage]) -> &[Stmt] {
 /// for plans with more than one `sort`.
 fn run_staged_in_memory<R: BufRead, W: Write>(
     plan: &Plan,
-    chunk_size: usize,
+    opts: &RunOpts,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let rows = materialize(chunk_size, input)?;
-    let rows = apply_stages_over_rows(&plan.stages, rows)?;
+    let rows = materialize(opts.chunk_size, input)?;
+    let rows = apply_stages_over_rows(&plan.stages, rows, opts)?;
     write_rows(output, &rows)
 }
 
@@ -843,6 +850,7 @@ fn run_staged_in_memory<R: BufRead, W: Write>(
 fn apply_stages_over_rows(
     stages: &[Stage],
     mut rows: Vec<OwnedRow>,
+    opts: &RunOpts,
 ) -> Result<Vec<OwnedRow>, Error> {
     for stage in stages {
         match stage {
@@ -868,9 +876,150 @@ fn apply_stages_over_rows(
                 let accs = build_colstats(&s.positions, &rows);
                 rows = profile_rows(s, &accs);
             }
+            Stage::Join(j) => rows = join_rows(j, rows, opts)?,
         }
     }
     Ok(rows)
+}
+
+/// Read each `join`'s right-side file header and resolve its sub-plan, recording
+/// the right output header on the `JoinStmt`. Must run before [`Plan::resolve`]
+/// (which needs the right header) — it's separate because it does IO. Recurses
+/// so a join nested inside a right sub-pipeline is prepared too.
+pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
+    for stage in &mut plan.stages {
+        if let Stage::Join(j) = stage {
+            prepare_joins(&mut j.right_plan)?;
+            let in_header = match &j.right_plan.input_header {
+                Some(h) => h.clone(),
+                None => read_header_from_path(Path::new(&j.file))?.0,
+            };
+            j.right_header = j.right_plan.resolve(&in_header)?;
+        }
+    }
+    Ok(())
+}
+
+/// Run a join's right sub-plan over its file and collect the result as owned
+/// rows (the build side). The sub-plan is run into a buffer via the normal
+/// executor, then its body re-parsed — join is blocking and the right side is
+/// the smaller one, so the extra serialize/parse is cheap and reuses all paths.
+fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>, Error> {
+    let path = Path::new(&j.file);
+    let (data_start, file_len) = match &j.right_plan.input_header {
+        Some(_) => (0, std::fs::metadata(path)?.len()),
+        None => {
+            let (_, ds, fl) = read_header_from_path(path)?;
+            (ds, fl)
+        }
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    run_file(
+        &j.right_plan,
+        &j.right_header,
+        opts,
+        path,
+        data_start,
+        file_len,
+        &mut buf,
+    )?;
+    // Drop the header line the executor wrote; parse the rest into owned rows.
+    let body = memchr(b'\n', &buf).map_or(buf.len(), |i| i + 1);
+    let text = std::str::from_utf8(&buf[body..])
+        .map_err(|e| Error::Other(format!("join right side is not valid UTF-8: {e}")))?;
+    let mut rows: Vec<OwnedRow> = Vec::new();
+    csv::parse_chunk(text, |row| {
+        rows.push(row.iter().map(|f| f.clone().into_owned()).collect());
+    });
+    Ok(rows)
+}
+
+/// Probe the left rows against a hash table built from the right side, emitting
+/// joined rows per the join type. One-to-many fan-out is honored (a left row
+/// matching N right rows yields N rows); unmatched rows are padded with empty
+/// cells for left/right/full as appropriate.
+fn join_rows(j: &JoinStmt, left: Vec<OwnedRow>, opts: &RunOpts) -> Result<Vec<OwnedRow>, Error> {
+    let right = materialize_join_right(j, opts)?;
+    let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut key = String::new();
+    let mut sel: Vec<Field<'static>> = Vec::new();
+    for (ri, row) in right.iter().enumerate() {
+        encode_key(&mut key, &mut sel, row, &j.right_key_pos);
+        table.entry(std::mem::take(&mut key)).or_default().push(ri);
+    }
+
+    let mut matched = vec![false; right.len()];
+    let mut out: Vec<OwnedRow> = Vec::new();
+    for lrow in &left {
+        encode_key(&mut key, &mut sel, lrow, &j.left_key_pos);
+        match table.get(&key) {
+            Some(idxs) => {
+                for &ri in idxs {
+                    matched[ri] = true;
+                    out.push(combine(j, lrow, Some(&right[ri])));
+                }
+            }
+            None if j.join_type.keeps_left_unmatched() => out.push(combine(j, lrow, None)),
+            None => {}
+        }
+    }
+    if j.join_type.keeps_right_unmatched() {
+        for (ri, &m) in matched.iter().enumerate() {
+            if !m {
+                out.push(combine_right_only(j, &right[ri]));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Build a CSV-encoded key from `positions` of `row` into `key` (reusing `sel`
+/// as scratch), so commas/quotes in cells can't collide between keys.
+fn encode_key(
+    key: &mut String,
+    sel: &mut Vec<Field<'static>>,
+    row: &[Field<'static>],
+    positions: &[usize],
+) {
+    key.clear();
+    sel.clear();
+    sel.extend(
+        positions
+            .iter()
+            .map(|&p| row.get(p).cloned().unwrap_or(Field::Str(""))),
+    );
+    csv::write_row(key, sel);
+}
+
+/// A joined output row: the left columns, then the right's emitted columns
+/// (empty cells when `rrow` is `None`, i.e. an unmatched left row).
+fn combine(j: &JoinStmt, lrow: &[Field<'static>], rrow: Option<&[Field<'static>]>) -> OwnedRow {
+    let mut out: OwnedRow = Vec::with_capacity(j.left_ncols + j.right_emit_pos.len());
+    for i in 0..j.left_ncols {
+        out.push(lrow.get(i).cloned().unwrap_or(Field::Str("")));
+    }
+    for &p in &j.right_emit_pos {
+        out.push(match rrow {
+            Some(r) => r.get(p).cloned().unwrap_or(Field::Str("")),
+            None => Field::Str(""),
+        });
+    }
+    out
+}
+
+/// An unmatched right row (right/full join): left columns empty, except the left
+/// key columns carry the equal right key value (coalesce), then the right cells.
+fn combine_right_only(j: &JoinStmt, rrow: &[Field<'static>]) -> OwnedRow {
+    let mut out: OwnedRow = vec![Field::Str(""); j.left_ncols];
+    for (&lp, &rp) in j.left_key_pos.iter().zip(&j.right_key_pos) {
+        if let Some(slot) = out.get_mut(lp) {
+            *slot = rrow.get(rp).cloned().unwrap_or(Field::Str(""));
+        }
+    }
+    for &p in &j.right_emit_pos {
+        out.push(rrow.get(p).cloned().unwrap_or(Field::Str("")));
+    }
+    out
 }
 
 /// Drop duplicate rows in place, keeping the first occurrence. The dedup key is
@@ -1185,6 +1334,37 @@ pub fn describe(plan: &Plan) -> String {
                     "  {n}.1 stats {:?} (positions {:?})\n",
                     s.names, s.positions
                 ));
+            }
+            Stage::Join(j) => {
+                out.push_str(&format!("stage {n} (join {}):\n", j.join_type.label()));
+                let keys: Vec<String> = j
+                    .keys
+                    .iter()
+                    .map(|(l, r)| {
+                        if l == r {
+                            l.clone()
+                        } else {
+                            format!("{l}={r}")
+                        }
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "  {n}.1 join {} on {} (left keys {:?}, right keys {:?})\n",
+                    j.file,
+                    keys.join(","),
+                    j.left_key_pos,
+                    j.right_key_pos
+                ));
+                out.push_str(&format!(
+                    "  {n}.1 emit right positions {:?}\n",
+                    j.right_emit_pos
+                ));
+                if !j.right_plan.stages.is_empty() {
+                    out.push_str("  right sub-pipeline:\n");
+                    for line in describe(&j.right_plan).lines() {
+                        out.push_str(&format!("    {line}\n"));
+                    }
+                }
             }
         }
     }

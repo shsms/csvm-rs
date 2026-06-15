@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AffixKind, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, Operand,
-    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt,
-    UniqStmt,
+    AffixKind, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt, JoinStmt, JoinType,
+    Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
+    Stmt, UniqStmt,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -54,7 +54,7 @@ fn err(msg: impl Into<String>) -> Error {
 /// Known command names, for the "did you mean …?" hint on an unknown verb.
 const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
-    "stats", "uniq", "color", "rename", "fmt", "hdr",
+    "stats", "uniq", "color", "rename", "fmt", "hdr", "join",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -71,6 +71,7 @@ enum Item {
     DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
+    Join(JoinStmt),
 }
 
 #[derive(Default)]
@@ -126,6 +127,10 @@ impl Builder {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Uniq(u));
                 }
+                Item::Join(j) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Join(j));
+                }
             }
         }
         flush(&mut transform, &mut stages);
@@ -149,6 +154,7 @@ impl Builder {
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
             "uniq" | "dedup" => self.parse_uniq(rest),
+            "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
             "fmt" => self.parse_fmt(rest),
@@ -206,6 +212,102 @@ impl Builder {
         self.items.push(Item::Uniq(UniqStmt {
             cols: split_list(rest),
             positions: Vec::new(),
+        }));
+        Ok(())
+    }
+
+    /// `join [FLAGS] [(SUBPIPELINE)] FILE on KEYS` merges a right-side file into
+    /// the stream by key. Flags pick the join type (`-l/--left`, `-r/--right`,
+    /// `-F/--full`; inner by default). The optional parenthesized sub-pipeline is
+    /// a full csvm script run over the right file before joining. `KEYS` is a
+    /// comma/space list of `name` or `lname=rname`.
+    fn parse_join(&mut self, rest: &str) -> Result<(), Error> {
+        let mut s = rest.trim_start();
+        let mut join_type = JoinType::Inner;
+        let mut lsuffix = None;
+        let mut rsuffix = None;
+        loop {
+            let (word, after) = split_first_word(s);
+            // `--lsuffix S` / `--rsuffix S` (or `=S`) set per-side clash suffixes.
+            if let Some(v) = flag_value(word, after, "--lsuffix") {
+                let (val, rest_after) = v?;
+                lsuffix = Some(val);
+                s = rest_after;
+                continue;
+            }
+            if let Some(v) = flag_value(word, after, "--rsuffix") {
+                let (val, rest_after) = v?;
+                rsuffix = Some(val);
+                s = rest_after;
+                continue;
+            }
+            match word {
+                "-l" | "--left" => join_type = JoinType::Left,
+                "-r" | "--right" => join_type = JoinType::Right,
+                "-F" | "--full" => join_type = JoinType::Full,
+                "--inner" => join_type = JoinType::Inner,
+                w if w.starts_with('-') && w != "-" => {
+                    return Err(err(format!("join: unknown flag '{w}'")));
+                }
+                _ => break,
+            }
+            s = after;
+        }
+
+        // Optional `(SUBPIPELINE)` — a full csvm script over the right file.
+        let right_plan = if s.starts_with('(') {
+            let (inner, after) = take_paren_group(s)?;
+            s = after.trim_start();
+            if inner.trim().is_empty() {
+                Box::new(identity_plan())
+            } else {
+                Box::new(parse(inner)?)
+            }
+        } else {
+            Box::new(identity_plan())
+        };
+
+        // The right-side file path.
+        let (file, after) = take_token(s);
+        if file.is_empty() {
+            return Err(err("join expects a right-side file"));
+        }
+        if file == "-" {
+            return Err(err("join's right side must be a file, not stdin"));
+        }
+        s = after.trim_start();
+
+        // `on KEY[,KEY...]`.
+        let (kw, key_str) = split_first_word(s);
+        if kw != "on" {
+            return Err(err("join expects `on KEY[,KEY...]` after the file"));
+        }
+        let mut keys = Vec::new();
+        for spec in split_list(key_str) {
+            match spec.split_once('=') {
+                None => keys.push((spec.clone(), spec)),
+                Some((l, r)) if !l.is_empty() && !r.is_empty() => {
+                    keys.push((l.to_string(), r.to_string()));
+                }
+                Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
+            }
+        }
+        if keys.is_empty() {
+            return Err(err("join `on` expects at least one key column"));
+        }
+
+        self.items.push(Item::Join(JoinStmt {
+            join_type,
+            right_plan,
+            file: file.to_string(),
+            keys,
+            lsuffix,
+            rsuffix,
+            right_header: Vec::new(),
+            left_key_pos: Vec::new(),
+            right_key_pos: Vec::new(),
+            right_emit_pos: Vec::new(),
+            left_ncols: 0,
         }));
         Ok(())
     }
@@ -510,6 +612,7 @@ fn split_stages(script: &str) -> Vec<&str> {
     let mut start = 0;
     let mut i = 0;
     let mut quote: Option<u8> = None;
+    let mut depth = 0usize;
     while i < bytes.len() {
         let c = bytes[i];
         match quote {
@@ -523,6 +626,16 @@ fn split_stages(script: &str) -> Vec<&str> {
                 quote = Some(c);
                 i += 1;
             }
+            // A `join (SUBPIPELINE)` group has its own `|`s; don't split inside it.
+            None if c == b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            None if c == b')' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            None if c == b'|' && depth > 0 => i += 1,
             None if c == b'|' => {
                 if bytes.get(i + 1) == Some(&b'|') {
                     i += 2; // `||` is the or-operator, not a stage separator
@@ -537,6 +650,78 @@ fn split_stages(script: &str) -> Vec<&str> {
     }
     stages.push(&script[start..]);
     stages
+}
+
+/// A `Plan` that passes its input through unchanged — the right side of a `join`
+/// with no sub-pipeline (the file is loaded as-is).
+fn identity_plan() -> Plan {
+    Plan {
+        stages: Vec::new(),
+        output: OutputFormat::Csv,
+        input_header: None,
+        colors: Vec::new(),
+    }
+}
+
+/// Given `s` starting with `(`, return the contents of the balanced,
+/// quote-aware parenthesized group and the remainder after the closing `)`.
+fn take_paren_group(s: &str) -> Result<(&str, &str), Error> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes.first(), Some(&b'('));
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' || c == b'`' => quote = Some(c),
+            None if c == b'(' => depth += 1,
+            None if c == b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&s[1..i], &s[i + 1..]));
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    Err(err("join: unbalanced '(' in the right-side sub-pipeline"))
+}
+
+/// Split off the first token: a whitespace-delimited word, or a quoted run
+/// (`'…'`/`"…"`/`` `…` ``, surrounding quotes stripped) for paths with spaces.
+fn take_token(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    let bytes = s.as_bytes();
+    match bytes.first() {
+        Some(&q @ (b'"' | b'\'' | b'`')) => match s[1..].find(q as char) {
+            Some(end) => (&s[1..1 + end], &s[2 + end..]),
+            None => (&s[1..], ""), // unterminated: take the rest
+        },
+        _ => split_first_word(s),
+    }
+}
+
+/// Match a `--name VALUE` or `--name=VALUE` flag. `None` if `word` isn't this
+/// flag; otherwise the value and the input remaining after it.
+fn flag_value<'a>(
+    word: &str,
+    after: &'a str,
+    name: &str,
+) -> Option<Result<(String, &'a str), Error>> {
+    if word == name {
+        let (val, rest) = take_token(after);
+        if val.is_empty() {
+            return Some(Err(err(format!("{name} expects a value"))));
+        }
+        return Some(Ok((val.to_string(), rest)));
+    }
+    word.strip_prefix(name)
+        .and_then(|r| r.strip_prefix('='))
+        .map(|val| Ok((val.to_string(), after)))
 }
 
 /// Split off the first whitespace-delimited word (the command) from the rest.
@@ -1297,5 +1482,41 @@ mod tests {
         assert!(parse("head abc").is_err()); // head needs a number
         assert!(parse("rename old").is_err()); // rename needs old=new
         assert!(parse("fmt x").is_err()); // fmt takes no args
+        assert!(parse("join r.csv").is_err()); // missing `on KEYS`
+        assert!(parse("join on sku").is_err()); // missing file
+        assert!(parse("join r.csv on").is_err()); // empty key list
+        assert!(parse("join --bogus r.csv on sku").is_err()); // unknown flag
+        assert!(parse("join r.csv on a=").is_err()); // malformed key pair
+    }
+
+    #[test]
+    fn join_parses_flags_keys_and_subpipeline() {
+        // Type flag, aliased + composite keys, and a sub-pipeline whose inner
+        // `|` must not split the outer pipeline.
+        let plan =
+            parse("join -l (cols sku,price | select price > 0) r.csv on sku=item,qty").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("expected a single join stage, got {:?}", plan.stages);
+        };
+        assert_eq!(j.join_type, JoinType::Left);
+        assert_eq!(j.file, "r.csv");
+        assert_eq!(
+            j.keys,
+            vec![
+                ("sku".to_string(), "item".to_string()),
+                ("qty".to_string(), "qty".to_string()),
+            ]
+        );
+        assert_eq!(j.right_plan.stages.len(), 1); // the sub-pipeline's transform
+    }
+
+    #[test]
+    fn join_suffix_flags() {
+        let plan = parse("join --lsuffix _l --rsuffix=_r r.csv on k").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("expected a join stage");
+        };
+        assert_eq!(j.lsuffix.as_deref(), Some("_l"));
+        assert_eq!(j.rsuffix.as_deref(), Some("_r"));
     }
 }

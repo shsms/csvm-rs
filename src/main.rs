@@ -54,6 +54,8 @@ fn run() -> Result<(), String> {
     };
 
     let (mut source, header) = open_source(&args, plan.input_header.as_deref())?;
+    // Joins need each right file's header to resolve; read them (IO) first.
+    exec::prepare_joins(&mut plan).map_err(|e| e.to_string())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
 
     if args.print_engine {

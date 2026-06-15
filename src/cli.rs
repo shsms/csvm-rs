@@ -87,6 +87,7 @@ Commands (chain with |):
   sort COL[=nr] ...        sort: n numeric, r reverse
   head [N]                 first N rows (default 10)
   stats [COLS]             per-column count/min/max/sum/mean/stddev
+  join [(SUB)] FILE on K   merge a right file by key (-l/-r/-F: left/right/full)
   color ... | fmt          colourise / whitespace-align output
   rename OLD=NEW ...       rename columns
   hdr A,B,C                name columns of headerless input (must be first)
