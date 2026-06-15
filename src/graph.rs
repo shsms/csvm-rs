@@ -336,17 +336,128 @@ fn braille_char(bits: u8) -> char {
     char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
 }
 
-/// Fit two end-of-axis labels into `width`, truncating each to half the width
-/// (keeping a one-column gap) when the pair would otherwise overflow — long
-/// timestamp strings would otherwise collide or break alignment.
-fn fit_ends(lo: &str, hi: &str, width: usize) -> (String, String) {
-    let budget = width.saturating_sub(1);
-    if lo.chars().count() + hi.chars().count() <= budget {
-        return (lo.to_string(), hi.to_string());
+/// How to label the x-axis of a scatter/line chart.
+pub enum XAxis {
+    /// A numeric x: interpolate ticks over the range and format as numbers.
+    Numeric,
+    /// A timestamp x (epoch seconds): interpolate ticks and format as dates.
+    Time,
+    /// A category / row-index x: only the first and last raw cells are known.
+    Ends(String, String),
+}
+
+/// Tick `(fraction, label)` pairs evenly spaced over `[lo, hi]`.
+fn ticks(lo: f64, hi: f64, k: usize, fmt: impl Fn(f64) -> String) -> Vec<(f64, String)> {
+    (0..k)
+        .map(|i| {
+            let t = if k <= 1 {
+                0.0
+            } else {
+                i as f64 / (k - 1) as f64
+            };
+            (t, fmt(lo + (hi - lo) * t))
+        })
+        .collect()
+}
+
+/// "Nice" numeric ticks at round multiples of a 1/2/5×10ⁿ step (so labels read
+/// 0, 50, 100, … not 49.166667), as `(fraction, label)` pairs over `[lo, hi]`.
+pub(crate) fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<(f64, String)> {
+    let span = hi - lo;
+    if span <= 0.0 || target == 0 {
+        return vec![(0.0, format_num(lo))];
     }
-    let each = (budget / 2).max(1);
-    let cut = |s: &str| s.chars().take(each).collect::<String>();
-    (cut(lo), cut(hi))
+    let raw = span / target as f64;
+    let mag = 10f64.powf(raw.log10().floor());
+    let norm = raw / mag;
+    let step = mag
+        * if norm < 1.5 {
+            1.0
+        } else if norm < 3.0 {
+            2.0
+        } else if norm < 7.0 {
+            5.0
+        } else {
+            10.0
+        };
+    let mut out = Vec::new();
+    let mut v = (lo / step).ceil() * step;
+    while v <= hi + step * 1e-9 {
+        out.push(((v - lo) / span, format_num(v)));
+        // When the values dwarf the step (huge magnitude, tiny span), `v + step`
+        // can't change the float — stop rather than loop forever.
+        let next = v + step;
+        if next <= v {
+            break;
+        }
+        v = next;
+    }
+    out
+}
+
+/// How many ticks fit across `width` columns given a label of `label_w` chars
+/// (with a small gap), clamped to a sensible 2..=7.
+fn tick_count(width: usize, label_w: usize) -> usize {
+    (width / (label_w + 3)).clamp(2, 7)
+}
+
+/// Lay tick labels into a `width`-wide row, each centred on its fractional
+/// position; a label that would collide with the previous one is dropped. With
+/// `force_ends`, the first/last labels are pinned to the left/right edges (for
+/// evenly-spaced ticks whose ends are the data range) and middles also stay
+/// clear of the reserved last label; without it (nice ticks, whose ends aren't
+/// the range) every label sits at its true position.
+fn place_ticks(width: usize, labels: &[(f64, String)], force_ends: bool) -> String {
+    let mut buf = vec![' '; width];
+    let n = labels.len();
+    let last_w = labels.last().map_or(0, |(_, l)| l.chars().count());
+    let last_start = width.saturating_sub(last_w);
+    let mut last_end = 0usize;
+    for (i, (t, lab)) in labels.iter().enumerate() {
+        let lw = lab.chars().count();
+        let centred = ((t * width.saturating_sub(1) as f64).round() as usize)
+            .saturating_sub(lw / 2)
+            .min(width.saturating_sub(lw));
+        let (start, is_end) = match (force_ends, i) {
+            (true, 0) => (0, true),
+            (true, i) if i == n - 1 => (last_start, true),
+            _ => (centred, false),
+        };
+        if !is_end && (start < last_end || (force_ends && start + lw + 1 > last_start)) {
+            continue;
+        }
+        for (j, ch) in lab.chars().enumerate() {
+            if let Some(slot) = buf.get_mut(start + j) {
+                *slot = ch;
+            }
+        }
+        last_end = start + lw + 1;
+    }
+    let s: String = buf.into_iter().collect();
+    s.trim_end().to_string()
+}
+
+/// Build the x-axis label row (without the gutter prefix) for `xaxis` over the
+/// data range `[xlo, xhi]` and a `width`-wide canvas.
+fn x_label_row(xaxis: &XAxis, xlo: f64, xhi: f64, width: usize) -> String {
+    let (labels, force_ends) = match xaxis {
+        XAxis::Ends(lo, hi) => (vec![(0.0, lo.clone()), (1.0, hi.clone())], true),
+        // Round 1/2/5 ticks at their true positions (ends aren't forced).
+        XAxis::Numeric => {
+            let lw = format_num(xlo).len().max(format_num(xhi).len());
+            (nice_ticks(xlo, xhi, tick_count(width, lw)), false)
+        }
+        // Drop the date from time labels when every tick is the same day.
+        XAxis::Time => {
+            let (fmt, lw): (fn(f64) -> String, usize) = if crate::datetime::same_day(xlo, xhi) {
+                (crate::datetime::format_time, 8) // HH:MM:SS
+            } else {
+                (crate::datetime::format_epoch, 19) // yyyy-mm-dd HH:MM:SS
+            };
+            (ticks(xlo, xhi, tick_count(width, lw), fmt), true)
+        }
+    };
+    place_ticks(width, &labels, force_ends)
 }
 
 /// Render a scatter (`connect=false`) or line (`connect=true`) chart of one or
@@ -354,9 +465,9 @@ fn fit_ends(lo: &str, hi: &str, width: usize) -> (String, String) {
 /// Multiple series get distinct colours (when `colors`); on a shared cell the
 /// first series wins the glyph (overlap is approximate, as in other terminal
 /// plotters). `width`/`height` are the canvas size in terminal cells. `skipped`
-/// counts dropped non-numeric points. `xlabels` overrides the bottom axis ends
-/// (used by the temporal and row-index modes to show real x values, e.g.
-/// timestamps, instead of `1`/`N`).
+/// counts dropped non-numeric points. `xaxis` selects how the bottom axis is
+/// graduated (numeric/time interpolate intermediate ticks; a category axis shows
+/// only the first/last cells).
 #[allow(clippy::too_many_arguments)] // a chart has many independent display inputs
 pub fn render_xy(
     title: &str,
@@ -367,7 +478,7 @@ pub fn render_xy(
     colors: bool,
     connect: bool,
     skipped: u64,
-    xlabels: Option<(String, String)>,
+    xaxis: XAxis,
 ) -> String {
     let total: usize = series.iter().map(Vec::len).sum();
     if total == 0 {
@@ -470,18 +581,13 @@ pub fn render_xy(
         }
         out.push('\n');
     }
-    // Bottom axis and x-range labels — the real first/last x values when the
-    // caller overrode them (row-index fallback), else the numeric range.
+    // Bottom axis with graduated x labels (interpolated ticks for a numeric or
+    // time axis; first/last cells for a category axis).
     out.push_str(&format!("{:>gutter$} └{}\n", "", "─".repeat(wcells)));
-    let (xlo_s, xhi_s) = match &xlabels {
-        Some((lo, hi)) => fit_ends(lo, hi, wcells),
-        None => (format_num(xlo), format_num(xhi)),
-    };
-    let pad = wcells.saturating_sub(xlo_s.len() + xhi_s.len()).max(1);
     out.push_str(&format!(
-        "{:>gutter$}  {xlo_s}{}{xhi_s}\n",
+        "{:>gutter$}  {}\n",
         "",
-        " ".repeat(pad)
+        x_label_row(&xaxis, xlo, xhi, wcells)
     ));
 
     out.push_str(&format!("points={total}"));
@@ -607,7 +713,17 @@ mod tests {
     #[test]
     fn render_xy_frames_a_scatter() {
         let pts = vec![vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]];
-        let s = render_xy("y vs x", &["y".into()], &pts, 10, 4, false, false, 0, None);
+        let s = render_xy(
+            "y vs x",
+            &["y".into()],
+            &pts,
+            10,
+            4,
+            false,
+            false,
+            0,
+            XAxis::Numeric,
+        );
         assert!(s.starts_with("y vs x\n"));
         assert!(s.contains('┤')); // y-axis border
         assert!(s.contains('└')); // bottom axis
@@ -617,12 +733,55 @@ mod tests {
     }
 
     #[test]
-    fn render_xy_uses_override_labels_for_the_x_axis() {
+    fn render_xy_uses_end_labels_for_a_category_axis() {
         // Row-index fallback: positions are 1,2,3 but the axis shows real ends.
         let pts = vec![vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]];
-        let ends = Some(("2024-01-01".to_string(), "2024-01-03".to_string()));
+        let ends = XAxis::Ends("2024-01-01".to_string(), "2024-01-03".to_string());
         let s = render_xy("y vs t", &["y".into()], &pts, 40, 4, false, true, 0, ends);
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
+    }
+
+    #[test]
+    fn nice_ticks_are_round() {
+        // target 5 over 0..100 ⇒ a step of 20: 0,20,40,60,80,100.
+        let labels: Vec<String> = nice_ticks(0.0, 100.0, 5)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(labels, ["0", "20", "40", "60", "80", "100"], "{labels:?}");
+        // No repeating decimals even when the range doesn't divide evenly.
+        let messy: Vec<String> = nice_ticks(0.0, 295.0, 6)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert!(messy.iter().all(|l| !l.contains('.')), "{messy:?}");
+    }
+
+    #[test]
+    fn nice_ticks_terminate_on_huge_magnitude_tiny_span() {
+        // The step can be smaller than a float ULP at this magnitude, so naive
+        // `v += step` would never advance — must still terminate (and bounded).
+        let out = nice_ticks(1e10, 1e10 + 2e-6, 5);
+        assert!(out.len() < 1000, "should not blow up: {}", out.len());
+    }
+
+    #[test]
+    fn render_xy_numeric_axis_has_intermediate_ticks() {
+        // A wide numeric axis over 0..100 should graduate beyond just the ends.
+        let pts = vec![(0..=100).map(|i| (i as f64, i as f64)).collect()];
+        let s = render_xy(
+            "y vs x",
+            &["y".into()],
+            &pts,
+            80,
+            6,
+            false,
+            false,
+            0,
+            XAxis::Numeric,
+        );
+        // More than the two ends (0 and 100) — an intermediate tick near 50.
+        assert!(s.contains("50"), "{s}");
     }
 
     #[test]
@@ -636,7 +795,7 @@ mod tests {
             false,
             false,
             5,
-            None,
+            XAxis::Numeric,
         );
         assert!(s.contains("no numeric points to plot"));
         assert!(s.contains("skipped 5"));
@@ -646,7 +805,7 @@ mod tests {
     fn render_xy_multi_series_adds_a_legend_when_coloured() {
         let series = vec![vec![(0.0, 0.0)], vec![(0.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = render_xy("t", &names, &series, 8, 4, true, false, 0, None);
+        let s = render_xy("t", &names, &series, 8, 4, true, false, 0, XAxis::Numeric);
         assert!(s.contains('\x1b')); // coloured glyphs
         assert!(s.contains('●')); // legend markers
     }

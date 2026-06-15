@@ -157,12 +157,16 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple y-series
     get distinct colours (`render_xy`, when `--color`) with a legend; one braille
     canvas per series, first-series-wins per shared cell. `collect_xy` picks the
-    X mode: numeric (plotted as-is); else **temporal** — if every X cell parses
-    as a timestamp (`crate::datetime::parse_epoch`, no dep), plot at true epoch
-    positions with formatted-date axis labels; else the **row-index fallback**
-    (categories) — plot against the 1-based ordinal, label with the first/last
-    raw cells, and flag `even row spacing`. A partially-numeric X keeps the
-    strict drop-bad-rows behaviour.
+    X mode (a `graph::XAxis`): **numeric** (plotted as-is); else **temporal** — if
+    every X cell parses as a timestamp (`crate::datetime::parse_epoch`, no dep),
+    plot at true epoch positions; else the **row-index fallback** (categories) —
+    plot against the 1-based ordinal and flag `even row spacing`. A
+    partially-numeric X keeps the strict drop-bad-rows behaviour. The bottom axis
+    is *graduated* with intermediate ticks (`x_label_row`/`place_ticks`): numeric
+    uses round 1/2/5×10ⁿ values (`nice_ticks`), time interpolates and drops the
+    date to `HH:MM:SS` when every tick is the same day, categories show only the
+    end cells; tick count adapts to width (so `--scale` adds more), labels that
+    collide are dropped.
   Flags: `--bins N` (hist), `--scale F`, `--title T`, `--svg`. A single `--scale`
   multiplies both base dimensions (`graph::chart_size`: `BASE_W`=80 cols,
   `BASE_H`=15 rows; default 1.0) — there is no separate width/height knob and no

@@ -5,6 +5,7 @@
 //! `<svg>` document.
 
 use crate::field::format_num;
+use crate::graph::XAxis;
 
 const W: f64 = 720.0;
 const H: f64 = 440.0;
@@ -81,22 +82,59 @@ fn ylabels(lo: f64, hi: f64) -> String {
     )
 }
 
-/// x-axis labels at the left (lo) and right (hi) ends.
-fn xlabels(lo: f64, hi: f64) -> String {
-    xlabels_text(&format_num(lo), &format_num(hi))
+/// Graduated x-axis labels for `xaxis` over the data range `[xlo, xhi]`:
+/// interpolated ticks for a numeric/time axis, or the two end cells for a
+/// category axis. Ticks anchor start/middle/end so they don't run off the frame.
+fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
+    let labels: Vec<(f64, String)> = match xaxis {
+        XAxis::Ends(lo, hi) => vec![(0.0, lo.clone()), (1.0, hi.clone())],
+        // Round 1/2/5 numeric ticks (shared with the terminal renderer).
+        XAxis::Numeric => crate::graph::nice_ticks(xlo, xhi, tick_target(xlo, xhi, format_num)),
+        // Drop the date from time labels when every tick is the same day.
+        XAxis::Time => {
+            if crate::datetime::same_day(xlo, xhi) {
+                svg_ticks(xlo, xhi, crate::datetime::format_time)
+            } else {
+                svg_ticks(xlo, xhi, crate::datetime::format_epoch)
+            }
+        }
+    };
+    let y = T + ph() + 16.0;
+    labels
+        .iter()
+        .map(|(t, lab)| {
+            // Anchor by position so edge labels don't run off the frame.
+            let anchor = if *t <= 0.001 {
+                "start"
+            } else if *t >= 0.999 {
+                "end"
+            } else {
+                "middle"
+            };
+            let x = L + t * pw();
+            format!(
+                "<text x=\"{x:.1}\" y=\"{y}\" text-anchor=\"{anchor}\">{}</text>\n",
+                esc(lab)
+            )
+        })
+        .collect()
 }
 
-/// x-axis end labels from pre-formatted strings (used for the row-index
-/// fallback's real first/last x values, e.g. timestamps).
-fn xlabels_text(lo: &str, hi: &str) -> String {
-    let y = T + ph() + 16.0;
-    format!(
-        "<text x=\"{L}\" y=\"{y}\">{lo}</text>\n\
-<text x=\"{rx}\" y=\"{y}\" text-anchor=\"end\">{hi}</text>\n",
-        rx = L + pw(),
-        lo = esc(lo),
-        hi = esc(hi),
-    )
+/// Tick count for the plot width given a `fmt`'s label size (~7px per char).
+fn tick_target(lo: f64, hi: f64, fmt: impl Fn(f64) -> String) -> usize {
+    let label_px = fmt(hi).len().max(fmt(lo).len()) as f64 * 7.0 + 12.0;
+    ((pw() / label_px) as usize).clamp(2, 7)
+}
+
+/// Evenly-spaced `(fraction, label)` ticks, the count chosen so labels fit.
+fn svg_ticks(lo: f64, hi: f64, fmt: impl Fn(f64) -> String) -> Vec<(f64, String)> {
+    let k = tick_target(lo, hi, &fmt);
+    (0..k)
+        .map(|i| {
+            let t = i as f64 / (k - 1) as f64;
+            (t, fmt(lo + (hi - lo) * t))
+        })
+        .collect()
 }
 
 /// Histogram: one filled bar per bin spanning the plot width.
@@ -106,7 +144,7 @@ pub fn hist(title: &str, lo: f64, hi: f64, counts: &[u64], note: &str) -> String
     let bw = pw() / n as f64;
     let mut body = axes();
     body.push_str(&ylabels(0.0, max));
-    body.push_str(&xlabels(lo, hi));
+    body.push_str(&xlabels(&XAxis::Numeric, lo, hi));
     for (i, &c) in counts.iter().enumerate() {
         let bh = c as f64 / max * ph();
         let x = L + i as f64 * bw;
@@ -183,7 +221,7 @@ pub fn xy(
     series: &[Vec<(f64, f64)>],
     connect: bool,
     note: &str,
-    x_ends: Option<(String, String)>,
+    xaxis: XAxis,
 ) -> String {
     let mut xlo = f64::INFINITY;
     let mut xhi = f64::NEG_INFINITY;
@@ -210,10 +248,7 @@ pub fn xy(
 
     let mut body = axes();
     body.push_str(&ylabels(ylo, yhi));
-    body.push_str(&match &x_ends {
-        Some((lo, hi)) => xlabels_text(lo, hi),
-        None => xlabels(xlo, xhi),
-    });
+    body.push_str(&xlabels(&xaxis, xlo, xhi));
     for (si, pts) in series.iter().enumerate() {
         let color = SERIES[si % SERIES.len()];
         if connect {
@@ -271,24 +306,24 @@ mod tests {
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
         let series = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
         let names = ["y".to_string()];
-        assert!(xy("s", &names, &series, false, "", None).contains("<circle"));
-        assert!(xy("s", &names, &series, true, "", None).contains("<polyline"));
+        assert!(xy("s", &names, &series, false, "", XAxis::Numeric).contains("<circle"));
+        assert!(xy("s", &names, &series, true, "", XAxis::Numeric).contains("<polyline"));
     }
 
     #[test]
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
         let series = vec![vec![(0.0, 0.0)], vec![(1.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = xy("m", &names, &series, false, "", None);
+        let s = xy("m", &names, &series, false, "", XAxis::Numeric);
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
     }
 
     #[test]
-    fn xy_override_labels_appear_on_the_axis() {
+    fn xy_category_axis_shows_end_labels() {
         let series = vec![vec![(1.0, 0.0), (2.0, 1.0)]];
         let names = ["y".to_string()];
-        let ends = Some(("t0".to_string(), "t9".to_string()));
+        let ends = XAxis::Ends("t0".to_string(), "t9".to_string());
         let s = xy("y vs t", &names, &series, true, "", ends);
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }

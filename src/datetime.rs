@@ -104,6 +104,18 @@ pub fn format_epoch(secs: f64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mi:02}:{ss:02}")
 }
 
+/// Format just the time-of-day (UTC) as `HH:MM:SS` — for axis labels when every
+/// tick falls on the same calendar day, so the date isn't repeated.
+pub fn format_time(secs: f64) -> String {
+    let rem = (secs.floor() as i64).rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+}
+
+/// Whether two epochs fall on the same UTC calendar day.
+pub fn same_day(a: f64, b: f64) -> bool {
+    (a.floor() as i64).div_euclid(86400) == (b.floor() as i64).div_euclid(86400)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +159,15 @@ mod tests {
             let e = parse_epoch(ts).unwrap();
             assert_eq!(format_epoch(e), ts, "round-trip {ts}");
         }
+    }
+
+    #[test]
+    fn time_of_day_and_same_day() {
+        let a = parse_epoch("2024-01-01T08:30:15Z").unwrap();
+        let b = parse_epoch("2024-01-01T20:00:00Z").unwrap();
+        let c = parse_epoch("2024-01-02T00:00:00Z").unwrap();
+        assert_eq!(format_time(a), "08:30:15");
+        assert!(same_day(a, b));
+        assert!(!same_day(a, c));
     }
 }

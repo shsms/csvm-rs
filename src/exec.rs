@@ -1397,19 +1397,23 @@ fn render_graph<W: Write>(
             let XyData {
                 series,
                 skipped,
-                xends,
-                even_spacing,
+                xaxis,
             } = collect_xy(text, g.cols[0].pos, &ypos);
             let connect = g.kind == GraphKind::Line;
-            // Only the row-index fallback distorts spacing; a temporal axis is true.
-            let xnote = if even_spacing { "even row spacing" } else { "" };
+            // Only the category/row-index axis distorts spacing; numeric and
+            // time axes are true.
+            let xnote = if matches!(xaxis, crate::graph::XAxis::Ends(..)) {
+                "even row spacing"
+            } else {
+                ""
+            };
             if g.opts.svg {
                 let note = [skipped_note(skipped, 0), xnote.to_string()]
                     .into_iter()
                     .filter(|s| !s.is_empty())
                     .collect::<Vec<_>>()
                     .join("  ");
-                crate::svg::xy(&title, &ynames, &series, connect, &note, xends)
+                crate::svg::xy(&title, &ynames, &series, connect, &note, xaxis)
             } else {
                 let title = if xnote.is_empty() {
                     title
@@ -1417,7 +1421,7 @@ fn render_graph<W: Write>(
                     format!("{title}  ({xnote})")
                 };
                 crate::graph::render_xy(
-                    &title, &ynames, &series, width, height, color, connect, skipped, xends,
+                    &title, &ynames, &series, width, height, color, connect, skipped, xaxis,
                 )
             }
         }
@@ -1427,15 +1431,11 @@ fn render_graph<W: Write>(
 }
 
 /// The result of collecting `graph scatter`/`line` data: the points per
-/// y-series, the dropped-point count, an optional axis-end label override, and
-/// whether positions are by row (the even-spacing caveat).
+/// y-series, the dropped-point count, and how to graduate the x-axis.
 struct XyData {
     series: XySeries,
     skipped: u64,
-    /// Override for the bottom-axis end labels (`None` ⇒ format the numeric range).
-    xends: Option<(String, String)>,
-    /// True only for the row-index fallback, where spacing isn't the real x.
-    even_spacing: bool,
+    xaxis: crate::graph::XAxis,
 }
 
 /// Collect `(x, y)` points per y-series from the buffered output (header
@@ -1492,33 +1492,24 @@ fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
         return XyData {
             series,
             skipped,
-            xends: None,
-            even_spacing: false,
+            xaxis: crate::graph::XAxis::Numeric,
         };
     }
 
     // No numeric x — does every cell parse as a timestamp? Then use a true time
-    // axis (real spacing, formatted date labels).
+    // axis (real spacing; render formats the epoch ticks as dates).
     let epochs: Vec<Option<f64>> = rows
         .iter()
         .map(|(_, raw, _)| crate::datetime::parse_epoch(raw))
         .collect();
     if !rows.is_empty() && epochs.iter().all(Option::is_some) {
-        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
         for ((_, _, ys), e) in rows.into_iter().zip(&epochs) {
-            let xv = e.unwrap();
-            lo = lo.min(xv);
-            hi = hi.max(xv);
-            push_row(&mut series, &mut skipped, xv, ys);
+            push_row(&mut series, &mut skipped, e.unwrap(), ys);
         }
         return XyData {
             series,
             skipped,
-            xends: Some((
-                crate::datetime::format_epoch(lo),
-                crate::datetime::format_epoch(hi),
-            )),
-            even_spacing: false,
+            xaxis: crate::graph::XAxis::Time,
         };
     }
 
@@ -1532,8 +1523,7 @@ fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
     XyData {
         series,
         skipped,
-        xends: Some((xfirst, xlast)),
-        even_spacing: true,
+        xaxis: crate::graph::XAxis::Ends(xfirst, xlast),
     }
 }
 
@@ -2512,13 +2502,28 @@ mod tests {
     #[test]
     fn graph_xy_uses_a_true_time_axis_for_timestamps() {
         // A string timestamp x is parsed to epoch: real spacing (no even-row
-        // caveat) and the axis shows formatted dates.
+        // caveat). All three points are the same day, so the axis shows just
+        // HH:MM:SS (the date is dropped).
         let input = "t,v\n2024-01-01T00:00:00Z,1\n2024-01-01T01:00:00Z,5\n2024-01-01T02:00:00Z,3\n";
         let out = render_str("graph line t v", input, false);
         assert!(out.contains("points=3"), "{out}");
         assert!(!out.contains("even row spacing"), "{out}"); // true axis, not fallback
         assert!(
-            out.contains("2024-01-01 00:00:00") && out.contains("2024-01-01 02:00:00"),
+            out.contains("00:00:00") && out.contains("02:00:00"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("2024-01-01 0"),
+            "date should be dropped same-day: {out}"
+        );
+    }
+
+    #[test]
+    fn graph_xy_keeps_the_date_across_multiple_days() {
+        let input = "t,v\n2024-01-01T00:00:00Z,1\n2024-01-03T00:00:00Z,5\n";
+        let out = render_str("graph line t v", input, false);
+        assert!(
+            out.contains("2024-01-01") && out.contains("2024-01-03"),
             "{out}"
         );
     }
