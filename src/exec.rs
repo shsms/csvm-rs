@@ -20,8 +20,8 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{
-    BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, JoinStmt, Operand, OutputFormat, Plan,
-    SortStmt, Stage, StatsStmt, Stmt, ValExpr, apply_stmts,
+    AggFunc, AggSpec, BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, GroupStmt, JoinStmt,
+    Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr, apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -173,6 +173,7 @@ fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
                 | Stage::Tail(_)
                 | Stage::DropLast(_)
                 | Stage::Uniq(_)
+                | Stage::Group(_)
                 | Stage::Join(_)
         )
     }) {
@@ -329,6 +330,147 @@ fn profile_rows(stats: &StatsStmt, accs: &[ColStats]) -> Vec<OwnedRow> {
         .zip(accs)
         .map(|(name, a)| a.to_row(name))
         .collect()
+}
+
+/// Per-group state: the key cells (emitted verbatim, in first-seen order) and a
+/// [`ColStats`] per *distinct* aggregated column plus a row counter (for a bare
+/// `count`). One per distinct key — O(groups × aggregated-cols) memory.
+struct GroupAcc {
+    key: OwnedRow,
+    rows: u64,
+    stats: Vec<ColStats>,
+}
+
+/// `group … | agg …` reducer. The per-key sibling of [`build_colstats`]:
+/// folds rows into per-group accumulators keyed by the CSV-encoded key cells,
+/// preserving first-seen order. Aggregates sharing a column share one
+/// `ColStats` (deduped by position).
+struct Grouper<'a> {
+    g: &'a GroupStmt,
+    /// Distinct aggregated column positions (a bare `count` contributes none).
+    stat_positions: Vec<usize>,
+    /// For each agg, the slot into a group's `stats`, or `None` for a bare `count`.
+    agg_slot: Vec<Option<usize>>,
+    index: HashMap<String, usize>,
+    groups: Vec<GroupAcc>,
+}
+
+impl<'a> Grouper<'a> {
+    fn new(g: &'a GroupStmt) -> Self {
+        let mut stat_positions: Vec<usize> = Vec::new();
+        let agg_slot = g
+            .aggs
+            .iter()
+            .map(|a| {
+                a.pos.map(|p| {
+                    stat_positions
+                        .iter()
+                        .position(|&q| q == p)
+                        .unwrap_or_else(|| {
+                            stat_positions.push(p);
+                            stat_positions.len() - 1
+                        })
+                })
+            })
+            .collect();
+        Grouper {
+            g,
+            stat_positions,
+            agg_slot,
+            index: HashMap::new(),
+            groups: Vec::new(),
+        }
+    }
+
+    fn update(&mut self, row: &[Field]) {
+        let key: OwnedRow = self
+            .g
+            .key_positions
+            .iter()
+            .map(|&p| row.get(p).cloned().unwrap_or(Field::Str("")).into_owned())
+            .collect();
+        let mut keybuf = String::new();
+        csv::write_row(&mut keybuf, &key);
+        let idx = match self.index.get(&keybuf) {
+            Some(&i) => i,
+            None => {
+                let i = self.groups.len();
+                self.index.insert(keybuf, i);
+                self.groups.push(GroupAcc {
+                    key,
+                    rows: 0,
+                    stats: self
+                        .stat_positions
+                        .iter()
+                        .map(|_| ColStats::new())
+                        .collect(),
+                });
+                i
+            }
+        };
+        let acc = &mut self.groups[idx];
+        acc.rows += 1;
+        for (slot, &p) in self.stat_positions.iter().enumerate() {
+            match row.get(p) {
+                Some(f) => acc.stats[slot].update(f),
+                None => acc.stats[slot].update(&Field::Str("")),
+            }
+        }
+    }
+
+    /// Emit one row per group: key cells followed by one cell per aggregate.
+    fn into_rows(self) -> Vec<OwnedRow> {
+        let Grouper {
+            g,
+            agg_slot,
+            groups,
+            ..
+        } = self;
+        groups
+            .into_iter()
+            .map(|acc| {
+                let mut row = acc.key;
+                for (a, slot) in g.aggs.iter().zip(&agg_slot) {
+                    let stats = slot.map(|s| &acc.stats[s]);
+                    row.push(agg_value(a, stats, acc.rows));
+                }
+                row
+            })
+            .collect()
+    }
+}
+
+/// One aggregate's output cell. Numeric aggregates over a text/empty column are
+/// blank (the same policy `stats` uses).
+fn agg_value(a: &AggSpec, stats: Option<&ColStats>, rows: u64) -> Field<'static> {
+    match a.func {
+        // Bare `count` counts rows; `count(col)` counts non-empty cells.
+        AggFunc::Count => match stats {
+            Some(s) => Field::Num(s.count() as f64),
+            None => Field::Num(rows as f64),
+        },
+        AggFunc::Min => stats.map_or(Field::Str(""), ColStats::min_field),
+        AggFunc::Max => stats.map_or(Field::Str(""), ColStats::max_field),
+        AggFunc::Sum => num_or_blank(stats, ColStats::sum),
+        AggFunc::Mean => num_or_blank(stats, ColStats::mean),
+        AggFunc::Stddev => stats.map_or(Field::Str(""), ColStats::stddev_field),
+    }
+}
+
+fn num_or_blank(stats: Option<&ColStats>, f: fn(&ColStats) -> f64) -> Field<'static> {
+    match stats {
+        Some(s) if s.has_numeric() => Field::Num(f(s)),
+        _ => Field::Str(""),
+    }
+}
+
+/// Reduce already-materialized rows by `group … | agg …` (the in-memory path).
+fn group_rows(g: &GroupStmt, rows: &[OwnedRow]) -> Vec<OwnedRow> {
+    let mut grouper = Grouper::new(g);
+    for row in rows {
+        grouper.update(row);
+    }
+    grouper.into_rows()
 }
 
 /// Read and parse the header of a file, returning the header, the byte offset
@@ -755,7 +897,7 @@ fn run_staged<R: BufRead, W: Write>(
     let has_buffered = plan.stages.iter().any(|s| {
         matches!(
             s,
-            Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_) | Stage::Join(_)
+            Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_) | Stage::Group(_) | Stage::Join(_)
         )
     });
     // The streaming sort path handles exactly one sort and no head/stats/
@@ -938,6 +1080,7 @@ fn apply_stages_over_rows(
                 let accs = build_colstats(&s.positions, &rows);
                 rows = profile_rows(s, &accs);
             }
+            Stage::Group(g) => rows = group_rows(g, &rows),
             Stage::Join(j) => rows = join_rows(j, rows, opts)?,
         }
     }
@@ -1396,6 +1539,22 @@ pub fn describe(plan: &Plan) -> String {
                     "  {n}.1 stats {:?} (positions {:?})\n",
                     s.names, s.positions
                 ));
+            }
+            Stage::Group(g) => {
+                out.push_str(&format!("stage {n} (group):\n"));
+                out.push_str(&format!(
+                    "  {n}.1 keys {:?} (positions {:?})\n",
+                    g.keys, g.key_positions
+                ));
+                let aggs: Vec<String> = g
+                    .aggs
+                    .iter()
+                    .map(|a| match &a.col {
+                        Some(c) => format!("{}={}({c})", a.name, a.func.name()),
+                        None => format!("{}={}", a.name, a.func.name()),
+                    })
+                    .collect();
+                out.push_str(&format!("  {n}.2 agg {aggs:?}\n"));
             }
             Stage::Join(j) => {
                 out.push_str(&format!("stage {n} (join {}):\n", j.join_type.label()));
@@ -1897,6 +2056,68 @@ mod tests {
         let out = run_str("sort id=nr | stats id", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
+    }
+
+    #[test]
+    fn group_default_count_in_first_seen_order() {
+        // fieldA: 't' first (row 1), then 'f' (row 2). count = rows per group.
+        let out = run_str("group fieldA", INPUT).unwrap();
+        assert_eq!(out, "fieldA,count\nt,3\nf,1\n");
+    }
+
+    #[test]
+    fn group_agg_numeric_reductions() {
+        // 't' rows have countZ 5,0,9; 'f' has 0.
+        let out = run_str(
+            "group fieldA | agg sum(countZ),mean(countZ),min(countZ),max(countZ)",
+            INPUT,
+        )
+        .unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines[0],
+            "fieldA,countZ_sum,countZ_mean,countZ_min,countZ_max"
+        );
+        assert_eq!(lines[1], "t,14,4.666667,0,9");
+        assert_eq!(lines[2], "f,0,0,0,0");
+    }
+
+    #[test]
+    fn agg_global_with_no_keys_is_one_row() {
+        let out = run_str("agg count, sum(countZ)", INPUT).unwrap();
+        assert_eq!(out, "count,countZ_sum\n4,14\n");
+    }
+
+    #[test]
+    fn agg_by_clause_supplies_keys() {
+        let out = run_str("agg sum(countZ) by fieldA", INPUT).unwrap();
+        assert_eq!(out, "fieldA,countZ_sum\nt,14\nf,0\n");
+    }
+
+    #[test]
+    fn agg_sum_of_text_column_is_blank() {
+        // fieldA is text, so sum/mean are blank, but min/max stay lexical.
+        let out = run_str("group id | agg sum(fieldA),min(fieldA)", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "id,fieldA_sum,fieldA_min");
+        assert_eq!(lines[1], "1,,t");
+    }
+
+    #[test]
+    fn count_rows_differs_from_count_of_column() {
+        // A bare count counts rows; count(col) counts non-empty cells.
+        let input = "g,v\nx,1\nx,\nx,3\n";
+        let out = run_str("group g | agg count, count(v)", input).unwrap();
+        assert_eq!(out, "g,count,v_count\nx,3,2\n");
+    }
+
+    #[test]
+    fn group_composes_with_sort_and_fmt() {
+        let out = run_str("group fieldA | agg sum(countZ) | sort countZ_sum=nr", INPUT).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        // f,0 sorts after t,14 when descending by the aggregate.
+        assert_eq!(lines[1], "t,14");
+        assert_eq!(lines[2], "f,0");
     }
 
     #[test]

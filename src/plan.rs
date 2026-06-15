@@ -275,6 +275,78 @@ pub struct StatsStmt {
     pub names: Vec<String>,
 }
 
+/// An aggregate function applied per group. Each maps onto a [`ColStats`] field
+/// (`crate::stats`), so the group accumulator reuses the `stats` profiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggFunc {
+    /// `count` (no column) counts rows; `count(col)` counts non-empty cells.
+    Count,
+    Sum,
+    Min,
+    Max,
+    Mean,
+    Stddev,
+}
+
+impl AggFunc {
+    /// The verb as written, for the default output-column name and `--print-engine`.
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFunc::Count => "count",
+            AggFunc::Sum => "sum",
+            AggFunc::Min => "min",
+            AggFunc::Max => "max",
+            AggFunc::Mean => "mean",
+            AggFunc::Stddev => "stddev",
+        }
+    }
+}
+
+/// One `func(col)` aggregate in an `agg` list. `col`/`pos` are `None` only for a
+/// bare `count` (which counts rows, not a column's non-empty cells).
+#[derive(Clone, Debug)]
+pub struct AggSpec {
+    pub func: AggFunc,
+    pub col: Option<String>,
+    pub pos: Option<usize>,
+    /// Output column name (`amount_sum`, or `count` for a bare count).
+    pub name: String,
+}
+
+/// `group COLS` + `agg FNS`: reduce the input to one row per distinct key,
+/// emitting the key columns followed by one column per aggregate. The per-key
+/// sibling of `stats` (which reduces globally); a blocking, reducing stage that
+/// holds O(groups × aggregated-cols) accumulators, not O(rows). With no keys it
+/// reduces to a single row (a chosen-function global aggregate).
+#[derive(Clone, Debug)]
+pub struct GroupStmt {
+    pub keys: Vec<String>,
+    pub key_positions: Vec<usize>,
+    pub aggs: Vec<AggSpec>,
+}
+
+impl GroupStmt {
+    /// Resolve key and aggregated columns, then reshape the header to
+    /// `keys ++ agg names` so downstream `sort`/`cols`/`fmt` compose.
+    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+        self.key_positions = self
+            .keys
+            .iter()
+            .map(|n| resolve_col(n, header))
+            .collect::<Result<_, _>>()?;
+        for a in &mut self.aggs {
+            a.pos = match &a.col {
+                Some(c) => Some(resolve_col(c, header)?),
+                None => None,
+            };
+        }
+        let mut out = self.keys.clone();
+        out.extend(self.aggs.iter().map(|a| a.name.clone()));
+        *header = out;
+        Ok(())
+    }
+}
+
 /// Rename one or more columns (a header-only change; row data is untouched).
 #[derive(Clone, Debug)]
 pub struct RenameStmt {
@@ -499,6 +571,8 @@ pub enum Stage {
     DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
+    /// Reduce to one row per distinct key (`group … | agg …`). Blocking.
+    Group(GroupStmt),
     /// Merge a second (right) source in by key. Blocking: the right side is
     /// materialized into a hash table that the left rows probe.
     Join(JoinStmt),
@@ -1104,6 +1178,7 @@ impl Plan {
                 Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) => {} // no columns to resolve
                 Stage::Stats(s) => s.resolve(&mut header)?,
                 Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
+                Stage::Group(g) => g.resolve(&mut header)?,
                 Stage::Join(j) => j.resolve(&mut header)?,
             }
         }

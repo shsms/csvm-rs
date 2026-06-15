@@ -141,25 +141,68 @@ impl ColStats {
         row.push(Field::Owned(field_name.to_owned()));
         row.push(Field::Num(self.count as f64));
         row.push(Field::Num(self.empty as f64));
-        if self.numeric && self.nnum > 0 {
-            row.push(Field::Num(self.nmin));
-            row.push(Field::Num(self.nmax));
+        row.push(self.min_field());
+        row.push(self.max_field());
+        if self.has_numeric() {
             row.push(Field::Num(self.sum));
             row.push(Field::Num(self.mean));
-            // Sample stddev (n-1); undefined for a single value.
-            row.push(if self.nnum >= 2 {
-                Field::Num((self.m2 / (self.nnum - 1) as f64).sqrt())
-            } else {
-                Field::Str("")
-            });
+            row.push(self.stddev_field());
         } else {
-            row.push(opt_str(&self.smin));
-            row.push(opt_str(&self.smax));
             row.push(Field::Str(""));
             row.push(Field::Str(""));
             row.push(Field::Str(""));
         }
         row
+    }
+
+    // Granular accessors so the group-by reducer (`agg`) can pull a single
+    // aggregate out without re-deriving the numeric-vs-text policy. These mirror
+    // the branches of [`Self::to_row`]; presentation (column layout) stays the
+    // caller's job.
+
+    /// Non-empty cell count.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Whether finite numeric aggregates (sum/mean/stddev) are available.
+    pub fn has_numeric(&self) -> bool {
+        self.numeric && self.nnum > 0
+    }
+
+    pub fn sum(&self) -> f64 {
+        self.sum
+    }
+
+    pub fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// `min`: numeric for a numeric column, else lexical; blank when empty.
+    pub fn min_field(&self) -> Field<'static> {
+        if self.has_numeric() {
+            Field::Num(self.nmin)
+        } else {
+            opt_str(&self.smin)
+        }
+    }
+
+    /// `max`: numeric for a numeric column, else lexical; blank when empty.
+    pub fn max_field(&self) -> Field<'static> {
+        if self.has_numeric() {
+            Field::Num(self.nmax)
+        } else {
+            opt_str(&self.smax)
+        }
+    }
+
+    /// Sample stddev (n-1) as a cell; blank for <2 finite values or a text column.
+    pub fn stddev_field(&self) -> Field<'static> {
+        if self.has_numeric() && self.nnum >= 2 {
+            Field::Num((self.m2 / (self.nnum - 1) as f64).sqrt())
+        } else {
+            Field::Str("")
+        }
     }
 }
 

@@ -233,6 +233,34 @@ numeric-only. Composes with sort/head/fmt after it.",
         examples: &["csvm 'stats | sort mean=nr | fmt' data.csv"],
     },
     CmdHelp {
+        name: "group",
+        aliases: &[],
+        summary: "set group-by keys for agg",
+        synopsis: &[
+            "group COLS              one row per distinct key",
+            "group COLS | agg FNS    aggregate within each group",
+        ],
+        detail: "On its own, reduces to one row per key with a count of the group's rows. \
+Followed by agg, the aggregates replace that count. The per-key sibling of stats.",
+        examples: &["csvm 'group region | agg sum(amount) | fmt' sales.csv"],
+    },
+    CmdHelp {
+        name: "agg",
+        aliases: &[],
+        summary: "aggregate rows per group",
+        synopsis: &[
+            "agg FN(col),... [by COLS]",
+            "  FN: count sum min max mean stddev   (count alone counts rows)",
+            "  by COLS: keys, or fuse with a preceding group; neither ⇒ one global row",
+        ],
+        detail: "Reduces to one row per key: the key columns then one column per aggregate, \
+named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-numeric column.",
+        examples: &[
+            "csvm 'group region | agg count, mean(amount) | fmt' sales.csv",
+            "csvm 'agg sum(amount) by region,product' sales.csv",
+        ],
+    },
+    CmdHelp {
         name: "join",
         aliases: &[],
         summary: "merge a second CSV by key",

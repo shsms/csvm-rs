@@ -74,6 +74,20 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   combine) folds them. Counts/`min`/`max` are exact; floating `sum`/`mean`/
   `stddev` may differ from the `-n1` result by ~1 ULP (parallel reduction sums
   in a different order). stdin / `-n1` use the single-pass streaming path.
+- **`group COLS`** + **`agg FN(col),… [by COLS]`** reduce to one row per distinct
+  key — the per-key sibling of `stats` (which reduces globally). `group` sets the
+  keys; a following `agg` fuses with it (replacing `group`'s placeholder `count`),
+  or `agg … by COLS` carries its own keys, or `agg` with neither emits a single
+  global row. Functions are `count/sum/min/max/mean/stddev` (a bare `count`
+  counts rows; `count(col)` counts non-empty cells); output cols are named
+  `col_func` (`amount_sum`) or `count`. `sum/mean/stddev` are blank for a
+  non-numeric column (same policy as `stats`). A blocking, reducing stage
+  (`Stage::Group`, `GroupStmt`/`AggSpec`/`AggFunc` in `plan.rs`): the `Grouper`
+  in `exec.rs` folds rows into a `HashMap<key, GroupAcc>` keeping first-seen
+  order, reusing one `ColStats` (`stats.rs`) per distinct aggregated column —
+  O(groups × aggregated-cols) memory. Currently takes the in-memory path; a
+  streaming + sharded fast path (mirroring `stats`) is the planned follow-up
+  (`todo.org`).
 - **`join [FLAGS] [(SUBPIPELINE)] FILE on KEYS`** merges a right-side CSV in by
   key. A blocking stage: the right `FILE` is run through its optional
   parenthesized sub-`Plan` (a full recursive pipeline — this is the "DAG" node),
@@ -247,9 +261,11 @@ The pipe language is deliberately built to grow: new verbs are a parse arm plus
 a `Stmt`/`Stage`. `join` is implemented (`Stage::Join`, a sub-`Plan` right side —
 the `Plan` is now a small DAG). The computed `add` column is implemented
 (`Stmt::Add`, the `ValExpr` value engine; `prev`/`rownum` take the ordered
-in-memory path). Planned (see `todo.org` for design notes):
+in-memory path). Group-by aggregation is implemented (`Stage::Group`,
+`group … | agg …`). Planned (see `todo.org` for design notes):
 conditional colouring for `fmt`, pluggable formats via a
-`Source`/`Sink` trait (Parquet, TSV), and group-by aggregation.
+`Source`/`Sink` trait (Parquet, TSV), and terminal-native graphing
+(`graph hist/bar/scatter`, building on group-by).
 
 ## Conventions
 

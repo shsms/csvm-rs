@@ -69,6 +69,8 @@ Each stage is a command with comma- or space-separated arguments:
 | `tail [N]`         | keep the last `N` rows (default 10; blocking)              |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
+| `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |
+| `agg FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev) |
 | `join [(SUB)] FILE on KEYS` | merge a right-side file in by key (inner/left/right/full) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
@@ -155,6 +157,9 @@ csvm 'join prices.csv on sku | sort price=nr | head' sales.csv
 # per-column profile of every column, aligned
 csvm 'stats | fmt' input.csv
 
+# group-by: total and mean amount per region, biggest first
+csvm 'group region | agg sum(amount),mean(amount) | sort amount_sum=nr | fmt' sales.csv
+
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
 ```
@@ -222,8 +227,9 @@ and alignment — reporting per-operation throughput.
 ## Roadmap
 
 The pipe language is built to grow. Planned: conditional colouring for `fmt`,
-pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and group-by
-aggregation. See `todo.org` for design notes.
+pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and terminal-native
+graphing (`graph hist/bar/scatter`, building on group-by). See `todo.org` for
+design notes.
 
 ## License
 

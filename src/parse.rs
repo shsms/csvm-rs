@@ -21,9 +21,9 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AddStmt, AffixKind, ArithOp, BoolExpr, Cmp, CmpOp, ColRef, ColorRule, ColorScope, ConvStmt,
-    Func, JoinStmt, JoinType, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey,
-    SortStmt, Stage, StatsStmt, Stmt, UniqStmt, ValExpr,
+    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpOp, ColRef, ColorRule,
+    ColorScope, ConvStmt, Func, GroupStmt, JoinStmt, JoinType, Operand, OutputFormat, Plan,
+    ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt, Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -57,7 +57,7 @@ fn err(msg: impl Into<String>) -> Error {
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
-    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta",
+    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,7 @@ enum Item {
     DropLast(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
+    Group(GroupStmt),
     Join(JoinStmt),
 }
 
@@ -130,6 +131,10 @@ impl Builder {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Uniq(u));
                 }
+                Item::Group(g) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Group(g));
+                }
                 Item::Join(j) => {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::Join(j));
@@ -156,6 +161,8 @@ impl Builder {
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
+            "group" => self.parse_group(rest),
+            "agg" => self.parse_agg(rest),
             "uniq" | "dedup" => self.parse_uniq(rest),
             "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
@@ -325,6 +332,57 @@ impl Builder {
             cols: split_list(rest),
             positions: Vec::new(),
             names: Vec::new(),
+        }));
+        Ok(())
+    }
+
+    /// `group COLS` sets the group keys for a following `agg`. On its own it
+    /// reduces to one row per key with a `count` of the rows in each group.
+    fn parse_group(&mut self, rest: &str) -> Result<(), Error> {
+        let keys = split_list(rest);
+        if keys.is_empty() {
+            return Err(err(
+                "group expects at least one column (use `agg …` alone for a global aggregate)",
+            ));
+        }
+        self.items.push(Item::Group(GroupStmt {
+            keys,
+            key_positions: Vec::new(),
+            aggs: vec![count_rows_agg()],
+        }));
+        Ok(())
+    }
+
+    /// `agg FN(col),… [by COLS]` reduces to one row per key. Keys come from a
+    /// trailing `by`, or an immediately preceding `group` (fused, replacing its
+    /// default count); with neither it's a single-row global aggregate.
+    fn parse_agg(&mut self, rest: &str) -> Result<(), Error> {
+        let (specs, by) = split_off_by(rest);
+        if specs.is_empty() {
+            return Err(err(
+                "agg expects at least one aggregate, e.g. agg sum(amount)",
+            ));
+        }
+        let aggs = split_specs(specs)
+            .iter()
+            .map(|t| parse_agg_spec(t))
+            .collect::<Result<Vec<_>, _>>()?;
+        let keys = match by {
+            Some(k) => split_list(k),
+            // Fuse with a directly preceding `group`: adopt its keys and drop its
+            // placeholder count. Otherwise no keys ⇒ a single global row.
+            None => match self.items.last() {
+                Some(Item::Group(_)) => match self.items.pop() {
+                    Some(Item::Group(g)) => g.keys,
+                    _ => unreachable!(),
+                },
+                _ => Vec::new(),
+            },
+        };
+        self.items.push(Item::Group(GroupStmt {
+            keys,
+            key_positions: Vec::new(),
+            aggs,
         }));
         Ok(())
     }
@@ -892,6 +950,114 @@ fn split_list(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// The default `count` aggregate (counts rows) `group` uses when no `agg` follows.
+fn count_rows_agg() -> AggSpec {
+    AggSpec {
+        func: AggFunc::Count,
+        col: None,
+        pos: None,
+        name: "count".to_string(),
+    }
+}
+
+/// Split an `agg` argument at a top-level (paren-depth-0) `by` keyword into the
+/// aggregate specs and the optional grouping-key list. `func(col)` parens are
+/// skipped so a column couldn't accidentally swallow the keyword.
+fn split_off_by(s: &str) -> (&str, Option<&str>) {
+    let b = s.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'b' if depth == 0
+                && (i == 0 || b[i - 1].is_ascii_whitespace())
+                && s[i..].starts_with("by")
+                && b.get(i + 2).is_none_or(u8::is_ascii_whitespace) =>
+            {
+                return (s[..i].trim(), Some(s[i + 2..].trim()));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    (s.trim(), None)
+}
+
+/// Split an `agg` spec list on top-level commas/whitespace, keeping `func(col)`
+/// groups intact.
+fn split_specs(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0i32;
+    for c in s.chars() {
+        match c {
+            '(' => {
+                depth += 1;
+                cur.push(c);
+            }
+            ')' => {
+                depth -= 1;
+                cur.push(c);
+            }
+            c if depth == 0 && (c == ',' || c.is_whitespace()) => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// Parse one aggregate spec: `func` (only `count` may omit a column) or
+/// `func(col)`. The output column is named `col_func` (`amount_sum`), or `count`.
+fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
+    let (func_name, col) = match tok.find('(') {
+        Some(open) => {
+            let inner = tok[open + 1..]
+                .strip_suffix(')')
+                .ok_or_else(|| err(format!("agg: malformed aggregate `{tok}`")))?;
+            let col = inner.trim();
+            if col.is_empty() {
+                return Err(err(format!("agg: `{}` needs a column name", &tok[..open])));
+            }
+            (tok[..open].trim(), Some(col.to_string()))
+        }
+        None => (tok.trim(), None),
+    };
+    let func = match func_name {
+        "count" => AggFunc::Count,
+        "sum" => AggFunc::Sum,
+        "min" => AggFunc::Min,
+        "max" => AggFunc::Max,
+        "mean" | "avg" => AggFunc::Mean,
+        "stddev" | "std" => AggFunc::Stddev,
+        other => return Err(err(format!("agg: unknown function `{other}`"))),
+    };
+    // Only `count` aggregates rows; every other function needs a column.
+    if col.is_none() && func != AggFunc::Count {
+        return Err(err(format!(
+            "agg: {func_name} needs a column, e.g. {func_name}(col)"
+        )));
+    }
+    let name = match &col {
+        Some(c) => format!("{c}_{}", func.name()),
+        None => "count".to_string(),
+    };
+    Ok(AggSpec {
+        func,
+        col,
+        pos: None,
+        name,
+    })
 }
 
 // --- expression lexer -------------------------------------------------------
@@ -1569,6 +1735,40 @@ mod tests {
         ));
         // tail has no negative form.
         assert!(parse("tail -n -3").is_err());
+    }
+
+    #[test]
+    fn group_and_agg_parse_into_one_group_stage() {
+        // `group` + a following `agg` fuse into a single Group stage; the agg's
+        // functions replace group's placeholder count.
+        let plan = parse("group region | agg sum(amount),mean(amount)").unwrap();
+        assert_eq!(plan.stages.len(), 1);
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!("expected a group stage");
+        };
+        assert_eq!(g.keys, ["region"]);
+        let names: Vec<&str> = g.aggs.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["amount_sum", "amount_mean"]);
+        // `by` supplies keys directly; a bare `group` keeps its default count.
+        assert!(matches!(
+            parse("agg count by a,b").unwrap().stages[0],
+            Stage::Group(_)
+        ));
+        let solo = parse("group region").unwrap();
+        let Stage::Group(g) = &solo.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.aggs.len(), 1);
+        assert_eq!(g.aggs[0].func, AggFunc::Count);
+    }
+
+    #[test]
+    fn agg_rejects_bad_specs() {
+        assert!(parse("agg frobnicate(x)").is_err()); // unknown function
+        assert!(parse("agg sum").is_err()); // sum needs a column
+        assert!(parse("agg sum()").is_err()); // empty column
+        assert!(parse("agg").is_err()); // no aggregates
+        assert!(parse("group").is_err()); // no keys
     }
 
     #[test]
