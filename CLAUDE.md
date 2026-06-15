@@ -190,8 +190,13 @@ positional is an error). Long options take `--flag VALUE` or `--flag=VALUE`.
 suffixes. `--no-header` treats the input as headerless and auto-names columns
 `c1,c2,…` (main peeks the first line to count them — for stdin it reads the line
 and chains it back; `hdr` wins if both are given). `--color` honors
-`NO_COLOR`/`CLICOLOR_FORCE` under `auto`. `--help` prints a command + operator
-cheatsheet. Defaults: stdin/stdout, threads = 1,
+`NO_COLOR`/`CLICOLOR_FORCE` under `auto`. Help lives in one registry
+(`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
+or alias) a command's forms + example, `csvm help TOPIC` the `operators`/
+`colors`/`types`/`sizes` pages; a test cross-checks the registry against
+`parse::COMMANDS` so the help can't drift (the overview's command list is
+generated from it). Usage errors show only the brief synopsis. Defaults:
+stdin/stdout, threads = 1,
 chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)

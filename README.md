@@ -43,11 +43,18 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--no-header`      | input has no header row; columns are named `c1, c2, …`      |
 | `--color WHEN`     | `auto` (TTY only), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE` |
 | `--print-engine`   | print the compiled plan and exit                            |
+| `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
+
+Long options also accept the `--flag=value` form (e.g. `--color=always`).
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, `-n N` shards the work across N threads. A streaming input
 (stdin) emits output as rows arrive rather than buffering a full chunk first.
+
+`csvm help` prints the overview; `csvm help CMD` shows one command's forms and
+an example (`csvm help color`, `csvm help join`, …); `csvm help TOPIC` covers
+`operators`, `colors`, `types`, and `sizes`.
 
 ## The command language
 
