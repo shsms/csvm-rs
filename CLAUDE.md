@@ -158,8 +158,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     get distinct colours (`render_xy`, when `--color`) with a legend; one braille
     canvas per series, first-series-wins per shared cell.
   Flags: `--bins N` (hist), `--width W`, `--height H` (xy), `--title T`. Width
-  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). Colour density
-  ramps for scatter and SVG export are the remaining follow-ups (`todo.org`).
+  defaults to the terminal (`$COLUMNS`, else 80; no ioctl dep). `--svg` emits a
+  standalone SVG document to the normal output instead of the terminal chart
+  (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
+  (needs a raster dep) and a scatter density colour ramp are the remaining
+  follow-ups (`todo.org`).
 - `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
@@ -284,11 +287,11 @@ a `Stmt`/`Stage`. `join` is implemented (`Stage::Join`, a sub-`Plan` right side 
 the `Plan` is now a small DAG). The computed `add` column is implemented
 (`Stmt::Add`, the `ValExpr` value engine; `prev`/`rownum` take the ordered
 in-memory path). Group-by aggregation is implemented (`Stage::Group`,
-`group … | agg …`), as is terminal-native graphing's first chart
-(`graph hist`, `src/graph.rs`). Planned (see `todo.org` for design notes):
-conditional colouring for `fmt`, pluggable formats via a
-`Source`/`Sink` trait (Parquet, TSV), and the rest of `graph`
-(bar/scatter/line/spark + colour ramps).
+`group … | agg …`), as is terminal-native graphing (`graph
+hist/bar/spark/scatter/line` in `src/graph.rs`, `--svg` export in
+`src/svg.rs`). Planned (see `todo.org` for design notes): conditional
+colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait
+(Parquet, TSV), and a scatter density colour ramp.
 
 ## Conventions
 

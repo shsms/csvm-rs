@@ -231,7 +231,8 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 4. [X] =graph scatter= / =line= on a 2x4 braille canvas (=Braille=, Bresenham
    for line), multi-series via =X Y1,Y2= with distinct per-series colours +
    legend. (Density colour *ramps* for a single scatter still open — see below.)
-5. (optional, feature-gated) SVG/PNG export.
+5. [~] SVG export shipped (=--svg=, =src/svg.rs=, hand-written XML, no dep, so
+   not feature-gated). PNG (needs a raster dep) is still the feature-gated part.
 
 ** Follow-ups now open
 - Streaming + sharded group-by (the =stats= mirror): group is on the in-memory

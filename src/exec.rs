@@ -1358,8 +1358,12 @@ fn render_graph<W: Write>(
     let chart = match g.kind {
         GraphKind::Hist => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            let note = skipped_note(skipped, 0);
             match Histogram::build(&values, g.opts.bins, skipped) {
+                Some(h) if g.opts.svg => crate::svg::hist(&title, h.lo, h.hi, &h.counts, &note),
                 Some(h) => h.render(&title, g.opts.width),
+                // Keep the --svg contract even with nothing to plot: an empty SVG.
+                None if g.opts.svg => crate::svg::hist(&title, 0.0, 0.0, &[], &note),
                 None => {
                     format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n")
                 }
@@ -1367,26 +1371,31 @@ fn render_graph<W: Write>(
         }
         GraphKind::Spark => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
-            crate::graph::render_spark(&title, &values, g.opts.width, skipped)
+            if g.opts.svg {
+                crate::svg::spark(&title, &values, &skipped_note(skipped, 0))
+            } else {
+                crate::graph::render_spark(&title, &values, g.opts.width, skipped)
+            }
         }
         GraphKind::Bar => {
             let (rows, skipped, truncated) =
                 collect_label_value(text, g.cols[0].pos, g.cols[1].pos, crate::graph::MAX_BARS);
-            crate::graph::render_bars(&title, &rows, g.opts.width, skipped, truncated)
+            if g.opts.svg {
+                crate::svg::bars(&title, &rows, &skipped_note(skipped, truncated))
+            } else {
+                crate::graph::render_bars(&title, &rows, g.opts.width, skipped, truncated)
+            }
         }
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
             let (series, skipped) = collect_xy(text, g.cols[0].pos, &ypos);
-            crate::graph::render_xy(
-                &title,
-                &ynames,
-                &series,
-                &g.opts,
-                color,
-                g.kind == GraphKind::Line,
-                skipped,
-            )
+            let connect = g.kind == GraphKind::Line;
+            if g.opts.svg {
+                crate::svg::xy(&title, &ynames, &series, connect, &skipped_note(skipped, 0))
+            } else {
+                crate::graph::render_xy(&title, &ynames, &series, &g.opts, color, connect, skipped)
+            }
         }
     };
     output.write_all(chart.as_bytes())?;
@@ -1423,6 +1432,19 @@ fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> (Vec<Vec<(f64, f64)>>,
         }
     });
     (series, skipped)
+}
+
+/// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
+/// terminal renderers already print); empty when nothing was dropped.
+fn skipped_note(skipped: u64, truncated: usize) -> String {
+    let mut parts = Vec::new();
+    if truncated > 0 {
+        parts.push(format!("+{truncated} more not shown"));
+    }
+    if skipped > 0 {
+        parts.push(format!("skipped {skipped} non-numeric"));
+    }
+    parts.join("  ")
 }
 
 /// Collect one column's finite numeric values from the buffered output (header
@@ -2349,6 +2371,26 @@ mod tests {
         assert!(out.starts_with("countZ vs id\n"), "{out}");
         assert!(out.contains('┤') && out.contains('└'), "{out}");
         assert!(out.contains("points=4"), "{out}");
+    }
+
+    #[test]
+    fn graph_svg_emits_an_svg_document() {
+        let out = render_str("graph hist countZ --bins 3 --svg", INPUT, false);
+        assert!(out.starts_with("<svg"), "{out}");
+        assert!(out.trim_end().ends_with("</svg>"));
+        assert!(out.contains("<rect")); // bars
+        // --svg short-circuits the terminal renderer (no block glyphs).
+        assert!(!out.contains('█'));
+    }
+
+    #[test]
+    fn graph_svg_reports_skipped_and_stays_svg_with_no_data() {
+        // fieldA is all text: every value skipped, but the output is still SVG
+        // (not a plain-text diagnostic) and reports the dropped count.
+        let out = render_str("graph hist fieldA --svg", INPUT, false);
+        assert!(out.starts_with("<svg"), "{out}");
+        assert!(out.trim_end().ends_with("</svg>"), "{out}");
+        assert!(out.contains("skipped 4 non-numeric"), "{out}");
     }
 
     #[test]

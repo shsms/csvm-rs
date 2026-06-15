@@ -654,6 +654,8 @@ pub struct GraphOpts {
     /// Canvas height in terminal rows (scatter/line only).
     pub height: Option<usize>,
     pub title: Option<String>,
+    /// Emit an SVG document (to the normal output) instead of a terminal chart.
+    pub svg: bool,
 }
 
 /// A `graph` sink: draw a terminal chart from the columns reaching it instead of

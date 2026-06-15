@@ -173,6 +173,9 @@ csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv
 # braille line chart of two series over time
 csvm 'graph line ts open,close --height 12' prices.csv
 
+# write the chart as an SVG instead of drawing in the terminal
+csvm 'graph hist amount --svg' sales.csv -o amount.svg
+
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
 ```
@@ -239,10 +242,10 @@ and alignment — reporting per-operation throughput.
 
 ## Roadmap
 
-The pipe language is built to grow. Planned: conditional colouring for `fmt`,
-pluggable formats via a `Source`/`Sink` trait (Parquet, TSV), and more
-terminal-native charts (`graph bar/scatter/line/spark`; `graph hist` ships
-today). See `todo.org` for design notes.
+The pipe language is built to grow. Terminal-native charts ship today
+(`graph hist/bar/spark/scatter/line`, with `--svg` export). Planned: conditional
+colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait (Parquet,
+TSV), and a scatter density colour ramp. See `todo.org` for design notes.
 
 ## License
 

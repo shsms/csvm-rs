@@ -270,16 +270,18 @@ named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-
             "graph spark COL             one-line sparkline of a column",
             "graph scatter X Y[,Y2…]     points on a braille canvas",
             "graph line X Y[,Y2…]        connected points (multi-series)",
-            "  flags: --bins N (hist)  --width W  --height H (xy)  --title T",
+            "  flags: --bins N (hist)  --width W  --height H (xy)  --title T  --svg",
         ],
         detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
 it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
 Width defaults to the terminal ($COLUMNS, else 80); hist bins to Sturges' rule; bar is capped at \
-50 rows; scatter/line take multiple y-series, coloured with --color.",
+50 rows; scatter/line take multiple y-series, coloured with --color. --svg emits an SVG document \
+to the output instead of a terminal chart.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
             "csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv",
             "csvm 'graph line ts open,close --height 12' prices.csv",
+            "csvm 'graph hist amount --svg' data.csv -o chart.svg",
         ],
     },
     CmdHelp {

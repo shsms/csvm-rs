@@ -439,6 +439,9 @@ impl Builder {
                 let (val, tail) = v?;
                 opts.title = Some(val);
                 s = tail.trim_start();
+            } else if word == "--svg" {
+                opts.svg = true;
+                s = after;
             } else if word.starts_with('-') && word != "-" {
                 return Err(err(format!("graph: unknown flag `{word}`")));
             } else {
@@ -1918,6 +1921,12 @@ mod tests {
             GraphKind::Scatter
         );
         assert!(parse("graph scatter x").is_err()); // needs x + at least one y
+    }
+
+    #[test]
+    fn graph_svg_flag_sets_the_option() {
+        assert!(parse("graph hist x --svg").unwrap().graph.unwrap().opts.svg);
+        assert!(!parse("graph hist x").unwrap().graph.unwrap().opts.svg);
     }
 
     #[test]

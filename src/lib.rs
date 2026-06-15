@@ -17,6 +17,7 @@ pub mod parse;
 pub mod plan;
 pub mod sort;
 pub mod stats;
+pub mod svg;
 
 pub use error::Error;
 
