@@ -55,7 +55,7 @@ fn err(msg: impl Into<String>) -> Error {
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
-    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add",
+    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -159,6 +159,7 @@ impl Builder {
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
             "add" => self.parse_add(rest),
+            "delta" => self.parse_delta(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
             other => Err(err(match crate::error::did_you_mean(other, COMMANDS) {
@@ -505,6 +506,45 @@ impl Builder {
             pos: None,
             stateful,
         })));
+        Ok(())
+    }
+
+    /// `delta [-s SUFFIX] COLS` — shorthand for the per-column step difference.
+    /// For each column `C` it appends `C<SUFFIX> = C - prev(C)` (suffix defaults
+    /// to `_delta`), i.e. the same stateful `add` written once per column.
+    fn parse_delta(&mut self, rest: &str) -> Result<(), Error> {
+        let rest = rest.trim();
+        let (suffix, list_src) = match rest.strip_prefix("-s") {
+            Some(r) if r.is_empty() || r.starts_with('=') || r.starts_with(char::is_whitespace) => {
+                let r = r.strip_prefix('=').unwrap_or(r).trim_start();
+                let (suf, rest2) = split_first_word(r);
+                if suf.is_empty() {
+                    return Err(err("delta -s expects a suffix, e.g. delta -s _change a"));
+                }
+                (suf.to_string(), rest2)
+            }
+            _ => ("_delta".to_string(), rest),
+        };
+        let cols = split_list(list_src);
+        if cols.is_empty() {
+            return Err(err("delta expects at least one column"));
+        }
+        for c in cols {
+            let name = format!("{c}{suffix}");
+            let expr = ValExpr::Arith {
+                op: ArithOp::Sub,
+                lhs: Box::new(ValExpr::Col(ColRef::new(c.clone()))),
+                rhs: Box::new(ValExpr::Prev(ColRef::new(c))),
+            };
+            // A delta is numeric, so later comparisons on it coerce implicitly.
+            self.col_types.insert(name.clone(), ColType::Num);
+            self.items.push(Item::Stmt(Stmt::Add(AddStmt {
+                name,
+                expr,
+                pos: None,
+                stateful: true,
+            })));
+        }
         Ok(())
     }
 
@@ -1888,5 +1928,44 @@ mod tests {
         assert!(parse("add x bogus(a)").is_err()); // unknown function
         assert!(parse("add x prev(a + 1)").is_err()); // prev needs a bare column
         assert!(parse("add x round(a, b)").is_err()); // wrong arity
+    }
+
+    #[test]
+    fn delta_expands_to_one_stateful_add_per_column() {
+        let plan = parse("delta a b").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!();
+        };
+        assert_eq!(stmts.len(), 2);
+        let names: Vec<&str> = stmts
+            .iter()
+            .map(|s| match s {
+                Stmt::Add(a) => a.name.as_str(),
+                _ => panic!("expected add"),
+            })
+            .collect();
+        assert_eq!(names, ["a_delta", "b_delta"]);
+        // C_delta = C - prev(C), and stateful.
+        let Stmt::Add(a) = &stmts[0] else { panic!() };
+        assert!(a.stateful);
+        assert!(matches!(
+            &a.expr,
+            ValExpr::Arith {
+                op: ArithOp::Sub,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delta_custom_suffix_and_errors() {
+        let plan = parse("delta -s _change a").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!();
+        };
+        let Stmt::Add(a) = &stmts[0] else { panic!() };
+        assert_eq!(a.name, "a_change");
+        assert!(parse("delta").is_err()); // no columns
+        assert!(parse("delta -s").is_err()); // suffix flag, no suffix
     }
 }

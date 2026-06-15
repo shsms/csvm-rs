@@ -112,6 +112,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   is `is_stateful()` and routes to the **in-memory ordered path** (the guard
   `plan_has_stateful_add` in `exec::run_body`/`run_file`, mirroring the
   `tail`/`uniq`/`join` fallback), so its output is `-n`-independent.
+- **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
+  stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
+  default `_delta`), so it shares all of `add`'s machinery and guarantees.
 - **`hdr a,b,c`** supplies column names for headerless input: it sets
   `Plan.input_header` (plan-level metadata, must be the first command), so the
   whole input is data and `main`/the test harness skip reading a header line

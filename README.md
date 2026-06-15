@@ -75,6 +75,7 @@ comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
+| `delta [-s SUF] cols` | append `col_delta = col - prev(col)` per column (shorthand) |
 | `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
@@ -173,6 +174,18 @@ Because they depend on row order, an `add` using `prev()`/`rownum()` runs
 identical at any `-n`. `rownum()` reflects input order even before a later
 `sort`. A pure `add` (no `prev`/`rownum`) still shards and streams like any other
 transform.
+
+#### `delta` — step differences in one word
+
+Computing a delta for several columns with `add` is repetitive, so `delta` is
+shorthand: `delta a b` appends `a_delta`/`b_delta` exactly as
+`add a_delta a - prev(a) | add b_delta b - prev(b)` would. `-s SUFFIX` overrides
+the `_delta` suffix.
+
+```sh
+csvm 'delta a b | fmt' data.csv             # a_delta, b_delta
+csvm 'delta -s _change a | fmt' data.csv    # a_change
+```
 
 ### `stats`
 

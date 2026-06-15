@@ -182,6 +182,50 @@ fn prev_after_a_reshaping_cols_uses_the_new_layout() {
 }
 
 #[test]
+fn delta_appends_step_differences() {
+    // `delta` is sugar for `add C_delta C - prev(C)` per column.
+    assert_eq!(
+        run_checked("delta price | cols price_delta", NUM),
+        "price_delta\n0\n10\n-15\n"
+    );
+    // Multiple columns, and equivalence to the explicit add form.
+    assert_eq!(
+        run_checked("delta price qty | cols price_delta,qty_delta", NUM),
+        run_checked(
+            "add price_delta price - prev(price) | add qty_delta qty - prev(qty) \
+             | cols price_delta,qty_delta",
+            NUM
+        ),
+    );
+}
+
+#[test]
+fn delta_custom_suffix() {
+    assert_eq!(
+        run_checked("delta -s _change price | cols price_change", NUM),
+        "price_change\n0\n10\n-15\n"
+    );
+}
+
+#[test]
+fn delta_is_thread_independent_over_a_file() {
+    let mut content = String::from("id,val\n");
+    for i in 0..3000u32 {
+        content.push_str(&format!("{i},{}\n", (i * 17) % 89));
+    }
+    let path = temp_csv(&content);
+    let serial = run("delta val | cols val_delta", &content, 1).unwrap();
+    for n in [1usize, 2, 4, 8, 16] {
+        assert_eq!(
+            run_file_str("delta val | cols val_delta", &path, n),
+            serial,
+            "threads={n}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn stateful_add_is_thread_independent_over_a_file() {
     // Varied row lengths so shard boundaries fall mid-data; a stateful add must
     // still produce the serial result at every thread count (it can't shard).

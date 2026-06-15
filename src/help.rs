@@ -275,6 +275,23 @@ Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm 
         ],
     },
     CmdHelp {
+        name: "delta",
+        aliases: &[],
+        summary: "append per-column step differences",
+        synopsis: &[
+            "delta COLS         append COL_delta = COL - prev(COL) for each column",
+            "delta -s SUF COLS  use suffix SUF instead of _delta",
+        ],
+        detail: "Shorthand for the common cross-row difference: `delta a b` is exactly \
+`add a_delta a - prev(a) | add b_delta b - prev(b)`. Like any prev()-based add it runs \
+single-threaded and in input order, so its output is independent of -n; the first row's \
+delta is 0.",
+        examples: &[
+            "csvm 'delta amount' data.csv",
+            "csvm 'delta -s _change amount qty | fmt' data.csv",
+        ],
+    },
+    CmdHelp {
         name: "to-num",
         aliases: &[],
         summary: "force columns to numeric",
