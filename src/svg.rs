@@ -4,8 +4,9 @@
 //! data the terminal renderers do (see `crate::graph`) and emits a standalone
 //! `<svg>` document.
 
+use crate::color::Rgb;
 use crate::field::format_num;
-use crate::graph::XAxis;
+use crate::graph::{XAxis, series_rgb};
 
 const W: f64 = 720.0;
 const H: f64 = 440.0;
@@ -15,10 +16,12 @@ const R: f64 = 16.0;
 const T: f64 = 32.0;
 const B: f64 = 44.0;
 
-/// Distinct series colours (hex), mirroring the terminal palette.
-const SERIES: [&str; 6] = [
-    "#4fc3f7", "#ff8a65", "#81c784", "#ba68c8", "#ffd54f", "#e57373",
-];
+/// The series colour for index `i` as an SVG hex string, from the shared
+/// terminal palette ([`crate::graph::series_rgb`]) so the two can't drift.
+fn series_hex(i: usize) -> String {
+    let Rgb(r, g, b) = series_rgb(i);
+    format!("#{r:02x}{g:02x}{b:02x}")
+}
 
 fn pw() -> f64 {
     W - L - R
@@ -167,8 +170,7 @@ pub fn spark(title: &str, values: &[f64], note: &str) -> String {
     if values.is_empty() {
         return header(title, "", note);
     }
-    let lo = values.iter().cloned().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (lo, hi) = crate::graph::minmax(values).unwrap_or((0.0, 0.0));
     let span = (hi - lo).max(f64::MIN_POSITIVE);
     let n = values.len().max(2);
     let pts: Vec<String> = values
@@ -225,7 +227,7 @@ pub fn xy(
     body.push_str(&ylabels(ylo, yhi));
     body.push_str(&xlabels(&xaxis, xlo, xhi));
     for (si, pts) in series.iter().enumerate() {
-        let color = SERIES[si % SERIES.len()];
+        let color = series_hex(si);
         if connect {
             let line: Vec<String> = pts
                 .iter()
@@ -249,7 +251,7 @@ pub fn xy(
     }
     if series.len() > 1 {
         for (i, name) in names.iter().enumerate() {
-            let color = SERIES[i % SERIES.len()];
+            let color = series_hex(i);
             let y = T + 4.0 + i as f64 * 16.0;
             body.push_str(&format!(
                 "<rect x=\"{lx}\" y=\"{ry}\" width=\"10\" height=\"10\" fill=\"{color}\"/>\n\

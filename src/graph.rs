@@ -28,6 +28,13 @@ pub fn chart_size(scale: f64) -> (usize, usize) {
     (dim(BASE_W, 16), dim(BASE_H, 2))
 }
 
+/// Min and max of `values`, or `None` when empty. Shared by the chart renderers.
+pub(crate) fn minmax(values: &[f64]) -> Option<(f64, f64)> {
+    let mut it = values.iter().copied();
+    let first = it.next()?;
+    Some(it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v))))
+}
+
 /// A finished histogram: `bins` equal-width buckets spanning `[lo, hi]`, the last
 /// inclusive of `hi`. `skipped` counts non-empty cells that weren't finite
 /// numbers (reported below the chart, never plotted — the "strict and loud"
@@ -45,15 +52,7 @@ impl Histogram {
     /// Returns `None` when there is nothing to plot (no finite values). The
     /// default bin count is Sturges' rule, capped so the chart stays readable.
     pub fn build(values: &[f64], bins: Option<usize>, skipped: u64) -> Option<Histogram> {
-        if values.is_empty() {
-            return None;
-        }
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &v in values {
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
+        let (lo, hi) = minmax(values)?;
         let n = values.len();
         // Sturges: ⌈log2 n⌉ + 1, capped at 50; explicit --bins wins.
         let nbins = bins
@@ -206,8 +205,7 @@ pub fn render_spark(title: &str, values: &[f64], width: usize, skipped: u64) -> 
             })
             .collect()
     };
-    let lo = buckets.iter().cloned().fold(f64::INFINITY, f64::min);
-    let hi = buckets.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let (lo, hi) = minmax(&buckets).unwrap_or((0.0, 0.0));
     let span = hi - lo;
     let line: String = buckets
         .iter()
@@ -257,7 +255,8 @@ fn bar(count: u64, max: u64, width: usize) -> String {
 /// down the right (the Unicode ordering).
 const BRAILLE_DOTS: [[u8; 2]; 4] = [[0x01, 0x08], [0x02, 0x10], [0x04, 0x20], [0x40, 0x80]];
 
-/// Distinct foreground colours for multi-series charts (cycled).
+/// Distinct foreground colours for multi-series charts (cycled). The single
+/// source of truth for both the terminal and SVG renderers — see [`series_rgb`].
 const SERIES_RGB: [Rgb; 6] = [
     Rgb(0x4f, 0xc3, 0xf7), // cyan
     Rgb(0xff, 0x8a, 0x65), // orange
@@ -267,9 +266,14 @@ const SERIES_RGB: [Rgb; 6] = [
     Rgb(0xe5, 0x73, 0x73), // red
 ];
 
+/// The series colour for index `i` (cycled), shared with the SVG renderer.
+pub(crate) fn series_rgb(i: usize) -> Rgb {
+    SERIES_RGB[i % SERIES_RGB.len()]
+}
+
 fn series_style(i: usize) -> Style {
     Style {
-        fg: Some(SERIES_RGB[i % SERIES_RGB.len()]),
+        fg: Some(series_rgb(i)),
         ..Style::default()
     }
 }

@@ -1455,25 +1455,15 @@ struct XyData {
 ///   1-based row ordinal, label the axis with the first/last raw cells, and flag
 ///   even spacing.
 fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
-    let num = |r: &[Field], p: usize| -> Option<f64> {
-        r.get(p)
-            .and_then(|f| f.as_str().trim().parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-    };
     // (numeric x, raw x text, y values) per data row.
     let mut rows: Vec<(Option<f64>, String, Vec<Option<f64>>)> = Vec::new();
-    let mut first = true;
-    csv::parse_chunk(text, |r| {
-        if first {
-            first = false;
-            return;
-        }
+    for_each_data_row(text, |r| {
         let xcell = r
             .get(xpos)
             .map(|f| f.as_str().into_owned())
             .unwrap_or_default();
-        let x = num(r, xpos);
-        let ys = ypos.iter().map(|&p| num(r, p)).collect();
+        let x = cell_num(r, xpos);
+        let ys = ypos.iter().map(|&p| cell_num(r, p)).collect();
         rows.push((x, xcell, ys));
     });
 
@@ -1534,6 +1524,26 @@ fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
     }
 }
 
+/// Parse a cell as a finite f64 — the numeric-cell rule shared by the chart
+/// collectors. `None` for a missing, empty, or non-numeric cell.
+fn cell_num(row: &[Field], pos: usize) -> Option<f64> {
+    row.get(pos)
+        .and_then(|f| f.as_str().trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+}
+
+/// Apply `f` to each data row of the buffered CSV output, skipping the header.
+fn for_each_data_row(text: &str, mut f: impl FnMut(&[Field])) {
+    let mut first = true;
+    csv::parse_chunk(text, |r| {
+        if first {
+            first = false;
+        } else {
+            f(r);
+        }
+    });
+}
+
 /// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
 /// terminal renderers already print); empty when nothing was dropped.
 fn skipped_note(skipped: u64, truncated: usize) -> String {
@@ -1552,19 +1562,9 @@ fn skipped_note(skipped: u64, truncated: usize) -> String {
 fn collect_numeric(text: &str, pos: usize) -> (Vec<f64>, u64) {
     let mut values = Vec::new();
     let mut skipped = 0u64;
-    let mut first = true;
-    csv::parse_chunk(text, |r| {
-        if first {
-            first = false;
-            return;
-        }
-        match r.get(pos).map(|f| f.as_str()) {
-            Some(s) => match s.trim().parse::<f64>() {
-                Ok(v) if v.is_finite() => values.push(v),
-                _ => skipped += 1,
-            },
-            None => skipped += 1,
-        }
+    for_each_data_row(text, |r| match cell_num(r, pos) {
+        Some(v) => values.push(v),
+        None => skipped += 1,
     });
     (values, skipped)
 }
@@ -1581,26 +1581,16 @@ fn collect_label_value(
     let mut rows = Vec::new();
     let mut skipped = 0u64;
     let mut truncated = 0usize;
-    let mut first = true;
-    csv::parse_chunk(text, |r| {
-        if first {
-            first = false;
-            return;
+    for_each_data_row(text, |r| match cell_num(r, value_pos) {
+        Some(v) => {
+            if rows.len() < cap {
+                let label = r.get(label_pos).map(|f| f.as_str().into_owned());
+                rows.push((label.unwrap_or_default(), v));
+            } else {
+                truncated += 1;
+            }
         }
-        match r.get(value_pos).map(|f| f.as_str()) {
-            Some(s) => match s.trim().parse::<f64>() {
-                Ok(v) if v.is_finite() => {
-                    if rows.len() < cap {
-                        let label = r.get(label_pos).map(|f| f.as_str().into_owned());
-                        rows.push((label.unwrap_or_default(), v));
-                    } else {
-                        truncated += 1;
-                    }
-                }
-                _ => skipped += 1,
-            },
-            None => skipped += 1,
-        }
+        None => skipped += 1,
     });
     (rows, skipped, truncated)
 }
