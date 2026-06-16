@@ -24,6 +24,18 @@ columns stay lexical (float equality is fragile). Visible as =:auto= under
 =--print-engine=. The =num()= coercion alternative was dropped — auto fixes the
 default without new syntax.
 
+** TODO Decisions to make
+- Sort vs select numeric-detect asymmetry (follow-up to the auto-compare work
+  above): =select a > b= on two untyped columns now auto-detects numeric per row,
+  but =sort a= stays *lexical* by default (its own =SortKey.numeric=, set only by
+  =a=n= or a prior =to-num=). So =select qty > stock | sort qty= filters by
+  numeric magnitude yet orders =100= before =9= as text — a surprising mismatch on
+  the same column. Decide: give =sort= an analogous per-key auto-detect default
+  (changes the default order for every untyped column — a bigger behavioural
+  change, needs an escape hatch like =sort a=s= to force lexical), or leave the
+  asymmetry as-is (documented in =help types= / CLAUDE.md) since a streaming sort
+  can't cheaply sample types. Leaning: document-only for now; revisit if it bites.
+
 ** TODO Smaller features
 - Delimiter support =-d= / =--delim= (TSV) — a narrow near-term step toward the
   Source/Sink roadmap; touches the scanner + writer.
