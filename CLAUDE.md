@@ -85,9 +85,15 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (`Stage::Group`, `GroupStmt`/`AggSpec`/`AggFunc` in `plan.rs`): the `Grouper`
   in `exec.rs` folds rows into a `HashMap<key, GroupAcc>` keeping first-seen
   order, reusing one `ColStats` (`stats.rs`) per distinct aggregated column —
-  O(groups × aggregated-cols) memory. Currently takes the in-memory path; a
-  streaming + sharded fast path (mirroring `stats`) is the planned follow-up
-  (`todo.org`).
+  O(groups × aggregated-cols) memory. Like `stats` it has streaming and sharded
+  fast paths (`group_shape` gates both): stdin / `-n1` **stream** the input
+  through one `Grouper` (`run_group_streaming`), and a **seekable file with
+  `-n>1`** shards — each worker builds a partial `Grouper` over its byte range
+  and `Grouper::merge` folds them in file order (so first-seen group order is
+  preserved). Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may
+  differ from `-n1` by ~1 ULP (parallel reduction order), the same caveat as
+  sharded `stats`. A `group` combined with a `sort` (or another blocking stage)
+  still takes the in-memory path.
 - **`join [FLAGS] [(SUBPIPELINE)] FILE on KEYS`** merges a right-side CSV in by
   key. A blocking stage: the right `FILE` is run through its optional
   parenthesized sub-`Plan` (a full recursive pipeline — this is the "DAG" node),

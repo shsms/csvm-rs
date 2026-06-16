@@ -134,8 +134,8 @@ Implemented: =Stage::Group= (=GroupStmt=/=AggSpec=/=AggFunc= in =plan.rs=), the
 first-seen order, reusing one =ColStats= per distinct aggregated column. Both
 spellings ship (=group COLS | agg FNS=, fused; =agg FNS by COLS=; bare =agg= ⇒
 one global row). Funcs: =count/sum/min/max/mean/stddev= (bare =count= = rows,
-=count(col)= = non-empty). Still on the *in-memory path* — the streaming +
-sharded fast path (mirroring =stats=) is the follow-up below. Original notes:
+=count(col)= = non-empty). Streaming + sharded fast paths now ship too (mirroring
+=stats=; see the graph follow-ups-done list). Original notes:
 
 Prerequisite for =graph bar= (categorical charts), and useful on its own — the
 sibling of the =stats= profiler, which already reduces to one row *globally*;
@@ -237,9 +237,6 @@ below the chart rather than coercing to 0. Settle this before the binning code.
    not feature-gated). PNG (needs a raster dep) is still the feature-gated part.
 
 ** Follow-ups — open (deferred)
-- Streaming + sharded group-by (the =stats= mirror): group is on the in-memory
-  path; add a =group_shape= streaming fast path and an =-n>1= sharded path
-  (per-shard =HashMap=, merge unioning key sets, =ColStats::merge= per group).
 - =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=).
 - =graph scatter= density colour ramp: colour a single-series scatter by point
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
@@ -253,6 +250,11 @@ below the chart rather than coercing to 0. Settle this before the binning code.
   =Field::Num= values instead of re-parsing — a deep change to the sink design.
 
 ** Follow-ups — done (see git history)
+- [X] Streaming + sharded group-by (the =stats= mirror): =group_shape= gates a
+  streaming fast path (stdin/=-n1=, one =Grouper=) and an =-n>1= sharded path
+  (per-shard partial =Grouper=, =Grouper::merge= folds them in file order so
+  first-seen order holds, =ColStats::merge= per group). Same exact-counts /
+  ~1-ULP-float caveat as sharded =stats=. =group=+=sort= still materializes.
 - [X] Timestamp x-axis parses to epoch and plots on a true time axis
   (=src/datetime.rs=, =yyyy-mm-dd[ T]HH:MM:SS[.fff][Z|±HH:MM]=, no dep).
 - [X] Graduated axis ticks: numeric round 1/2/5x10^n; same-day =HH:MM:SS=; tick

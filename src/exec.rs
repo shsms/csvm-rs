@@ -158,6 +158,12 @@ fn run_body<R: BufRead, W: Write + Send>(
     if let Some((pre, stats, post)) = stats_shape(plan) {
         return run_stats_streaming(pre, stats, post, opts, input, output);
     }
+    // `group … | agg …` reduces the stream to one row per key; fold the input
+    // through a `Grouper` (O(groups) memory) and run any following stages over
+    // the per-group rows — the per-key sibling of the `stats` path above.
+    if let Some((pre, g, post)) = group_shape(plan) {
+        return run_group_streaming(pre, g, post, opts, input, output);
+    }
     match plan.stages.as_slice() {
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
@@ -273,6 +279,30 @@ fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
     Some((pre, stats, &plan.stages[si + 1..]))
 }
 
+/// If the plan has exactly one `group` stage with nothing blocking before it (an
+/// optional leading transform only), return the pre-group statements, the group
+/// stage, and the stages that follow it — the `group … | agg …` mirror of
+/// [`stats_shape`], enabling the streaming and sharded reduce paths.
+fn group_shape(plan: &Plan) -> Option<(&[Stmt], &GroupStmt, &[Stage])> {
+    let idxs: Vec<usize> = plan
+        .stages
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| matches!(s, Stage::Group(_)))
+        .map(|(i, _)| i)
+        .collect();
+    let [gi] = idxs[..] else { return None };
+    let pre: &[Stmt] = match &plan.stages[..gi] {
+        [] => &[],
+        [Stage::Transform(stmts)] => stmts,
+        _ => return None,
+    };
+    let Stage::Group(g) = &plan.stages[gi] else {
+        return None;
+    };
+    Some((pre, g, &plan.stages[gi + 1..]))
+}
+
 /// Stream `[pre | stats]`, folding each surviving row into per-column
 /// accumulators (O(columns) memory, not O(rows)), then run the post-stats
 /// stages over the tiny profile and write it. `stats` must read all input, so it
@@ -304,6 +334,41 @@ fn run_stats_streaming<R: BufRead, W: Write>(
         }
     }
     let rows = apply_stages_over_rows(post, profile_rows(stats, &accs), opts)?;
+    write_rows(output, &rows)
+}
+
+/// Stream `[pre | group … | agg …]`, folding each surviving row into a
+/// [`Grouper`] (O(groups × aggregated-cols) memory, not O(rows)), then run the
+/// post-group stages over the per-group rows and write them. The `group` mirror
+/// of [`run_stats_streaming`]; `group` must read all input, so it uses the
+/// throughput-batched [`next_chunk`].
+fn run_group_streaming<R: BufRead, W: Write>(
+    pre: &[Stmt],
+    g: &GroupStmt,
+    post: &[Stage],
+    opts: &RunOpts,
+    input: &mut R,
+    output: &mut W,
+) -> Result<(), Error> {
+    let mut grouper = Grouper::new(g);
+    while let Some(chunk) = next_chunk(input, opts.chunk_size)? {
+        let mut scratch: Vec<Field> = Vec::new();
+        let mut err: Option<Error> = None;
+        csv::parse_chunk(&chunk, |row| {
+            if err.is_some() {
+                return;
+            }
+            match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
+                Ok(true) => grouper.update(row),
+                Ok(false) => {}
+                Err(e) => err = Some(e),
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+    }
+    let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
     write_rows(output, &rows)
 }
 
@@ -430,6 +495,35 @@ impl<'a> Grouper<'a> {
         }
     }
 
+    /// Fold another shard's partial `Grouper` into this one, preserving
+    /// first-seen order: keys already present accumulate (rows + a per-column
+    /// [`ColStats::merge`]), keys new to this accumulator are appended in the
+    /// other's first-seen order. Both share the same `GroupStmt`, so the `stats`
+    /// vectors line up slot-for-slot. The reduce mirror of [`Self::update`];
+    /// merging in file order makes the merged result match a single pass (modulo
+    /// the ~1-ULP `sum`/`mean`/`stddev` drift any parallel reduction has, since
+    /// the float combine sums in a different order — like sharded `stats`).
+    fn merge(&mut self, other: Grouper<'a>) {
+        for acc in other.groups {
+            self.keybuf.clear();
+            csv::write_row(&mut self.keybuf, &acc.key);
+            match self.index.get(&self.keybuf) {
+                Some(&i) => {
+                    let dst = &mut self.groups[i];
+                    dst.rows += acc.rows;
+                    for (d, s) in dst.stats.iter_mut().zip(&acc.stats) {
+                        d.merge(s);
+                    }
+                }
+                None => {
+                    let i = self.groups.len();
+                    self.index.insert(self.keybuf.clone(), i);
+                    self.groups.push(acc);
+                }
+            }
+        }
+    }
+
     /// Emit one row per group: key cells followed by one cell per aggregate.
     fn into_rows(self) -> Vec<OwnedRow> {
         let Grouper {
@@ -541,6 +635,17 @@ pub fn run_file<W: Write + Send>(
             file_len,
         )?;
         let rows = apply_stages_over_rows(post, profile_rows(stats, &merged), opts)?;
+        return write_rows(output, &rows);
+    }
+
+    // `group … | agg …` reduces per key associatively, so shard it over the file
+    // too — the per-key mirror of the `stats` branch above.
+    if opts.threads > 1
+        && !stateful
+        && let Some((pre, g, post)) = group_shape(plan)
+    {
+        let grouper = run_group_sharded(pre, g, opts.threads, path, data_start, file_len)?;
+        let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
         return write_rows(output, &rows);
     }
 
@@ -883,6 +988,81 @@ fn run_stats_sharded(
             for (m, p) in merged.iter_mut().zip(&part?) {
                 m.merge(p);
             }
+        }
+    }
+    Ok(merged)
+}
+
+/// Accumulate a partial [`Grouper`] over one shard's byte range, applying the
+/// pre-group statements. The partials merge associatively ([`Grouper::merge`]),
+/// so the grouped output matches a single pass regardless of how the file was
+/// split (modulo the ~1-ULP float drift). The `group` mirror of
+/// [`stats_over_range`].
+fn group_over_range<'a>(
+    pre: &[Stmt],
+    g: &'a GroupStmt,
+    path: &Path,
+    start: u64,
+    end: u64,
+) -> Result<Grouper<'a>, Error> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((end - start) as usize);
+    file.take(end - start).read_to_end(&mut bytes)?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+
+    let mut grouper = Grouper::new(g);
+    let mut scratch: Vec<Field> = Vec::new();
+    let mut err: Option<Error> = None;
+    csv::parse_chunk(text, |row| {
+        if err.is_some() {
+            return;
+        }
+        match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
+            Ok(true) => grouper.update(row),
+            Ok(false) => {}
+            Err(e) => err = Some(e),
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(grouper),
+    }
+}
+
+/// Sharded `group … | agg …` over a seekable file: each shard builds a partial
+/// [`Grouper`] over its line-aligned byte range, then the partials merge in file
+/// order (preserving first-seen group order). Returns the merged `Grouper`; the
+/// caller emits its rows and runs any post-group stages. The reduce mirror of
+/// [`run_sharded`], like [`run_stats_sharded`] — same exact counts/min/max and
+/// ~1-ULP `sum`/`mean`/`stddev` caveat.
+fn run_group_sharded<'a>(
+    pre: &[Stmt],
+    g: &'a GroupStmt,
+    threads: usize,
+    path: &Path,
+    data_start: u64,
+    file_len: u64,
+) -> Result<Grouper<'a>, Error> {
+    let mut merged = Grouper::new(g);
+    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    if !ranges.is_empty() {
+        let partials: Vec<Result<Grouper, Error>> = thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .into_iter()
+                .map(|(start, end)| scope.spawn(move || group_over_range(pre, g, path, start, end)))
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(Error::Other("group shard worker panicked".into())))
+                })
+                .collect()
+        });
+        for part in partials {
+            merged.merge(part?);
         }
     }
     Ok(merged)
@@ -2402,6 +2582,84 @@ mod tests {
         // f,0 sorts after t,14 when descending by the aggregate.
         assert_eq!(lines[1], "t,14");
         assert_eq!(lines[2], "f,0");
+    }
+
+    #[test]
+    fn group_sharded_matches_serial() {
+        // A CSV with several keys, fractional values, text and empties, enough
+        // rows to split into several shards. Group it single-threaded (streaming
+        // path) and multi-threaded (sharded path). Counts/min/max are
+        // order-independent and must match exactly; floating sum/mean/stddev may
+        // differ by ~1 ULP (the sharded reduce sums in a different order), so
+        // compare those within a tiny relative tolerance. First-seen group order
+        // (EU, US, APAC — the order keys first appear in the file) must match.
+        let mut csv = String::from("region,price\n");
+        for i in 0..900 {
+            let region = ["EU", "US", "APAC"][i % 3];
+            let price = if i % 11 == 0 {
+                String::new()
+            } else {
+                format!("{:.2}", (i % 400) as f64 * 0.97)
+            };
+            csv.push_str(&format!("{region},{price}\n"));
+        }
+        let path =
+            std::env::temp_dir().join(format!("csvm-group-shard-{}.csv", std::process::id()));
+        std::fs::write(&path, &csv).unwrap();
+
+        let run_threads = |threads: usize| -> String {
+            let mut plan =
+                parse("group region | agg count, sum(price), mean(price), min(price), max(price), stddev(price)")
+                    .unwrap();
+            let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
+            let out_header = plan.resolve(&header).unwrap();
+            let opts = RunOpts {
+                chunk_size: 256,
+                threads,
+                temp_dir: std::env::temp_dir(),
+                sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            };
+            let mut out = Vec::new();
+            run_file(
+                &plan,
+                &out_header,
+                &opts,
+                &path,
+                data_start,
+                file_len,
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+
+        let serial = run_threads(1); // streaming reader path
+        let parallel = run_threads(8); // sharded path
+        std::fs::remove_file(&path).ok();
+
+        let rows = |s: &str| -> Vec<Vec<String>> {
+            s.lines()
+                .map(|l| l.split(',').map(str::to_string).collect())
+                .collect()
+        };
+        let (sr, pr) = (rows(&serial), rows(&parallel));
+        assert_eq!(sr.len(), pr.len(), "row count differs");
+        for (a, b) in sr.iter().zip(&pr) {
+            assert_eq!(a.len(), b.len());
+            for (x, y) in a.iter().zip(b) {
+                match (x.parse::<f64>(), y.parse::<f64>()) {
+                    (Ok(xv), Ok(yv)) => assert!(
+                        (xv - yv).abs() <= 1e-9 * xv.abs().max(1.0),
+                        "numeric cell differs: {x} vs {y}"
+                    ),
+                    _ => assert_eq!(x, y, "text cell differs"),
+                }
+            }
+        }
+        // First-seen key order is preserved across the shard merge.
+        assert_eq!(sr[1][0], "EU");
+        assert_eq!(sr[2][0], "US");
+        assert_eq!(sr[3][0], "APAC");
     }
 
     #[test]
