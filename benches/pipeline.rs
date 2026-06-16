@@ -97,6 +97,14 @@ fn pipeline(c: &mut Criterion) {
         ("sort_numeric", "sort amount=n"),
         ("sort_lexical", "sort region"),
         ("sort_multikey", "sort region amount=n"),
+        // group-by folds every row into a `Grouper` (the streaming reduce path);
+        // low- and high-cardinality cases stress the per-row update vs the
+        // per-group accumulator growth respectively.
+        (
+            "group_low_card",
+            "group region | agg count, sum(amount), mean(amount)",
+        ),
+        ("group_high_card", "group name | agg sum(amount)"),
     ];
 
     let mut group = c.benchmark_group("pipeline");
