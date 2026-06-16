@@ -41,7 +41,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   words). Operands: bare identifiers are columns (backtick-quote a name that
   isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers are numeric
   literals, `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`
-  fall out for free, and chaining `select`s ANDs them.
+  fall out for free, and chaining `select`s ANDs them. Comparison mode (numeric /
+  lexical / per-row auto for bare-column orderings) is covered under *Implicit
+  conversions* below.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
   and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
@@ -196,14 +198,34 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 csvm requires explicit `to_num` before numeric comparison/sort and `to_str`
 before output. csvm-rs makes these implicit:
 
-- A comparison against a **numeric literal** ⇒ numeric compare (the field is
-  parsed). Against a **string literal** ⇒ string compare.
+Each comparison resolves to one of three modes at compile time (`CmpMode` in
+`plan.rs`, decided in the `parse.rs` expression parser; visible per-compare as
+`:num`/`:str`/`:auto` under `--print-engine`). The three checks below run **in
+order**, so a numeric signal wins over a string one (`to-str c | select c > 5`
+is still `Numeric` — the numeric literal decides). This is comparison-only;
+`sort` keeps its own per-key flag (a bare `sort c` stays lexical unless `=n` or
+an earlier `to-num`), so it does *not* auto-detect:
+
+- A comparison with a **numeric literal** or a `to-num`-typed column ⇒
+  `Numeric`: both sides parse to `f64` (a non-number aborts the run).
+- A comparison with a **string literal** or a `to-str`-typed column, **or an
+  `==`/`!=` between two untyped columns** ⇒ `String`: lexical. (Equality stays
+  lexical because numeric equality on floats is fragile.)
+- An **ordering (`< > <= >=`) between two untyped columns** ⇒ `Auto`: decided
+  *per row* — if both cells parse as numbers, order numerically, else fall back
+  to lexical. This kills the old footgun where `select qty > stock` silently
+  compared `"100" < "9"` as text. It's reproducible (a function of the two
+  values, not a sampled type) and never aborts; the successful `f64` parses are
+  reused so the common all-numeric case costs the same as an explicit `to-num`.
+  Pin a genuinely-text column back to lexical with `to-str`.
 - Numbers always serialize correctly on output — no `to-str` needed to print.
 - `to-num c` / `to-str c` remain as explicit **type overrides** affecting later
   column-vs-column comparisons and the default sort mode for that column.
 
 Numeric coercion: trim, empty ⇒ `0.0`, else parse `f64`; non-numeric is an error
-that aborts the run with the offending value (matches csvm's `to_num` strictness).
+that aborts the run with the offending value (matches csvm's `to_num`
+strictness) — except in `Auto` mode, where a non-number quietly drops to lexical
+for that row instead of aborting.
 
 ## CSV spec (the "input spec")
 

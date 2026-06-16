@@ -21,9 +21,9 @@ use crate::error::Error;
 use crate::field::Field;
 use crate::graph::Histogram;
 use crate::plan::{
-    AggFunc, AggSpec, BoolExpr, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphSpec,
-    GroupStmt, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
-    apply_stmts,
+    AggFunc, AggSpec, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind,
+    GraphSpec, GroupStmt, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt,
+    ValExpr, apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -2159,15 +2159,20 @@ fn fmt_expr(e: &BoolExpr) -> String {
         BoolExpr::And(es) => format!("(and {})", fmt_list(es)),
         BoolExpr::Or(es) => format!("(or {})", fmt_list(es)),
         BoolExpr::Not(e) => format!("(not {})", fmt_expr(e)),
-        // The `:num`/`:str` tag exposes whether the comparison coerces to a
-        // number or compares text — so a surprise lexical compare (e.g. two bare
-        // columns, with no numeric literal to trigger numeric mode) is visible.
+        // The `:num`/`:str`/`:auto` tag exposes how the comparison orders its
+        // operands — numeric coercion, lexical text, or the per-row auto-detect
+        // two untyped columns get for an ordering — so the mode is never a
+        // surprise.
         BoolExpr::Cmp(c) => format!(
             "({} {} {} :{})",
             cmp_symbol(c.op),
             fmt_operand(&c.lhs),
             fmt_operand(&c.rhs),
-            if c.numeric { "num" } else { "str" }
+            match c.mode {
+                CmpMode::Numeric => "num",
+                CmpMode::String => "str",
+                CmpMode::Auto => "auto",
+            }
         ),
         BoolExpr::Match { col, negate, .. } => {
             let op = if *negate { "!~" } else { "=~" };
@@ -2399,13 +2404,16 @@ mod tests {
 
     #[test]
     fn describe_annotates_compare_mode_and_affix() {
-        // Two bare columns compare as text (the footgun, now visible as :str);
-        // a numeric literal forces :num; affix renders with its operator.
-        let mut plan = parse("select fieldA > id && countZ > 0 && fieldA ^= 't'").unwrap();
+        // Two bare columns ordered with `>` auto-detect per row (:auto); a
+        // numeric literal forces :num; `==` between bare columns stays :str;
+        // affix renders with its operator.
+        let mut plan =
+            parse("select fieldA > id && countZ > 0 && fieldA == id && fieldA ^= 't'").unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
-        assert!(d.contains("(> fieldA[1] id[0] :str)"), "{d}");
+        assert!(d.contains("(> fieldA[1] id[0] :auto)"), "{d}");
         assert!(d.contains("(> countZ[2] 0 :num)"), "{d}");
+        assert!(d.contains("(== fieldA[1] id[0] :str)"), "{d}");
         assert!(d.contains("(^= fieldA[1] \"t\")"), "{d}");
     }
 

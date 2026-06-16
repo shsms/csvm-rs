@@ -52,14 +52,30 @@ pub enum CmpOp {
     Ge,
 }
 
-/// A single comparison. `numeric` is decided at compile time from the operand
-/// types and the column's tracked type.
+/// How a comparison orders its operands, decided at compile time from the
+/// operand types and the columns' tracked types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmpMode {
+    /// At least one operand is a number literal or a `to-num`-typed column:
+    /// parse both to `f64` and order numerically (a non-number aborts the run).
+    Numeric,
+    /// A string literal, a `to-str`-typed column, or an `==`/`!=` between two
+    /// untyped columns: order the cells lexically.
+    String,
+    /// An ordering (`< > <= >=`) between two untyped columns: decide per row —
+    /// if both cells parse as numbers, order numerically, else fall back to
+    /// lexical. Reproducible (a function of the two values) and never aborts.
+    Auto,
+}
+
+/// A single comparison. `mode` is decided at compile time from the operand
+/// types and the columns' tracked types.
 #[derive(Clone, Debug)]
 pub struct Cmp {
     pub op: CmpOp,
     pub lhs: Operand,
     pub rhs: Operand,
-    pub numeric: bool,
+    pub mode: CmpMode,
 }
 
 /// Which end of the cell a substring test anchors to.
@@ -753,12 +769,20 @@ impl Operand {
 impl Cmp {
     #[inline]
     fn eval(&self, row: &[Field]) -> Result<bool, Error> {
-        let ord = if self.numeric {
-            let l = self.lhs.as_num(row)?;
-            let r = self.rhs.as_num(row)?;
-            l.partial_cmp(&r)
-        } else {
-            Some(self.lhs.as_str(row).cmp(&self.rhs.as_str(row)))
+        let ord = match self.mode {
+            CmpMode::Numeric => {
+                let l = self.lhs.as_num(row)?;
+                let r = self.rhs.as_num(row)?;
+                l.partial_cmp(&r)
+            }
+            CmpMode::String => Some(self.lhs.as_str(row).cmp(&self.rhs.as_str(row))),
+            // Per-row: order numerically when both cells parse as numbers, else
+            // lexically. The successful parses are reused (no second pass), and
+            // a non-number quietly falls back to text rather than aborting.
+            CmpMode::Auto => match (self.lhs.as_num(row), self.rhs.as_num(row)) {
+                (Ok(l), Ok(r)) => l.partial_cmp(&r),
+                _ => Some(self.lhs.as_str(row).cmp(&self.rhs.as_str(row))),
+            },
         };
         // For numeric NaN, `partial_cmp` is None; treat as "unordered": equal is
         // false, not-equal is true, and orderings are false.
@@ -1269,7 +1293,7 @@ mod tests {
                 pos: 1,
             }),
             rhs: Operand::Num(0.0),
-            numeric: true,
+            mode: CmpMode::Numeric,
         };
         assert!(cmp.eval(&row(&["a", "5"])).unwrap());
         assert!(!cmp.eval(&row(&["a", "0"])).unwrap());
@@ -1282,10 +1306,35 @@ mod tests {
                 pos: 0,
             }),
             rhs: Operand::Str("t".into()),
-            numeric: false,
+            mode: CmpMode::String,
         };
         assert!(cmp.eval(&row(&["t", "5"])).unwrap());
         assert!(!cmp.eval(&row(&["f", "5"])).unwrap());
+    }
+
+    #[test]
+    fn auto_compare_is_numeric_then_lexical_per_row() {
+        // (> a b) auto: both cells parse as numbers -> numeric order; a
+        // non-number on either side falls back to lexical, never aborting.
+        let cmp = Cmp {
+            op: CmpOp::Gt,
+            lhs: Operand::Col(ColRef {
+                name: "a".into(),
+                pos: 0,
+            }),
+            rhs: Operand::Col(ColRef {
+                name: "b".into(),
+                pos: 1,
+            }),
+            mode: CmpMode::Auto,
+        };
+        // Numeric: 100 > 9 is true (lexically "100" < "9" would be false).
+        assert!(cmp.eval(&row(&["100", "9"])).unwrap());
+        assert!(!cmp.eval(&row(&["9", "100"])).unwrap());
+        // A non-numeric cell drops to lexical instead of erroring: "banana" >
+        // "apple" lexically.
+        assert!(cmp.eval(&row(&["banana", "apple"])).unwrap());
+        assert!(!cmp.eval(&row(&["apple", "banana"])).unwrap());
     }
 
     #[test]
@@ -1299,7 +1348,7 @@ mod tests {
                     pos: 0,
                 }),
                 rhs: Operand::Str("t".into()),
-                numeric: false,
+                mode: CmpMode::String,
             }),
             BoolExpr::Or(vec![
                 BoolExpr::Cmp(Cmp {
@@ -1309,7 +1358,7 @@ mod tests {
                         pos: 1,
                     }),
                     rhs: Operand::Num(0.0),
-                    numeric: true,
+                    mode: CmpMode::Numeric,
                 }),
                 BoolExpr::Cmp(Cmp {
                     op: CmpOp::Gt,
@@ -1318,7 +1367,7 @@ mod tests {
                         pos: 2,
                     }),
                     rhs: Operand::Num(0.0),
-                    numeric: true,
+                    mode: CmpMode::Numeric,
                 }),
             ]),
         ]);
@@ -1343,7 +1392,7 @@ mod tests {
                     op: CmpOp::Eq,
                     lhs: Operand::Col(col("a")),
                     rhs: Operand::Str("x".into()),
-                    numeric: false,
+                    mode: CmpMode::String,
                 })),
             ])],
             output: OutputFormat::Csv,

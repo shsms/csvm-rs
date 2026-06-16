@@ -21,10 +21,10 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpOp, ColRef, ColorRule,
-    ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
-    Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
-    Stmt, UniqStmt, ValExpr,
+    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
+    ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
+    JoinType, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage,
+    StatsStmt, Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -1468,8 +1468,21 @@ impl ExprParser<'_> {
         };
         let mut lhs = lhs;
         let mut rhs = self.parse_operand()?;
-        let numeric = self.is_numeric(&lhs) || self.is_numeric(&rhs);
-        if numeric {
+        // Precedence: an explicit numeric operand (a number literal or a
+        // `to-num` column) wins; else an explicit string operand (a literal or a
+        // `to-str` column) compares lexically; else two untyped columns auto-
+        // detect per row for the orderings, and stay lexical for `==`/`!=`.
+        let mode = if self.is_numeric(&lhs) || self.is_numeric(&rhs) {
+            CmpMode::Numeric
+        } else if self.is_stringy(&lhs) || self.is_stringy(&rhs) {
+            CmpMode::String
+        } else {
+            match cmp_op {
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge => CmpMode::Auto,
+                CmpOp::Eq | CmpOp::Ne => CmpMode::String,
+            }
+        };
+        if mode == CmpMode::Numeric {
             lhs = numericize(lhs)?;
             rhs = numericize(rhs)?;
         }
@@ -1477,7 +1490,7 @@ impl ExprParser<'_> {
             op: cmp_op,
             lhs,
             rhs,
-            numeric,
+            mode,
         }))
     }
 
@@ -1507,6 +1520,16 @@ impl ExprParser<'_> {
             Operand::Num(_) => true,
             Operand::Col(c) => self.types.get(&c.name) == Some(&ColType::Num),
             Operand::Str(_) => false,
+        }
+    }
+
+    /// Whether an operand pins the comparison to lexical: a string literal, or a
+    /// column an earlier `to-str` marked as text.
+    fn is_stringy(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Str(_) => true,
+            Operand::Col(c) => self.types.get(&c.name) == Some(&ColType::Str),
+            Operand::Num(_) => false,
         }
     }
 
@@ -1758,11 +1781,45 @@ mod tests {
         let BoolExpr::Cmp(eq) = &parts[0] else {
             panic!()
         };
-        assert!(!eq.numeric);
+        assert_eq!(eq.mode, CmpMode::String);
         let BoolExpr::Cmp(gt) = &parts[1] else {
             panic!()
         };
-        assert!(gt.numeric);
+        assert_eq!(gt.mode, CmpMode::Numeric);
+    }
+
+    #[test]
+    fn select_untyped_ordering_is_auto_equality_is_string() {
+        // Two bare columns: an ordering auto-detects per row; `==`/`!=` stay
+        // lexical (numeric equality on floats is fragile).
+        let plan = parse("select qty > stock && a == b && a != b").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Select(BoolExpr::And(parts)) = &stmts[0] else {
+            panic!()
+        };
+        let modes: Vec<CmpMode> = parts
+            .iter()
+            .map(|p| {
+                let BoolExpr::Cmp(c) = p else { panic!() };
+                c.mode
+            })
+            .collect();
+        assert_eq!(modes, [CmpMode::Auto, CmpMode::String, CmpMode::String]);
+    }
+
+    #[test]
+    fn to_str_pins_ordering_lexical() {
+        // `to-str` opts a column back out of the numeric auto-detect.
+        let plan = parse("to-str qty | select qty > stock").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
+            panic!()
+        };
+        assert_eq!(c.mode, CmpMode::String);
     }
 
     #[test]
@@ -1774,7 +1831,7 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
             panic!()
         };
-        assert!(c.numeric);
+        assert_eq!(c.mode, CmpMode::Numeric);
         assert!(matches!(c.rhs, Operand::Num(n) if n == 5.0));
     }
 
@@ -2080,7 +2137,7 @@ mod tests {
         };
         let Operand::Col(col) = &c.lhs else { panic!() };
         assert_eq!(col.name, "frequenz-app-edge");
-        assert!(!c.numeric);
+        assert_eq!(c.mode, CmpMode::String); // RHS is a string literal
         assert!(matches!(&c.rhs, Operand::Str(s) if s.is_empty()));
     }
 

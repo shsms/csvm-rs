@@ -170,8 +170,10 @@ backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`
             "select -v EXPR  drop rows where EXPR is true",
         ],
         detail: "EXPR is a bare infix expression (quote only string literals, not the whole \
-expression). See `csvm help operators` for the full operator set; comparisons go numeric \
-against a number literal, lexical against a string.",
+expression). See `csvm help operators` for the full operator set. A comparison is numeric \
+against a number literal or to-num column, lexical against a string literal or to-str column; \
+an ordering (< > <= >=) between two bare columns auto-detects per row (numeric when both cells \
+parse as numbers, else lexical), while == / != between bare columns stay lexical.",
         examples: &[
             "csvm 'select amount > 1000 && flag == \"t\"' data.csv",
             "csvm 'select name =~ \"^A\"' data.csv",
@@ -411,7 +413,9 @@ logic:        &&  ||  !  ()         (&& and || short-circuit)\n  \
 operands:     bare word = column; 3.14 = number; 'txt'/\"txt\" = string;\n               \
 `name with spaces` = backtick-quoted column\n  \
 comment:      # to end of line (outside quotes)\n\n\
-A comparison against a number literal is numeric; against a string literal, lexical.",
+Compare mode: numeric with a number literal or to-num column; lexical with a string\n\
+literal or to-str column. Two bare columns: an ordering (< > <= >=) auto-detects per\n\
+row (numeric if both cells are numbers, else lexical); == / != stay lexical.",
     },
     Topic {
         name: "colors",
@@ -450,10 +454,15 @@ If NAME already exists, add replaces it in place; otherwise it is appended.",
     Topic {
         name: "types",
         summary: "numeric vs string handling (implicit to-num/to-str)",
-        body: "Columns are text by default. A comparison or sort becomes numeric when one side is \
-a number literal, or when to-num marked the column. Empty cells coerce to 0 in numeric context; \
-a non-numeric cell in a numeric op aborts the run. Numbers always serialize correctly on output \
-— no to-str needed just to print.",
+        body: "Columns are text by default. A comparison (select / color predicate) is numeric if \
+either side is a number literal or a to-num column; else lexical if either side is a string \
+literal or a to-str column; else two bare columns auto-detect per row for an ordering \
+(< > <= >=) — numeric if both cells parse as numbers, else lexical (to-str forces lexical) — \
+while == / != stay lexical. A numeric literal or to-num thus wins over a to-str column. Sort is \
+separate: `sort col` is lexical unless you pass =n or to-num the column — it does not \
+auto-detect. Empty cells coerce to 0 in numeric context; a non-numeric cell in a strictly-numeric \
+op aborts the run (auto falls back to lexical instead). Numbers always serialize correctly on \
+output — no to-str needed just to print.",
     },
     Topic {
         name: "sizes",

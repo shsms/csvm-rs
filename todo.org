@@ -12,11 +12,17 @@ git history; this file is the "what next / what was decided" scratchpad.
   A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
   (documented in CLAUDE.md).
 
-** TODO Decisions to make
-- Numeric-vs-string footgun: =select qty > stock= is silently *lexical* (both are
-  bare columns, no numeric literal). =--print-engine= tags each compare
-  =:num=/=:str= so it's visible; still to decide: default the orderings
-  (=< > <= >=) to numeric when neither side is typed, or add a =num()= coercion.
+** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
+=select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a
+third comparison mode =CmpMode::Auto= (=plan.rs=; decided in the =parse.rs=
+expression parser): an ordering (=< > <= >=) between two untyped columns now
+auto-detects *per row* — numeric when both cells parse as numbers, else lexical.
+Reproducible (a function of the two values, not a sampled type) and never aborts;
+the successful =f64= parses are reused, so it tracks an explicit =to-num= within
+noise (benchmarked). =to-str= pins a column back to lexical. ===/!== between bare
+columns stay lexical (float equality is fragile). Visible as =:auto= under
+=--print-engine=. The =num()= coercion alternative was dropped — auto fixes the
+default without new syntax.
 
 ** TODO Smaller features
 - Delimiter support =-d= / =--delim= (TSV) — a narrow near-term step toward the
