@@ -28,3 +28,7 @@ jobs:
         run: cargo build --release
       - name: Build benchmarks
         run: cargo bench --no-run
+      - name: Clippy (parquet feature)
+        run: cargo clippy --all-targets --features parquet -- -D warnings
+      - name: Test (parquet feature)
+        run: cargo test --features parquet
