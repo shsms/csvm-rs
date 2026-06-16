@@ -379,17 +379,32 @@ impl Builder {
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
+        let preceding_group = self.items.iter().any(|it| matches!(it, Item::Group(_)));
         let keys = match by {
-            Some(k) => split_list(k),
+            Some(k) => {
+                if matches!(self.items.last(), Some(Item::Group(_))) {
+                    return Err(err(
+                        "`agg … by COLS` can't follow a `group` — the group already sets the keys",
+                    ));
+                }
+                split_list(k)
+            }
             // Fuse with a directly preceding `group`: adopt its keys and drop its
-            // placeholder count. Otherwise no keys ⇒ a single global row.
-            None => match self.items.last() {
-                Some(Item::Group(_)) => match self.items.pop() {
-                    Some(Item::Group(g)) => g.keys,
-                    _ => unreachable!(),
-                },
-                _ => Vec::new(),
+            // placeholder count.
+            None if matches!(self.items.last(), Some(Item::Group(_))) => match self.items.pop() {
+                Some(Item::Group(g)) => g.keys,
+                _ => unreachable!(),
             },
+            // A `group` is present but a stage sits between it and this `agg`, so
+            // they can't fuse (the group already reduced the rows). Flag it
+            // rather than silently making a global aggregate / a cryptic error.
+            None if preceding_group => {
+                return Err(err(
+                    "`agg` must directly follow its `group` (no stage in between), or use `agg … by COLS`",
+                ));
+            }
+            // No group anywhere ⇒ a single global aggregate row.
+            None => Vec::new(),
         };
         self.items.push(Item::Group(GroupStmt {
             keys,
@@ -1900,6 +1915,20 @@ mod tests {
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
         assert!(parse("group").is_err()); // no keys
+    }
+
+    #[test]
+    fn agg_must_directly_follow_group() {
+        // Adjacent fuses; a global agg with no group is fine.
+        assert!(parse("group r | agg sum(a)").is_ok());
+        assert!(parse("agg sum(a)").is_ok());
+        assert!(parse("agg sum(a) by r").is_ok());
+        // A stage between group and agg can't fuse — clear error, not a silent
+        // global aggregate or a cryptic column error.
+        assert!(parse("group r | head 5 | agg count").is_err());
+        assert!(parse("group r | select a > 0 | agg sum(a)").is_err());
+        // `by` contradicts a preceding group's keys.
+        assert!(parse("group r | agg sum(a) by b").is_err());
     }
 
     #[test]
