@@ -28,6 +28,17 @@ pub fn chart_size(scale: f64) -> (usize, usize) {
     (dim(BASE_W, 16), dim(BASE_H, 2))
 }
 
+/// Format `v` rounded to `step`'s precision (one digit finer than the step's
+/// magnitude), then trimmed — keeps bin-edge labels readable.
+fn fmt_to_step(v: f64, step: f64) -> String {
+    if step <= 0.0 || !step.is_finite() {
+        return format_num(v);
+    }
+    let decimals = (1.0 - step.log10().floor()).clamp(0.0, 6.0) as i32;
+    let factor = 10f64.powi(decimals);
+    format_num((v * factor).round() / factor)
+}
+
 /// Min and max of `values`, or `None` when empty. Shared by the chart renderers.
 pub(crate) fn minmax(values: &[f64]) -> Option<(f64, f64)> {
     let mut it = values.iter().copied();
@@ -87,9 +98,10 @@ impl Histogram {
         let span = self.hi - self.lo;
         let step = if nbins > 0 { span / nbins as f64 } else { 0.0 };
 
-        // Left axis: each bin's lower edge, right-aligned to a common width.
+        // Left axis: each bin's lower edge, rounded to the bin step's precision
+        // (so a step of ~9 reads 16.7, not 16.688889), right-aligned.
         let edges: Vec<String> = (0..nbins)
-            .map(|i| format_num(self.lo + step * i as f64))
+            .map(|i| fmt_to_step(self.lo + step * i as f64, step))
             .collect();
         let axis_w = edges.iter().map(String::len).max().unwrap_or(1);
 
@@ -759,6 +771,14 @@ mod tests {
         let ends = XAxis::Ends("2024-01-01".to_string(), "2024-01-03".to_string());
         let s = render_xy("y vs t", &["y".into()], &pts, 40, 4, false, true, 0, ends);
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
+    }
+
+    #[test]
+    fn fmt_to_step_rounds_to_the_step_precision() {
+        assert_eq!(fmt_to_step(16.688889, 9.19), "16.7"); // ~9 step ⇒ 1 decimal
+        assert_eq!(fmt_to_step(35.0, 9.19), "35");
+        assert_eq!(fmt_to_step(123.4, 100.0), "123"); // big step ⇒ integer
+        assert_eq!(fmt_to_step(0.123456, 0.05), "0.123"); // small step ⇒ 3 decimals
     }
 
     #[test]
