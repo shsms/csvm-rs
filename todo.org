@@ -236,40 +236,33 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 5. [~] SVG export shipped (=--svg=, =src/svg.rs=, hand-written XML, no dep, so
    not feature-gated). PNG (needs a raster dep) is still the feature-gated part.
 
-** Follow-ups now open
+** Follow-ups — open (deferred)
 - Streaming + sharded group-by (the =stats= mirror): group is on the in-memory
   path; add a =group_shape= streaming fast path and an =-n>1= sharded path
   (per-shard =HashMap=, merge unioning key sets, =ColStats::merge= per group).
-- Histogram polish: bin-edge labels show full =format_num= precision
-  (=16.688889=); round edges to a sensible step-derived precision.
 - =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=).
 - =graph scatter= density colour ramp: colour a single-series scatter by point
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
   gets distinct per-series colours.
-- [X] Timestamp x-axis for =graph scatter=/=line=: a timestamp x parses to epoch
-  (=src/datetime.rs=, =yyyy-mm-dd[ T]HH:MM:SS[.fff][Z|±HH:MM]=, no dep) and plots
-  on a true time axis; other non-numeric x falls back to row order. Remaining
-  polish: expose =datetime= via an =add= =epoch()=/date function; honour the
-  source offset in axis labels (currently formatted as UTC).
-- [X] Graduated axis ticks: numeric uses round 1/2/5x10^n values, time drops the
-  date to =HH:MM:SS= within one day, tick count adapts to width. Shared between
-  the terminal and SVG renderers (=graph::axis_ticks=/=axis_label_width=).
-
-Surfaced by the graphing branch review (known limitations, not bugs):
+- =add= =epoch()= / date function: expose =src/datetime.rs= parsing in the value
+  expression (also lets a chart take a numeric time x directly).
+- Time-axis labels honour the source offset (currently formatted as UTC).
 - Chart data fidelity is capped at =format_num='s 6 decimals because charts
-  re-parse the serialized output (the same buffer reuse =fmt=/=color= use), so a
-  column of sub-1e-6 values collapses to 0. A faithful fix means feeding the
-  charts the raw =Field::Num= values instead of re-parsing — a bigger change than
-  the current sink design.
-- =group … | agg …= fusion only fires when =agg= *immediately* follows =group=;
-  an intervening stage (=select=/=head=) breaks it (then errors, or silently
-  becomes a global aggregate). Either generalise fusion or reject the in-between
-  case with a clear message.
-- =Grouper::update= allocates a fresh key =Vec= + =String= per row even on a
-  group cache hit; hoist-and-=clear()= reusable buffers like =dedup_rows= does.
-- Duplication to consolidate: the series colour palette (=graph.rs= =Rgb= vs
-  =svg.rs= hex), the min/max range fold (5+ copies), and the three =collect_*=
-  header-skip + numeric-parse helpers in =exec.rs=.
+  re-parse the serialized output (the buffer reuse =fmt=/=color= share), so a
+  column of sub-1e-6 values collapses to 0. A faithful fix feeds the charts raw
+  =Field::Num= values instead of re-parsing — a deep change to the sink design.
+
+** Follow-ups — done (see git history)
+- [X] Timestamp x-axis parses to epoch and plots on a true time axis
+  (=src/datetime.rs=, =yyyy-mm-dd[ T]HH:MM:SS[.fff][Z|±HH:MM]=, no dep).
+- [X] Graduated axis ticks: numeric round 1/2/5x10^n; same-day =HH:MM:SS=; tick
+  count adapts to width; shared =graph::axis_ticks=/=axis_label_width=.
+- [X] Histogram bin-edge labels rounded to the bin-step precision.
+- [X] =group … | agg …= non-fusable cases (a stage between, or a contradictory
+  =by=) now error clearly instead of silently mis-aggregating.
+- [X] =Grouper= reuses its per-row key buffers.
+- [X] Duplication consolidated: =graph::series_rgb=, =exec::cell_num=/
+  =for_each_data_row=, =graph::minmax=.
 
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
