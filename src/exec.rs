@@ -655,6 +655,50 @@ pub fn run_file<W: Write + Send>(
     run_body(plan, opts, &mut reader, output)
 }
 
+/// Run a plan over a `.parquet` file (feature `parquet`). Batches decode to
+/// owned, typed rows (numeric columns are already `Field::Num`, so no `to-num`
+/// is needed). A pure transform streams batch by batch (O(batch) memory);
+/// anything blocking (sort/group/tail/uniq/join, or a stateful `add`)
+/// materializes every batch and runs the staged in-memory path. Row-group-
+/// parallel reads are a follow-up (see `todo.org`).
+#[cfg(feature = "parquet")]
+pub fn run_parquet<W: Write + Send>(
+    plan: &Plan,
+    out_header: &[String],
+    opts: &RunOpts,
+    path: &Path,
+    output: &mut W,
+) -> Result<(), Error> {
+    write_header(output, out_header)?;
+    let mut reader = crate::parquet::ParquetReader::open(path)?;
+
+    // A lone transform with no stateful `add` is order-independent and streams.
+    if let [Stage::Transform(stmts)] = plan.stages.as_slice()
+        && !stmts.iter().any(Stmt::is_stateful)
+    {
+        let mut out_buf = String::new();
+        let mut scratch: Vec<Field> = Vec::new();
+        while let Some(batch) = reader.next_batch() {
+            out_buf.clear();
+            for mut row in batch? {
+                if apply_stmts(stmts, &mut row, &mut scratch, &EvalCtx::default())? {
+                    csv::write_row(&mut out_buf, &row);
+                }
+            }
+            output.write_all(out_buf.as_bytes())?;
+        }
+        return Ok(());
+    }
+
+    // Otherwise materialize all rows, then run the stages in order.
+    let mut rows: Vec<OwnedRow> = Vec::new();
+    while let Some(batch) = reader.next_batch() {
+        rows.extend(batch?);
+    }
+    let rows = apply_stages_over_rows(&plan.stages, rows, opts)?;
+    write_rows(output, &rows)
+}
+
 fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error> {
     let row: Vec<Field> = header.iter().map(|s| Field::Str(s.as_str())).collect();
     let mut buf = String::new();

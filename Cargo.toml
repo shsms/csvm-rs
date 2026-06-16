@@ -17,6 +17,16 @@ path = "src/main.rs"
 name = "pipeline"
 harness = false
 
+# The parquet generator needs the optional arrow/parquet deps.
+[[example]]
+name = "gen_parquet"
+required-features = ["parquet"]
+
+[features]
+# Read `.parquet` input (`--format parquet`). Off by default to keep the lean
+# dep tree — enabling it pulls `parquet` + `arrow` + compression codecs.
+parquet = ["dep:parquet", "dep:arrow"]
+
 [dependencies]
 # MPMC bounded channels for the parse -> work -> write pipeline.
 crossbeam-channel = "0.5"
@@ -26,6 +36,9 @@ memchr = "2"
 regex = "1"
 # Display width (CJK/wide + zero-width glyphs) for `fmt` column alignment.
 unicode-width = "0.2"
+# Optional: arrow-backed `.parquet` reader, gated behind the `parquet` feature.
+parquet = { version = "59", optional = true }
+arrow = { version = "59", optional = true, default-features = false }
 
 [dev-dependencies]
 # Reference RFC-4180 parser, used only to confirm our scanner's conformance.

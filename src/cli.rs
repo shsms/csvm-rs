@@ -5,8 +5,9 @@
 //! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
-//! `--no-header`, `--color`, and `--print-engine`. Long options take their value
-//! as `--flag VALUE` or `--flag=VALUE`. See [`USAGE`] for the full help.
+//! `--no-header`, `--color`, `--format` (csv | parquet), and `--print-engine`.
+//! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
+//! help registry for the full help.
 
 use std::path::PathBuf;
 
@@ -28,6 +29,17 @@ pub struct Args {
     /// `--no-header`: the input has no header line; columns are auto-named
     /// `c1, c2, …`. Ignored if a `hdr` command supplies names instead.
     pub no_header: bool,
+    /// `--format`: input format override. `None` auto-detects from the file
+    /// extension (`.parquet` ⇒ Parquet, else CSV).
+    pub format: Option<InputFormat>,
+}
+
+/// The input format, set by `--format` or auto-detected from the extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFormat {
+    Csv,
+    /// Read `.parquet` (only with the `parquet` build feature).
+    Parquet,
 }
 
 /// When to emit ANSI colour for `color` rules.
@@ -84,6 +96,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut color = ColorWhen::default();
     let mut script_file = None;
     let mut no_header = false;
+    let mut format = None;
 
     let mut it = args.into_iter();
     while let Some(raw) = it.next() {
@@ -136,6 +149,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             "--print-engine" => print_engine = true,
             "--no-header" => no_header = true,
+            "--format" => {
+                let v = value!();
+                format = Some(match v.as_str() {
+                    "csv" => InputFormat::Csv,
+                    "parquet" => InputFormat::Parquet,
+                    _ => return Err(format!("invalid --format value: {v} (csv|parquet)")),
+                });
+            }
             "--color" => {
                 let v = value!();
                 color = match v.as_str() {
@@ -199,6 +220,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         print_engine,
         color,
         no_header,
+        format,
     })))
 }
 

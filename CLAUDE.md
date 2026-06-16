@@ -243,6 +243,33 @@ Hand-rolled zero-copy, quote-aware scanner over each chunk (uses `memchr`):
 parallel-chunk + zero-copy-borrow design needs to slice fields directly out of
 the chunk buffer. A `csv`-backed strict mode could be a future option.
 
+## Parquet input (optional `parquet` feature)
+
+The first cut of the pluggable-format roadmap. **Off by default** to keep the
+lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the same
+"gate dep-needing formats" rule the SVG-vs-PNG split follows). `src/parquet.rs`
+(cfg-gated) wraps the arrow `ParquetRecordBatchReader`:
+- Selected by a `.parquet` extension or `--format parquet`; `--format csv`
+  forces CSV. Parquet's metadata is in the file footer, so it needs a **seekable
+  file** — stdin is rejected, and `hdr`/`--no-header` error (the schema *is* the
+  header). Without the feature, a parquet input errors with a build hint.
+- The schema gives the header **and types**: numeric columns decode straight to
+  `Field::Num`, so the implicit-typing engine works with **no `to-num`**; bool ⇒
+  `t`/`f`; null ⇒ empty cell. Only flat primitives (int/uint/float/string/bool)
+  are supported — any other column type (temporal/decimal/binary/nested, and a
+  dictionary/categorical-encoded column whose arrow type is `Dictionary`) errors
+  by name in `validate_schema`. Numbers join the `f64` model, so an int64/uint64
+  magnitude above 2^53 loses integer precision on read (the same limit CSV hits).
+- `exec::run_parquet` drives it: each arrow `RecordBatch` is transposed columnar
+  ⇒ rows of owned `Field`. A lone non-stateful transform **streams** batch by
+  batch (O(batch) memory); anything blocking (sort/group/tail/uniq/join, or a
+  stateful `add`) materializes and runs the staged in-memory path — mirroring
+  `run_body`'s dispatch.
+- Follow-ups (`todo.org`): **row-group-parallel reads** (the natural shard unit,
+  mirroring CSV byte-range shards — currently single-threaded), more column types
+  (temporal/decimal), and parquet *output* (the `Sink` half). `gen_parquet`
+  (feature-gated example) writes a deterministic fixture for trying it.
+
 ## Execution model
 
 - Main thread streams the input file in chunks into a bounded MPMC channel.
@@ -329,9 +356,11 @@ the `Plan` is now a small DAG). The computed `add` column is implemented
 in-memory path). Group-by aggregation is implemented (`Stage::Group`,
 `group … | agg …`), as is terminal-native graphing (`graph
 hist/bar/spark/scatter/line` in `src/graph.rs`, `--svg` export in
-`src/svg.rs`). Planned (see `todo.org` for design notes): conditional
-colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait
-(Parquet, TSV), and a scatter density colour ramp.
+`src/svg.rs`). Pluggable input formats have begun: **parquet read** ships behind
+the optional `parquet` feature (`src/parquet.rs`, see above). Planned (see
+`todo.org` for design notes): conditional colouring for `fmt`, the rest of the
+`Source`/`Sink` trait (TSV, parquet *write*, row-group-parallel parquet), and a
+scatter density colour ramp.
 
 ## Conventions
 

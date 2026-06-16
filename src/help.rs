@@ -36,6 +36,8 @@ options (--flag VALUE or --flag=VALUE):
   -o, --output FILE    write to FILE (default: stdout)
   -f, --file FILE      read the pipeline from FILE instead of SCRIPT
       --no-header      input has no header; name columns c1, c2, ...
+      --format FMT     input format: csv (default) | parquet (auto by extension;
+                       parquet needs a build with --features parquet)
   -n, --threads N      worker threads for a seekable file (default: 1)
   -t, --temp-dir DIR   directory for sort spill files (default: system temp)
       --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)

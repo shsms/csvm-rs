@@ -284,9 +284,35 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 - [X] Duplication consolidated: =graph::series_rgb=, =exec::cell_num=/
   =for_each_data_row=, =graph::minmax=.
 
+* DONE Parquet read (optional =parquet= feature)
+First cut of the pluggable-format roadmap. Feature-gated (=--features parquet=
+pulls =parquet=+=arrow=+codecs) to keep the default dep tree lean. =src/parquet.rs=
+wraps the arrow =ParquetRecordBatchReader=; selected by a =.parquet= extension or
+=--format parquet=; needs a seekable file (footer metadata), so stdin/=hdr=/
+=--no-header= are rejected. The schema gives header *and types* — numeric columns
+decode to =Field::Num= (no =to-num= needed), bool ⇒ =t=/=f=, null ⇒ empty; only
+flat primitives are supported (others error by name). =exec::run_parquet= streams
+a lone transform batch-by-batch, materializes for blocking stages. =gen_parquet=
+example writes fixtures; CI runs a =--features parquet= clippy+test job.
+
+** TODO Parquet follow-ups (deferred)
+- Row-group-parallel reads: the natural shard unit (mirrors the CSV byte-range
+  shards). Currently single-threaded; each worker could decode independent row
+  groups, then concatenate in file order. Pairs with column/row-group projection
+  push-down (only decode the columns the plan touches).
+- More column types: temporal (date/timestamp → epoch or formatted string, reuse
+  =src/datetime.rs=), decimal, binary, and dictionary/categorical string columns
+  (common from pandas; arrow surfaces them as =Dictionary=, decode to the value).
+  Today these all error in =validate_schema=.
+- Exact-integer columns: int64/uint64 above 2^53 lose precision under the =f64=
+  numeric model. A dedicated integer =Field= variant would fix it (big change).
+- Parquet *write* (the =Sink= half) and the general =Source=/=Sink= trait that
+  also subsumes TSV / JSON-lines.
+
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
-- Pluggable formats via a =Source=/=Sink= trait: Parquet, TSV, JSON-lines.
+- Remaining pluggable formats via a =Source=/=Sink= trait: TSV, JSON-lines
+  (parquet read shipped; see above).
 - =join= follow-ups (core implemented — =Stage::Join=, sub-pipeline right side):
   stream / shard-probe the left side with a shared =Arc= build table instead of
   forcing the in-memory path; numeric-key normalization; auto-pick the smaller

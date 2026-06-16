@@ -22,6 +22,11 @@ enum Source {
         file_len: u64,
     },
     Stream(Box<dyn BufRead>),
+    /// A `.parquet` file (feature `parquet`): typed, columnar, read in batches.
+    #[cfg(feature = "parquet")]
+    Parquet {
+        path: PathBuf,
+    },
 }
 
 fn run() -> Result<(), String> {
@@ -115,6 +120,11 @@ fn open_source(
     args: &cli::Args,
     input_header: Option<&[String]>,
 ) -> Result<(Source, Vec<String>), String> {
+    // Parquet carries its own typed schema, so it bypasses the CSV header logic
+    // (and, without the feature, reports the build hint before anything else).
+    if input_format(args) == cli::InputFormat::Parquet {
+        return open_parquet(args, input_header);
+    }
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
             let (header, data_start, file_len) = if let Some(h) = input_header {
@@ -168,6 +178,61 @@ fn auto_header(n: usize) -> Vec<String> {
     (1..=n).map(|i| format!("c{i}")).collect()
 }
 
+/// The input format: an explicit `--format` wins, else auto-detect from the
+/// input file's extension (`.parquet` ⇒ Parquet, everything else CSV).
+fn input_format(args: &cli::Args) -> cli::InputFormat {
+    if let Some(f) = args.format {
+        return f;
+    }
+    match args.in_file.as_deref() {
+        Some(p)
+            if Path::new(p)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("parquet")) =>
+        {
+            cli::InputFormat::Parquet
+        }
+        _ => cli::InputFormat::Csv,
+    }
+}
+
+/// Resolve a parquet input to a `Source` and its schema header. Parquet needs a
+/// seekable file (footer metadata) and ignores `hdr`/`--no-header` (the schema
+/// is the header). Without the feature this returns the build hint immediately,
+/// so a missing build is reported ahead of any other argument problem.
+#[cfg(feature = "parquet")]
+fn open_parquet(
+    args: &cli::Args,
+    input_header: Option<&[String]>,
+) -> Result<(Source, Vec<String>), String> {
+    let path = args
+        .in_file
+        .as_deref()
+        .filter(|p| *p != "-")
+        .ok_or_else(|| "parquet input must be a seekable file, not stdin".to_string())?;
+    if input_header.is_some() || args.no_header {
+        return Err(
+            "hdr / --no-header don't apply to parquet input (it carries a typed schema)"
+                .to_string(),
+        );
+    }
+    let header = csvm::parquet::read_header(Path::new(path)).map_err(|e| e.to_string())?;
+    Ok((
+        Source::Parquet {
+            path: PathBuf::from(path),
+        },
+        header,
+    ))
+}
+
+#[cfg(not(feature = "parquet"))]
+fn open_parquet(
+    _args: &cli::Args,
+    _input_header: Option<&[String]>,
+) -> Result<(Source, Vec<String>), String> {
+    Err("parquet input requires building csvm with --features parquet".to_string())
+}
+
 fn run_into<W: Write + Send>(
     source: &mut Source,
     plan: &csvm::plan::Plan,
@@ -182,6 +247,8 @@ fn run_into<W: Write + Send>(
             file_len,
         } => exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output),
         Source::Stream(reader) => exec::run(plan, out_header, opts, reader, output),
+        #[cfg(feature = "parquet")]
+        Source::Parquet { path } => exec::run_parquet(plan, out_header, opts, path, output),
     }
     .map_err(|e| e.to_string())
 }
