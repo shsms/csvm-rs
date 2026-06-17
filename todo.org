@@ -304,9 +304,56 @@ outputs concatenated in file order — the parquet mirror of CSV's =run_sharded=
 group file can't shard. Blocking stages (group/sort/…) still take the
 single-threaded materialize path. =gen_parquet= now writes multiple row groups.
 
+** TODO Projection push-down (parquet) — only decode the columns the plan needs
+Parquet is columnar, so an unused column's chunk can be skipped on disk
+entirely. Today =batch_to_rows= decodes *every* column of every batch into
+=Field=s even when the plan never reads them — pure waste on a wide file (a
+2-of-50-column query still reads + decompresses + transposes all 50). Pushing a
+projection into the arrow reader cuts I/O + decode to the columns actually used;
+the reader side is one call (=ParquetRecordBatchReaderBuilder::with_projection=
+with a =ProjectionMask=). The work is *deciding what to project*.
+
+*** The crux: "needed columns" is a liveness question, not "columns mentioned"
+- =select EXPR= filters *rows* but keeps *all columns*, so unless a later
+  =cols=/=group=/=agg=/=stats= narrows the output, the plan still emits every
+  column ⇒ needs every column. Push-down only helps when output + all reads use a
+  strict subset.
+- =cols a,b= narrows to {a,b}; =cols -v x= *drops* x ⇒ needs the complement (most
+  columns). =add NAME EXPR= adds a column derived from input cols (its refs are
+  live); =rename= just relabels.
+- =group COLS | agg FN(col)= / =stats col= reduce to a known subset (keys ∪
+  aggregated cols) — the highest-value case, and unambiguous.
+So the needed set is a *backward liveness* pass over the plan: which input columns
+transitively affect the output. It must be exhaustive across every position
+holder — =ColRef.pos=, =ProjectStmt=/=ConvStmt= =.positions=,
+=GroupStmt.key_positions= + =AggSpec.pos=, =SortKey.pos=, =ValExpr::Col=, join
+keys — because a missed ref ⇒ wrong column or panic.
+
+*** Mechanics
+1. =plan::live_input_columns(&Plan, &input_header) -> Option<Vec<usize>>=: the
+   minimal ascending input indices, or =None= = "need all" (the safe fallback for
+   a passthrough =select=, =cols -v=, or anything the analysis can't prove a
+   subset of).
+2. On =Some(cols)=: build the =ProjectionMask= from those leaf indices *and
+   resolve the plan against the projected sub-header* — positions shift (=name= at
+   input idx 7 → idx 1). Reorders =main='s =read_header → resolve= flow (resolve
+   needs the projected header) or keeps a remap table.
+3. Each sharded worker applies the same projection (=open_row_groups= grows a
+   projection arg) — composes cleanly with the row-group sharding.
+
+*** Scope / staging
+- Soundness over coverage: push down only when =live_input_columns= *proves* a
+  strict subset (leading =cols=, or =group=/=agg=/=stats= naming their columns);
+  otherwise =None= ⇒ read everything (correct, just no speedup). Never under-read.
+- Test: a wide fixture — projected output byte-identical to the full read for a
+  subset query, and an all-columns query falls back. Bench projected vs full.
+
 ** TODO Parquet follow-ups (deferred)
-- Column/row-group projection push-down: only decode the columns the plan touches
-  (and skip row groups via stats). Pairs naturally with the row-group sharding.
+- Row-group / predicate push-down (separate, deeper than column projection): skip
+  whole row groups whose column min/max stats prove no row matches a =select=
+  filter (arrow =RowFilter= / page-index stats). Pairs with the row-group
+  sharding (a worker skips its non-matching groups). Lower leverage than column
+  projection — only selective filters benefit, vs. every wide-file query.
 - More column types: temporal (date/timestamp → epoch or formatted string, reuse
   =src/datetime.rs=), decimal, binary, and dictionary/categorical string columns
   (common from pandas; arrow surfaces them as =Dictionary=, decode to the value).
