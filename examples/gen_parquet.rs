@@ -17,6 +17,7 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 
 fn main() {
     let mut args = env::args().skip(1);
@@ -59,8 +60,13 @@ fn main() {
     )
     .expect("build batch");
 
+    // Cap the row-group size so a large file has several groups — the unit of
+    // read parallelism (`csvm -n N ... data.parquet`).
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(65_536))
+        .build();
     let file = File::create(&path).expect("create output");
-    let mut writer = ArrowWriter::try_new(file, schema, None).expect("open writer");
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props)).expect("open writer");
     writer.write(&batch).expect("write batch");
     writer.close().expect("close writer");
     eprintln!("wrote {rows} rows to {path}");

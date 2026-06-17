@@ -295,11 +295,18 @@ flat primitives are supported (others error by name). =exec::run_parquet= stream
 a lone transform batch-by-batch, materializes for blocking stages. =gen_parquet=
 example writes fixtures; CI runs a =--features parquet= clippy+test job.
 
+** DONE Row-group-parallel parquet reads
+A pure-transform read with =-n>1= now shards across row groups
+(=run_parquet_sharded=/=process_row_groups=/=partition_row_groups= in =exec.rs=;
+=ParquetReader::open_row_groups= in =parquet.rs=): contiguous per-worker blocks,
+outputs concatenated in file order — the parquet mirror of CSV's =run_sharded=.
+~3.2x on 4 cores (benchmarked, 3M rows); =-n1=/=-n4= byte-identical. A single-row-
+group file can't shard. Blocking stages (group/sort/…) still take the
+single-threaded materialize path. =gen_parquet= now writes multiple row groups.
+
 ** TODO Parquet follow-ups (deferred)
-- Row-group-parallel reads: the natural shard unit (mirrors the CSV byte-range
-  shards). Currently single-threaded; each worker could decode independent row
-  groups, then concatenate in file order. Pairs with column/row-group projection
-  push-down (only decode the columns the plan touches).
+- Column/row-group projection push-down: only decode the columns the plan touches
+  (and skip row groups via stats). Pairs naturally with the row-group sharding.
 - More column types: temporal (date/timestamp → epoch or formatted string, reuse
   =src/datetime.rs=), decimal, binary, and dictionary/categorical string columns
   (common from pandas; arrow surfaces them as =Dictionary=, decode to the value).

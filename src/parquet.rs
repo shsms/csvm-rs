@@ -9,8 +9,9 @@
 //! other logical types error clearly. The metadata lives in the file footer, so
 //! a seekable file is required — stdin is rejected upstream.
 //!
-//! Row-group-parallel reads (the natural sharding unit, mirroring the CSV
-//! byte-range shards) are a follow-up; this first cut streams single-threaded.
+//! With `-n>1`, a pure-transform read **shards across row groups** (the natural
+//! parallelism unit, mirroring the CSV byte-range shards): each worker decodes a
+//! disjoint block of row groups via [`ParquetReader::open_row_groups`].
 
 use std::fs::File;
 use std::path::Path;
@@ -51,6 +52,12 @@ pub fn read_header(path: &Path) -> Result<Vec<String>, Error> {
     Ok(schema.fields().iter().map(|f| f.name().clone()).collect())
 }
 
+/// Number of row groups in the file — the unit of read parallelism, mirroring
+/// the CSV byte-range shards.
+pub fn num_row_groups(path: &Path) -> Result<usize, Error> {
+    Ok(open_builder(path)?.metadata().num_row_groups())
+}
+
 /// Reject any column whose type the row converter can't map (nested, temporal,
 /// decimal, binary, …), naming the offending column and type.
 fn validate_schema(schema: &Schema) -> Result<(), Error> {
@@ -88,8 +95,22 @@ fn supported(dt: &DataType) -> bool {
 
 impl ParquetReader {
     pub fn open(path: &Path) -> Result<ParquetReader, Error> {
-        let builder = open_builder(path)?;
+        Self::build(path, None)
+    }
+
+    /// Open a reader restricted to `row_groups` (a subset of the file's groups),
+    /// for sharded reads — each worker decodes a disjoint block. Indices must be
+    /// ascending and in range; arrow yields the groups in the order given.
+    pub fn open_row_groups(path: &Path, row_groups: Vec<usize>) -> Result<ParquetReader, Error> {
+        Self::build(path, Some(row_groups))
+    }
+
+    fn build(path: &Path, row_groups: Option<Vec<usize>>) -> Result<ParquetReader, Error> {
+        let mut builder = open_builder(path)?;
         validate_schema(builder.schema())?;
+        if let Some(rgs) = row_groups {
+            builder = builder.with_row_groups(rgs);
+        }
         let inner = builder
             .with_batch_size(BATCH_ROWS)
             .build()
@@ -187,6 +208,7 @@ mod tests {
     use arrow::array::{BooleanArray, Float64Array, Int64Array, StringArray};
     use arrow::datatypes::{Field as AField, Schema};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
 
     /// Write a small mixed-type parquet fixture (with a null name) and return its
@@ -238,16 +260,25 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("csvm-pq-{tag}-{}.parquet", std::process::id()));
         let file = File::create(&path).unwrap();
-        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        // Small row groups so a fixture above ~512 rows spans several groups —
+        // the unit the sharded read partitions over.
+        let props = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(512))
+            .build();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         path
     }
 
     fn run_script(path: &std::path::Path, script: &str) -> String {
+        run_script_n(path, script, 1)
+    }
+
+    fn run_script_n(path: &std::path::Path, script: &str, threads: usize) -> String {
         let opts = crate::exec::RunOpts {
             chunk_size: 1 << 20,
-            threads: 1,
+            threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1 << 20,
         };
@@ -368,6 +399,43 @@ mod tests {
             "count,id_max\n20000,19999\n"
         );
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sharded_read_matches_serial_across_row_groups() {
+        // 5000 rows with 512-row groups ⇒ ~10 row groups, enough to shard 4 ways.
+        let path = write_n("rg", 5000);
+        assert!(
+            num_row_groups(&path).unwrap() > 4,
+            "fixture needs several row groups"
+        );
+        let script = "select id >= 2500 && amount < 4900";
+        // -n1 streams; -n4 shards across row-group blocks. Byte-identical, and
+        // the row order (file order) is preserved across the shard concatenation.
+        let serial = run_script_n(&path, script, 1);
+        let parallel = run_script_n(&path, script, 4);
+        assert_eq!(serial, parallel);
+        // ids 2500..4899 survive (amount==id), 2400 rows + header.
+        assert_eq!(serial.lines().count(), 1 + 2400);
+        assert!(serial.starts_with("id,amount\n2500,2500\n2501,2501\n"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn sharded_handles_single_group_and_empty() {
+        // < 512 rows ⇒ one row group: -n4 routes through the sharded path with a
+        // single worker and matches -n1 (a single-group file "can't shard").
+        let single = write_n("single", 300);
+        assert_eq!(num_row_groups(&single).unwrap(), 1);
+        assert_eq!(
+            run_script_n(&single, "select id >= 100", 4),
+            run_script_n(&single, "select id >= 100", 1),
+        );
+        std::fs::remove_file(&single).ok();
+        // An empty file through the sharded path (-n4) is header-only.
+        let empty = write_n("empty-sh", 0);
+        assert_eq!(run_script_n(&empty, "select id >= 0", 4), "id,amount\n");
+        std::fs::remove_file(&empty).ok();
     }
 
     #[test]

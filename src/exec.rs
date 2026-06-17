@@ -657,10 +657,10 @@ pub fn run_file<W: Write + Send>(
 
 /// Run a plan over a `.parquet` file (feature `parquet`). Batches decode to
 /// owned, typed rows (numeric columns are already `Field::Num`, so no `to-num`
-/// is needed). A pure transform streams batch by batch (O(batch) memory);
-/// anything blocking (sort/group/tail/uniq/join, or a stateful `add`)
-/// materializes every batch and runs the staged in-memory path. Row-group-
-/// parallel reads are a follow-up (see `todo.org`).
+/// is needed). A pure transform streams batch by batch (O(batch) memory), and
+/// with `-n>1` shards across row groups; anything blocking (sort/group/tail/
+/// uniq/join, or a stateful `add`) materializes every batch and runs the staged
+/// in-memory path.
 #[cfg(feature = "parquet")]
 pub fn run_parquet<W: Write + Send>(
     plan: &Plan,
@@ -670,12 +670,16 @@ pub fn run_parquet<W: Write + Send>(
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
-    let mut reader = crate::parquet::ParquetReader::open(path)?;
 
-    // A lone transform with no stateful `add` is order-independent and streams.
+    // A lone transform with no stateful `add` is order-independent: stream it,
+    // sharded across row groups when `-n>1` (the parquet mirror of `run_sharded`).
     if let [Stage::Transform(stmts)] = plan.stages.as_slice()
         && !stmts.iter().any(Stmt::is_stateful)
     {
+        if opts.threads > 1 {
+            return run_parquet_sharded(stmts, opts.threads, path, output);
+        }
+        let mut reader = crate::parquet::ParquetReader::open(path)?;
         let mut out_buf = String::new();
         let mut scratch: Vec<Field> = Vec::new();
         while let Some(batch) = reader.next_batch() {
@@ -691,12 +695,81 @@ pub fn run_parquet<W: Write + Send>(
     }
 
     // Otherwise materialize all rows, then run the stages in order.
+    let mut reader = crate::parquet::ParquetReader::open(path)?;
     let mut rows: Vec<OwnedRow> = Vec::new();
     while let Some(batch) = reader.next_batch() {
         rows.extend(batch?);
     }
     let rows = apply_stages_over_rows(&plan.stages, rows, opts)?;
     write_rows(output, &rows)
+}
+
+/// Sharded parquet transform: partition the file's row groups into contiguous
+/// per-worker blocks, decode + apply each block in parallel, and concatenate the
+/// serialized output in row-group (file) order. The parquet mirror of
+/// [`run_sharded`]; a file with a single row group can't shard (one worker).
+#[cfg(feature = "parquet")]
+fn run_parquet_sharded<W: Write>(
+    stmts: &[Stmt],
+    threads: usize,
+    path: &Path,
+    output: &mut W,
+) -> Result<(), Error> {
+    let n = crate::parquet::num_row_groups(path)?;
+    if n == 0 {
+        return Ok(()); // header already written; no data rows
+    }
+    let blocks = partition_row_groups(n, threads);
+    let results: Vec<Result<String, Error>> = thread::scope(|scope| {
+        let handles: Vec<_> = blocks
+            .into_iter()
+            .map(|rgs| scope.spawn(move || process_row_groups(stmts, path, rgs)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(Error::Other("parquet shard worker panicked".into())))
+            })
+            .collect()
+    });
+    for r in results {
+        output.write_all(r?.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Decode one worker's row groups, apply the statements, return serialized rows.
+#[cfg(feature = "parquet")]
+fn process_row_groups(stmts: &[Stmt], path: &Path, rgs: Vec<usize>) -> Result<String, Error> {
+    let mut reader = crate::parquet::ParquetReader::open_row_groups(path, rgs)?;
+    let mut out = String::new();
+    let mut scratch: Vec<Field> = Vec::new();
+    while let Some(batch) = reader.next_batch() {
+        for mut row in batch? {
+            if apply_stmts(stmts, &mut row, &mut scratch, &EvalCtx::default())? {
+                csv::write_row(&mut out, &row);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Split `n` row groups into at most `threads` contiguous blocks, so the workers'
+/// outputs concatenate in file order.
+#[cfg(feature = "parquet")]
+fn partition_row_groups(n: usize, threads: usize) -> Vec<Vec<usize>> {
+    let k = threads.min(n).max(1);
+    let (base, rem) = (n / k, n % k);
+    let mut blocks = Vec::with_capacity(k);
+    let mut start = 0;
+    for i in 0..k {
+        // The first `rem` blocks take one extra group, so all `n` are covered.
+        let len = base + usize::from(i < rem);
+        blocks.push((start..start + len).collect());
+        start += len;
+    }
+    blocks
 }
 
 fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error> {
@@ -2259,6 +2332,20 @@ mod tests {
     /// Parse, resolve against the input's header, and run end to end.
     fn run_str(script: &str, input: &str) -> Result<String, Error> {
         run_with(script, input, 1, 1_000_000)
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn partition_row_groups_covers_all_groups_contiguously() {
+        // For every (n>=1, threads): blocks are non-empty, number min(threads,n),
+        // and flatten to exactly 0..n in order (contiguous, no gaps/overlaps).
+        for (n, threads) in [(1, 1), (1, 4), (3, 5), (7, 3), (8, 8), (10, 4)] {
+            let blocks = partition_row_groups(n, threads);
+            assert_eq!(blocks.len(), threads.min(n).max(1), "n={n} t={threads}");
+            assert!(blocks.iter().all(|b| !b.is_empty()), "n={n} t={threads}");
+            let flat: Vec<usize> = blocks.into_iter().flatten().collect();
+            assert_eq!(flat, (0..n).collect::<Vec<_>>(), "n={n} t={threads}");
+        }
     }
 
     fn run_with(script: &str, input: &str, threads: usize, chunk: usize) -> Result<String, Error> {

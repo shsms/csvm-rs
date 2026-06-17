@@ -262,13 +262,18 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   magnitude above 2^53 loses integer precision on read (the same limit CSV hits).
 - `exec::run_parquet` drives it: each arrow `RecordBatch` is transposed columnar
   ⇒ rows of owned `Field`. A lone non-stateful transform **streams** batch by
-  batch (O(batch) memory); anything blocking (sort/group/tail/uniq/join, or a
-  stateful `add`) materializes and runs the staged in-memory path — mirroring
-  `run_body`'s dispatch.
-- Follow-ups (`todo.org`): **row-group-parallel reads** (the natural shard unit,
-  mirroring CSV byte-range shards — currently single-threaded), more column types
-  (temporal/decimal), and parquet *output* (the `Sink` half). `gen_parquet`
-  (feature-gated example) writes a deterministic fixture for trying it.
+  batch (O(batch) memory) and, with `-n>1`, **shards across row groups**
+  (`run_parquet_sharded`/`process_row_groups`): the row-group indices are split
+  into contiguous per-worker blocks (`partition_row_groups`), each worker decodes
+  its block via `ParquetReader::open_row_groups`, and the serialized outputs
+  concatenate in file order — the parquet mirror of CSV's `run_sharded` (~3.2× on
+  4 cores; a single-row-group file can't shard). Anything blocking
+  (sort/group/tail/uniq/join, or a stateful `add`) materializes and runs the
+  staged in-memory path — mirroring `run_body`'s dispatch.
+- Follow-ups (`todo.org`): column/row-group projection push-down (only decode the
+  columns the plan touches), more column types (temporal/decimal/dictionary), and
+  parquet *output* (the `Sink` half). `gen_parquet` (feature-gated example) writes
+  a multi-row-group fixture for trying / benchmarking it.
 
 ## Execution model
 
