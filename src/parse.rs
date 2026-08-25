@@ -1722,6 +1722,7 @@ impl ExprParser<'_> {
 fn check_arity(func: Func, n: usize) -> Result<(), Error> {
     let ok = match func {
         Func::Min | Func::Max | Func::Coalesce => n >= 1,
+        Func::Pow => n == 2,
         // The rest are unary.
         _ => n == 1,
     };

@@ -154,6 +154,13 @@ pub enum Func {
     Ceil,
     Abs,
     Int,
+    Sqrt,
+    Pow,
+    Exp,
+    Log,
+    Log10,
+    Log2,
+    Sign,
     Min,
     Max,
     Len,
@@ -172,6 +179,13 @@ impl Func {
             Func::Ceil => "ceil",
             Func::Abs => "abs",
             Func::Int => "int",
+            Func::Sqrt => "sqrt",
+            Func::Pow => "pow",
+            Func::Exp => "exp",
+            Func::Log => "log",
+            Func::Log10 => "log10",
+            Func::Log2 => "log2",
+            Func::Sign => "sign",
             Func::Min => "min",
             Func::Max => "max",
             Func::Len => "len",
@@ -190,6 +204,13 @@ impl Func {
             "ceil" => Func::Ceil,
             "abs" => Func::Abs,
             "int" => Func::Int,
+            "sqrt" => Func::Sqrt,
+            "pow" => Func::Pow,
+            "exp" => Func::Exp,
+            "log" => Func::Log,
+            "log10" => Func::Log10,
+            "log2" => Func::Log2,
+            "sign" => Func::Sign,
             "min" => Func::Min,
             "max" => Func::Max,
             "len" => Func::Len,
@@ -203,8 +224,8 @@ impl Func {
 
     /// Every function name, for the "did you mean …?" hint on a typo.
     pub const NAMES: &'static [&'static str] = &[
-        "round", "floor", "ceil", "abs", "int", "min", "max", "len", "upper", "lower", "trim",
-        "coalesce",
+        "round", "floor", "ceil", "abs", "int", "sqrt", "pow", "exp", "log", "log10", "log2",
+        "sign", "min", "max", "len", "upper", "lower", "trim", "coalesce",
     ];
 }
 
@@ -1002,6 +1023,19 @@ fn eval_func(
         Func::Ceil => Field::Num(num(&args[0])?.ceil()),
         Func::Abs => Field::Num(num(&args[0])?.abs()),
         Func::Int => Field::Num(num(&args[0])?.trunc()),
+        // Domain edges follow IEEE (sqrt(-1) = NaN, log(0) = -inf) rather than
+        // aborting — matching how stats and comparisons treat non-finite values.
+        Func::Sqrt => Field::Num(num(&args[0])?.sqrt()),
+        Func::Pow => Field::Num(num(&args[0])?.powf(num(&args[1])?)),
+        Func::Exp => Field::Num(num(&args[0])?.exp()),
+        Func::Log => Field::Num(num(&args[0])?.ln()),
+        Func::Log10 => Field::Num(num(&args[0])?.log10()),
+        Func::Log2 => Field::Num(num(&args[0])?.log2()),
+        Func::Sign => {
+            let v = num(&args[0])?;
+            // f64::signum(0.0) is 1.0; a mathematical sign wants 0 there.
+            Field::Num(if v == 0.0 { 0.0 } else { v.signum() })
+        }
         Func::Len => Field::Num(args[0].eval(row, ctx)?.as_str().chars().count() as f64),
         Func::Upper => Field::Owned(args[0].eval(row, ctx)?.as_str().to_uppercase()),
         Func::Lower => Field::Owned(args[0].eval(row, ctx)?.as_str().to_lowercase()),
