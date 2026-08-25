@@ -60,6 +60,21 @@ first row reads the current cell, so =amount - prev(amount)= is 0 there.
 Still deferred (follow-ups): =split=, regex =match=, and date functions; grouped
 =prev=/delta (=… by g=) once group-by lands.
 
+** DONE unified comparison operands + math functions
+Comparison operands (=Cmp= in =plan.rs=) are now full =ValExpr=s, so arithmetic
+(=select price * qty >= 30=), functions (=abs(x) > 1=), and parenthesized
+boolean subexpressions compared as =t=/=f= (=(a >= 0) == (b >= 0)=) work in
+=select=, ternary tests, and =color= predicates. The =CmpMode= decision
+generalized to static expression types (=ExprParser::static_type=). Leaf
+operands keep the old allocation-free fast path (=cmp_num=/=cmp_str= with
+=#[inline(never)]= compound fallbacks — benchmarked ~equal to the old
+=Operand=). A stateful =select= (=prev()=/=rownum()=) routes to the ordered
+in-memory path like a stateful =add=; =color= rejects stateful at parse time.
+New functions: =sqrt/pow/exp/log/log10/log2/sign= (IEEE at domain edges, e.g.
+=sqrt(-1)= is NaN — no abort). =coalesce= is now statically untyped (its result
+type follows the data), so comparisons against it auto-detect instead of
+assuming numeric.
+
 Original design notes (kept for the deferred parts):
 Append a new column =NAME= computed per row from a value expression over the
 existing columns. If =NAME= already exists, replace it in place (so

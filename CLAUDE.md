@@ -38,12 +38,22 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
   `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
-  words). Operands: bare identifiers are columns (backtick-quote a name that
-  isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers are numeric
-  literals, `'…'`/`"…"` are string literals. A parenthesized expression makes `select (…)`
-  fall out for free, and chaining `select`s ANDs them. Comparison mode (numeric /
-  lexical / per-row auto for bare-column orderings) is covered under *Implicit
-  conversions* below.
+  words). Operands of the six comparisons are full **value expressions** (the
+  `add` grammar below the ternary): bare identifiers are columns (backtick-quote
+  a name that isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers
+  are numeric literals, `'…'`/`"…"` are string literals, and arithmetic
+  (`select price * qty >= 30`), functions (`abs(x) > 1`), and parenthesized
+  boolean subexpressions compared as `t`/`f` (`(a >= 0) == (b >= 0)`) all work
+  (`Cmp` holds two `ValExpr`s; leaf operands take allocation-free fast paths,
+  compound ones outlined `#[inline(never)]` fallbacks). `=~`/`!~` and
+  the affixes still take a plain column on the left. A `select` reading
+  `prev()`/`rownum()` is stateful and routes to the ordered in-memory path,
+  like a stateful `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
+  `color` predicates reject stateful expressions at parse time (they render
+  post-run, where an unresolvable rule is silently dropped). A parenthesized
+  expression makes `select (…)` fall out for free, and chaining `select`s ANDs
+  them. Comparison mode (numeric / lexical / per-row auto) is covered under
+  *Implicit conversions* below.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
   and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
@@ -126,15 +136,21 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`add NAME EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`
   in place if it already exists (`AddStmt.pos`). `EXPR` is a *value* expression
   (`ValExpr` in `plan.rs`): arithmetic (`+ - * / %`), `++` concat, the function
-  set (`round/floor/.../coalesce`), a `?:` ternary (reusing `BoolExpr` for the
-  test), constants, and `prev(col)`/`rownum()`. It reuses the `select` tokenizer
+  set (`round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/sign/min/max/len/
+  upper/lower/trim/coalesce` — the math functions follow IEEE at domain edges,
+  `sqrt(-1)` = NaN, no abort; div/mod-by-zero still aborts), a `?:` ternary
+  (reusing `BoolExpr` for the test), constants, and `prev(col)`/`rownum()`. It reuses the `select` tokenizer
   (`lex_expr`, extended with arithmetic operators + context-sensitive sign) and a
   sibling recursive-descent parser (`ExprParser::parse_value`). `eval` takes an
   `EvalCtx { prev_row, rownum }` and returns an owned `Field`. A pure `add` is
   per-row and **shardable** (rides every path); an `add` reading `prev`/`rownum`
   is `is_stateful()` and routes to the **in-memory ordered path** (the guard
-  `plan_has_stateful_add` in `exec::run_body`/`run_file`, mirroring the
-  `tail`/`uniq`/`join` fallback), so its output is `-n`-independent.
+  `plan_has_stateful_expr` in `exec::run_body`/`run_file`, mirroring the
+  `tail`/`uniq`/`join` fallback), so its output is `-n`-independent. The new
+  column carries the expression's **static type** (numeric / text / untyped,
+  `ExprParser::static_type` — including a type inherited from a
+  `to-num`/`to-str` column or a `?:` whose branches agree), so later
+  comparisons against it are typed the same as against the expression itself.
 - **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
   stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
   default `_delta`), so it shares all of `add`'s machinery and guarantees.
@@ -191,7 +207,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `join (…)` group are left intact, and blank/comment-only stages are dropped.
   `parse.rs` is a hand-written tokenizer plus a recursive-descent expression
   parser producing the `BoolExpr`/`Cmp` IR (and the `ValExpr` value IR for
-  `add`).
+  `add`). The grammar is **single-pass**: each position parses once as a
+  boolean-or-value (`BV` in `ExprParser`) and lookahead settles which — no
+  backtracking, so parse time is linear in the script and errors point at the
+  offending token.
 
 ## Implicit conversions (`to_num`/`to_str` are implicit)
 
@@ -199,19 +218,24 @@ csvm requires explicit `to_num` before numeric comparison/sort and `to_str`
 before output. csvm-rs makes these implicit:
 
 Each comparison resolves to one of three modes at compile time (`CmpMode` in
-`plan.rs`, decided in the `parse.rs` expression parser; visible per-compare as
-`:num`/`:str`/`:auto` under `--print-engine`). The three checks below run **in
-order**, so a numeric signal wins over a string one (`to-str c | select c > 5`
-is still `Numeric` — the numeric literal decides). This is comparison-only;
-`sort` keeps its own per-key flag (a bare `sort c` stays lexical unless `=n` or
-an earlier `to-num`), so it does *not* auto-detect:
+`plan.rs`, decided in the `parse.rs` expression parser from the operands'
+**static types** — `ExprParser::static_type`, which consults the tracked
+`to-num`/`to-str` column types for `Col`/`prev` leaves and types a `?:` only
+when both branches agree; visible per-compare as `:num`/`:str`/`:auto` under
+`--print-engine`). The three checks below run **in order**, so a numeric signal
+wins over a string one (`to-str c | select c > 5` is still `Numeric` — the
+numeric literal decides). This is comparison-only; `sort` keeps its own per-key
+flag (a bare `sort c` stays lexical unless `=n` or an earlier `to-num`), so it
+does *not* auto-detect:
 
-- A comparison with a **numeric literal** or a `to-num`-typed column ⇒
+- A comparison with a **statically numeric side** (a numeric literal,
+  arithmetic, a numeric function, `rownum()`, or a `to-num`-typed column) ⇒
   `Numeric`: both sides parse to `f64` (a non-number aborts the run).
-- A comparison with a **string literal** or a `to-str`-typed column, **or an
-  `==`/`!=` between two untyped columns** ⇒ `String`: lexical. (Equality stays
-  lexical because numeric equality on floats is fragile.)
-- An **ordering (`< > <= >=`) between two untyped columns** ⇒ `Auto`: decided
+- A comparison with a **statically string side** (a string literal, `++`
+  concat, a boolean value, a string function, or a `to-str`-typed column),
+  **or an `==`/`!=` between two untyped sides** ⇒ `String`: lexical. (Equality
+  stays lexical because numeric equality on floats is fragile.)
+- An **ordering (`< > <= >=`) between two untyped sides** ⇒ `Auto`: decided
   *per row* — if both cells parse as numbers, order numerically, else fall back
   to lexical. This kills the old footgun where `select qty > stock` silently
   compared `"100" < "9"` as text. It's reproducible (a function of the two

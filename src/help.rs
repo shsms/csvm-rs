@@ -172,12 +172,18 @@ backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`
             "select -v EXPR  drop rows where EXPR is true",
         ],
         detail: "EXPR is a bare infix expression (quote only string literals, not the whole \
-expression). See `csvm help operators` for the full operator set. A comparison is numeric \
-against a number literal or to-num column, lexical against a string literal or to-str column; \
-an ordering (< > <= >=) between two bare columns auto-detects per row (numeric when both cells \
-parse as numbers, else lexical), while == / != between bare columns stay lexical.",
+expression). See `csvm help operators` for the full operator set. Comparison operands are full \
+value expressions — arithmetic, functions (see `csvm help expr`), parenthesized booleans \
+(compared as t/f), prev(col), rownum() — not just columns and literals; a stateful comparison \
+(prev/rownum) makes the run single-threaded and in input order. A comparison is numeric \
+against a statically numeric side (a number literal, arithmetic, a numeric function, a to-num \
+column), lexical against a statically string side (a string literal, ++ concat, a bool, a \
+to-str column); an ordering (< > <= >=) between two untyped operands auto-detects per row \
+(numeric when both sides parse as numbers, else lexical), while == / != between untyped \
+operands stay lexical.",
         examples: &[
             "csvm 'select amount > 1000 && flag == \"t\"' data.csv",
+            "csvm 'select price * qty >= 1000' data.csv",
             "csvm 'select name =~ \"^A\"' data.csv",
         ],
     },
@@ -321,8 +327,9 @@ the left columns plus the right's non-key columns; a clashing right name is suff
         summary: "append a computed column",
         synopsis: &["add NAME EXPR   append (or, if NAME exists, replace) a column = EXPR"],
         detail: "EXPR is a value expression over the row: arithmetic (+ - * / %, parens), \
-string concat with ++, the functions round/floor/ceil/abs/int/min/max/len/upper/lower/trim/\
-coalesce, a ternary TEST ? A : B, and constants. prev(col) is col's value in the previous row \
+string concat with ++, the functions round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/\
+sign/min/max/len/upper/lower/trim/coalesce, a ternary TEST ? A : B, and constants. \
+prev(col) is col's value in the previous row \
 (the current cell on the first row, so a delta is 0 there) and rownum() is the 1-based row \
 index — both make the run single-threaded and in input order. A bare comparison yields t/f. \
 Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm help expr`.",
@@ -413,11 +420,15 @@ substring:    ^= (begins)  *= (contains)  $= (ends)   — literal, no escaping\n
 regex:        =~  !~        (Rust regex syntax)\n  \
 logic:        &&  ||  !  ()         (&& and || short-circuit)\n  \
 operands:     bare word = column; 3.14 = number; 'txt'/\"txt\" = string;\n               \
-`name with spaces` = backtick-quoted column\n  \
+`name with spaces` = backtick-quoted column;\n               \
+any value expression: arithmetic, functions, (bool) as t/f,\n               \
+prev(col), rownum()   (see `csvm help expr`)\n  \
 comment:      # to end of line (outside quotes)\n\n\
-Compare mode: numeric with a number literal or to-num column; lexical with a string\n\
-literal or to-str column. Two bare columns: an ordering (< > <= >=) auto-detects per\n\
-row (numeric if both cells are numbers, else lexical); == / != stay lexical.",
+Compare mode: numeric with a statically numeric side (number literal, arithmetic,\n\
+numeric function, to-num column); lexical with a statically string side (string\n\
+literal, ++ concat, bool, to-str column). Two untyped operands: an ordering (< > <= >=)\n\
+auto-detects per row (numeric if both cells are numbers, else lexical); == / != stay\n\
+lexical.",
     },
     Topic {
         name: "colors",
@@ -442,14 +453,19 @@ unary minus: -x\n  \
 concat:      a ++ b ++ c        (string; never use + for text)\n  \
 ternary:     TEST ? A : B        (TEST is a select-style comparison)\n  \
 boolean:     a bare comparison yields t / f\n  \
-functions:   round floor ceil abs int   (numeric, 1 arg)\n               \
+functions:   round floor ceil abs int sign   (numeric, 1 arg)\n               \
+sqrt exp log log10 log2  (numeric, 1 arg; IEEE at domain edges,\n                                        \
+e.g. sqrt(-1) = NaN — no abort)\n               \
+pow             (numeric, 2 args)\n               \
 min max         (numeric, 1+ args)\n               \
 len             (length of text)\n               \
 upper lower trim (text, 1 arg)\n               \
 coalesce        (first non-empty, 1+ args)\n  \
 cross-row:   prev(col)   col in the previous row (current cell on row 1)\n               \
 rownum()    1-based row index\n\n\
-prev() / rownum() make the run single-threaded and in input order. \
+The same value grammar works as a comparison operand in select / ternary tests, \
+so `select price * qty >= 30`, `abs(x) > 1`, and `(a >= 0) == (b >= 0)` all parse. \
+prev() / rownum() make the run single-threaded and in input order (also from a select). \
 Divide/modulo by zero, or arithmetic on a non-number, aborts the run. \
 If NAME already exists, add replaces it in place; otherwise it is appended.",
     },
@@ -457,10 +473,14 @@ If NAME already exists, add replaces it in place; otherwise it is appended.",
         name: "types",
         summary: "numeric vs string handling (implicit to-num/to-str)",
         body: "Columns are text by default. A comparison (select / color predicate) is numeric if \
-either side is a number literal or a to-num column; else lexical if either side is a string \
-literal or a to-str column; else two bare columns auto-detect per row for an ordering \
-(< > <= >=) — numeric if both cells parse as numbers, else lexical (to-str forces lexical) — \
-while == / != stay lexical. A numeric literal or to-num thus wins over a to-str column. Sort is \
+either side is statically numeric (a number literal, arithmetic, a numeric function, a to-num \
+column); else lexical if either side is statically string (a string literal, ++ concat, a bool, \
+a to-str column); else two untyped operands auto-detect per row for an ordering \
+(< > <= >=) — numeric if both sides parse as numbers, else lexical (to-str forces lexical) — \
+while == / != stay lexical. A numeric literal or to-num thus wins over a to-str column. A column \
+added by `add` carries its expression's static type — including one inherited from a to-num/\
+to-str column or from a ternary whose branches agree — so later comparisons against it behave \
+the same as against the expression itself. Sort is \
 separate: `sort col` is lexical unless you pass =n or to-num the column — it does not \
 auto-detect. Empty cells coerce to 0 in numeric context; a non-numeric cell in a strictly-numeric \
 op aborts the run (auto falls back to lexical instead). Numbers always serialize correctly on \
