@@ -33,15 +33,6 @@ impl ColRef {
     }
 }
 
-/// An operand of a comparison. String/number literals are normalized at compile
-/// time, so a numeric comparison never sees a `Str`.
-#[derive(Clone, Debug)]
-pub enum Operand {
-    Col(ColRef),
-    Str(String),
-    Num(f64),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpOp {
     Eq,
@@ -56,25 +47,32 @@ pub enum CmpOp {
 /// operand types and the columns' tracked types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpMode {
-    /// At least one operand is a number literal or a `to-num`-typed column:
-    /// parse both to `f64` and order numerically (a non-number aborts the run).
+    /// At least one operand is statically numeric (a number literal,
+    /// arithmetic, a numeric function, `rownum()`, or a `to-num`-typed
+    /// column): parse both to `f64` and order numerically (a non-number
+    /// aborts the run).
     Numeric,
-    /// A string literal, a `to-str`-typed column, or an `==`/`!=` between two
-    /// untyped columns: order the cells lexically.
+    /// A statically string operand (a string literal, `++` concat, a boolean
+    /// value, a string function, or a `to-str`-typed column), or an `==`/`!=`
+    /// between two untyped operands: order lexically.
     String,
-    /// An ordering (`< > <= >=`) between two untyped columns: decide per row —
-    /// if both cells parse as numbers, order numerically, else fall back to
-    /// lexical. Reproducible (a function of the two values) and never aborts.
+    /// An ordering (`< > <= >=`) between two untyped operands: decide per
+    /// row — if both sides coerce to numbers, order numerically, else fall
+    /// back to lexical. Reproducible (a function of the two values); a leaf
+    /// that fails to coerce falls back, but a hard error inside a compound
+    /// operand still aborts.
     Auto,
 }
 
-/// A single comparison. `mode` is decided at compile time from the operand
-/// types and the columns' tracked types.
+/// A single comparison. Operands are full value expressions ([`ValExpr`]), so
+/// arithmetic, function calls, and boolean subexpressions (compared as their
+/// `t`/`f` rendering) all work. `mode` is decided at compile time from the
+/// operands' static types and the columns' tracked types.
 #[derive(Clone, Debug)]
 pub struct Cmp {
     pub op: CmpOp,
-    pub lhs: Operand,
-    pub rhs: Operand,
+    pub lhs: ValExpr,
+    pub rhs: ValExpr,
     pub mode: CmpMode,
 }
 
@@ -758,51 +756,33 @@ fn cell_num(row: &[Field], pos: usize) -> Result<f64, Error> {
     }
 }
 
-impl Operand {
-    #[inline]
-    fn as_num(&self, row: &[Field]) -> Result<f64, Error> {
-        match self {
-            Operand::Col(c) => cell_num(row, c.pos),
-            Operand::Num(n) => Ok(*n),
-            // A numeric comparison never carries a `Str` operand (compile-time
-            // normalization parses string literals), but coerce defensively.
-            Operand::Str(s) => Field::Str(s).coerce_num().map_err(Error::Num),
-        }
-    }
-
-    #[inline]
-    fn as_str<'r>(&'r self, row: &'r [Field]) -> std::borrow::Cow<'r, str> {
-        match self {
-            Operand::Col(c) => cell_str(row, c.pos),
-            Operand::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
-            Operand::Num(n) => std::borrow::Cow::Owned(format_num(*n)),
-        }
-    }
-
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
-        if let Operand::Col(c) = self {
-            c.resolve(header)?;
-        }
-        Ok(())
-    }
-}
-
 impl Cmp {
     #[inline]
-    fn eval(&self, row: &[Field]) -> Result<bool, Error> {
+    fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<bool, Error> {
         let ord = match self.mode {
             CmpMode::Numeric => {
-                let l = self.lhs.as_num(row)?;
-                let r = self.rhs.as_num(row)?;
+                let l = self.lhs.cmp_num(row, ctx)?;
+                let r = self.rhs.cmp_num(row, ctx)?;
                 l.partial_cmp(&r)
             }
-            CmpMode::String => Some(self.lhs.as_str(row).cmp(&self.rhs.as_str(row))),
+            CmpMode::String => Some(
+                self.lhs
+                    .cmp_str(row, ctx)?
+                    .cmp(&self.rhs.cmp_str(row, ctx)?),
+            ),
             // Per-row: order numerically when both cells parse as numbers, else
-            // lexically. The successful parses are reused (no second pass), and
-            // a non-number quietly falls back to text rather than aborting.
-            CmpMode::Auto => match (self.lhs.as_num(row), self.rhs.as_num(row)) {
-                (Ok(l), Ok(r)) => l.partial_cmp(&r),
-                _ => Some(self.lhs.as_str(row).cmp(&self.rhs.as_str(row))),
+            // lexically. A non-number quietly falls back to text rather than
+            // aborting (but a hard error inside a compound operand still aborts).
+            CmpMode::Auto => match (
+                self.lhs.cmp_num_soft(row, ctx)?,
+                self.rhs.cmp_num_soft(row, ctx)?,
+            ) {
+                (Some(l), Some(r)) => l.partial_cmp(&r),
+                _ => Some(
+                    self.lhs
+                        .cmp_str(row, ctx)?
+                        .cmp(&self.rhs.cmp_str(row, ctx)?),
+                ),
             },
         };
         // For numeric NaN, `partial_cmp` is None; treat as "unordered": equal is
@@ -823,11 +803,11 @@ impl Cmp {
 
 impl BoolExpr {
     #[inline]
-    pub fn eval(&self, row: &[Field]) -> Result<bool, Error> {
+    pub fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<bool, Error> {
         match self {
             BoolExpr::And(es) => {
                 for e in es {
-                    if !e.eval(row)? {
+                    if !e.eval(row, ctx)? {
                         return Ok(false);
                     }
                 }
@@ -835,14 +815,14 @@ impl BoolExpr {
             }
             BoolExpr::Or(es) => {
                 for e in es {
-                    if e.eval(row)? {
+                    if e.eval(row, ctx)? {
                         return Ok(true);
                     }
                 }
                 Ok(false)
             }
-            BoolExpr::Not(e) => Ok(!e.eval(row)?),
-            BoolExpr::Cmp(c) => c.eval(row),
+            BoolExpr::Not(e) => Ok(!e.eval(row, ctx)?),
+            BoolExpr::Cmp(c) => c.eval(row, ctx),
             BoolExpr::Match { col, regex, negate } => {
                 Ok(regex.is_match(&cell_str(row, col.pos)) ^ negate)
             }
@@ -873,6 +853,17 @@ impl BoolExpr {
             BoolExpr::Affix { col, .. } => col.resolve(header)?,
         }
         Ok(())
+    }
+
+    /// Whether the expression reads cross-row state (`prev()`/`rownum()`) via a
+    /// comparison operand, which routes the plan to the ordered in-memory path.
+    pub fn is_stateful(&self) -> bool {
+        match self {
+            BoolExpr::And(es) | BoolExpr::Or(es) => es.iter().any(BoolExpr::is_stateful),
+            BoolExpr::Not(e) => e.is_stateful(),
+            BoolExpr::Cmp(c) => c.lhs.is_stateful() || c.rhs.is_stateful(),
+            BoolExpr::Match { .. } | BoolExpr::Affix { .. } => false,
+        }
     }
 }
 
@@ -916,13 +907,13 @@ impl ValExpr {
                     ArithOp::Mul => l * r,
                     ArithOp::Div => {
                         if r == 0.0 {
-                            return Err(Error::Other("division by zero in add expression".into()));
+                            return Err(Error::Other("division by zero in expression".into()));
                         }
                         l / r
                     }
                     ArithOp::Mod => {
                         if r == 0.0 {
-                            return Err(Error::Other("modulo by zero in add expression".into()));
+                            return Err(Error::Other("modulo by zero in expression".into()));
                         }
                         l % r
                     }
@@ -937,9 +928,9 @@ impl ValExpr {
                 Field::Owned(s)
             }
             ValExpr::Func(f, args) => eval_func(*f, args, row, ctx)?,
-            ValExpr::Bool(b) => Field::Str(if b.eval(row)? { "t" } else { "f" }),
+            ValExpr::Bool(b) => Field::Str(if b.eval(row, ctx)? { "t" } else { "f" }),
             ValExpr::Cond { test, then_, else_ } => {
-                if test.eval(row)? {
+                if test.eval(row, ctx)? {
                     then_.eval(row, ctx)?
                 } else {
                     else_.eval(row, ctx)?
@@ -953,6 +944,66 @@ impl ValExpr {
             }
             ValExpr::Rownum => Field::Num(ctx.rownum as f64),
         })
+    }
+
+    /// A comparison operand as a number. Leaf shortcuts keep the hot path
+    /// allocation-free (a bare column or literal never builds a `Field`); the
+    /// compound fallback is outlined so these stay small enough to inline.
+    #[inline]
+    fn cmp_num(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
+        match self {
+            ValExpr::Col(c) => cell_num(row, c.pos),
+            ValExpr::Num(n) => Ok(*n),
+            // A numeric comparison never carries a `Str` operand (compile-time
+            // normalization parses string literals), but coerce defensively.
+            ValExpr::Str(s) => Field::Str(s).coerce_num().map_err(Error::Num),
+            e => e.cmp_num_compound(row, ctx),
+        }
+    }
+
+    #[inline(never)]
+    fn cmp_num_compound(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
+        Ok(self.eval(row, ctx)?.coerce_num()?)
+    }
+
+    /// A comparison operand as text (borrowed for the leaf cases).
+    #[inline]
+    fn cmp_str<'r>(
+        &'r self,
+        row: &'r [Field],
+        ctx: &EvalCtx,
+    ) -> Result<std::borrow::Cow<'r, str>, Error> {
+        Ok(match self {
+            ValExpr::Col(c) => cell_str(row, c.pos),
+            ValExpr::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            ValExpr::Num(n) => std::borrow::Cow::Owned(format_num(*n)),
+            e => std::borrow::Cow::Owned(e.cmp_str_compound(row, ctx)?),
+        })
+    }
+
+    #[inline(never)]
+    fn cmp_str_compound(&self, row: &[Field], ctx: &EvalCtx) -> Result<String, Error> {
+        Ok(self.eval(row, ctx)?.as_str().into_owned())
+    }
+
+    /// A comparison operand as a number for `Auto` mode: `None` means "not a
+    /// number, fall back to lexical" — but a hard error inside a compound
+    /// operand (e.g. arithmetic over text) still propagates.
+    #[inline]
+    fn cmp_num_soft(&self, row: &[Field], ctx: &EvalCtx) -> Result<Option<f64>, Error> {
+        match self {
+            // Leaves share cmp_num's coercion (including the missing-cell-is-0
+            // rule); only the error-to-None softening differs.
+            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Str(_) => Ok(self.cmp_num(row, ctx).ok()),
+            e => e.cmp_num_soft_compound(row, ctx),
+        }
+    }
+
+    #[inline(never)]
+    fn cmp_num_soft_compound(&self, row: &[Field], ctx: &EvalCtx) -> Result<Option<f64>, Error> {
+        // `?` on eval: a hard error (bad arithmetic, div by zero) still aborts;
+        // only the final coercion is soft.
+        Ok(self.eval(row, ctx)?.coerce_num().ok())
     }
 
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
@@ -984,27 +1035,16 @@ impl ValExpr {
     pub fn is_stateful(&self) -> bool {
         match self {
             ValExpr::Prev(_) | ValExpr::Rownum => true,
-            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Str(_) | ValExpr::Bool(_) => false,
+            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Str(_) => false,
+            ValExpr::Bool(b) => b.is_stateful(),
             ValExpr::Neg(e) => e.is_stateful(),
             ValExpr::Arith { lhs, rhs, .. } => lhs.is_stateful() || rhs.is_stateful(),
             ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
                 parts.iter().any(ValExpr::is_stateful)
             }
-            ValExpr::Cond { then_, else_, .. } => then_.is_stateful() || else_.is_stateful(),
-        }
-    }
-
-    /// A best-effort static type, used by the parser to mark the new column
-    /// numeric/text for later implicit comparisons. `None` when it depends on
-    /// the data (a bare column, `prev`, or a `?:`).
-    pub fn static_numeric(&self) -> Option<bool> {
-        match self {
-            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
-                Some(true)
+            ValExpr::Cond { test, then_, else_ } => {
+                test.is_stateful() || then_.is_stateful() || else_.is_stateful()
             }
-            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(false),
-            ValExpr::Func(f, _) => Some(!matches!(f, Func::Upper | Func::Lower | Func::Trim)),
-            ValExpr::Col(_) | ValExpr::Prev(_) | ValExpr::Cond { .. } => None,
         }
     }
 }
@@ -1095,7 +1135,7 @@ impl Stmt {
                 project(row, &p.positions, scratch);
                 Ok(true)
             }
-            Stmt::Select(expr) => expr.eval(row),
+            Stmt::Select(expr) => expr.eval(row, ctx),
             Stmt::Add(a) => {
                 let value = a.expr.eval(row, ctx)?;
                 match a.pos {
@@ -1151,10 +1191,15 @@ impl Stmt {
         }
     }
 
-    /// Whether this statement reads cross-row state (only a stateful `add`),
-    /// which routes the plan to the in-memory ordered execution path.
+    /// Whether this statement reads cross-row state (a stateful `add` or a
+    /// `select` comparing against `prev()`/`rownum()`), which routes the plan
+    /// to the in-memory ordered execution path.
     pub fn is_stateful(&self) -> bool {
-        matches!(self, Stmt::Add(a) if a.stateful)
+        match self {
+            Stmt::Add(a) => a.stateful,
+            Stmt::Select(e) => e.is_stateful(),
+            _ => false,
+        }
     }
 }
 
@@ -1322,28 +1367,28 @@ mod tests {
         // (> b 0) numeric: "5" > 0 -> true, "0" > 0 -> false
         let cmp = Cmp {
             op: CmpOp::Gt,
-            lhs: Operand::Col(ColRef {
+            lhs: ValExpr::Col(ColRef {
                 name: "b".into(),
                 pos: 1,
             }),
-            rhs: Operand::Num(0.0),
+            rhs: ValExpr::Num(0.0),
             mode: CmpMode::Numeric,
         };
-        assert!(cmp.eval(&row(&["a", "5"])).unwrap());
-        assert!(!cmp.eval(&row(&["a", "0"])).unwrap());
+        assert!(cmp.eval(&row(&["a", "5"]), &EvalCtx::default()).unwrap());
+        assert!(!cmp.eval(&row(&["a", "0"]), &EvalCtx::default()).unwrap());
 
         // (== a "t") string
         let cmp = Cmp {
             op: CmpOp::Eq,
-            lhs: Operand::Col(ColRef {
+            lhs: ValExpr::Col(ColRef {
                 name: "a".into(),
                 pos: 0,
             }),
-            rhs: Operand::Str("t".into()),
+            rhs: ValExpr::Str("t".into()),
             mode: CmpMode::String,
         };
-        assert!(cmp.eval(&row(&["t", "5"])).unwrap());
-        assert!(!cmp.eval(&row(&["f", "5"])).unwrap());
+        assert!(cmp.eval(&row(&["t", "5"]), &EvalCtx::default()).unwrap());
+        assert!(!cmp.eval(&row(&["f", "5"]), &EvalCtx::default()).unwrap());
     }
 
     #[test]
@@ -1352,23 +1397,29 @@ mod tests {
         // non-number on either side falls back to lexical, never aborting.
         let cmp = Cmp {
             op: CmpOp::Gt,
-            lhs: Operand::Col(ColRef {
+            lhs: ValExpr::Col(ColRef {
                 name: "a".into(),
                 pos: 0,
             }),
-            rhs: Operand::Col(ColRef {
+            rhs: ValExpr::Col(ColRef {
                 name: "b".into(),
                 pos: 1,
             }),
             mode: CmpMode::Auto,
         };
         // Numeric: 100 > 9 is true (lexically "100" < "9" would be false).
-        assert!(cmp.eval(&row(&["100", "9"])).unwrap());
-        assert!(!cmp.eval(&row(&["9", "100"])).unwrap());
+        assert!(cmp.eval(&row(&["100", "9"]), &EvalCtx::default()).unwrap());
+        assert!(!cmp.eval(&row(&["9", "100"]), &EvalCtx::default()).unwrap());
         // A non-numeric cell drops to lexical instead of erroring: "banana" >
         // "apple" lexically.
-        assert!(cmp.eval(&row(&["banana", "apple"])).unwrap());
-        assert!(!cmp.eval(&row(&["apple", "banana"])).unwrap());
+        assert!(
+            cmp.eval(&row(&["banana", "apple"]), &EvalCtx::default())
+                .unwrap()
+        );
+        assert!(
+            !cmp.eval(&row(&["apple", "banana"]), &EvalCtx::default())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1377,38 +1428,52 @@ mod tests {
         let expr = BoolExpr::And(vec![
             BoolExpr::Cmp(Cmp {
                 op: CmpOp::Eq,
-                lhs: Operand::Col(ColRef {
+                lhs: ValExpr::Col(ColRef {
                     name: "a".into(),
                     pos: 0,
                 }),
-                rhs: Operand::Str("t".into()),
+                rhs: ValExpr::Str("t".into()),
                 mode: CmpMode::String,
             }),
             BoolExpr::Or(vec![
                 BoolExpr::Cmp(Cmp {
                     op: CmpOp::Gt,
-                    lhs: Operand::Col(ColRef {
+                    lhs: ValExpr::Col(ColRef {
                         name: "b".into(),
                         pos: 1,
                     }),
-                    rhs: Operand::Num(0.0),
+                    rhs: ValExpr::Num(0.0),
                     mode: CmpMode::Numeric,
                 }),
                 BoolExpr::Cmp(Cmp {
                     op: CmpOp::Gt,
-                    lhs: Operand::Col(ColRef {
+                    lhs: ValExpr::Col(ColRef {
                         name: "c".into(),
                         pos: 2,
                     }),
-                    rhs: Operand::Num(0.0),
+                    rhs: ValExpr::Num(0.0),
                     mode: CmpMode::Numeric,
                 }),
             ]),
         ]);
-        assert!(expr.eval(&row(&["t", "0", "3"])).unwrap());
-        assert!(expr.eval(&row(&["t", "1", "0"])).unwrap());
-        assert!(!expr.eval(&row(&["t", "0", "0"])).unwrap());
-        assert!(!expr.eval(&row(&["f", "9", "9"])).unwrap());
+        assert!(
+            expr.eval(&row(&["t", "0", "3"]), &EvalCtx::default())
+                .unwrap()
+        );
+        assert!(
+            expr.eval(&row(&["t", "1", "0"]), &EvalCtx::default())
+                .unwrap()
+        );
+        assert!(
+            !expr
+                .eval(&row(&["t", "0", "0"]), &EvalCtx::default())
+                .unwrap()
+        );
+        assert!(
+            !expr
+                .eval(&row(&["f", "9", "9"]), &EvalCtx::default())
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1424,8 +1489,8 @@ mod tests {
                 // must resolve `a` to position 1, not its original 0.
                 Stmt::Select(BoolExpr::Cmp(Cmp {
                     op: CmpOp::Eq,
-                    lhs: Operand::Col(col("a")),
-                    rhs: Operand::Str("x".into()),
+                    lhs: ValExpr::Col(col("a")),
+                    rhs: ValExpr::Str("x".into()),
                     mode: CmpMode::String,
                 })),
             ])],
@@ -1446,7 +1511,7 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
             unreachable!()
         };
-        let Operand::Col(cref) = &c.lhs else {
+        let ValExpr::Col(cref) = &c.lhs else {
             unreachable!()
         };
         assert_eq!(cref.pos, 1);

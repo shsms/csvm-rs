@@ -23,8 +23,8 @@ use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
-    JoinType, Operand, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage,
-    StatsStmt, Stmt, UniqStmt, ValExpr,
+    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
+    Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -510,6 +510,12 @@ impl Builder {
             types: &self.col_types,
         };
         let expr = parser.parse()?;
+        // Colour rules render from the buffered output rows, where there is no
+        // previous-row/rownum context to read. (Checked here rather than at
+        // resolve time, where an unresolvable rule is silently dropped.)
+        if expr.is_stateful() {
+            return Err(err("prev()/rownum() are not allowed in a color condition"));
+        }
         self.colors
             .push(ColorRule::Predicate { scope, style, expr });
         Ok(())
@@ -647,7 +653,7 @@ impl Builder {
         let stateful = expr.is_stateful();
         // Track the new column's type so later comparisons can go numeric
         // implicitly (a data-dependent expression leaves it untyped).
-        match expr.static_numeric() {
+        match parser.static_type(&expr) {
             Some(true) => {
                 self.col_types.insert(name.clone(), ColType::Num);
             }
@@ -1337,6 +1343,14 @@ struct ExprParser<'a> {
     types: &'a HashMap<String, ColType>,
 }
 
+/// A parsed subexpression that is either a boolean or a value. The unified
+/// grammar parses each position once and classifies afterward; a
+/// `V(ValExpr::Bool(_))` is a parenthesized boolean usable as either.
+enum BV {
+    B(BoolExpr),
+    V(ValExpr),
+}
+
 impl ExprParser<'_> {
     /// The token at the cursor, quoted, for an error message — or "end of
     /// expression" when the cursor is past the last token.
@@ -1350,7 +1364,8 @@ impl ExprParser<'_> {
     }
 
     fn parse(&mut self) -> Result<BoolExpr, Error> {
-        let expr = self.parse_or()?;
+        let expr = self.parse_bv()?;
+        let expr = self.need_bool(expr)?;
         if self.pos != self.toks.len() {
             return Err(err(format!(
                 "unexpected {} after the expression",
@@ -1369,77 +1384,101 @@ impl ExprParser<'_> {
         }
     }
 
-    fn parse_or(&mut self) -> Result<BoolExpr, Error> {
-        let mut parts = vec![self.parse_and()?];
+    /// Whether the cursor is at the symbol `sym` (without consuming it).
+    fn at(&self, sym: &str) -> bool {
+        matches!(self.toks.get(self.pos), Some(ETok::Sym(s)) if *s == sym)
+    }
+
+    /// Require a boolean where the grammar demands one, unwrapping a
+    /// parenthesized boolean that came back as a value (`(a > 0) && …`).
+    fn need_bool(&self, e: BV) -> Result<BoolExpr, Error> {
+        match e {
+            BV::B(b) => Ok(b),
+            BV::V(ValExpr::Bool(b)) => Ok(*b),
+            BV::V(_) => Err(err(format!(
+                "expected a comparison operator (==, !=, <, >, <=, >=, =~, ^=, *=, $=), found {}",
+                self.here()
+            ))),
+        }
+    }
+
+    // The boolean/value grammar is single-pass: every token position parses
+    // once, and whether a subexpression is a boolean or a value is settled by
+    // lookahead (a following comparison operator, `&&`, `?`, …), never by
+    // re-parsing. `parse_bv_cmp` parses a value and upgrades it to a
+    // comparison if an operator follows; the connective levels demand booleans
+    // via `need_bool`.
+
+    /// `||` level.
+    fn parse_bv(&mut self) -> Result<BV, Error> {
+        let first = self.parse_bv_and()?;
+        if !self.at("||") {
+            return Ok(first);
+        }
+        let mut parts = vec![self.need_bool(first)?];
         while self.eat("||") {
-            parts.push(self.parse_and()?);
+            let next = self.parse_bv_and()?;
+            parts.push(self.need_bool(next)?);
         }
-        Ok(if parts.len() == 1 {
-            parts.pop().unwrap()
-        } else {
-            BoolExpr::Or(parts)
-        })
+        Ok(BV::B(BoolExpr::Or(parts)))
     }
 
-    fn parse_and(&mut self) -> Result<BoolExpr, Error> {
-        let mut parts = vec![self.parse_not()?];
+    /// `&&` level.
+    fn parse_bv_and(&mut self) -> Result<BV, Error> {
+        let first = self.parse_bv_not()?;
+        if !self.at("&&") {
+            return Ok(first);
+        }
+        let mut parts = vec![self.need_bool(first)?];
         while self.eat("&&") {
-            parts.push(self.parse_not()?);
+            let next = self.parse_bv_not()?;
+            parts.push(self.need_bool(next)?);
         }
-        Ok(if parts.len() == 1 {
-            parts.pop().unwrap()
-        } else {
-            BoolExpr::And(parts)
-        })
+        Ok(BV::B(BoolExpr::And(parts)))
     }
 
-    fn parse_not(&mut self) -> Result<BoolExpr, Error> {
+    /// `!` level.
+    fn parse_bv_not(&mut self) -> Result<BV, Error> {
         if self.eat("!") {
-            Ok(BoolExpr::Not(Box::new(self.parse_not()?)))
+            let operand = self.parse_bv_not()?;
+            Ok(BV::B(BoolExpr::Not(Box::new(self.need_bool(operand)?))))
         } else {
-            self.parse_primary()
+            self.parse_bv_cmp()
         }
     }
 
-    fn parse_primary(&mut self) -> Result<BoolExpr, Error> {
-        if self.eat("(") {
-            let expr = self.parse_or()?;
-            if !self.eat(")") {
-                return Err(err(format!("expected ')', found {}", self.here())));
-            }
-            Ok(expr)
-        } else {
-            self.parse_comparison()
-        }
-    }
-
-    fn parse_comparison(&mut self) -> Result<BoolExpr, Error> {
-        let lhs = self.parse_operand()?;
+    /// Comparison level: a value, optionally completed into a comparison by a
+    /// following operator. Without one it stays a value — the enclosing level
+    /// decides whether that is acceptable.
+    fn parse_bv_cmp(&mut self) -> Result<BV, Error> {
+        let lhs = self.parse_concat()?;
         let op = match self.toks.get(self.pos) {
-            Some(ETok::Sym(s)) => *s,
-            _ => {
-                return Err(err(format!(
-                    "expected a comparison operator (==, !=, <, >, <=, >=, =~, ^=, *=, $=), found {}",
-                    self.here()
-                )));
+            Some(ETok::Sym(s))
+                if matches!(
+                    *s,
+                    "==" | "!=" | "<" | ">" | "<=" | ">=" | "=~" | "!~" | "^=" | "*=" | "$="
+                ) =>
+            {
+                *s
             }
+            _ => return Ok(BV::V(lhs)),
         };
         self.pos += 1;
         if op == "=~" || op == "!~" {
-            let Operand::Col(col) = lhs else {
+            let ValExpr::Col(col) = lhs else {
                 return Err(err("left side of =~ must be a column"));
             };
-            let pattern = match self.parse_operand()? {
-                Operand::Str(s) => s,
+            let pattern = match self.parse_concat()? {
+                ValExpr::Str(s) => s,
                 _ => return Err(err("=~ pattern must be a string")),
             };
             let regex = regex::Regex::new(&pattern)
                 .map_err(|e| err(format!("invalid regex '{pattern}': {e}")))?;
-            return Ok(BoolExpr::Match {
+            return Ok(BV::B(BoolExpr::Match {
                 col,
                 regex,
                 negate: op == "!~",
-            });
+            }));
         }
         let affix = match op {
             "^=" => Some(AffixKind::StartsWith),
@@ -1448,14 +1487,14 @@ impl ExprParser<'_> {
             _ => None,
         };
         if let Some(kind) = affix {
-            let Operand::Col(col) = lhs else {
+            let ValExpr::Col(col) = lhs else {
                 return Err(err(format!("left side of {op} must be a column")));
             };
-            let needle = match self.parse_operand()? {
-                Operand::Str(s) => s,
+            let needle = match self.parse_concat()? {
+                ValExpr::Str(s) => s,
                 _ => return Err(err(format!("{op} needs a string literal on the right"))),
             };
-            return Ok(BoolExpr::Affix { col, needle, kind });
+            return Ok(BV::B(BoolExpr::Affix { col, needle, kind }));
         }
         let cmp_op = match op {
             "==" => CmpOp::Eq,
@@ -1464,17 +1503,19 @@ impl ExprParser<'_> {
             ">" => CmpOp::Gt,
             "<=" => CmpOp::Le,
             ">=" => CmpOp::Ge,
-            other => return Err(err(format!("'{other}' is not a comparison operator"))),
+            _ => unreachable!("filtered above"),
         };
         let mut lhs = lhs;
-        let mut rhs = self.parse_operand()?;
-        // Precedence: an explicit numeric operand (a number literal or a
-        // `to-num` column) wins; else an explicit string operand (a literal or a
-        // `to-str` column) compares lexically; else two untyped columns auto-
+        let mut rhs = self.parse_concat()?;
+        // Precedence: a statically numeric operand (a number literal,
+        // arithmetic, a numeric function, a `to-num` column) wins; else a
+        // statically string operand (a literal, concat, a bool value, a
+        // `to-str` column) compares lexically; else two untyped operands auto-
         // detect per row for the orderings, and stay lexical for `==`/`!=`.
-        let mode = if self.is_numeric(&lhs) || self.is_numeric(&rhs) {
+        let (lt, rt) = (self.static_type(&lhs), self.static_type(&rhs));
+        let mode = if lt == Some(true) || rt == Some(true) {
             CmpMode::Numeric
-        } else if self.is_stringy(&lhs) || self.is_stringy(&rhs) {
+        } else if lt == Some(false) || rt == Some(false) {
             CmpMode::String
         } else {
             match cmp_op {
@@ -1486,50 +1527,38 @@ impl ExprParser<'_> {
             lhs = numericize(lhs)?;
             rhs = numericize(rhs)?;
         }
-        Ok(BoolExpr::Cmp(Cmp {
+        Ok(BV::B(BoolExpr::Cmp(Cmp {
             op: cmp_op,
             lhs,
             rhs,
             mode,
-        }))
+        })))
     }
 
-    fn parse_operand(&mut self) -> Result<Operand, Error> {
-        match self.toks.get(self.pos).cloned() {
-            Some(ETok::Ident(name)) => {
-                self.pos += 1;
-                Ok(Operand::Col(ColRef::new(name)))
+    /// The static type of a value expression, for the comparison-mode decision
+    /// and the `add` column type: `Some(true)` numeric, `Some(false)` string,
+    /// `None` data-dependent. Column (and `prev`) leaves consult the tracked
+    /// `to-num`/`to-str` types; a `?:` is typed only if both branches agree.
+    fn static_type(&self, e: &ValExpr) -> Option<bool> {
+        match e {
+            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
+                Some(true)
             }
-            Some(ETok::Num(n)) => {
-                self.pos += 1;
-                Ok(Operand::Num(n))
+            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(false),
+            ValExpr::Func(f, _) => Some(!matches!(f, Func::Upper | Func::Lower | Func::Trim)),
+            ValExpr::Col(c) | ValExpr::Prev(c) => match self.types.get(&c.name) {
+                Some(ColType::Num) => Some(true),
+                Some(ColType::Str) => Some(false),
+                None => None,
+            },
+            ValExpr::Cond { then_, else_, .. } => {
+                let t = self.static_type(then_);
+                if t == self.static_type(else_) {
+                    t
+                } else {
+                    None
+                }
             }
-            Some(ETok::Str(s)) => {
-                self.pos += 1;
-                Ok(Operand::Str(s))
-            }
-            _ => Err(err(format!(
-                "expected a column, number, or string, found {}",
-                self.here()
-            ))),
-        }
-    }
-
-    fn is_numeric(&self, op: &Operand) -> bool {
-        match op {
-            Operand::Num(_) => true,
-            Operand::Col(c) => self.types.get(&c.name) == Some(&ColType::Num),
-            Operand::Str(_) => false,
-        }
-    }
-
-    /// Whether an operand pins the comparison to lexical: a string literal, or a
-    /// column an earlier `to-str` marked as text.
-    fn is_stringy(&self, op: &Operand) -> bool {
-        match op {
-            Operand::Str(_) => true,
-            Operand::Col(c) => self.types.get(&c.name) == Some(&ColType::Str),
-            Operand::Num(_) => false,
         }
     }
 
@@ -1547,33 +1576,30 @@ impl ExprParser<'_> {
         Ok(expr)
     }
 
-    /// A value expression. Precedence (loosest first): `?:` ternary, `++`
-    /// concat, `+ -`, `* / %`, unary `-`, then atoms. A purely boolean
-    /// expression (a bare comparison, e.g. `add ok amount > 0`) yields `t`/`f`.
+    /// A value expression. Precedence (loosest first): `?:` ternary, the
+    /// boolean connectives, `++` concat, `+ -`, `* / %`, unary `-`, then
+    /// atoms. A boolean subexpression used as a value (`add ok amount > 0`,
+    /// `(a > 0) ++ '!'`) renders csvm-style `t`/`f`.
     fn parse_value(&mut self) -> Result<ValExpr, Error> {
-        // A leading boolean form is either a ternary condition or, on its own, a
-        // boolean-valued column. Try it first and backtrack if it isn't one (an
-        // arithmetic value like `a * b` isn't a comparison and fails fast here).
-        let start = self.pos;
-        if let Ok(test) = self.parse_or() {
-            if self.eat("?") {
-                let then_ = self.parse_value()?;
-                if !self.eat(":") {
-                    return Err(err("expected ':' in ?: expression"));
-                }
-                let else_ = self.parse_value()?;
-                return Ok(ValExpr::Cond {
-                    test: Box::new(test),
-                    then_: Box::new(then_),
-                    else_: Box::new(else_),
-                });
+        let e = self.parse_bv()?;
+        if self.at("?") {
+            let test = self.need_bool(e)?;
+            self.pos += 1;
+            let then_ = self.parse_value()?;
+            if !self.eat(":") {
+                return Err(err("expected ':' in ?: expression"));
             }
-            if self.pos == self.toks.len() {
-                return Ok(ValExpr::Bool(Box::new(test)));
-            }
+            let else_ = self.parse_value()?;
+            return Ok(ValExpr::Cond {
+                test: Box::new(test),
+                then_: Box::new(then_),
+                else_: Box::new(else_),
+            });
         }
-        self.pos = start;
-        self.parse_concat()
+        Ok(match e {
+            BV::B(b) => ValExpr::Bool(Box::new(b)),
+            BV::V(v) => v,
+        })
     }
 
     fn parse_concat(&mut self) -> Result<ValExpr, Error> {
@@ -1734,10 +1760,10 @@ fn check_arity(func: Func, n: usize) -> Result<(), Error> {
 }
 
 /// In a numeric comparison, a string literal is parsed at parse time.
-fn numericize(op: Operand) -> Result<Operand, Error> {
-    match op {
-        Operand::Str(s) => match s.trim().parse::<f64>() {
-            Ok(n) => Ok(Operand::Num(n)),
+fn numericize(e: ValExpr) -> Result<ValExpr, Error> {
+    match e {
+        ValExpr::Str(s) => match s.trim().parse::<f64>() {
+            Ok(n) => Ok(ValExpr::Num(n)),
             Err(_) => Err(err(format!(
                 "non-numeric literal '{s}' in numeric comparison"
             ))),
@@ -1833,7 +1859,7 @@ mod tests {
             panic!()
         };
         assert_eq!(c.mode, CmpMode::Numeric);
-        assert!(matches!(c.rhs, Operand::Num(n) if n == 5.0));
+        assert!(matches!(c.rhs, ValExpr::Num(n) if n == 5.0));
     }
 
     #[test]
@@ -1895,7 +1921,7 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[0] else {
             panic!()
         };
-        assert!(matches!(&c.rhs, Operand::Str(s) if s == "#urgent"));
+        assert!(matches!(&c.rhs, ValExpr::Str(s) if s == "#urgent"));
     }
 
     #[test]
@@ -2136,10 +2162,10 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[0] else {
             panic!()
         };
-        let Operand::Col(col) = &c.lhs else { panic!() };
+        let ValExpr::Col(col) = &c.lhs else { panic!() };
         assert_eq!(col.name, "frequenz-app-edge");
         assert_eq!(c.mode, CmpMode::String); // RHS is a string literal
-        assert!(matches!(&c.rhs, Operand::Str(s) if s.is_empty()));
+        assert!(matches!(&c.rhs, ValExpr::Str(s) if s.is_empty()));
     }
 
     #[test]

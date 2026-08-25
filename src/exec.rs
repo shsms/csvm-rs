@@ -22,8 +22,8 @@ use crate::field::Field;
 use crate::graph::Histogram;
 use crate::plan::{
     AggFunc, AggSpec, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind,
-    GraphSpec, GroupStmt, JoinStmt, Operand, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt,
-    ValExpr, apply_stmts,
+    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
+    apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -143,10 +143,10 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    // A stateful `add` (`prev()`/`rownum()`) is order-dependent: it can't shard
-    // or stream chunk-parallel. Materialize and run the ordered in-memory path
-    // (the same fallback `tail`/`uniq`/`join` use).
-    if plan_has_stateful_add(plan) {
+    // A stateful `add`/`select` (`prev()`/`rownum()`) is order-dependent: it
+    // can't shard or stream chunk-parallel. Materialize and run the ordered
+    // in-memory path (the same fallback `tail`/`uniq`/`join` use).
+    if plan_has_stateful_expr(plan) {
         return run_staged_in_memory(plan, opts, input, output);
     }
     // `head` with no sort streams single-threaded and stops early.
@@ -612,7 +612,7 @@ pub fn run_file<W: Write + Send>(
 
     // A stateful `add` forces the ordered in-memory path (see `run_body`); skip
     // all sharded fast paths and let the reader path route it there.
-    let stateful = plan_has_stateful_add(plan);
+    let stateful = plan_has_stateful_expr(plan);
 
     if let [Stage::Transform(stmts)] = plan.stages.as_slice()
         && opts.threads > 1
@@ -1286,9 +1286,10 @@ fn apply_post_to_line(post: &[Stmt], line: &[u8], out: &mut Vec<u8>) -> Result<(
     err.map_or(Ok(()), Err)
 }
 
-/// Whether any transform stage holds a stateful `add` (`prev()`/`rownum()`),
-/// which is order-dependent and so can't shard or stream chunk-parallel.
-fn plan_has_stateful_add(plan: &Plan) -> bool {
+/// Whether any transform stage holds a stateful statement — an `add` or
+/// `select` reading `prev()`/`rownum()` — which is order-dependent and so
+/// can't shard or stream chunk-parallel.
+fn plan_has_stateful_expr(plan: &Plan) -> bool {
     plan.stages.iter().any(|s| match s {
         Stage::Transform(stmts) => stmts.iter().any(Stmt::is_stateful),
         _ => false,
@@ -1911,7 +1912,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> 
                 for (ri, row) in rows.iter().enumerate().skip(1) {
                     frow.clear();
                     frow.extend(row.iter().map(|s| Field::Str(s)));
-                    if !matches!(expr.eval(&frow), Ok(true)) {
+                    if !matches!(expr.eval(&frow, &EvalCtx::default()), Ok(true)) {
                         continue;
                     }
                     match scope {
@@ -2283,8 +2284,8 @@ fn fmt_expr(e: &BoolExpr) -> String {
         BoolExpr::Cmp(c) => format!(
             "({} {} {} :{})",
             cmp_symbol(c.op),
-            fmt_operand(&c.lhs),
-            fmt_operand(&c.rhs),
+            fmt_valexpr(&c.lhs),
+            fmt_valexpr(&c.rhs),
             match c.mode {
                 CmpMode::Numeric => "num",
                 CmpMode::String => "str",
@@ -2303,14 +2304,6 @@ fn fmt_expr(e: &BoolExpr) -> String {
 
 fn fmt_list(es: &[BoolExpr]) -> String {
     es.iter().map(fmt_expr).collect::<Vec<_>>().join(" ")
-}
-
-fn fmt_operand(op: &Operand) -> String {
-    match op {
-        Operand::Col(c) => format!("{}[{}]", c.name, c.pos),
-        Operand::Str(s) => format!("{s:?}"),
-        Operand::Num(n) => n.to_string(),
-    }
 }
 
 fn cmp_symbol(op: CmpOp) -> &'static str {
@@ -2984,6 +2977,21 @@ mod tests {
         );
         assert!(!line("10").contains('\u{1b}'), "10 unpainted: {out:?}");
         assert!(!line("NA").contains('\u{1b}'), "NA unpainted: {out:?}");
+    }
+
+    #[test]
+    fn color_predicate_with_computed_operands() {
+        // Arithmetic works as a predicate operand, and a row where the
+        // compound operand errors (NA * …) is left unpainted, not fatal.
+        let input = "price,qty\n10,3\n5,NA\n2,4\n";
+        let out = render_str("color red price * qty > 20 | fmt", input, true);
+        let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap();
+        assert!(line("10").contains('\u{1b}'), "10*3=30 painted: {out:?}");
+        assert!(
+            !line("NA").contains('\u{1b}'),
+            "erroring row unpainted: {out:?}"
+        );
+        assert!(!line("2 ").contains('\u{1b}'), "2*4=8 unpainted: {out:?}");
     }
 
     #[test]
