@@ -1545,6 +1545,9 @@ impl ExprParser<'_> {
                 Some(true)
             }
             ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(false),
+            // `coalesce` passes its arguments through, so its type depends on
+            // the data; every other function returns a fixed type.
+            ValExpr::Func(Func::Coalesce, _) => None,
             ValExpr::Func(f, _) => Some(!matches!(f, Func::Upper | Func::Lower | Func::Trim)),
             ValExpr::Col(c) | ValExpr::Prev(c) => match self.types.get(&c.name) {
                 Some(ColType::Num) => Some(true),

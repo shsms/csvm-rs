@@ -250,6 +250,19 @@ fn arithmetic_beats_auto_mode_against_a_bare_column() {
 }
 
 #[test]
+fn coalesce_result_type_follows_the_data() {
+    // coalesce passes its arguments through, so its static type is unknown: a
+    // comparison against the added column must auto-detect per row (numeric
+    // when both cells parse, else lexical) instead of assuming numeric, which
+    // aborted on text data.
+    let input = "a,b,thresh\nbanana,,apple\n,10,20\n";
+    assert_eq!(
+        run_checked("add c coalesce(a, b) | select c > thresh | cols c", input),
+        "c\nbanana\n"
+    );
+}
+
+#[test]
 fn select_arithmetic_on_non_numeric_aborts() {
     // Specifically the runtime coercion error, not a parse failure.
     let e = run("select x * 2 > 1", "x\nhello\n", 1).unwrap_err();
@@ -294,6 +307,29 @@ fn add_column_copy_inherits_explicit_type_overrides() {
             input
         ),
         "id\n9\n"
+    );
+}
+
+// --- auto-mode compound operands --------------------------------------------
+
+#[test]
+fn auto_mode_compound_hard_error_aborts() {
+    // Auto mode's leaf coercion is soft (falls back to lexical), but a hard
+    // error inside a compound operand still aborts the run.
+    let input = "x,y,z\n1,0,2\n";
+    let e = run("select coalesce(x / y, x) > z", input, 1).unwrap_err();
+    assert!(e.contains("division by zero"), "unexpected error: {e}");
+    assert!(!e.contains("add"), "a select abort must not blame add: {e}");
+}
+
+#[test]
+fn auto_mode_compound_soft_fallback_is_lexical() {
+    // Both sides compound and non-numeric: the comparison quietly drops to
+    // lexical for the row instead of aborting.
+    let input = "a,b,c,d\nbanana,,apple,\n";
+    assert_eq!(
+        run_checked("select coalesce(a, b) > coalesce(c, d)", input),
+        "a,b,c,d\nbanana,,apple,\n"
     );
 }
 
