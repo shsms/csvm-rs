@@ -30,8 +30,15 @@ use crate::plan::{
 /// Compile a pipe script into an executable [`Plan`].
 pub fn parse(script: &str) -> Result<Plan, Error> {
     let script = strip_comments(script);
-    let mut builder = Builder::default();
-    for stage in split_stages(&script) {
+    let (fns, rest) = parse_prologue(&script)?;
+    parse_stages(rest, &fns, 0)
+}
+
+/// Parse stage text into a plan. Sub-pipelines and fragment bodies re-enter
+/// here with the shared fn table and their expansion depth.
+fn parse_stages(script: &str, fns: &FnTable, depth: usize) -> Result<Plan, Error> {
+    let mut builder = Builder::new(fns, depth);
+    for stage in split_stages(script) {
         let stage = stage.trim();
         // Skip blank stages: a blank or comment-only line in a multi-line `-f`
         // script, or a trailing `|`. A wholly empty script is caught below.
@@ -64,16 +71,18 @@ pub(crate) const COMMANDS: &[&str] = &[
 ];
 
 /// Names a `fn` may not take: every command, every alias, and `fn` itself.
-#[allow(dead_code)]
 const RESERVED: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to_num", "to-str", "to_str",
     "head", "tail", "stats", "uniq", "dedup", "color", "colour", "rename", "fmt", "hdr", "join",
     "add", "delta", "group", "agg", "graph", "plot", "fn",
 ];
 
+/// How deep fragment expansion may nest before it is treated as runaway
+/// recursion (a fragment that calls itself, directly or in a cycle).
+const MAX_FN_DEPTH: usize = 64;
+
 /// A user-defined pipeline fragment: parameter names plus the raw body text
 /// between its braces (comment-stripped, substituted at each call).
-#[allow(dead_code)]
 #[derive(Debug)]
 struct FnDef {
     params: Vec<String>,
@@ -100,8 +109,11 @@ enum Item {
     Join(JoinStmt),
 }
 
-#[derive(Default)]
-struct Builder {
+struct Builder<'a> {
+    /// Fragment definitions from the script prologue (shared, read-only).
+    fns: &'a FnTable,
+    /// Current fragment-expansion depth; `MAX_FN_DEPTH` stops recursion.
+    depth: usize,
     items: Vec<Item>,
     col_types: HashMap<String, ColType>,
     output: OutputFormat,
@@ -113,7 +125,20 @@ struct Builder {
     graph: Option<GraphSpec>,
 }
 
-impl Builder {
+impl<'a> Builder<'a> {
+    fn new(fns: &'a FnTable, depth: usize) -> Self {
+        Builder {
+            fns,
+            depth,
+            items: Vec::new(),
+            col_types: HashMap::new(),
+            output: OutputFormat::Csv,
+            header: None,
+            colors: Vec::new(),
+            graph: None,
+        }
+    }
+
     fn is_num(&self, name: &str) -> bool {
         self.col_types.get(name) == Some(&ColType::Num)
     }
@@ -181,6 +206,21 @@ impl Builder {
         if self.graph.is_some() {
             return Err(err("graph must be the last command in the pipeline"));
         }
+        // A stage that is exactly `NAME(ARGS)` is a fragment call.
+        if let Some((name, args)) = fragment_call(stage) {
+            let fns = self.fns;
+            return match fns.get(name) {
+                Some(def) => self.expand_fragment(name, def, args),
+                None => {
+                    let mut cands: Vec<String> = fns.keys().cloned().collect();
+                    cands.extend(COMMANDS.iter().map(|s| s.to_string()));
+                    Err(err(match crate::error::did_you_mean(name, &cands) {
+                        Some(s) => format!("unknown fragment: {name} (did you mean `{s}`?)"),
+                        None => format!("unknown fragment: {name}"),
+                    }))
+                }
+            };
+        }
         let (cmd, rest) = split_first_word(stage);
         match cmd {
             "cols" | "cut" => self.parse_cols(rest),
@@ -202,11 +242,59 @@ impl Builder {
             "delta" => self.parse_delta(rest),
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
+            "fn" => Err(err("fn definitions must come before the first stage")),
             other => Err(err(match crate::error::did_you_mean(other, COMMANDS) {
                 Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
                 None => format!("unknown command: {other}"),
             })),
         }
+    }
+
+    /// Instantiate fragment `name` and splice its stages in at this position:
+    /// substitute the arguments into the body, then parse the result into
+    /// this builder one level deeper (so runaway recursion errors out).
+    fn expand_fragment(
+        &mut self,
+        name: &str,
+        def: &'a FnDef,
+        args_text: &str,
+    ) -> Result<(), Error> {
+        if self.depth >= MAX_FN_DEPTH {
+            return Err(err(format!(
+                "fn expansion too deep at `{name}` — recursive fragments?"
+            )));
+        }
+        let args: Vec<String> = if args_text.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_commas(args_text)
+                .iter()
+                .map(|a| a.trim().to_string())
+                .collect()
+        };
+        if args.len() != def.params.len() {
+            return Err(err(format!(
+                "`{name}` expects {} argument(s), got {}",
+                def.params.len(),
+                args.len()
+            )));
+        }
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let body = subst_params(&def.body, &def.params, &arg_refs);
+        self.depth += 1;
+        let result = (|| {
+            for stage in split_stages(&body) {
+                let stage = stage.trim();
+                if stage.is_empty() {
+                    continue;
+                }
+                self.parse_stage(stage)
+                    .map_err(|e| err(format!("in fn `{name}`: {e}")))?;
+            }
+            Ok(())
+        })();
+        self.depth -= 1;
+        result
     }
 
     /// `hdr a,b,c` supplies column names for headerless input: the whole input
@@ -333,7 +421,7 @@ impl Builder {
                 if inner.trim().is_empty() {
                     Box::new(identity_plan())
                 } else {
-                    Box::new(parse(inner)?)
+                    Box::new(parse_stages(inner, self.fns, self.depth)?)
                 }
             } else {
                 Box::new(identity_plan())
@@ -1020,7 +1108,6 @@ fn take_paren_group(s: &str) -> Result<(&str, &str), Error> {
 
 /// Given `s` starting with `{`, return the contents of the balanced,
 /// quote-aware brace group and the remainder after the closing `}`.
-#[allow(dead_code)]
 fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
     let bytes = s.as_bytes();
     debug_assert_eq!(bytes.first(), Some(&b'{'));
@@ -1048,7 +1135,6 @@ fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
 }
 
 /// A bare identifier: ASCII letter or `_` first, then letters/digits/`_`.
-#[allow(dead_code)]
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
@@ -1057,7 +1143,6 @@ fn is_ident(s: &str) -> bool {
 
 /// Peel leading `fn NAME(PARAM, ...) { BODY }` definitions off the
 /// (comment-stripped) script. Returns the table and the remaining script.
-#[allow(dead_code)]
 fn parse_prologue(script: &str) -> Result<(FnTable, &str), Error> {
     let mut fns = FnTable::new();
     let mut rest = script.trim_start();
@@ -1147,6 +1232,19 @@ fn flag_value<'a>(
     word.strip_prefix(name)
         .and_then(|r| r.strip_prefix('='))
         .map(|val| Ok((val.to_string(), after)))
+}
+
+/// `NAME(ARGS)` filling the whole stage — the fragment-call shape. Returns
+/// the name and the raw argument text when the stage is exactly one
+/// identifier followed by one balanced paren group.
+fn fragment_call(stage: &str) -> Option<(&str, &str)> {
+    let open = stage.find('(')?;
+    let name = &stage[..open];
+    if !is_ident(name) {
+        return None;
+    }
+    let (inner, after) = take_paren_group(&stage[open..]).ok()?;
+    after.trim().is_empty().then_some((name, inner))
 }
 
 /// Split off the first whitespace-delimited word (the command) from the rest.
@@ -1272,7 +1370,6 @@ fn split_list(s: &str) -> Vec<String> {
 /// identifier outside quoted literals, with its argument's verbatim text.
 /// Textual on purpose: this is what lets one mechanism parameterize file
 /// operands, column names, rename halves, and expression operands alike.
-#[allow(dead_code)]
 fn subst_params(body: &str, params: &[String], args: &[&str]) -> String {
     let mut out = String::with_capacity(body.len());
     let mut rest = body;
@@ -2980,5 +3077,51 @@ mod tests {
         );
         // A digit-led run is one token: `9a` does not substitute its tail.
         assert_eq!(subst_params("add x 9a", &params, &args), "add x 9a");
+    }
+
+    #[test]
+    fn fn_fragment_expands_as_a_stage() {
+        let plan = parse("fn prep(n) { rename value=n | cols -v metric }\nprep(pv)").unwrap();
+        let [Stage::Transform(stmts)] = plan.stages.as_slice() else {
+            panic!("expected one transform stage, got {:?}", plan.stages);
+        };
+        assert_eq!(stmts.len(), 2); // rename + cols, spliced in place
+        // Zero-parameter fragments call as `name()`.
+        let plan = parse("fn t() { head 3 }\nt()").unwrap();
+        assert!(matches!(plan.stages.as_slice(), [Stage::Head(3)]));
+    }
+
+    #[test]
+    fn fn_fragment_call_inside_join_subpipeline() {
+        let plan = parse("fn prep(n) { rename value=n }\njoin (prep(x)) r.csv on k").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("expected a join stage, got {:?}", plan.stages);
+        };
+        assert_eq!(j.right_plan.stages.len(), 1);
+    }
+
+    #[test]
+    fn fn_fragment_calls_fragment() {
+        let plan = parse("fn a(x) { rename v=x }\nfn b(y) { a(y) | cols -v m }\nb(q)").unwrap();
+        let [Stage::Transform(stmts)] = plan.stages.as_slice() else {
+            panic!("expected one transform stage, got {:?}", plan.stages);
+        };
+        assert_eq!(stmts.len(), 2);
+    }
+
+    #[test]
+    fn fn_call_errors() {
+        let m = |s: &str| parse(s).unwrap_err().to_string();
+        assert!(m("fn f(a) { head }\nf(x, y)").contains("expects 1 argument"));
+        assert!(m("prep(x)").contains("unknown fragment"));
+        let e = m("fn prep(n) { head }\nprepp(x)");
+        assert!(e.contains("did you mean `prep`"), "{e}");
+        assert!(m("fn f(a) { f(a) }\nf(x)").contains("too deep"));
+        let e = m("fn f(a) { bogus x }\nf(y)");
+        assert!(
+            e.contains("in fn `f`") && e.contains("unknown command"),
+            "{e}"
+        );
+        assert!(m("head\nfn f(a) { tail }").contains("before the first stage"));
     }
 }
