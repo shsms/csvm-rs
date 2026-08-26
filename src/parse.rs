@@ -1268,6 +1268,51 @@ fn split_list(s: &str) -> Vec<String> {
     out
 }
 
+/// Replace each parameter, wherever it appears in `body` as a whole
+/// identifier outside quoted literals, with its argument's verbatim text.
+/// Textual on purpose: this is what lets one mechanism parameterize file
+/// operands, column names, rename halves, and expression operands alike.
+#[allow(dead_code)]
+fn subst_params(body: &str, params: &[String], args: &[&str]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    let mut quote: Option<char> = None;
+    while let Some(c) = rest.chars().next() {
+        match quote {
+            Some(q) => {
+                out.push(c);
+                if c == q {
+                    quote = None;
+                }
+                rest = &rest[c.len_utf8()..];
+            }
+            None if matches!(c, '"' | '\'' | '`') => {
+                quote = Some(c);
+                out.push(c);
+                rest = &rest[1..];
+            }
+            None if c.is_ascii_alphanumeric() || c == '_' => {
+                // Consume the whole identifier-ish run; only a run that
+                // starts like an identifier can be a parameter (`9a` can't).
+                let end = rest
+                    .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                    .unwrap_or(rest.len());
+                let word = &rest[..end];
+                match params.iter().position(|p| p == word) {
+                    Some(k) if is_ident(word) => out.push_str(args[k]),
+                    _ => out.push_str(word),
+                }
+                rest = &rest[end..];
+            }
+            None => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
 /// Validate the column count for a chart type: hist/spark take one, bar takes
 /// two, scatter/line take an x plus one or more y-series.
 fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error> {
@@ -2917,5 +2962,23 @@ mod tests {
         assert!(m("fn f a { head }").contains("malformed"));
         assert!(m("fn 9x(a) { head }").contains("not a valid name"));
         assert!(m("fn f(a-b) { head }").contains("not a valid parameter"));
+    }
+
+    #[test]
+    fn subst_params_is_identifier_bounded_and_quote_aware() {
+        let params = vec!["a".to_string(), "value_f".to_string()];
+        let args = ["pv_active", "grid_q"];
+        // Whole identifiers substitute; substrings (`abs`, `a1`) and quoted
+        // literals do not; params inside `old=new` tokens do.
+        assert_eq!(
+            subst_params(
+                "abs(a) + a*a1 ++ 'a' | rename value=value_f",
+                &params,
+                &args
+            ),
+            "abs(pv_active) + pv_active*a1 ++ 'a' | rename value=grid_q"
+        );
+        // A digit-led run is one token: `9a` does not substitute its tail.
+        assert_eq!(subst_params("add x 9a", &params, &args), "add x 9a");
     }
 }
