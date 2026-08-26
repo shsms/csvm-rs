@@ -63,6 +63,25 @@ pub(crate) const COMMANDS: &[&str] = &[
     "graph",
 ];
 
+/// Names a `fn` may not take: every command, every alias, and `fn` itself.
+#[allow(dead_code)]
+const RESERVED: &[&str] = &[
+    "cols", "cut", "select", "where", "filter", "sort", "to-num", "to_num", "to-str", "to_str",
+    "head", "tail", "stats", "uniq", "dedup", "color", "colour", "rename", "fmt", "hdr", "join",
+    "add", "delta", "group", "agg", "graph", "plot", "fn",
+];
+
+/// A user-defined pipeline fragment: parameter names plus the raw body text
+/// between its braces (comment-stripped, substituted at each call).
+#[allow(dead_code)]
+#[derive(Debug)]
+struct FnDef {
+    params: Vec<String>,
+    body: String,
+}
+
+type FnTable = std::collections::HashMap<String, FnDef>;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ColType {
     Str,
@@ -997,6 +1016,104 @@ fn take_paren_group(s: &str) -> Result<(&str, &str), Error> {
         i += 1;
     }
     Err(err("join: unbalanced '(' in the right-side sub-pipeline"))
+}
+
+/// Given `s` starting with `{`, return the contents of the balanced,
+/// quote-aware brace group and the remainder after the closing `}`.
+#[allow(dead_code)]
+fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
+    let bytes = s.as_bytes();
+    debug_assert_eq!(bytes.first(), Some(&b'{'));
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' || c == b'`' => quote = Some(c),
+            None if c == b'{' => depth += 1,
+            None if c == b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok((&s[1..i], &s[i + 1..]));
+                }
+            }
+            None => {}
+        }
+        i += 1;
+    }
+    Err(err("unterminated `{` group"))
+}
+
+/// A bare identifier: ASCII letter or `_` first, then letters/digits/`_`.
+#[allow(dead_code)]
+fn is_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Peel leading `fn NAME(PARAM, ...) { BODY }` definitions off the
+/// (comment-stripped) script. Returns the table and the remaining script.
+#[allow(dead_code)]
+fn parse_prologue(script: &str) -> Result<(FnTable, &str), Error> {
+    let mut fns = FnTable::new();
+    let mut rest = script.trim_start();
+    loop {
+        let (word, after) = split_first_word(rest);
+        if word != "fn" {
+            return Ok((fns, rest));
+        }
+        let brace = after
+            .find('{')
+            .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
+        let header = after[..brace].trim();
+        let (name, params_text) = header
+            .split_once('(')
+            .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
+        let name = name.trim();
+        if !is_ident(name) {
+            return Err(err(format!(
+                "fn: `{name}` is not a valid name (bare identifier)"
+            )));
+        }
+        if RESERVED.contains(&name) {
+            return Err(err(format!("fn `{name}` collides with a built-in command")));
+        }
+        let params_text = params_text
+            .trim()
+            .strip_suffix(')')
+            .ok_or_else(|| err(format!("fn `{name}`: malformed parameter list")))?;
+        let mut params = Vec::new();
+        for p in split_list(params_text) {
+            if !is_ident(&p) {
+                return Err(err(format!(
+                    "fn `{name}`: `{p}` is not a valid parameter name"
+                )));
+            }
+            if params.contains(&p) {
+                return Err(err(format!("fn `{name}`: duplicate parameter `{p}`")));
+            }
+            params.push(p);
+        }
+        let (body, after_body) = take_brace_group(&after[brace..])
+            .map_err(|_| err(format!("fn `{name}`: unterminated body — missing `}}`")))?;
+        if fns
+            .insert(
+                name.to_string(),
+                FnDef {
+                    params,
+                    body: body.trim().to_string(),
+                },
+            )
+            .is_some()
+        {
+            return Err(err(format!("fn `{name}` is defined twice")));
+        }
+        rest = after_body.trim_start();
+    }
 }
 
 /// Split off the first token: a whitespace-delimited word, or a quoted run
@@ -2767,5 +2884,38 @@ mod tests {
         // A newline inside a `join (…)` group doesn't split the outer pipeline.
         let plan = parse("rename value=a\njoin (\n rename value=b\n) r.csv on key\nfmt").unwrap();
         assert!(plan.stages.iter().any(|s| matches!(s, Stage::Join(_))));
+    }
+
+    #[test]
+    fn prologue_extracts_fn_definitions() {
+        let (fns, rest) =
+            parse_prologue("fn prep(n) { rename value=n | cols -v m }\nfn t() { head }\nprep(x)")
+                .unwrap();
+        assert_eq!(fns.len(), 2);
+        let prep = &fns["prep"];
+        assert_eq!(prep.params, vec!["n".to_string()]);
+        assert_eq!(prep.body, "rename value=n | cols -v m");
+        assert!(fns["t"].params.is_empty());
+        assert_eq!(rest, "prep(x)");
+        // No prologue: everything is the remainder.
+        let (fns, rest) = parse_prologue("head 3").unwrap();
+        assert!(fns.is_empty());
+        assert_eq!(rest, "head 3");
+    }
+
+    #[test]
+    fn prologue_definition_errors() {
+        let m = |s: &str| parse_prologue(s).unwrap_err().to_string();
+        assert!(
+            m("fn cols(a) { head }").contains("collides"),
+            "{}",
+            m("fn cols(a) { head }")
+        );
+        assert!(m("fn f(a) { head }\nfn f(b) { tail }").contains("defined twice"));
+        assert!(m("fn f(a, a) { head }").contains("duplicate parameter"));
+        assert!(m("fn f(a) { head").contains("missing `}`"));
+        assert!(m("fn f a { head }").contains("malformed"));
+        assert!(m("fn 9x(a) { head }").contains("not a valid name"));
+        assert!(m("fn f(a-b) { head }").contains("not a valid parameter"));
     }
 }
