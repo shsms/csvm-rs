@@ -67,7 +67,7 @@ fn err(msg: impl Into<String>) -> Error {
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
     "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg",
-    "graph",
+    "graph", "fn",
 ];
 
 /// Names a `fn` may not take: every command, every alias, and `fn` itself.

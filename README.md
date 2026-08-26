@@ -72,6 +72,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |
 | `agg FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev) |
 | `join [(SUB)] FILE on KEYS, …` | merge right-side files in by key (inner/left/right/full) |
+| `fn name(a,b) { … }` | define a reusable pipeline fragment; call as `name(x,y)` |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
@@ -160,6 +161,10 @@ csvm 'join prices.csv on sku | sort price=nr | head' sales.csv
 
 # several files in one join — a trailing `on` is shared by every file
 csvm 'join pv.csv, batt.csv on timestamp' grid.csv
+
+# a fragment factors repeated stages; called like name(args)
+csvm 'fn prep(n) { rename value=n | cols -v metric }
+prep(pv) | join (prep(grid)) grid.csv on timestamp' pv.csv
 
 # per-column profile of every column, aligned
 csvm 'stats | fmt' input.csv

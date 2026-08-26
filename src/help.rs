@@ -296,6 +296,23 @@ instead of a terminal chart.",
         ],
     },
     CmdHelp {
+        name: "fn",
+        aliases: &[],
+        summary: "define a reusable pipeline fragment",
+        synopsis: &[
+            "fn NAME(PARAM[, PARAM...]) { STAGES }   (definitions come before the first stage)",
+            "  call: NAME(ARG[, ARG...]), as a stage of its own",
+        ],
+        detail: "A fragment is a reusable run of stages. A call is a stage that is exactly \
+NAME(args); the arguments substitute into the body by name (whole identifiers, outside \
+quotes), so column names, file names, and expression operands all parameterize. Fragments \
+may call other fragments. A fragment cannot be called inside an expression — compute into \
+a column with add first.",
+        examples: &[
+            "csvm 'fn prep(n) { rename value=n | cols -v metric }\nprep(pv) | join (prep(q)) r.csv on ts' data.csv",
+        ],
+    },
+    CmdHelp {
         name: "join",
         aliases: &[],
         summary: "merge one or more CSVs by key",

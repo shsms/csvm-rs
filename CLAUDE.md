@@ -136,6 +136,16 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `apply_stages_over_rows`). The right side must be a file (never stdin). Paren
   groups make `split_stages` paren-aware so the sub-pipeline's `|` doesn't split
   the outer pipeline.
+- **`fn NAME(PARAM, …) { STAGES }`** defines a pipeline fragment in the script
+  prologue (before the first stage); a stage that is exactly `NAME(ARGS)`
+  expands it in place. Purely front-end textual macros (`parse_prologue` /
+  `FnTable` / `subst_params` / `Builder::expand_fragment` in `parse.rs`):
+  arguments substitute by whole identifier outside quoted literals, fragments
+  may call fragments (`MAX_FN_DEPTH` caps recursion), and calls work inside
+  `join (…)` sub-pipelines because the fn table threads through the sub-parse.
+  By `Plan` time no fragments remain, so the hot path is untouched. A fragment
+  name used inside an expression gets a whole-stages hint. Design:
+  `docs/superpowers/specs/2026-08-26-fn-fragments-design.md`.
 - **`color …`** attaches a colour rule (plan metadata, like `fmt`'s output
   mode): `color COLOUR EXPR` paints a row, `-c COL` a cell, `-g COLS RAMP [LO HI]`
   a value gradient (`-g` takes several columns, emitting one `Gradient` rule each
