@@ -222,7 +222,7 @@ impl<'a> Builder<'a> {
             };
         }
         let (cmd, rest) = split_first_word(stage);
-        match cmd {
+        let result = match cmd {
             "cols" | "cut" => self.parse_cols(rest),
             "select" | "where" | "filter" => self.parse_select(rest),
             "sort" => self.parse_sort(rest),
@@ -247,7 +247,24 @@ impl<'a> Builder<'a> {
                 Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
                 None => format!("unknown command: {other}"),
             })),
+        };
+        result.map_err(|e| self.hint_fragment(e))
+    }
+
+    /// A fragment name used inside an expression fails as an unknown
+    /// function; point at the whole-stage call form.
+    fn hint_fragment(&self, e: Error) -> Error {
+        let Error::Compile(msg) = &e else { return e };
+        let Some(tail) = msg.strip_prefix("unknown function: ") else {
+            return e;
+        };
+        let name = tail.split([' ', '(']).next().unwrap_or("");
+        if self.fns.contains_key(name) {
+            return err(format!(
+                "unknown function: {name} (`{name}` is a fragment — fragments expand only as whole stages)"
+            ));
         }
+        e
     }
 
     /// Instantiate fragment `name` and splice its stages in at this position:
@@ -3123,5 +3140,16 @@ mod tests {
             "{e}"
         );
         assert!(m("head\nfn f(a) { tail }").contains("before the first stage"));
+    }
+
+    #[test]
+    fn fn_used_in_expression_gets_a_hint() {
+        let e = parse("fn pf(a) { head }\nadd x pf(a)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("whole stages"), "{e}");
+        // No fragment of that name: the plain unknown-function error stands.
+        let e = parse("add x bogus(a)").unwrap_err().to_string();
+        assert!(!e.contains("whole stages"), "{e}");
     }
 }
