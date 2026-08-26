@@ -243,9 +243,17 @@ impl<'a> Builder<'a> {
             "fmt" => self.parse_fmt(rest),
             "hdr" => self.parse_hdr(rest),
             "fn" => Err(err("fn definitions must come before the first stage")),
-            other => Err(err(match crate::error::did_you_mean(other, COMMANDS) {
-                Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
-                None => format!("unknown command: {other}"),
+            other => Err(err(if self.fns.contains_key(other) {
+                format!(
+                    "unknown command: {other} (`{other}` is a fragment — call it as `{other}(ARGS)`)"
+                )
+            } else {
+                let mut cands: Vec<String> = COMMANDS.iter().map(|s| s.to_string()).collect();
+                cands.extend(self.fns.keys().cloned());
+                match crate::error::did_you_mean(other, &cands) {
+                    Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
+                    None => format!("unknown command: {other}"),
+                }
             })),
         };
         result.map_err(|e| self.hint_fragment(e))
@@ -3140,6 +3148,31 @@ mod tests {
             "{e}"
         );
         assert!(m("head\nfn f(a) { tail }").contains("before the first stage"));
+        // A defined fragment called without parens points at the call form.
+        let e = m("fn prep(n) { head }\nprep pv");
+        assert!(e.contains("call it as `prep(ARGS)`"), "{e}");
+        // ...and a near-miss bare word suggests fragment names too.
+        let e = m("fn prep(n) { head }\nprepp pv");
+        assert!(e.contains("did you mean `prep`"), "{e}");
+    }
+
+    #[test]
+    fn reserved_covers_every_command() {
+        // A new command added to COMMANDS must also be fn-reserved, or a
+        // user fragment could shadow it.
+        for c in COMMANDS {
+            assert!(RESERVED.contains(c), "`{c}` missing from RESERVED");
+        }
+    }
+
+    #[test]
+    fn fn_recursion_through_join_subpipeline_hits_depth_cap() {
+        // Depth threads through the join sub-parse; without it this would
+        // recurse unboundedly instead of erroring.
+        let e = parse("fn f(a) { join (f(a)) r.csv on k }\nf(x)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("too deep"), "{e}");
     }
 
     #[test]

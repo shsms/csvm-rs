@@ -45,7 +45,9 @@ default without new syntax.
   right columns: =join pv.csv as pv on ts= → =pv_value=, =pv_metric=) and/or a
   =--auto= flag deriving the prefix from the file stem (=pv.active.csv= →
   =pv_active_…=). Sugar over the sub-pipeline, never a replacement. Decided
-  with the multi-file join (2026-08-26); naming mechanism still open.
+  with the multi-file join (2026-08-26); naming mechanism still open. The
+  =fn= fragments feature (shipped) reduces this item's urgency but does not
+  replace it.
 - Multiple input files: =csvm SCRIPT a.csv b.csv= — concatenate inputs sharing a
   header (currently only one input is accepted; =join= already covers keyed
   merges).
