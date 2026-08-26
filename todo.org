@@ -40,6 +40,12 @@ default without new syntax.
 - Delimiter support =-d= / =--delim= (TSV) — a narrow near-term step toward the
   Source/Sink roadmap; touches the scanner + writer.
 - Column ranges / indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
+- Join naming sugar: kill the per-file =(rename value=X | cols -v metric)=
+  boilerplate in multi-file joins — per-item =as NAME= (prefix all non-key
+  right columns: =join pv.csv as pv on ts= → =pv_value=, =pv_metric=) and/or a
+  =--auto= flag deriving the prefix from the file stem (=pv.active.csv= →
+  =pv_active_…=). Sugar over the sub-pipeline, never a replacement. Decided
+  with the multi-file join (2026-08-26); naming mechanism still open.
 - Multiple input files: =csvm SCRIPT a.csv b.csv= — concatenate inputs sharing a
   header (currently only one input is accepted; =join= already covers keyed
   merges).

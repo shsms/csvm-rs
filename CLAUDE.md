@@ -106,8 +106,21 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   differ from `-n1` by ~1 ULP (parallel reduction order), the same caveat as
   sharded `stats`. A `group` combined with a `sort` (or another blocking stage)
   still takes the in-memory path.
-- **`join [FLAGS] [(SUBPIPELINE)] FILE on KEYS`** merges a right-side CSV in by
-  key. A blocking stage: the right `FILE` is run through its optional
+- **`join [FLAGS] ITEM[, ITEM…]`** (`ITEM := [(SUBPIPELINE)] FILE [on KEYS]`)
+  merges one or more right-side CSVs in by key. Items are separated by
+  top-level commas (`split_top_commas` — protects quoted and parenthesized
+  commas only, so quote a file path containing a comma; a composite key
+  list's commas split too, and the key-continuation step stitches those
+  fragments back onto their `on` clause). Either every item has its own
+  `on`, or a single trailing `on` is shared by all — mixing errors where
+  detectable, but a keyless, paren-less fragment after an `on` clause is
+  lexically identical to more keys, so a forgotten per-file `on` surfaces
+  at resolve time (`JoinStmt::own_keys` counts the keys from an explicit
+  `on` — the item's own, or the shared trailing one; `join_key_err` in
+  `plan.rs` hints on the continuation-appended ones). Multiple
+  items desugar to one `JoinStmt`/`Stage::Join` per file, left to right — pure
+  parser-level sugar (like `delta`), identical to chaining single joins; flags
+  apply to every item. A blocking stage: the right `FILE` is run through its optional
   parenthesized sub-`Plan` (a full recursive pipeline — this is the "DAG" node),
   materialized, and built into a `HashMap<key, Vec<right_row_idx>>`; the left rows
   probe it. Type flags `-l/--left`, `-r/--right`, `-F/--full` (inner default);

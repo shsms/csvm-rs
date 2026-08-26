@@ -193,3 +193,94 @@ fn stdin_right_side_rejected() {
     let err = csvm::parse::parse("join - on sku").unwrap_err().to_string();
     assert!(err.contains("not stdin"), "got: {err}");
 }
+
+#[test]
+fn multi_file_join_shared_trailing_keys() {
+    // The long-format widening this form was built for: each right file has
+    // its own sub-pipeline, one trailing `on` shared by all.
+    let pv = temp_csv("timestamp,metric,value\n1,pv,5\n2,pv,6\n");
+    let batt = temp_csv("timestamp,metric,value\n1,batt,7\n2,batt,8\n");
+    let out = run(
+        &format!(
+            "join (rename value=pv | cols -v metric) {}, \
+             (rename value=batt | cols -v metric) {} on timestamp",
+            pv.display(),
+            batt.display()
+        ),
+        "timestamp,grid\n1,10\n2,20\n",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        "timestamp,grid,pv,batt\n\
+         1,10,5,7\n\
+         2,20,6,8\n"
+    );
+}
+
+#[test]
+fn multi_file_join_per_item_keys() {
+    let prices = temp_csv("sku,price\nA,10\nB,20\n");
+    let tags = temp_csv("oid,tag\n1,x\n2,y\n");
+    let out = run(
+        &format!(
+            "join {} on sku, {} on id=oid",
+            prices.display(),
+            tags.display()
+        ),
+        "id,sku\n1,A\n2,B\n",
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        "id,sku,price,tag\n\
+         1,A,10,x\n\
+         2,B,20,y\n"
+    );
+}
+
+#[test]
+fn forgotten_per_file_on_gets_a_hint() {
+    // `join a.csv on x, b.csv` reads `b.csv` as another key column (it is
+    // lexically identical to a composite key list), so it fails at resolve —
+    // with a hint that it was read as an extra join key.
+    let prices = temp_csv("sku,price\nA,10\n");
+    let tags = temp_csv("oid,tag\n1,x\n");
+    let err = run(
+        &format!("join {} on sku, {}", prices.display(), tags.display()),
+        SALES,
+    )
+    .unwrap_err();
+    assert!(err.contains("did you forget its `on`"), "got: {err}");
+}
+
+#[test]
+fn shared_form_hint_is_provenance_based() {
+    let a = temp_csv("sku,x\nA,1\n");
+    let b = temp_csv("sku,y\nA,2\n");
+    // A dot-free continuation key hints too (it may be a forgotten file);
+    // the keyless first item inherits the same provenance boundary.
+    let err = run(
+        &format!("join {}, {} on sku, nope", a.display(), b.display()),
+        SALES,
+    )
+    .unwrap_err();
+    assert!(err.contains("did you forget its `on`"), "got: {err}");
+    // ...while a misspelled key from the `on` clause itself does not.
+    let err = run(
+        &format!("join {}, {} on skux", a.display(), b.display()),
+        SALES,
+    )
+    .unwrap_err();
+    assert!(!err.contains("did you forget"), "got: {err}");
+}
+
+#[test]
+fn explicit_dotted_key_gets_no_hint() {
+    // A missing key from an item's own `on` clause is a plain column error,
+    // even when its name looks like a file (`user.id` is a normal header).
+    let p = temp_csv("sku,price\nA,10\n");
+    let err = run(&format!("join {} on user.id", p.display()), SALES).unwrap_err();
+    assert!(err.contains("column not found"), "got: {err}");
+    assert!(!err.contains("did you forget"), "got: {err}");
+}

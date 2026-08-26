@@ -493,6 +493,12 @@ pub struct JoinStmt {
     /// defaults to `_r`. Only columns that would otherwise collide are suffixed.
     pub lsuffix: Option<String>,
     pub rsuffix: Option<String>,
+    /// How many leading `keys` came from an explicit `on` clause — this item's
+    /// own, or the shared trailing one copied verbatim onto keyless items.
+    /// Entries past it were appended by comma-continuation fragments, which
+    /// are lexically identical to a file missing its `on` — those drive the
+    /// forgotten-`on` hint when they fail to resolve.
+    pub own_keys: usize,
     /// The right sub-plan's *output* header, filled in before resolution by
     /// `exec::prepare_joins` (it requires reading the right file).
     pub right_header: Vec<String>,
@@ -517,15 +523,23 @@ impl JoinStmt {
     /// Non-clashing names are left untouched.
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
         self.left_ncols = header.len();
+        let own = self.own_keys;
         self.left_key_pos = self
             .keys
             .iter()
-            .map(|(l, _)| resolve_col(l, header))
+            .enumerate()
+            .map(|(i, (l, _))| {
+                resolve_col(l, header).map_err(|e| if i < own { e } else { join_key_err(e) })
+            })
             .collect::<Result<_, _>>()?;
         self.right_key_pos = self
             .keys
             .iter()
-            .map(|(_, r)| resolve_col(r, &self.right_header))
+            .enumerate()
+            .map(|(i, (_, r))| {
+                resolve_col(r, &self.right_header)
+                    .map_err(|e| if i < own { e } else { join_key_err(e) })
+            })
             .collect::<Result<_, _>>()?;
         // Emit every right column except the (redundant) key columns, in order.
         self.right_emit_pos = (0..self.right_header.len())
@@ -725,6 +739,18 @@ pub struct Plan {
     pub colors: Vec<ColorRule>,
     /// A terminal chart to draw instead of emitting CSV (the `graph` sink).
     pub graph: Option<GraphSpec>,
+}
+
+/// A continuation key (appended after an item's own `on` clause) that fails to
+/// resolve may really be a file missing its own `on` — the two are lexically
+/// identical (`join a.csv on x, b.csv`). Add that hint to the error.
+fn join_key_err(e: Error) -> Error {
+    match &e {
+        Error::Column { name, .. } => Error::Other(format!(
+            "{e} (`{name}` was read as an extra join key — did you forget its `on`?)"
+        )),
+        _ => e,
+    }
 }
 
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {

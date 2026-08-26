@@ -298,19 +298,24 @@ instead of a terminal chart.",
     CmdHelp {
         name: "join",
         aliases: &[],
-        summary: "merge a second CSV by key",
+        summary: "merge one or more CSVs by key",
         synopsis: &[
-            "join [FLAGS] [(SUB)] FILE on KEYS",
+            "join [FLAGS] ITEM[, ITEM...]      ITEM: [(SUB)] FILE [on KEYS]",
             "  FLAGS: -l/--left  -r/--right  -F/--full   (inner by default)",
             "         --lsuffix S  --rsuffix S   (suffix clashing columns)",
             "  KEYS:  name  or  lname=rname,  comma-separated for composite keys",
+            "         every item has its own `on`, or one trailing `on` shared by all",
         ],
-        detail: "FILE (the right side) is loaded fully and probed by the streamed left side, so \
-make it the smaller one. (SUB) is an optional csvm sub-pipeline run over FILE first. Output is \
-the left columns plus the right's non-key columns; a clashing right name is suffixed _r.",
+        detail: "Each FILE (a right side) is loaded fully and probed by the streamed left side, so \
+make it the smaller one. (SUB) is an optional csvm sub-pipeline run over its FILE first. Several \
+items join left to right, exactly like chaining one join per file. Quote a file path that \
+contains a comma. After an `on`, a keyless entry reads as another key column — so a file \
+missing its own `on` fails at resolve, with a hint. Output is the left columns \
+plus each right's non-key columns; a clashing right name is suffixed _r.",
         examples: &[
             "csvm 'join prices.csv on sku' sales.csv",
             "csvm 'join -l (cols sku,price) prices.csv on sku=item' sales.csv",
+            "csvm 'join pv.csv, batt.csv on timestamp' grid.csv",
         ],
     },
     CmdHelp {
@@ -529,7 +534,11 @@ mod tests {
 
     #[test]
     fn render_resolves_commands_aliases_and_topics() {
-        assert!(render(Some("join")).unwrap().contains("merge a second CSV"));
+        assert!(
+            render(Some("join"))
+                .unwrap()
+                .contains("merge one or more CSVs")
+        );
         assert!(render(Some("cut")).unwrap().contains("cols —")); // alias resolves
         assert!(render(Some("colors")).unwrap().contains("magenta")); // topic
         assert!(render(None).unwrap().contains("commands")); // overview

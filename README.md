@@ -71,7 +71,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |
 | `agg FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev) |
-| `join [(SUB)] FILE on KEYS` | merge a right-side file in by key (inner/left/right/full) |
+| `join [(SUB)] FILE on KEYS, …` | merge right-side files in by key (inner/left/right/full) |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
@@ -157,6 +157,9 @@ csvm 'add total amount * qty | delta total | fmt' input.csv
 
 # inner join on a key, then sort the result
 csvm 'join prices.csv on sku | sort price=nr | head' sales.csv
+
+# several files in one join — a trailing `on` is shared by every file
+csvm 'join pv.csv, batt.csv on timestamp' grid.csv
 
 # per-column profile of every column, aligned
 csvm 'stats | fmt' input.csv

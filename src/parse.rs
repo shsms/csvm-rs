@@ -240,11 +240,19 @@ impl Builder {
         Ok(())
     }
 
-    /// `join [FLAGS] [(SUBPIPELINE)] FILE on KEYS` merges a right-side file into
-    /// the stream by key. Flags pick the join type (`-l/--left`, `-r/--right`,
-    /// `-F/--full`; inner by default). The optional parenthesized sub-pipeline is
-    /// a full csvm script run over the right file before joining. `KEYS` is a
-    /// comma/space list of `name` or `lname=rname`.
+    /// `join [FLAGS] ITEM[, ITEM...]` where `ITEM := [(SUBPIPELINE)] FILE [on
+    /// KEYS]` merges one or more right-side files into the stream by key
+    /// (desugaring to one join stage per file, left to right). Flags pick the
+    /// join type (`-l/--left`, `-r/--right`, `-F/--full`; inner by default) and
+    /// apply to every item. The optional parenthesized sub-pipeline is a full
+    /// csvm script run over that right file before joining. `KEYS` is a
+    /// comma/space list of `name` or `lname=rname`; either every item has its
+    /// own `on`, or a single trailing `on` is shared by all. A keyless,
+    /// paren-less fragment after an `on` clause reads as more keys (it is
+    /// lexically identical to a composite key list), so a file missing its
+    /// `on` in the all-explicit form surfaces at resolve time, with a hint —
+    /// not here (with a sub-pipeline it still errors at parse time). A file
+    /// path containing a comma must be quoted.
     fn parse_join(&mut self, rest: &str) -> Result<(), Error> {
         let mut s = rest.trim_start();
         let mut join_type = JoinType::Inner;
@@ -278,61 +286,101 @@ impl Builder {
             s = after;
         }
 
-        // Optional `(SUBPIPELINE)` — a full csvm script over the right file.
-        let right_plan = if s.starts_with('(') {
-            let (inner, after) = take_paren_group(s)?;
-            s = after.trim_start();
-            if inner.trim().is_empty() {
-                Box::new(identity_plan())
-            } else {
-                Box::new(parse(inner)?)
-            }
-        } else {
-            Box::new(identity_plan())
-        };
-
-        // The right-side file path.
-        let (file, after) = take_token(s);
-        if file.is_empty() {
+        // Comma-separated items: `[(SUBPIPELINE)] FILE [on KEYS]`.
+        if s.is_empty() {
             return Err(err("join expects a right-side file"));
         }
-        if file == "-" {
-            return Err(err("join's right side must be a file, not stdin"));
-        }
-        s = after.trim_start();
+        let mut stmts: Vec<JoinStmt> = Vec::new();
+        for frag in split_top_commas(s) {
+            let frag = frag.trim();
+            if frag.is_empty() {
+                return Err(err("join: empty item (stray comma?)"));
+            }
+            // Composite keys are comma-separated too: a fragment with no `on`
+            // and no sub-pipeline extends the previous item's key list.
+            if !frag.starts_with('(')
+                && !has_bare_word(frag, "on")
+                && let Some(prev) = stmts.last_mut().filter(|j| !j.keys.is_empty())
+            {
+                parse_join_keys(frag, &mut prev.keys)?;
+                continue;
+            }
 
-        // `on KEY[,KEY...]`.
-        let (kw, key_str) = split_first_word(s);
-        if kw != "on" {
+            // Optional `(SUBPIPELINE)` — a full csvm script over the right file.
+            let mut f = frag;
+            let right_plan = if f.starts_with('(') {
+                let (inner, after) = take_paren_group(f)?;
+                f = after.trim_start();
+                if inner.trim().is_empty() {
+                    Box::new(identity_plan())
+                } else {
+                    Box::new(parse(inner)?)
+                }
+            } else {
+                Box::new(identity_plan())
+            };
+
+            // The right-side file path.
+            let (file, after) = take_token(f);
+            if file.is_empty() {
+                return Err(err("join expects a right-side file"));
+            }
+            if file == "-" {
+                return Err(err("join's right side must be a file, not stdin"));
+            }
+            f = after.trim_start();
+
+            // Optional `on KEY[,KEY...]`.
+            let mut keys = Vec::new();
+            if !f.is_empty() {
+                let (kw, key_str) = split_first_word(f);
+                if kw != "on" {
+                    return Err(err("join expects `on KEY[,KEY...]` after the file"));
+                }
+                parse_join_keys(key_str, &mut keys)?;
+                if keys.is_empty() {
+                    return Err(err("join `on` expects at least one key column"));
+                }
+            }
+
+            stmts.push(JoinStmt {
+                join_type,
+                right_plan,
+                file: file.to_string(),
+                own_keys: keys.len(),
+                keys,
+                lsuffix: lsuffix.clone(),
+                rsuffix: rsuffix.clone(),
+                right_header: Vec::new(),
+                left_key_pos: Vec::new(),
+                right_key_pos: Vec::new(),
+                right_emit_pos: Vec::new(),
+                left_ncols: 0,
+            });
+        }
+
+        // Key rule: every item carries its own `on`, or only the last does and
+        // its keys are shared by all — mixing the two forms is an error.
+        // (`stmts` can't be empty: the first fragment either errors or pushes.)
+        let (last, init) = stmts.split_last_mut().expect("non-empty");
+        if last.keys.is_empty() {
             return Err(err("join expects `on KEY[,KEY...]` after the file"));
         }
-        let mut keys = Vec::new();
-        for spec in split_list(key_str) {
-            match spec.split_once('=') {
-                None => keys.push((spec.clone(), spec)),
-                Some((l, r)) if !l.is_empty() && !r.is_empty() => {
-                    keys.push((l.to_string(), r.to_string()));
-                }
-                Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
+        let missing = init.iter().filter(|j| j.keys.is_empty()).count();
+        if missing > 0 && missing != init.len() {
+            return Err(err(
+                "join: give every file its own `on`, or one trailing `on` shared by all",
+            ));
+        }
+        if missing > 0 {
+            let shared = last.keys.clone();
+            for j in init.iter_mut().filter(|j| j.keys.is_empty()) {
+                j.keys = shared.clone();
+                j.own_keys = last.own_keys;
             }
         }
-        if keys.is_empty() {
-            return Err(err("join `on` expects at least one key column"));
-        }
 
-        self.items.push(Item::Join(JoinStmt {
-            join_type,
-            right_plan,
-            file: file.to_string(),
-            keys,
-            lsuffix,
-            rsuffix,
-            right_header: Vec::new(),
-            left_key_pos: Vec::new(),
-            right_key_pos: Vec::new(),
-            right_emit_pos: Vec::new(),
-            left_ncols: 0,
-        }));
+        self.items.extend(stmts.into_iter().map(Item::Join));
         Ok(())
     }
 
@@ -1008,6 +1056,64 @@ fn split_add_name(rest: &str) -> Result<(String, &str), Error> {
         let (name, expr) = split_first_word(rest);
         Ok((name.to_string(), expr))
     }
+}
+
+/// Split `s` on commas outside quotes and parens — `join`'s item separator.
+/// Only quoted and parenthesized (sub-pipeline) commas are protected; a
+/// composite key list's commas split here too, and the key-continuation step
+/// in `parse_join` stitches those fragments back onto their `on` clause.
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut start = 0;
+    for (i, &c) in bytes.iter().enumerate() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == b'"' || c == b'\'' || c == b'`' => quote = Some(c),
+            None if c == b'(' => depth += 1,
+            None if c == b')' => depth = depth.saturating_sub(1),
+            None if c == b',' && depth == 0 => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            None => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// True when `word` appears as a bare (unquoted) whitespace-delimited token.
+fn has_bare_word(s: &str, word: &str) -> bool {
+    let mut rest = s.trim_start();
+    while !rest.is_empty() {
+        let quoted = matches!(rest.as_bytes()[0], b'"' | b'\'' | b'`');
+        let (tok, after) = take_token(rest);
+        if !quoted && tok == word {
+            return true;
+        }
+        // Always progresses: a quoted token consumes its quotes even when
+        // empty, and an unquoted token is non-empty (`rest` is trimmed).
+        rest = after.trim_start();
+    }
+    false
+}
+
+/// Parse `KEY[,KEY...]` specs (`name` or `lname=rname`) onto `keys`.
+fn parse_join_keys(spec_list: &str, keys: &mut Vec<(String, String)>) -> Result<(), Error> {
+    for spec in split_list(spec_list) {
+        match spec.split_once('=') {
+            None => keys.push((spec.clone(), spec)),
+            Some((l, r)) if !l.is_empty() && !r.is_empty() => {
+                keys.push((l.to_string(), r.to_string()));
+            }
+            Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
+        }
+    }
+    Ok(())
 }
 
 /// Split an argument string into items on commas and whitespace, respecting
@@ -2415,6 +2521,95 @@ mod tests {
         };
         assert_eq!(j.lsuffix.as_deref(), Some("_l"));
         assert_eq!(j.rsuffix.as_deref(), Some("_r"));
+    }
+
+    #[test]
+    fn join_multiple_files_shared_trailing_keys() {
+        // Comma-separated files with one trailing `on` shared by all; the
+        // composite key list's own commas must not split items.
+        let plan = parse("join a.csv, b.csv on ts,serial").unwrap();
+        let [Stage::Join(a), Stage::Join(b)] = plan.stages.as_slice() else {
+            panic!("expected two join stages, got {:?}", plan.stages);
+        };
+        assert_eq!(a.file, "a.csv");
+        assert_eq!(b.file, "b.csv");
+        let keys = vec![
+            ("ts".to_string(), "ts".to_string()),
+            ("serial".to_string(), "serial".to_string()),
+        ];
+        assert_eq!(a.keys, keys);
+        assert_eq!(b.keys, keys);
+    }
+
+    #[test]
+    fn join_multiple_files_per_item_keys_and_subpipelines() {
+        // Every item carries its own `on`; sub-pipelines and aliased keys are
+        // per-item. A keyless fragment after an `on` extends that key list.
+        let plan =
+            parse("join (cols -v metric) a.csv on ts, sn, (rename v=w) b.csv on ts=stamp").unwrap();
+        let [Stage::Join(a), Stage::Join(b)] = plan.stages.as_slice() else {
+            panic!("expected two join stages, got {:?}", plan.stages);
+        };
+        assert_eq!(a.file, "a.csv");
+        assert_eq!(
+            a.keys,
+            vec![
+                ("ts".to_string(), "ts".to_string()),
+                ("sn".to_string(), "sn".to_string()),
+            ]
+        );
+        assert_eq!(a.right_plan.stages.len(), 1);
+        assert_eq!(b.file, "b.csv");
+        assert_eq!(b.keys, vec![("ts".to_string(), "stamp".to_string())]);
+        assert_eq!(b.right_plan.stages.len(), 1);
+    }
+
+    #[test]
+    fn join_shared_flags_apply_to_every_item() {
+        let plan = parse("join -l --rsuffix _x a.csv, b.csv on k").unwrap();
+        let [Stage::Join(a), Stage::Join(b)] = plan.stages.as_slice() else {
+            panic!("expected two join stages, got {:?}", plan.stages);
+        };
+        for j in [a, b] {
+            assert_eq!(j.join_type, JoinType::Left);
+            assert_eq!(j.rsuffix.as_deref(), Some("_x"));
+        }
+    }
+
+    #[test]
+    fn join_rejects_mixed_key_forms() {
+        // A keyless first item followed by keyed items is neither the
+        // all-explicit nor the single-trailing-`on` form.
+        let e = parse("join a.csv, b.csv on x, c.csv on y").unwrap_err();
+        assert!(e.to_string().contains("every file"), "{e}");
+        // A stray comma is a dedicated error.
+        let e = parse("join a.csv,, b.csv on k").unwrap_err();
+        assert!(e.to_string().contains("stray comma"), "{e}");
+        // A lone file still requires `on`.
+        let e = parse("join a.csv").unwrap_err();
+        assert!(e.to_string().contains("expects `on"), "{e}");
+        // `on` with no keys.
+        let e = parse("join a.csv on").unwrap_err();
+        assert!(e.to_string().contains("at least one key"), "{e}");
+        // No file at all: the pre-branch message, not the stray-comma one.
+        let e = parse("join").unwrap_err();
+        assert!(e.to_string().contains("right-side file"), "{e}");
+        let e = parse("join -l").unwrap_err();
+        assert!(e.to_string().contains("right-side file"), "{e}");
+        // An empty quoted token is not a silent key-extension.
+        let e = parse("join a.csv on x, '' b.csv on y").unwrap_err();
+        assert!(e.to_string().contains("right-side file"), "{e}");
+    }
+
+    #[test]
+    fn join_quoted_path_keeps_its_comma() {
+        // A file path containing a comma must be quoted; the quoted comma is
+        // not an item separator.
+        let plan = parse("join 'a,b.csv' on k").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("expected one join stage, got {:?}", plan.stages);
+        };
+        assert_eq!(j.file, "a,b.csv");
     }
 
     /// The single `add`'s expression, for assertions.
