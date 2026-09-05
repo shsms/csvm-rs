@@ -290,19 +290,19 @@ sum/mean/stddev are blank for a non-numeric column.",
             "graph spark COL             one-line sparkline of a column",
             "graph scatter X Y[,Y2…]     points on a braille canvas",
             "graph line X Y[,Y2…]        connected points (multi-series)",
-            "  flags: --bins N (hist)  --scale F (size ×F)  --title T  --svg",
+            "  flags: -b/--bins N (hist)  -s/--scale F (size ×F)  -t/--title T  -S/--svg",
         ],
         detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
 it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
---scale F multiplies the default size; hist bins to Sturges' rule; bar is capped at 50 rows; \
+-s F multiplies the default size; hist bins to Sturges' rule; bar is capped at 50 rows; \
 scatter/line take multiple y-series, coloured with --color. A timestamp x is plotted on a true \
-time axis; any other non-numeric x plots by row order. --svg emits an SVG document to the output \
+time axis; any other non-numeric x plots by row order. -S emits an SVG document to the output \
 instead of a terminal chart.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
             "csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv",
-            "csvm 'graph line ts open,close --scale 1.5' prices.csv",
-            "csvm 'graph hist amount --svg' data.csv -o chart.svg",
+            "csvm 'graph line ts open,close -s 1.5' prices.csv",
+            "csvm 'graph hist amount -S' data.csv -o chart.svg",
         ],
     },
     CmdHelp {
@@ -329,7 +329,7 @@ a column with add first.",
         synopsis: &[
             "join [FLAGS] ITEM[, ITEM...]      ITEM: [(SUB)] FILE [on KEYS]",
             "  FLAGS: -l/--left  -r/--right  -F/--full   (inner by default)",
-            "         --lsuffix S  --rsuffix S   (suffix clashing columns)",
+            "         -L/--lsuffix S  -R/--rsuffix S   (suffix clashing columns)",
             "  KEYS:  name  or  lname=rname,  comma-separated for composite keys",
             "         every item has its own `on`, or one trailing `on` shared by all",
         ],

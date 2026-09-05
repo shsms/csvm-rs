@@ -152,11 +152,7 @@ fn stages_compose_after_join() {
 #[test]
 fn configured_suffixes_apply_to_both_sides() {
     let p = temp_csv(PRICES);
-    let out = run(
-        &format!("join --lsuffix _s --rsuffix _p {} on sku", p.display()),
-        SALES,
-    )
-    .unwrap();
+    let out = run(&format!("join -L _s -R _p {} on sku", p.display()), SALES).unwrap();
     // Only the clashing `qty` is suffixed; `price` (no clash) is untouched.
     assert_eq!(
         out,

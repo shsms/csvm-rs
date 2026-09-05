@@ -436,14 +436,14 @@ impl<'a> Builder<'a> {
         let mut rsuffix = None;
         loop {
             let (word, after) = split_first_word(s);
-            // `--lsuffix S` / `--rsuffix S` (or `=S`) set per-side clash suffixes.
-            if let Some(v) = flag_value(word, after, "--lsuffix") {
+            // `-L S` / `-R S` (or `=S`) set per-side clash suffixes.
+            if let Some(v) = flag_value(word, after, &["-L", "--lsuffix"]) {
                 let (val, rest_after) = v?;
                 lsuffix = Some(val);
                 s = rest_after;
                 continue;
             }
-            if let Some(v) = flag_value(word, after, "--rsuffix") {
+            if let Some(v) = flag_value(word, after, &["-R", "--rsuffix"]) {
                 let (val, rest_after) = v?;
                 rsuffix = Some(val);
                 s = rest_after;
@@ -607,7 +607,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `graph KIND COLS [--bins N] [--scale F] [--title T] [--svg]` — a
+    /// `graph KIND COLS [-b N] [-s F] [-t T] [-S]` — a
     /// terminal-chart sink. Draws from the columns reaching it instead of
     /// emitting CSV, so it must be the last command. `hist COL`, `spark COL`,
     /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`.
@@ -631,19 +631,19 @@ impl<'a> Builder<'a> {
         let mut s = rest.trim();
         while !s.is_empty() {
             let (word, after) = split_first_word(s);
-            if let Some(v) = flag_value(word, after, "--bins") {
+            if let Some(v) = flag_value(word, after, &["-b", "--bins"]) {
                 let (val, tail) = v?;
-                opts.bins = Some(parse_positive(&val, "--bins")?);
+                opts.bins = Some(parse_positive(&val, "-b/--bins")?);
                 s = tail.trim_start();
-            } else if let Some(v) = flag_value(word, after, "--scale") {
+            } else if let Some(v) = flag_value(word, after, &["-s", "--scale"]) {
                 let (val, tail) = v?;
                 opts.scale = parse_scale(&val)?;
                 s = tail.trim_start();
-            } else if let Some(v) = flag_value(word, after, "--title") {
+            } else if let Some(v) = flag_value(word, after, &["-t", "--title"]) {
                 let (val, tail) = v?;
                 opts.title = Some(val);
                 s = tail.trim_start();
-            } else if word == "--svg" {
+            } else if word == "-S" || word == "--svg" {
                 opts.svg = true;
                 s = after;
             } else if word.starts_with('-') && word != "-" {
@@ -1207,23 +1207,30 @@ fn take_token(s: &str) -> (&str, &str) {
     }
 }
 
-/// Match a `--name VALUE` or `--name=VALUE` flag. `None` if `word` isn't this
-/// flag; otherwise the value and the input remaining after it.
+/// Match a `-x VALUE` / `-x=VALUE` flag under any of its spellings (`names`
+/// lists the short and long forms). `None` if `word` isn't this flag;
+/// otherwise the value and the input remaining after it.
 fn flag_value<'a>(
     word: &str,
     after: &'a str,
-    name: &str,
+    names: &[&str],
 ) -> Option<Result<(String, &'a str), Error>> {
-    if word == name {
-        let (val, rest) = take_token(after);
-        if val.is_empty() {
-            return Some(Err(err(format!("{name} expects a value"))));
+    for name in names {
+        let Some(tail) = word.strip_prefix(name) else {
+            continue;
+        };
+        if tail.is_empty() {
+            let (val, rest) = take_token(after);
+            if val.is_empty() {
+                return Some(Err(err(format!("{name} expects a value"))));
+            }
+            return Some(Ok((val.to_string(), rest)));
         }
-        return Some(Ok((val.to_string(), rest)));
+        if let Some(val) = tail.strip_prefix('=') {
+            return Some(Ok((val.to_string(), after)));
+        }
     }
-    word.strip_prefix(name)
-        .and_then(|r| r.strip_prefix('='))
-        .map(|val| Ok((val.to_string(), after)))
+    None
 }
 
 /// `NAME(ARGS)` filling the whole stage — the fragment-call shape. Returns
@@ -1443,7 +1450,7 @@ fn parse_scale(s: &str) -> Result<f64, Error> {
     s.parse::<f64>()
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0)
-        .ok_or_else(|| err(format!("--scale expects a positive number, got `{s}`")))
+        .ok_or_else(|| err(format!("-s/--scale expects a positive number, got `{s}`")))
 }
 
 /// Split an `agg` argument at a top-level (paren-depth-0) `by` keyword into the
@@ -2410,6 +2417,13 @@ mod tests {
         assert_eq!(g.cols[0].name, "amount");
         assert_eq!(g.opts.bins, Some(12));
         assert_eq!(g.opts.title.as_deref(), Some("Spread"));
+        // Every flag has a short spelling too.
+        let plan = parse("graph hist amount -b 12 -s 1.5 -t Spread -S").unwrap();
+        let g = plan.graph.expect("graph metadata");
+        assert_eq!(g.opts.bins, Some(12));
+        assert_eq!(g.opts.title.as_deref(), Some("Spread"));
+        assert!(g.opts.svg);
+        assert!(parse("graph hist amount -b=3").is_ok());
     }
 
     #[test]
@@ -2787,6 +2801,13 @@ mod tests {
         let plan = parse("join --lsuffix _l --rsuffix=_r r.csv on k").unwrap();
         let [Stage::Join(j)] = plan.stages.as_slice() else {
             panic!("expected a join stage");
+        };
+        assert_eq!(j.lsuffix.as_deref(), Some("_l"));
+        assert_eq!(j.rsuffix.as_deref(), Some("_r"));
+        // Short spellings: `-L S` / `-R S`.
+        let plan = parse("join -L _l -R=_r r.csv on k").unwrap();
+        let Stage::Join(j) = &plan.stages[0] else {
+            panic!()
         };
         assert_eq!(j.lsuffix.as_deref(), Some("_l"));
         assert_eq!(j.rsuffix.as_deref(), Some("_r"));

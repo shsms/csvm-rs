@@ -175,16 +175,16 @@ csvm 'stats | fmt' input.csv
 csvm 'agg sum(amount),mean(amount) by region | sort amount_sum=nr | fmt' sales.csv
 
 # terminal histogram of a column's distribution (after a filter)
-csvm 'select region == "EU" | graph hist amount --bins 12' sales.csv
+csvm 'select region == "EU" | graph hist amount -b 12' sales.csv
 
 # horizontal bar chart of a total per group
 csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv
 
 # braille line chart of two series over time
-csvm 'graph line ts open,close --scale 1.5' prices.csv
+csvm 'graph line ts open,close -s 1.5' prices.csv
 
 # write the chart as an SVG instead of drawing in the terminal
-csvm 'graph hist amount --svg' sales.csv -o amount.svg
+csvm 'graph hist amount -S' sales.csv -o amount.svg
 
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
@@ -253,7 +253,7 @@ and alignment — reporting per-operation throughput.
 ## Roadmap
 
 The pipe language is built to grow. Terminal-native charts ship today
-(`graph hist/bar/spark/scatter/line`, with `--svg` export), as do conditional
+(`graph hist/bar/spark/scatter/line`, with `-S` SVG export), as do conditional
 colouring (`color`) and Parquet input. Planned: Parquet projection push-down and
 write, JSON-lines output, and a scatter density colour ramp. See `todo.org` for
 design notes.

@@ -171,7 +171,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   the left key column). `on` keys are `name` or `lname=rname`, composite via a
   list; matching is exact string equality on the CSV-encoded key cells (like
   `uniq`). Output = left cols ++ right non-key cols; a clashing right name is
-  suffixed `_r` (configurable per side with `--lsuffix`/`--rsuffix` — only
+  suffixed `_r` (configurable per side with `-L`/`-R`, long `--lsuffix`/`--rsuffix` — only
   *clashing* names are touched). `exec::prepare_joins` reads each right file's
   header and resolves its sub-plan *before* the pure `Plan::resolve` (which needs
   the right header to compute the joined schema); `main` calls it between parse
@@ -257,12 +257,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     is *graduated* with intermediate ticks (`x_label_row`/`place_ticks`): numeric
     uses round 1/2/5×10ⁿ values (`nice_ticks`), time interpolates and drops the
     date to `HH:MM:SS` when every tick is the same day, categories show only the
-    end cells; tick count adapts to width (so `--scale` adds more), labels that
+    end cells; tick count adapts to width (so `-s` adds more), labels that
     collide are dropped.
-  Flags: `--bins N` (hist), `--scale F`, `--title T`, `--svg`. A single `--scale`
+  Flags: `-b N` (hist), `-s F`, `-t T`, `-S`, with long forms `--bins`,
+  `--scale`, `--title`, `--svg` (`flag_value` in `parse.rs` takes every
+  spelling of a flag). A single `-s`
   multiplies both base dimensions (`graph::chart_size`: `BASE_W`=80 cols,
   `BASE_H`=15 rows; default 1.0) — there is no separate width/height knob and no
-  terminal probing. `--svg` emits a
+  terminal probing. `-S` emits a
   standalone SVG document to the normal output instead of the terminal chart
   (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
   (needs a raster dep) and a scatter density colour ramp are the remaining
