@@ -16,12 +16,11 @@ fn csvm(args: &[&str], stdin: &str) -> (bool, String, String) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn csvm");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin.as_bytes())
-        .unwrap();
+    // A script that fails to parse exits before reading stdin, so the write
+    // can find the pipe already closed.
+    if let Err(e) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     let out = child.wait_with_output().unwrap();
     (
         out.status.success(),
