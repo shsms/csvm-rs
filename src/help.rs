@@ -514,7 +514,9 @@ a to-str column); else two untyped operands auto-detect per row for an ordering 
 while == / != stay lexical. A numeric literal or to-num thus wins over a to-str column. A column \
 added by `add` carries its expression's static type — including one inherited from a to-num/\
 to-str column or from a ternary whose branches agree — so later comparisons against it behave \
-the same as against the expression itself. Sort follows the same idea per key: a bare `sort col` \
+the same as against the expression itself. A type is pinned by position, so to-num 2 and to-num \
+qty pin the same column, and the pin survives a rename or a cols reorder. Sort follows the same \
+idea per key: a bare `sort col` \
 auto-detects per cell (numbers numerically and first, then text lexically; a blank reads as 0, \
 as in select), =n / to-num forces numeric, =s / to-str forces lexical. Empty cells coerce to 0 in \
 numeric context; a non-numeric cell in a strictly-numeric \

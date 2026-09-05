@@ -22,14 +22,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   (=to-num=, =add=, parquet). Fix: spill the already-computed key bytes with
   each line (length-prefixed) and read them back in the merge — which also
   removes the per-line re-parse — or serialize spilled numbers round-trip.
-- =to-num= / =to-str= type tracking is keyed by the spec text at parse time
-  (=col_types= in =parse.rs=), so a positional spelling misses it: =to-str 1 |
-  sort qty= and =to-str qty | sort 1= both sort =auto=, and =to-num qty | sort
-  1= quietly drops =to-num='s strictness. Fix: decide =SortMode= / =CmpMode=
-  upgrades at resolve time from a position-keyed type map that =Plan::resolve=
-  threads through the statements (=ConvStmt= sets, =cols= reorders, reducing
-  stages reset), or reject mixed spellings.
-
 ** TODO Feature ideas
 - Default =-n= to the core count (=std::thread::available_parallelism=). Today
   threads default to 1, so the headline benefit needs =-n 8= every time. Output
@@ -67,6 +59,14 @@ git history; this file is the "what next / what was decided" scratchpad.
   document; consider dropping =:=.
 
 ** TODO Correctness / edges
+- Two type maps decide sort and compare modes: the parser's name-keyed
+  =col_types= (=parse.rs=; never sees a rename or a position) and
+  =Plan::resolve='s position-keyed one; resolve re-decides every comparison
+  (the parser never knows a type resolve lacks, so this only pins further)
+  and pins =Auto= sort keys. Make resolve the single owner: the parser leaves comparisons undecided and sort keys =Auto=, and
+  =col_types= / =default_sort_mode= go. =numericize='s non-numeric-literal
+  error then moves from parse time to resolve time (still before any row is
+  read), and =describe= of an unresolved plan shows undecided modes.
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
   spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
   A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
@@ -137,7 +137,8 @@ Comparison operands (=Cmp= in =plan.rs=) are now full =ValExpr=s, so arithmetic
 (=select price * qty >= 30=), functions (=abs(x) > 1=), and parenthesized
 boolean subexpressions compared as =t=/=f= (=(a >= 0) == (b >= 0)=) work in
 =select=, ternary tests, and =color= predicates. The =CmpMode= decision
-generalized to static expression types (=ExprParser::static_type=). Leaf
+generalized to static expression types (=CmpMode::decide= in =plan.rs=, from
+=ValExpr::static_type=). Leaf
 operands keep the old allocation-free fast path (=cmp_num=/=cmp_str= with
 =#[inline(never)]= compound fallbacks — benchmarked ~equal to the old
 =Operand=). A stateful =select= (=prev()=/=rownum()=) routes to the ordered

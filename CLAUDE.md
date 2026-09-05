@@ -52,9 +52,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   output and `--print-engine` show `qty`, not `2`. Join keys and `rename`'s
   source name still echo the spec text.
   Backticks are stripped before resolution (`split_list`), so they do not
-  force a name reading. Known gap: the parser's `to-num`/`to-str` type map is
-  keyed by the spec text, so `to-str 1 | sort qty` does not see the `to-str`
-  (`todo.org`).
+  force a name reading. A `to-num`/`to-str` given by position pins the same
+  column as one given by name: types are re-derived by position in
+  `Plan::resolve` (see *Implicit conversions*).
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
   `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
@@ -70,7 +70,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `prev()`/`rownum()` is stateful and routes to the ordered in-memory path,
   like a stateful `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
   `color` predicates reject stateful expressions at parse time (they render
-  post-run, where an unresolvable rule is silently dropped). A parenthesized
+  post-run, where a rule whose column is missing from the output, by name or
+  by position, is silently dropped; any other resolve error in a rule still
+  aborts). A parenthesized
   expression makes `select (…)` fall out for free, and chaining `select`s ANDs
   them. Comparison mode (numeric / lexical / per-row auto) is covered under
   *Implicit conversions* below.
@@ -272,15 +274,24 @@ csvm requires explicit `to_num` before numeric comparison/sort and `to_str`
 before output. csvm-rs makes these implicit:
 
 Each comparison resolves to one of three modes at compile time (`CmpMode` in
-`plan.rs`, decided in the `parse.rs` expression parser from the operands'
-**static types** — `ExprParser::static_type`, which consults the tracked
-`to-num`/`to-str` column types for `Col`/`prev` leaves and types a `?:` only
-when both branches agree; visible per-compare as `:num`/`:str`/`:auto` under
-`--print-engine`). The three checks below run **in order**, so a numeric signal
-wins over a string one (`to-str c | select c > 5` is still `Numeric` — the
-numeric literal decides). `sort` mirrors this per key with its own `SortMode`
-(a bare `sort c` auto-detects per cell; `=n`/`=s` or an earlier `to-num`/
-`to-str` pin it — see the `sort` bullet above):
+`plan.rs`, decided by `CmpMode::decide` from the operands' **static types** —
+`ValExpr::static_type`, which consults the tracked `to-num`/`to-str`/`add`
+column types for `Col`/`prev` leaves and types a `?:` only when both branches
+agree; visible per-compare as `:num`/`:str`/`:auto` under `--print-engine`).
+The decision runs twice: the parser decides by column *name*, then
+`Plan::resolve` re-decides from a **position-keyed** type map it threads
+through the statements (`to-num`/`to-str`/`add` set a column's type, `cols`
+reorders the map, `group` keeps its keys' types and types its aggregates,
+`stats` types its profile columns, a join keeps the left side's), so a type
+follows the column however it is spelled — `to-str 2 | sort qty`, a rename in
+between, a `cols` reorder, a `group` on the column. Resolve only pins further:
+an `Auto` becomes `Numeric`/`String` and a default `String` becomes
+`Numeric` (numericizing a literal), never the reverse. The three checks
+below run **in order**, so a numeric signal wins over a string one (`to-str c
+| select c > 5` is still `Numeric` — the numeric literal decides). `sort`
+mirrors this per key with its own `SortMode` (a bare `sort c` auto-detects
+per cell; `=n`/`=s` or a typed column pin it, the latter also at resolve time
+— see the `sort` bullet above):
 
 - A comparison with a **statically numeric side** (a numeric literal,
   arithmetic, a numeric function, `rownum()`, or a `to-num`-typed column) ⇒
