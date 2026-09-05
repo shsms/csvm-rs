@@ -11,8 +11,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   below): =split(s, sep, i)=, regex =match(s, re)= (first capture) and =sub=,
   and =epoch(ts)= exposing =src/datetime.rs= so a timestamp column becomes a
   numeric x for charts or plain arithmetic.
-- =count_distinct(col)= in =agg=: one =HashSet= per group, merged by union —
-  unlike median it is cheaply mergeable, so it fits the sharded path as-is.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
@@ -83,6 +81,11 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE =count_distinct(col)= in =agg=
+Shipped 2026-09-05: one =HashSet= per group and column, merged by union, so
+it shards like the other aggregates (unlike median). Empty cells are
+skipped, as =count(col)= skips them.
 
 ** DONE One aggregation spelling: =agg [NAME=]FN(col)… by KEYS=
 Shipped 2026-09-05: =group= is gone (a hint rewrites =group k= to =agg count

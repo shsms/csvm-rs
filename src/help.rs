@@ -273,12 +273,13 @@ numeric-only. Composes with sort/head/fmt after it.",
         summary: "aggregate rows per group",
         synopsis: &[
             "agg [NAME=]FN(col),... [by COLS]",
-            "  FN: count sum min max mean stddev   (count alone counts rows)",
+            "  FN: count count_distinct sum min max mean stddev   (count alone counts rows)",
             "  NAME=: name the output column (default col_func, e.g. amount_sum)",
             "  by COLS: the group keys; without it, one global row",
         ],
         detail: "Reduces to one row per key: the key columns then one column per aggregate. \
-sum/mean/stddev are blank for a non-numeric column.",
+count(col) and count_distinct(col) skip empty cells, and count_distinct tells values apart \
+by their output text (like a `by` key); sum/mean/stddev are blank for a non-numeric column.",
         examples: &[
             "csvm 'agg count, mean(amount) by region | fmt' sales.csv",
             "csvm 'agg total=sum(amount) by region,product' sales.csv",

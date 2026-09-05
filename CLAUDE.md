@@ -132,8 +132,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   streaming path.
 - **`agg [NAME=]FN(col),… [by COLS]`** reduces to one row per distinct key —
   the per-key sibling of `stats` (which reduces globally). `by COLS` gives the
-  keys; without it `agg` emits a single global row. Functions are `count/sum/min/max/mean/stddev` (a bare `count`
-  counts rows; `count(col)` counts non-empty cells); output cols are named
+  keys; without it `agg` emits a single global row. Functions are
+  `count/count_distinct/sum/min/max/mean/stddev` (a bare `count` counts rows;
+  `count(col)` counts non-empty cells, `count_distinct(col)` the distinct
+  ones, told apart by their output text like a `by` key, so a typed number
+  counts once per six-decimal rendering — one `HashSet` per group and
+  column, merged by union); output cols are named
   `col_func` (`amount_sum`) or `count`, or whatever a `NAME=FN(col)` spec
   gives (`AggSpec.name`). `sum/mean/stddev` are blank for a
   non-numeric column (same policy as `stats`). A blocking, reducing stage
