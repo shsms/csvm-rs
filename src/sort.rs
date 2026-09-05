@@ -29,7 +29,7 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
-use crate::plan::{SortStmt, Stmt, apply_stmts};
+use crate::plan::{self, SortMode, SortStmt, Stmt, apply_stmts};
 
 /// Default in-memory budget before runs start spilling to disk.
 pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
@@ -77,45 +77,58 @@ enum RunData {
 /// Append an order-preserving encoding of `row`'s sort keys to `out`, so that a
 /// plain byte comparison of two encodings reproduces [`SortStmt`] ordering
 /// (direction included). Numeric keys are 8 bytes; string keys are the bytes
-/// plus a terminator. (A `\0` inside a string key — never produced by normal
-/// CSV — would compare slightly off; UTF-8 never contains `\xFF`, used for the
-/// descending terminator.)
+/// plus a terminator; an auto key is a one-byte tag (numbers before text) and
+/// then whichever of the two encodings the cell got. (A `\0` inside a string
+/// key — never produced by normal CSV — would compare slightly off; UTF-8
+/// never contains `\xFF`, used for the descending terminator.)
 fn encode_key(row: &[Field], sort: &SortStmt, out: &mut Vec<u8>) -> Result<(), Error> {
     for key in &sort.keys {
         let field = row.get(key.pos);
-        if key.numeric {
-            let n = match field {
-                Some(f) => f.coerce_num()?,
-                None => 0.0,
-            };
-            // Map f64 to an order-preserving u64: flip the sign bit for
-            // positives, all bits for negatives.
-            let bits = n.to_bits();
-            let ordered = if bits >> 63 == 1 {
-                !bits
-            } else {
-                bits ^ (1 << 63)
-            };
-            let mut bytes = ordered.to_be_bytes();
-            if key.descending {
-                for b in &mut bytes {
-                    *b = !*b;
+        match key.mode {
+            SortMode::Numeric => encode_num(plan::cell_num(row, key.pos)?, key.descending, out),
+            SortMode::Lexical => encode_str(field, key.descending, out),
+            SortMode::Auto => match plan::auto_num(row, key.pos) {
+                Some(n) => {
+                    out.push(if key.descending { 0xFF } else { 0x00 });
+                    encode_num(n, key.descending, out);
                 }
-            }
-            out.extend_from_slice(&bytes);
-        } else if key.descending {
-            if let Some(f) = field {
-                out.extend(f.as_str().bytes().map(|b| !b));
-            }
-            out.push(0xFF);
-        } else {
-            if let Some(f) = field {
-                out.extend_from_slice(f.as_str().as_bytes());
-            }
-            out.push(0x00);
+                None => {
+                    out.push(if key.descending { 0xFE } else { 0x01 });
+                    encode_str(field, key.descending, out);
+                }
+            },
         }
     }
     Ok(())
+}
+
+/// Map an f64 to 8 order-preserving bytes: flip the sign bit for positives,
+/// all bits for negatives; every bit inverted again for descending.
+fn encode_num(n: f64, descending: bool, out: &mut Vec<u8>) {
+    let bits = n.to_bits();
+    let ordered = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits ^ (1 << 63)
+    };
+    let ordered = if descending { !ordered } else { ordered };
+    out.extend_from_slice(&ordered.to_be_bytes());
+}
+
+/// The cell's bytes plus a `0x00` terminator, every byte inverted for
+/// descending (so the terminator becomes `0xFF`). Bulk-copied, then
+/// inverted in place: this runs per row.
+fn encode_str(field: Option<&Field>, descending: bool, out: &mut Vec<u8>) {
+    let start = out.len();
+    if let Some(f) = field {
+        out.extend_from_slice(f.as_str().as_bytes());
+    }
+    out.push(0x00);
+    if descending {
+        for b in &mut out[start..] {
+            *b = !*b;
+        }
+    }
 }
 
 // --- the parallel sorter ----------------------------------------------------
@@ -616,14 +629,14 @@ fn encode_file_line(line: &[u8], sort: &SortStmt) -> Result<Box<[u8]>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plan::{SortKey, SortStmt};
+    use crate::plan::{SortKey, SortMode, SortStmt};
 
-    fn key(pos: usize, descending: bool, numeric: bool) -> SortKey {
+    fn key(pos: usize, descending: bool, mode: SortMode) -> SortKey {
         SortKey {
             name: "k".into(),
             pos,
             descending,
-            numeric,
+            mode,
         }
     }
 
@@ -651,7 +664,7 @@ mod tests {
     #[test]
     fn numeric_ascending() {
         let s = SortStmt {
-            keys: vec![key(0, false, true)],
+            keys: vec![key(0, false, SortMode::Numeric)],
         };
         assert_eq!(
             sort_lines(&s, &["10", "9", "100", "2", "-5"], 4, 1 << 30),
@@ -662,7 +675,7 @@ mod tests {
     #[test]
     fn numeric_descending_and_spilling() {
         let s = SortStmt {
-            keys: vec![key(0, true, true)],
+            keys: vec![key(0, true, SortMode::Numeric)],
         };
         // budget = 1 forces spilling so the file path is exercised too.
         assert_eq!(
@@ -674,14 +687,14 @@ mod tests {
     #[test]
     fn string_keys() {
         let s = SortStmt {
-            keys: vec![key(0, false, false)],
+            keys: vec![key(0, false, SortMode::Lexical)],
         };
         assert_eq!(
             sort_lines(&s, &["banana", "apple", "cherry", "ab"], 4, 1 << 30),
             ["ab", "apple", "banana", "cherry"]
         );
         let s = SortStmt {
-            keys: vec![key(0, true, false)],
+            keys: vec![key(0, true, SortMode::Lexical)],
         };
         assert_eq!(
             sort_lines(&s, &["banana", "apple", "cherry"], 4, 1),
@@ -693,7 +706,7 @@ mod tests {
     fn stable_on_ties() {
         // Sort by col 0; equal keys keep input order even one-row-per-block.
         let s = SortStmt {
-            keys: vec![key(0, false, true)],
+            keys: vec![key(0, false, SortMode::Numeric)],
         };
         assert_eq!(
             sort_lines(&s, &["1,a", "1,b", "0,c", "1,d"], 4, 1 << 30),
@@ -705,7 +718,10 @@ mod tests {
     fn multi_key() {
         // grp ascending (string), then val descending (numeric).
         let s = SortStmt {
-            keys: vec![key(0, false, false), key(1, true, true)],
+            keys: vec![
+                key(0, false, SortMode::Lexical),
+                key(1, true, SortMode::Numeric),
+            ],
         };
         assert_eq!(
             sort_lines(&s, &["a,1", "b,5", "a,9", "b,2"], 4, 1),
@@ -717,7 +733,7 @@ mod tests {
     /// levels before the final merge.
     fn sort_multilevel(lines: &[&str], threads: usize, budget: usize, fanout: usize) -> Vec<i64> {
         let sort = SortStmt {
-            keys: vec![key(0, false, true)],
+            keys: vec![key(0, false, SortMode::Numeric)],
         };
         let mut s = Sorter::with_params(&sort, &[], threads, std::env::temp_dir(), budget, 1 << 20);
         s.set_fanout(fanout);
@@ -760,7 +776,7 @@ mod tests {
         // Tag column carried along; equal keys must keep input order across all
         // the merge levels.
         let sort = SortStmt {
-            keys: vec![key(0, false, true)],
+            keys: vec![key(0, false, SortMode::Numeric)],
         };
         let lines: Vec<String> = (0..30).map(|i| format!("{},{i}", i % 3)).collect();
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();

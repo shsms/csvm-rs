@@ -22,8 +22,8 @@ use crate::field::Field;
 use crate::graph::Histogram;
 use crate::plan::{
     AggFunc, AggSpec, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind,
-    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
-    apply_stmts,
+    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
+    ValExpr, apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -2263,9 +2263,11 @@ fn describe_sort(sort: &SortStmt) -> String {
             if k.descending {
                 s.push_str(" reverse");
             }
-            if k.numeric {
-                s.push_str(" numeric");
-            }
+            s.push_str(match k.mode {
+                SortMode::Numeric => " numeric",
+                SortMode::Lexical => " lexical",
+                SortMode::Auto => " auto",
+            });
             s
         })
         .collect();
@@ -2442,12 +2444,23 @@ mod tests {
     }
 
     #[test]
-    fn lexical_vs_numeric_sort() {
+    fn auto_vs_forced_sort_modes() {
         let input = "n\n10\n9\n100\n";
         // numeric: 9 < 10 < 100
         assert_eq!(run_str("sort n=n", input).unwrap(), "n\n9\n10\n100\n");
-        // lexical (default): "10" < "100" < "9"
-        assert_eq!(run_str("sort n", input).unwrap(), "n\n10\n100\n9\n");
+        // auto (default) detects an all-numeric column: same order, no =n.
+        assert_eq!(run_str("sort n", input).unwrap(), "n\n9\n10\n100\n");
+        // lexical, forced with =s (or a to-str): "10" < "100" < "9"
+        assert_eq!(run_str("sort n=s", input).unwrap(), "n\n10\n100\n9\n");
+        assert_eq!(
+            run_str("to-str n | sort n", input).unwrap(),
+            "n\n10\n100\n9\n"
+        );
+        // A mixed column never aborts under auto: numbers first (numeric),
+        // then the rest lexically — while =n still rejects the text cell.
+        let mixed = "n\nx\n10\n\n9\n";
+        assert_eq!(run_str("sort n", mixed).unwrap(), "n\n9\n10\n\nx\n");
+        assert!(run_str("sort n=n", mixed).is_err());
     }
 
     #[test]

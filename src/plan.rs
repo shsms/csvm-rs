@@ -285,13 +285,30 @@ pub struct ConvStmt {
     pub positions: Vec<usize>,
 }
 
+/// How one `sort` key orders its cells. The sort-side counterpart of
+/// [`CmpMode`]: a bare column defaults to `Auto`; `=n` / a `to-num` column
+/// pins `Numeric`, `=s` / a `to-str` column pins `Lexical`. One deliberate
+/// difference: `select`'s auto reads a blank cell as 0, while `Auto` here
+/// reads it as text, so blanks sort after every number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortMode {
+    /// Decided per cell: a cell that parses as a number orders numerically
+    /// and before every non-number; the rest (text, empty) order lexically.
+    /// A total order that needs no type sampling, so it streams and shards.
+    Auto,
+    /// Every cell is coerced to a number (a non-number aborts the run).
+    Numeric,
+    /// Plain byte-wise text order.
+    Lexical,
+}
+
 /// One key of a `sort`.
 #[derive(Clone, Debug)]
 pub struct SortKey {
     pub name: String,
     pub pos: usize,
     pub descending: bool,
-    pub numeric: bool,
+    pub mode: SortMode,
 }
 
 #[derive(Clone, Debug)]
@@ -775,7 +792,7 @@ fn cell_str<'r>(row: &'r [Field], pos: usize) -> std::borrow::Cow<'r, str> {
 
 /// Coerce a row cell to a number, treating an out-of-range index as `0.0`.
 #[inline]
-fn cell_num(row: &[Field], pos: usize) -> Result<f64, Error> {
+pub(crate) fn cell_num(row: &[Field], pos: usize) -> Result<f64, Error> {
     match row.get(pos) {
         Some(f) => Ok(f.coerce_num()?),
         None => Ok(0.0),
@@ -1292,7 +1309,10 @@ impl SortStmt {
 
     /// Positions whose values must be converted to numbers before sorting.
     pub fn numeric_positions(&self) -> impl Iterator<Item = usize> + '_ {
-        self.keys.iter().filter(|k| k.numeric).map(|k| k.pos)
+        self.keys
+            .iter()
+            .filter(|k| k.mode == SortMode::Numeric)
+            .map(|k| k.pos)
     }
 
     /// Compare two rows by the sort keys. Numeric keys are assumed already
@@ -1300,10 +1320,15 @@ impl SortStmt {
     #[inline]
     pub fn compare(&self, a: &[Field], b: &[Field]) -> Ordering {
         for k in &self.keys {
-            let ord = if k.numeric {
-                num_of(a, k.pos).total_cmp(&num_of(b, k.pos))
-            } else {
-                cell_str(a, k.pos).cmp(&cell_str(b, k.pos))
+            let ord = match k.mode {
+                SortMode::Numeric => num_of(a, k.pos).total_cmp(&num_of(b, k.pos)),
+                SortMode::Lexical => cell_str(a, k.pos).cmp(&cell_str(b, k.pos)),
+                SortMode::Auto => match (auto_num(a, k.pos), auto_num(b, k.pos)) {
+                    (Some(x), Some(y)) => x.total_cmp(&y),
+                    (Some(_), None) => Ordering::Less,
+                    (None, Some(_)) => Ordering::Greater,
+                    (None, None) => cell_str(a, k.pos).cmp(&cell_str(b, k.pos)),
+                },
             };
             let ord = if k.descending { ord.reverse() } else { ord };
             if ord != Ordering::Equal {
@@ -1321,6 +1346,14 @@ fn num_of(row: &[Field], pos: usize) -> f64 {
         Some(f) => f.coerce_num().unwrap_or(0.0),
         None => 0.0,
     }
+}
+
+/// A cell as a number under [`SortMode::Auto`]: `None` for anything that is
+/// not a number — including an empty or missing cell, which `coerce_num`
+/// would read as 0 but auto treats as text (so blanks sort after numbers).
+#[inline]
+pub(crate) fn auto_num(row: &[Field], pos: usize) -> Option<f64> {
+    row.get(pos)?.num_opt()
 }
 
 /// Apply a sequence of statements to a row, returning whether it survives (only
@@ -1579,7 +1612,7 @@ mod tests {
                 name: "n".into(),
                 pos: 0,
                 descending: true,
-                numeric: true,
+                mode: SortMode::Numeric,
             }],
         };
         // numeric: 10 > 9 (lexically "10" < "9", so this proves numeric mode)

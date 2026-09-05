@@ -23,8 +23,8 @@ use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
-    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortStmt, Stage, StatsStmt,
-    Stmt, UniqStmt, ValExpr,
+    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage,
+    StatsStmt, Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -139,8 +139,14 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn is_num(&self, name: &str) -> bool {
-        self.col_types.get(name) == Some(&ColType::Num)
+    /// The default [`SortMode`] for a column: pinned by an earlier `to-num` /
+    /// `to-str`, else auto-detected per cell.
+    fn default_sort_mode(&self, name: &str) -> SortMode {
+        match self.col_types.get(name) {
+            Some(ColType::Num) => SortMode::Numeric,
+            Some(ColType::Str) => SortMode::Lexical,
+            None => SortMode::Auto,
+        }
     }
 
     /// Group the flat item list into stages: runs of statements become a
@@ -905,17 +911,20 @@ impl<'a> Builder<'a> {
                 return Err(err("sort spec is missing a column name"));
             }
             let mut key = SortKey {
-                numeric: self.is_num(&name),
+                mode: self.default_sort_mode(&name),
                 name,
                 pos: 0,
                 descending: false,
             };
             for ch in flags.chars() {
                 match ch {
-                    'n' => key.numeric = true,
+                    'n' => key.mode = SortMode::Numeric,
+                    's' => key.mode = SortMode::Lexical,
                     'r' => key.descending = true,
                     other => {
-                        return Err(err(format!("unknown sort flag '{other}' (use n and/or r)")));
+                        return Err(err(format!(
+                            "unknown sort flag '{other}' (use n or s, and/or r)"
+                        )));
                     }
                 }
             }
@@ -2262,17 +2271,17 @@ mod tests {
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
         };
-        assert!(s.keys[0].descending && s.keys[0].numeric); // c: =r, and numeric from to-num
-        assert!(!s.keys[1].descending && !s.keys[1].numeric); // a: default
-        assert!(s.keys[2].descending && s.keys[2].numeric); // id: =nr
+        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Numeric); // c: =r, numeric from to-num
+        assert!(!s.keys[1].descending && s.keys[1].mode == SortMode::Auto); // a: default
+        assert!(s.keys[2].descending && s.keys[2].mode == SortMode::Numeric); // id: =nr
 
         // `:` is an accepted alternative to `=` for the flags.
         let plan = parse("sort a:nr b").unwrap();
         let Stage::Sort(s) = &plan.stages[0] else {
             panic!()
         };
-        assert!(s.keys[0].descending && s.keys[0].numeric); // a: :nr
-        assert!(!s.keys[1].descending && !s.keys[1].numeric); // b: default
+        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Numeric); // a: :nr
+        assert!(!s.keys[1].descending && s.keys[1].mode == SortMode::Auto); // b: default
     }
 
     #[test]
