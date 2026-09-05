@@ -192,11 +192,15 @@ operands stay lexical.",
         aliases: &[],
         summary: "stable multi-key sort",
         synopsis: &[
-            "sort COL ...           sort by each column (lexical)",
-            "sort COL=nr ...        flags: n numeric, r reverse (also COL:nr)",
+            "sort COL ...           sort by each column (auto: numbers numerically, then text)",
+            "sort COL=nr ...        flags: n numeric, s lexical (string), r reverse (also COL:nr)",
         ],
-        detail: "Keys are applied left to right; the sort is stable. A column marked numeric by \
-to-num defaults to a numeric sort.",
+        detail: "Keys are applied left to right; the sort is stable. A bare column auto-detects per \
+cell: cells that parse as numbers order numerically and come first, the rest (text, empty) \
+follow lexically — so an all-numeric column sorts numerically with no flag, and a mixed one \
+never aborts. A blank is text here (select's auto reads it as 0); NaN and inf are numbers, as \
+for to-num. =n forces numeric (a non-number aborts), =s forces lexical; a to-num / to-str \
+column defaults to the matching mode. See `csvm help types`.",
         examples: &["csvm 'sort region score=nr' data.csv"],
     },
     CmdHelp {
@@ -382,8 +386,9 @@ delta is 0.",
         aliases: &[],
         summary: "force columns to numeric",
         synopsis: &["to-num COLS     parse these columns as numbers (alias: to_num)"],
-        detail: "Usually unnecessary (comparisons against a number literal coerce implicitly); \
-use it to make column-vs-column comparisons or a sort numeric. A non-numeric cell aborts the run.",
+        detail: "Usually unnecessary (comparisons and a bare sort auto-detect numbers); use it to \
+pin a column numeric so that == / != compare numerically, a sort rejects text instead of \
+sorting it last, and later stages inherit the type. A non-numeric cell aborts the run.",
         examples: &["csvm 'to-num qty | select qty > stock' data.csv"],
     },
     CmdHelp {
@@ -502,9 +507,10 @@ a to-str column); else two untyped operands auto-detect per row for an ordering 
 while == / != stay lexical. A numeric literal or to-num thus wins over a to-str column. A column \
 added by `add` carries its expression's static type — including one inherited from a to-num/\
 to-str column or from a ternary whose branches agree — so later comparisons against it behave \
-the same as against the expression itself. Sort is \
-separate: `sort col` is lexical unless you pass =n or to-num the column — it does not \
-auto-detect. Empty cells coerce to 0 in numeric context; a non-numeric cell in a strictly-numeric \
+the same as against the expression itself. Sort follows the same idea per key: a bare `sort col` \
+auto-detects per cell (numbers numerically and first, then text lexically; an empty cell counts \
+as text), =n / to-num forces numeric, =s / to-str forces lexical. Empty cells coerce to 0 in \
+numeric context; a non-numeric cell in a strictly-numeric \
 op aborts the run (auto falls back to lexical instead). Numbers always serialize correctly on \
 output — no to-str needed just to print.",
     },

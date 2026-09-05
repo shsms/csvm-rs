@@ -54,8 +54,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   expression makes `select (…)` fall out for free, and chaining `select`s ANDs
   them. Comparison mode (numeric / lexical / per-row auto) is covered under
   *Implicit conversions* below.
-- **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric)
-  and/or `r` (reverse) — e.g. `amount=nr`. Multi-key, stable.
+- **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric),
+  `s` (lexical / string), and/or `r` (reverse) — e.g. `amount=nr`. Multi-key,
+  stable. Each key has a `SortMode` (`plan.rs`): a bare column is `Auto`
+  (decided per *cell*: a cell that parses as a number orders numerically and
+  before every non-number; text and empty cells follow lexically, so unlike
+  `select`'s auto a blank is text, not 0; NaN/inf are numbers — a total
+  order, so it streams and shards without sampling types, and a mixed column
+  never aborts), `=n` or a `to-num` column is `Numeric` (a non-number aborts),
+  `=s` or a `to-str` column is `Lexical`. The external sort's encoded key
+  (`encode_key` in `sort.rs`) prefixes an auto key with a one-byte tag
+  (number / text) and the in-memory comparator (`SortStmt::compare`) applies
+  the same rule via `plan::auto_num`, so both paths agree byte for byte.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort, else truncates in the materialized
@@ -247,9 +257,9 @@ Each comparison resolves to one of three modes at compile time (`CmpMode` in
 when both branches agree; visible per-compare as `:num`/`:str`/`:auto` under
 `--print-engine`). The three checks below run **in order**, so a numeric signal
 wins over a string one (`to-str c | select c > 5` is still `Numeric` — the
-numeric literal decides). This is comparison-only; `sort` keeps its own per-key
-flag (a bare `sort c` stays lexical unless `=n` or an earlier `to-num`), so it
-does *not* auto-detect:
+numeric literal decides). `sort` mirrors this per key with its own `SortMode`
+(a bare `sort c` auto-detects per cell; `=n`/`=s` or an earlier `to-num`/
+`to-str` pin it — see the `sort` bullet above):
 
 - A comparison with a **statically numeric side** (a numeric literal,
   arithmetic, a numeric function, `rownum()`, or a `to-num`-typed column) ⇒

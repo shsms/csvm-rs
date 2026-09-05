@@ -84,17 +84,21 @@ columns stay lexical (float equality is fragile). Visible as =:auto= under
 =--print-engine=. The =num()= coercion alternative was dropped — auto fixes the
 default without new syntax.
 
-** TODO Decisions to make
-- Sort vs select numeric-detect asymmetry (follow-up to the auto-compare work
-  above): =select a > b= on two untyped columns now auto-detects numeric per row,
-  but =sort a= stays *lexical* by default (its own =SortKey.numeric=, set only by
-  =a=n= or a prior =to-num=). So =select qty > stock | sort qty= filters by
-  numeric magnitude yet orders =100= before =9= as text — a surprising mismatch on
-  the same column. Decide: give =sort= an analogous per-key auto-detect default
-  (changes the default order for every untyped column — a bigger behavioural
-  change, needs an escape hatch like =sort a=s= to force lexical), or leave the
-  asymmetry as-is (documented in =help types= / CLAUDE.md) since a streaming sort
-  can't cheaply sample types. Leaning: document-only for now; revisit if it bites.
+** DONE Sort auto-detects like select (per-cell =SortMode::Auto=)
+The sort-vs-select asymmetry is closed (2026-09-05): =select qty > stock | sort
+qty= used to filter numerically yet order =100= before =9= as text. =SortKey=
+now carries a three-way =SortMode= (=plan.rs=): a bare column is =Auto=, =a=n= /
+=to-num= pins =Numeric=, and the new =a=s= / =to-str= pins =Lexical=. Auto is
+decided per *cell* rather than per column, because the external sort streams
+and cannot sample types first: a cell that parses as a number orders
+numerically and before every non-number; text and empty cells follow
+lexically. That is a total order, so it is reproducible at any =-n= and a
+mixed column never aborts. =encode_key= (=sort.rs=) prefixes an auto key with
+a one-byte tag and =SortStmt::compare= applies the same rule, so the external
+and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
+=--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
+a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
+auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
 
 ** TODO Smaller features
 - Column ranges / indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).

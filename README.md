@@ -64,7 +64,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `cols a,b,c`       | keep these columns, in this order                          |
 | `cols -v a,b`      | keep everything *except* these columns                     |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
-| `sort SPEC...`     | sort rows (stable, multi-key)                              |
+| `sort SPEC...`     | sort rows (stable, multi-key; `col=nr` flags: `n` numeric, `s` string, `r` reverse) |
 | `head [N]`         | keep the first `N` rows (default 10; `head -n -N` keeps all *but* the last N) |
 | `tail [N]`         | keep the last `N` rows (default 10; blocking)              |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
@@ -107,8 +107,10 @@ A few things worth knowing up front:
   and `&& || !` with parens; a leading `-v` negates the whole expression.
 - **Conversions are implicit.** A comparison against a number is numeric, against
   a string lexical — `amount > 1000` just works, and numbers print correctly with
-  no `to-str`. `to-num`/`to-str` remain as explicit overrides. Empty coerces to
-  `0`; a non-numeric value where a number is required aborts the run.
+  no `to-str`. A bare `sort col` auto-detects too: cells that are numbers sort
+  numerically and first, the rest lexically (`col=n` / `col=s` force one mode).
+  `to-num`/`to-str` remain as explicit overrides. Empty coerces to `0`; a
+  non-numeric value where a number is required aborts the run.
 - **`add` / `delta`** compute columns: `add total amount * qty`, and
   `add rate amount - prev(amount)` — or the shorthand `delta amount` — for the
   step-to-step difference. An `add` using `prev()`/`rownum()` runs ordered and

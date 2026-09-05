@@ -100,7 +100,11 @@ fn pipeline(c: &mut Criterion) {
         ("select_regex", "select name =~ '^name1'"),
         ("to_num", "to-num amount"),
         ("sort_numeric", "sort amount=n"),
-        ("sort_lexical", "sort region"),
+        ("sort_lexical", "sort region=s"),
+        // Auto (the bare-column default): a text key pays a failed number parse
+        // per cell, a numeric key the same parse `=n` does plus a tag byte.
+        ("sort_auto_text", "sort region"),
+        ("sort_auto_numeric", "sort amount"),
         ("sort_multikey", "sort region amount=n"),
         // group-by folds every row into a `Grouper` (the streaming reduce path);
         // low- and high-cardinality cases stress the per-row update vs the
