@@ -1606,6 +1606,29 @@ mod tests {
     }
 
     #[test]
+    fn sort_compare_auto_numbers_first_then_text() {
+        let s = SortStmt {
+            keys: vec![SortKey {
+                name: "n".into(),
+                pos: 0,
+                descending: false,
+                mode: SortMode::Auto,
+            }],
+        };
+        let row = |s: &str| vec![Field::Owned(s.to_string())];
+        // Two numbers: numeric (lexically "10" < "9").
+        assert_eq!(s.compare(&row("10"), &row("9")), Ordering::Greater);
+        // A number sorts before any text, including the empty cell.
+        assert_eq!(s.compare(&row("5"), &row("abc")), Ordering::Less);
+        assert_eq!(s.compare(&row("5"), &row("")), Ordering::Less);
+        // Two non-numbers: lexical.
+        assert_eq!(s.compare(&row(""), &row("abc")), Ordering::Less);
+        assert_eq!(s.compare(&row("b"), &row("a")), Ordering::Greater);
+        // A pre-converted number is still a number.
+        assert_eq!(s.compare(&[Field::Num(2.0)], &row("10")), Ordering::Less);
+    }
+
+    #[test]
     fn sort_compare_numeric_reverse() {
         let s = SortStmt {
             keys: vec![SortKey {

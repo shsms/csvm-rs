@@ -123,6 +123,37 @@ fn sort_numeric_reverse() {
 }
 
 #[test]
+fn sort_auto_agrees_with_select_on_the_same_column() {
+    // The motivating case: `select qty > stock` compares numerically per row,
+    // so a bare `sort qty` must order the same column numerically too
+    // (lexically 100 < 25 < 9). Thread count must not change the order.
+    let input = "id,qty,stock\n1,100,50\n2,9,5\n3,25,3\n4,7,30\n";
+    assert_eq!(
+        run_checked("select qty > stock | sort qty | cols id,qty", input),
+        "id,qty\n2,9\n3,25\n1,100\n"
+    );
+}
+
+#[test]
+fn sort_auto_treats_nan_and_inf_as_numbers_like_to_num() {
+    // f64 parsing accepts NaN and inf, as `to-num` does, so auto orders them
+    // as numbers (NaN last among them, per total_cmp) before any text.
+    let input = "n\nNaN\n5\nabc\ninf\n-inf\n";
+    assert_eq!(run_checked("sort n", input), "n\n-inf\n5\ninf\nNaN\nabc\n");
+}
+
+#[test]
+fn sort_of_a_string_typed_add_column_is_lexical() {
+    // The static type of an `add` expression pins the sort mode, so a
+    // string column stays lexical under the auto default.
+    let input = "id,qty\n1,10\n2,9\n3,100\n";
+    assert_eq!(
+        run_checked("add s qty ++ '' | sort s | cols s", input),
+        "s\n10\n100\n9\n"
+    );
+}
+
+#[test]
 fn sort_multi_key_lexical_then_reverse() {
     // forward by fieldA, then reverse by id (lexical) within ties
     assert_eq!(

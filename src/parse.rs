@@ -2285,6 +2285,43 @@ mod tests {
     }
 
     #[test]
+    fn sort_mode_flags_and_column_types() {
+        // `=s` pins lexical; a to-str column defaults to lexical; `=n` on a
+        // to-str column still wins (an explicit flag beats the tracked type).
+        let plan = parse("to-str z | sort a=s b z z=n").unwrap();
+        let Stage::Sort(s) = &plan.stages[1] else {
+            panic!()
+        };
+        assert_eq!(s.keys[0].mode, SortMode::Lexical); // a=s
+        assert_eq!(s.keys[1].mode, SortMode::Auto); // b: untyped
+        assert_eq!(s.keys[2].mode, SortMode::Lexical); // z: to-str
+        assert_eq!(s.keys[3].mode, SortMode::Numeric); // z=n
+        assert!(s.keys.iter().all(|k| !k.descending));
+        // `=sr` combines like `=nr`.
+        let plan = parse("sort a=sr").unwrap();
+        let Stage::Sort(s) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(s.keys[0].mode, SortMode::Lexical);
+        assert!(s.keys[0].descending);
+        // Unknown flags still error, naming the accepted set.
+        let err = parse("sort a=x").unwrap_err().to_string();
+        assert!(err.contains("unknown sort flag 'x'"), "{err}");
+        // A column typed by `add` inherits the mode too: a string expression
+        // sorts lexically, and a replace-in-place re-types the column.
+        let plan = parse("add s a ++ 'x' | sort s").unwrap();
+        let Stage::Sort(s) = &plan.stages[1] else {
+            panic!()
+        };
+        assert_eq!(s.keys[0].mode, SortMode::Lexical);
+        let plan = parse("to-num a | add a a ++ 'x' | sort a").unwrap();
+        let Stage::Sort(s) = &plan.stages[1] else {
+            panic!()
+        };
+        assert_eq!(s.keys[0].mode, SortMode::Lexical);
+    }
+
+    #[test]
     fn nested_and_or_with_parens() {
         let plan = parse("select a == 't' && (b > 0 || c > 0)").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
