@@ -91,7 +91,7 @@ fn removed_cast(cmd: &str) -> Option<&'static str> {
 fn removed_hint(cmd: &str, cast: &str, args: &str) -> Error {
     let cols = split_list(args);
     let stages: Vec<String> = if cols.is_empty() {
-        vec![format!("add COL {cast}(COL)")]
+        vec![format!("add COL = {cast}(COL)")]
     } else {
         cols.iter()
             .map(|c| {
@@ -105,7 +105,7 @@ fn removed_hint(cmd: &str, cast: &str, args: &str) -> Error {
                 } else {
                     c.clone()
                 };
-                format!("add {target} {cast}({arg})")
+                format!("add {target} = {cast}({arg})")
             })
             .collect()
     };
@@ -801,21 +801,45 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `add NAME EXPR` — append (or replace, if `NAME` exists) a computed
+    /// `add NAME = EXPR` — append (or replace, if `NAME` exists) a computed
     /// column. The expression is the value-expression grammar (arithmetic,
     /// `++` concat, functions, `?:`, `prev()`/`rownum()`). A backtick-quoted
     /// `NAME` may contain spaces.
     fn parse_add(&mut self, rest: &str) -> Result<(), Error> {
-        let (name, expr_src) = split_add_name(rest)?;
+        let (name, after, assigned) = split_name_eq(rest)?;
         if name.is_empty() {
             return Err(err(
-                "add expects a column name, e.g. add total amount * qty",
+                "add expects `add NAME = EXPR`, e.g. add total = amount * qty",
             ));
         }
-        if expr_src.trim().is_empty() {
-            return Err(err("add expects an expression after the column name"));
+        let expr_src = match assigned {
+            Some(e) => e.trim(),
+            None => {
+                let old = after.trim();
+                // The hints quote the name as the script must (a name with
+                // spaces or an `=` needs backticks).
+                let target = if name.contains(|c: char| c.is_whitespace() || c == '=') {
+                    format!("`{name}`")
+                } else {
+                    name.clone()
+                };
+                return Err(err(if old.is_empty() {
+                    "add expects `add NAME = EXPR`".to_string()
+                } else if let Some(value) = old.strip_prefix("==") {
+                    let value = value.trim();
+                    format!(
+                        "add: `==` is a comparison, not an assignment; write `add {target} = {value}` \
+                         (or `add {target} = `{name}` == {value}` for a t/f column)"
+                    )
+                } else {
+                    format!("add expects `add NAME = EXPR`, i.e. `add {target} = {old}`")
+                }));
+            }
+        };
+        if expr_src.is_empty() {
+            return Err(err("add expects an expression after `=`"));
         }
-        let toks = lex_expr(expr_src.trim())?;
+        let toks = lex_expr(expr_src)?;
         let mut parser = ExprParser { toks, pos: 0 };
         let expr = parser.parse_value_top()?;
         let stateful = expr.is_stateful();
@@ -1264,22 +1288,31 @@ fn split_first_word(stage: &str) -> (&str, &str) {
     }
 }
 
-/// Split `add`'s target column name from the rest (its expression). A
-/// backtick-quoted name may contain spaces; otherwise it's the first word.
-fn split_add_name(rest: &str) -> Result<(String, &str), Error> {
+/// Split a `NAME = …` assignment: the name, everything after it, and what
+/// follows a single `=` (`None` when there is no `=`, or a `==`, which is a
+/// comparison). A backtick-quoted name may contain spaces; otherwise the
+/// name ends at whitespace or at the `=`.
+fn split_name_eq(rest: &str) -> Result<(String, &str, Option<&str>), Error> {
     let rest = rest.trim_start();
-    if let Some(after_tick) = rest.strip_prefix('`') {
+    let (name, after) = if let Some(after_tick) = rest.strip_prefix('`') {
         match after_tick.find('`') {
-            Some(end) => Ok((
+            Some(end) => (
                 after_tick[..end].to_string(),
                 after_tick[end + 1..].trim_start(),
-            )),
-            None => Err(err("unterminated backtick column name in add")),
+            ),
+            None => return Err(err("unterminated backtick column name")),
         }
     } else {
-        let (name, expr) = split_first_word(rest);
-        Ok((name.to_string(), expr))
-    }
+        let end = rest
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(rest.len());
+        (rest[..end].to_string(), rest[end..].trim_start())
+    };
+    let assigned = match after.strip_prefix('=') {
+        Some(e) if !e.starts_with('=') => Some(e),
+        _ => None,
+    };
+    Ok((name, after, assigned))
 }
 
 /// Split `s` on commas outside quotes and parens — `join`'s item separator.
@@ -1904,7 +1937,7 @@ impl ExprParser {
 
     /// A value expression. Precedence (loosest first): `?:` ternary, the
     /// boolean connectives, `++` concat, `+ -`, `* / %`, unary `-`, then
-    /// atoms. A boolean subexpression used as a value (`add ok amount > 0`,
+    /// atoms. A boolean subexpression used as a value (`add ok = amount > 0`,
     /// `(a > 0) ++ '!'`) renders csvm-style `t`/`f`.
     fn parse_value(&mut self) -> Result<ValExpr, Error> {
         let e = self.parse_bv()?;
@@ -2157,7 +2190,7 @@ mod tests {
         // The parser decides no modes: every compare is `Auto` until
         // `Plan::resolve` decides from the operands and the column types it
         // tracks by position; a string literal stays a literal until then.
-        let plan = parse("add qty str(qty) | select qty > stock").unwrap();
+        let plan = parse("add qty = str(qty) | select qty > stock").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2165,7 +2198,7 @@ mod tests {
             panic!()
         };
         assert_eq!(c.mode, CmpMode::Auto);
-        let plan = parse("add c num(c) | select c == '5'").unwrap();
+        let plan = parse("add c = num(c) | select c == '5'").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2190,23 +2223,23 @@ mod tests {
             let err = parse(&format!("{cmd} a,b")).unwrap_err().to_string();
             assert!(err.contains("removed"), "{err}");
             assert!(
-                err.contains(&format!("add a {cast}(a) | add b {cast}(b)")),
+                err.contains(&format!("add a = {cast}(a) | add b = {cast}(b)")),
                 "{err}"
             );
         }
         let err = parse("to-str 2").unwrap_err().to_string();
-        assert!(err.contains("add 2 str(`2`)"), "{err}");
+        assert!(err.contains("add 2 = str(`2`)"), "{err}");
         let err = parse("to-num 'my col'").unwrap_err().to_string();
-        assert!(err.contains("add `my col` num(`my col`)"), "{err}");
+        assert!(err.contains("add `my col` = num(`my col`)"), "{err}");
         let err = parse("to_num(qty)").unwrap_err().to_string();
-        assert!(err.contains("add qty num(qty)"), "{err}");
+        assert!(err.contains("add qty = num(qty)"), "{err}");
         let err = parse("to-num").unwrap_err().to_string();
-        assert!(err.contains("add COL num(COL)"), "{err}");
+        assert!(err.contains("add COL = num(COL)"), "{err}");
     }
 
     #[test]
     fn sort_flags_and_stage_split() {
-        let plan = parse("add c num(c) | select c > 0 | sort c=r a id=nr").unwrap();
+        let plan = parse("add c = num(c) | select c > 0 | sort c=r a id=nr").unwrap();
         assert_eq!(plan.stages.len(), 2);
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
@@ -2228,7 +2261,7 @@ mod tests {
     fn sort_mode_flags() {
         // `=s` pins lexical and `=n` numeric; a bare key is auto until
         // `Plan::resolve` sees the column's type.
-        let plan = parse("add z str(z) | sort a=s b z z=n").unwrap();
+        let plan = parse("add z = str(z) | sort a=s b z z=n").unwrap();
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
         };
@@ -2751,7 +2784,7 @@ mod tests {
             "{}",
             msg("select a > 0 b")
         );
-        assert!(msg("add x a + b c").contains("unexpected 'c'"));
+        assert!(msg("add x = a + b c").contains("unexpected 'c'"));
         // A missing operator lists the valid ones and says what it found.
         let m = msg("select a");
         assert!(
@@ -2761,7 +2794,7 @@ mod tests {
         // Missing operand / close paren report what was found.
         assert!(msg("select a >").contains("found end of expression"));
         assert!(msg("select (a > 0").contains("expected ')'"));
-        assert!(msg("add x )").contains("found ')'"));
+        assert!(msg("add x = )").contains("found ')'"));
         // The shared lexer message no longer hardcodes "select".
         let u = msg("color red a == 'x");
         assert!(
@@ -2909,7 +2942,7 @@ mod tests {
             op: ArithOp::Add,
             rhs,
             ..
-        } = add_expr("add v a + b * c")
+        } = add_expr("add v = a + b * c")
         else {
             panic!("expected a top-level +");
         };
@@ -2927,19 +2960,19 @@ mod tests {
         // `amount - prev(amount)` must lex `-` as subtraction, not a sign on a
         // number — the case that makes a step delta expressible.
         assert!(matches!(
-            add_expr("add d amount - prev(amount)"),
+            add_expr("add d = amount - prev(amount)"),
             ValExpr::Arith {
                 op: ArithOp::Sub,
                 ..
             }
         ));
         // But in unary position a signed number is still a literal.
-        assert!(matches!(add_expr("add d -5"), ValExpr::Num(n) if n == -5.0));
+        assert!(matches!(add_expr("add d = -5"), ValExpr::Num(n) if n == -5.0));
     }
 
     #[test]
     fn add_prev_and_rownum_are_stateful() {
-        for script in ["add d a - prev(a)", "add n rownum()"] {
+        for script in ["add d = a - prev(a)", "add n = rownum()"] {
             let plan = parse(script).unwrap();
             let Stage::Transform(stmts) = &plan.stages[0] else {
                 panic!();
@@ -2947,7 +2980,7 @@ mod tests {
             assert!(stmts[0].is_stateful(), "{script} should be stateful");
         }
         // Pure arithmetic is not stateful (it can shard).
-        let plan = parse("add t a * 2").unwrap();
+        let plan = parse("add t = a * 2").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!();
         };
@@ -2957,11 +2990,11 @@ mod tests {
     #[test]
     fn add_ternary_and_concat() {
         assert!(matches!(
-            add_expr("add tier a > 1 ? 'big' : 'small'"),
+            add_expr("add tier = a > 1 ? 'big' : 'small'"),
             ValExpr::Cond { .. }
         ));
         assert!(matches!(
-            add_expr("add full a ++ ' ' ++ b"),
+            add_expr("add full = a ++ ' ' ++ b"),
             ValExpr::Concat(parts) if parts.len() == 3
         ));
     }
@@ -2970,10 +3003,37 @@ mod tests {
     fn add_rejects_bad_input() {
         assert!(parse("add").is_err()); // no name
         assert!(parse("add x").is_err()); // no expression
-        assert!(parse("add x a +").is_err()); // dangling operator
-        assert!(parse("add x bogus(a)").is_err()); // unknown function
-        assert!(parse("add x prev(a + 1)").is_err()); // prev needs a bare column
-        assert!(parse("add x round(a, b)").is_err()); // wrong arity
+        assert!(parse("add x = a +").is_err()); // dangling operator
+        assert!(parse("add x = bogus(a)").is_err()); // unknown function
+        assert!(parse("add x = prev(a + 1)").is_err()); // prev needs a bare column
+        assert!(parse("add x = round(a, b)").is_err()); // wrong arity
+    }
+
+    #[test]
+    fn add_requires_an_equals_sign() {
+        let plan = parse("add total = amount * qty").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Add(a) = &stmts[0] else { panic!() };
+        assert_eq!(a.name, "total");
+        // Spaces around `=` are optional; a backticked name works too.
+        assert!(parse("add total=amount * qty").is_ok());
+        assert!(parse("add `my col` = 1").is_ok());
+        // The old spacing form is an error that shows the `=` spelling.
+        let err = parse("add total amount * qty").unwrap_err().to_string();
+        assert!(err.contains("add total = amount * qty"), "{err}");
+        let err = parse("add total").unwrap_err().to_string();
+        assert!(err.contains("add NAME = EXPR"), "{err}");
+        // `==` is not an assignment, and the hint does not paste it back in.
+        let err = parse("add total == 1").unwrap_err().to_string();
+        assert!(err.contains("`add total = 1`"), "{err}");
+        assert!(!err.contains("= =="), "{err}");
+        // The hints see past a backticked name (which the rest is sliced after).
+        let err = parse("add `x y` foo").unwrap_err().to_string();
+        assert!(err.contains("add `x y` = foo"), "{err}");
+        let err = parse("add `é` == 1").unwrap_err().to_string();
+        assert!(err.contains("`add é = 1`"), "{err}");
     }
 
     #[test]
@@ -3033,7 +3093,7 @@ mod tests {
     fn newlines_separate_stages_and_blank_lines_are_skipped() {
         // A multi-line `-f`-style script: newlines split stages, and blank or
         // comment-only lines are dropped.
-        let script = "# header comment\nselect a > 0\n\nadd b a * 2   # trailing comment\nfmt";
+        let script = "# header comment\nselect a > 0\n\nadd b = a * 2   # trailing comment\nfmt";
         let plan = parse(script).unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!();
@@ -3095,7 +3155,7 @@ mod tests {
             "abs(pv_active) + pv_active*a1 ++ 'a' | rename value=grid_q"
         );
         // A digit-led run is one token: `9a` does not substitute its tail.
-        assert_eq!(subst_params("add x 9a", &params, &args), "add x 9a");
+        assert_eq!(subst_params("add x = 9a", &params, &args), "add x = 9a");
     }
 
     #[test]
@@ -3171,12 +3231,12 @@ mod tests {
 
     #[test]
     fn fn_used_in_expression_gets_a_hint() {
-        let e = parse("fn pf(a) { head }\nadd x pf(a)")
+        let e = parse("fn pf(a) { head }\nadd x = pf(a)")
             .unwrap_err()
             .to_string();
         assert!(e.contains("whole stages"), "{e}");
         // No fragment of that name: the plain unknown-function error stands.
-        let e = parse("add x bogus(a)").unwrap_err().to_string();
+        let e = parse("add x = bogus(a)").unwrap_err().to_string();
         assert!(!e.contains("whole stages"), "{e}");
     }
 }

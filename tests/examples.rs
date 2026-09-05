@@ -111,7 +111,7 @@ fn num_then_str_roundtrip() {
     // num() then str() canonicalizes the number but is otherwise transparent.
     assert_eq!(
         run_checked(
-            "add countA num(countA) | select countA > 0 | add countA str(countA) | cols id,countA",
+            "add countA = num(countA) | select countA > 0 | add countA = str(countA) | cols id,countA",
             INPUT
         ),
         "id,countA\n1,3\n4,7\n"
@@ -186,7 +186,7 @@ fn sort_of_a_string_typed_add_column_is_lexical() {
     // string column stays lexical under the auto default.
     let input = "id,qty\n1,10\n2,9\n3,100\n";
     assert_eq!(
-        run_checked("add s qty ++ '' | sort s | cols s", input),
+        run_checked("add s = qty ++ '' | sort s | cols s", input),
         "s\n10\n100\n9\n"
     );
 }
@@ -208,17 +208,17 @@ fn column_types_follow_the_column_not_its_spelling() {
     // by name, after a rename, or after cols reorders it.
     let input = "id,qty\n1,10\n2,9\n3,100\n";
     let lexical = "id,qty\n1,10\n3,100\n2,9\n";
-    assert_eq!(run_checked("add qty str(qty) | sort 2", input), lexical);
+    assert_eq!(run_checked("add qty = str(qty) | sort 2", input), lexical);
     assert_eq!(
         run_checked(
-            "add qty str(qty) | cols qty,id | sort 1 | cols id,qty",
+            "add qty = str(qty) | cols qty,id | sort 1 | cols id,qty",
             input
         ),
         lexical
     );
     assert_eq!(
         run_checked(
-            "add qty num(qty) | rename qty=n | sort n | rename n=qty",
+            "add qty = num(qty) | rename qty=n | sort n | rename n=qty",
             input
         ),
         "id,qty\n2,9\n1,10\n3,100\n"
@@ -226,18 +226,18 @@ fn column_types_follow_the_column_not_its_spelling() {
     // The same for comparisons: a num()-typed column makes == numeric ...
     let pair = "a,b\n1000,1e3\n10,9\n9,10\n";
     assert_eq!(
-        run_checked("add a num(a) | select a == b", pair),
+        run_checked("add a = num(a) | select a == b", pair),
         "a,b\n1000,1e3\n"
     );
     // ... and a str()-typed column makes an ordering lexical ("9" > "10").
     assert_eq!(
-        run_checked("add a str(a) | select a > b", pair),
+        run_checked("add a = str(a) | select a > b", pair),
         "a,b\n9,10\n"
     );
     // A group key keeps its column's type, so the pin survives the reduce.
     assert_eq!(
         run_checked(
-            "add qty str(qty) | group qty | agg count | sort qty | cols qty",
+            "add qty = str(qty) | group qty | agg count | sort qty | cols qty",
             input
         ),
         "qty\n10\n100\n9\n"
@@ -247,28 +247,28 @@ fn column_types_follow_the_column_not_its_spelling() {
     // position 1 was typed numeric, and the stats `field` column is text.
     assert_eq!(
         run_checked(
-            "add amount num(amount) | group region | agg count | sort region",
+            "add amount = num(amount) | group region | agg count | sort region",
             "amount,region\n10,west\n9,east\n100,north\n"
         ),
         "region,count\neast,1\nnorth,1\nwest,1\n"
     );
     assert_eq!(
-        run_checked("add id num(id) | stats | sort field | cols field", input),
+        run_checked("add id = num(id) | stats | sort field | cols field", input),
         "field\nid\nqty\n"
     );
     // An `add` column carries its expression's static type, appended or
     // replaced in place, so a positional key on it sorts by that type.
     assert_eq!(
-        run_checked("add lbl upper(qty) | sort 3", input),
+        run_checked("add lbl = upper(qty) | sort 3", input),
         "id,qty,lbl\n1,10,10\n3,100,100\n2,9,9\n"
     );
     assert_eq!(
-        run_checked("add qty num(qty) | add qty upper(qty) | sort 2", input),
+        run_checked("add qty = num(qty) | add qty = upper(qty) | sort 2", input),
         "id,qty\n1,10\n3,100\n2,9\n"
     );
     // A literal that cannot be a number is a compile error, even inside a
     // colour rule ...
-    let err = run("add qty num(qty) | color red qty == 'x'", input, 1).unwrap_err();
+    let err = run("add qty = num(qty) | color red qty == 'x'", input, 1).unwrap_err();
     assert!(err.contains("non-numeric literal 'x'"), "{err}");
     // ... while a colour rule whose column is gone from the output is still
     // dropped, whether it named the column or gave its position.
@@ -608,16 +608,16 @@ fn add_can_name_its_target_by_position() {
     // by the expression, so a later bare sort on it is pinned.
     let input = "id,qty\n1,10\n2,9\n3,100\n";
     assert_eq!(
-        run_checked("add 2 str(`2`) | sort qty", input),
+        run_checked("add 2 = str(`2`) | sort qty", input),
         "id,qty\n1,10\n3,100\n2,9\n"
     );
     assert_eq!(
-        run_checked("add 2 num(`2`) | sort qty", input),
+        run_checked("add 2 = num(`2`) | sort qty", input),
         "id,qty\n2,9\n1,10\n3,100\n"
     );
     // A column literally named `7` wins over the (non-existent) position 7.
     assert_eq!(
-        run_checked("add 7 num(qty) * 2", "7,qty\nx,10\n"),
+        run_checked("add 7 = num(qty) * 2", "7,qty\nx,10\n"),
         "7,qty\n20,10\n"
     );
 }
@@ -627,8 +627,8 @@ fn add_rejects_a_position_that_is_out_of_range() {
     // A bare integer target is a position, so one past the header is an
     // error like anywhere else, not a new column named after the number.
     let input = "id,qty\n1,10\n";
-    let err = run("add 7 num(qty)", input, 1).unwrap_err();
+    let err = run("add 7 = num(qty)", input, 1).unwrap_err();
     assert!(err.contains("column index 7 is out of range"), "{err}");
-    let err = run("add 0 num(qty)", input, 1).unwrap_err();
+    let err = run("add 0 = num(qty)", input, 1).unwrap_err();
     assert!(err.contains("column index 0 is out of range"), "{err}");
 }

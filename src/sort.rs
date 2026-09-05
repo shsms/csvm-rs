@@ -753,11 +753,11 @@ mod tests {
 
     #[test]
     fn spilled_runs_keep_full_key_precision() {
-        // `add v num(v)` makes the sort key a `Field::Num`, which serializes
+        // `add v = num(v)` makes the sort key a `Field::Num`, which serializes
         // with six decimals. The spilled order must still be the in-memory
         // order, so values that differ past the sixth decimal (and the
         // stability of ties) cannot depend on `--sort-buffer`.
-        let mut plan = crate::parse::parse("add v num(v) | sort v=nr").unwrap();
+        let mut plan = crate::parse::parse("add v = num(v) | sort v=nr").unwrap();
         plan.resolve(&["v".to_string(), "tag".to_string()]).unwrap();
         let [
             crate::plan::Stage::Transform(pre),

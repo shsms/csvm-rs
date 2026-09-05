@@ -278,7 +278,7 @@ fn join_keeps_the_left_columns_types() {
     let right = temp_csv("id,tag\n1,a\n2,b\n3,c\n");
     let out = run(
         &format!(
-            "add qty str(qty) | join {} on id | sort qty",
+            "add qty = str(qty) | join {} on id | sort qty",
             right.display()
         ),
         "id,qty\n1,10\n2,9\n3,100\n",

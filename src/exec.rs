@@ -2452,7 +2452,7 @@ mod tests {
         // lexical, forced with =s (or a str() column): "10" < "100" < "9"
         assert_eq!(run_str("sort n=s", input).unwrap(), "n\n10\n100\n9\n");
         assert_eq!(
-            run_str("add n str(n) | sort n", input).unwrap(),
+            run_str("add n = str(n) | sort n", input).unwrap(),
             "n\n10\n100\n9\n"
         );
         // A mixed column never aborts under auto: numbers first (numeric, a
@@ -2641,7 +2641,7 @@ mod tests {
     #[test]
     fn describe_shows_header_names_for_positional_refs() {
         let mut plan =
-            parse("add countZ num(`3`) | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
+            parse("add countZ = num(`3`) | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("add countZ[2] = (num countZ[2])"), "{d}");
@@ -2655,20 +2655,21 @@ mod tests {
     fn describe_shows_modes_pinned_at_resolve_time() {
         // A str()/num()-typed column pins later keys and compares on it, and
         // the pin shows in the engine dump.
-        let mut plan =
-            parse("add fieldA str(fieldA) | add id num(id) | sort fieldA id | select id == countZ")
-                .unwrap();
+        let mut plan = parse(
+            "add fieldA = str(fieldA) | add id = num(id) | sort fieldA id | select id == countZ",
+        )
+        .unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("sort fieldA[1] lexical, id[0] numeric"), "{d}");
         assert!(d.contains("(== id[0] countZ[2] :num)"), "{d}");
         // A colour predicate resolves against the output types too.
-        let mut plan = parse("add countZ num(countZ) | color red countZ > id").unwrap();
+        let mut plan = parse("add countZ = num(countZ) | color red countZ > id").unwrap();
         let _ = plan.resolve(&["id".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("countZ[1] id[0] :num"), "{d}");
         // `add` can name its target by position; the dump shows the column.
-        let mut plan = parse("add 2 num(`2`)").unwrap();
+        let mut plan = parse("add 2 = num(`2`)").unwrap();
         let _ = plan.resolve(&["id".into(), "qty".into()]);
         let d = describe(&plan);
         assert!(d.contains("add qty[1] = (num qty[1])"), "{d}");

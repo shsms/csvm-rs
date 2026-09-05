@@ -74,7 +74,7 @@ price,qty
 #[test]
 fn arithmetic_appends_a_numeric_column() {
     assert_eq!(
-        run_checked("add total price * qty", NUM),
+        run_checked("add total = price * qty", NUM),
         "price,qty,total\n10,3,30\n20,2,40\n5,4,20\n"
     );
 }
@@ -83,7 +83,7 @@ fn arithmetic_appends_a_numeric_column() {
 fn precedence_and_parens() {
     // (price - qty) * 2, not price - qty*2
     assert_eq!(
-        run_checked("add v (price - qty) * 2 | cols v", NUM),
+        run_checked("add v = (price - qty) * 2 | cols v", NUM),
         "v\n14\n36\n2\n"
     );
 }
@@ -92,7 +92,7 @@ fn precedence_and_parens() {
 fn replace_existing_column_in_place() {
     // Replaces `price`, keeping column position; does not append.
     assert_eq!(
-        run_checked("add price price * 2", NUM),
+        run_checked("add price = price * 2", NUM),
         "price,qty\n20,3\n40,2\n10,4\n"
     );
 }
@@ -101,11 +101,11 @@ fn replace_existing_column_in_place() {
 fn functions() {
     let input = "x\n2.4\n-3.7\n";
     assert_eq!(
-        run_checked("add r round(x) | add a abs(x) | cols r,a", input),
+        run_checked("add r = round(x) | add a = abs(x) | cols r,a", input),
         "r,a\n2,2.4\n-4,3.7\n"
     );
     assert_eq!(
-        run_checked("add m min(price, qty) | cols m", NUM),
+        run_checked("add m = min(price, qty) | cols m", NUM),
         "m\n3\n2\n4\n"
     );
 }
@@ -114,11 +114,11 @@ fn functions() {
 fn string_concat_and_funcs() {
     let input = "first,last\nAda,Lovelace\nAlan,Turing\n";
     assert_eq!(
-        run_checked("add full first ++ ' ' ++ last | cols full", input),
+        run_checked("add full = first ++ ' ' ++ last | cols full", input),
         "full\nAda Lovelace\nAlan Turing\n"
     );
     assert_eq!(
-        run_checked("add u upper(first) | cols u", input),
+        run_checked("add u = upper(first) | cols u", input),
         "u\nADA\nALAN\n"
     );
 }
@@ -126,12 +126,12 @@ fn string_concat_and_funcs() {
 #[test]
 fn ternary_and_boolean_value() {
     assert_eq!(
-        run_checked("add tier price > 8 ? 'hi' : 'lo' | cols tier", NUM),
+        run_checked("add tier = price > 8 ? 'hi' : 'lo' | cols tier", NUM),
         "tier\nhi\nhi\nlo\n"
     );
     // A bare comparison yields t/f.
     assert_eq!(
-        run_checked("add ok price > 8 | cols ok", NUM),
+        run_checked("add ok = price > 8 | cols ok", NUM),
         "ok\nt\nt\nf\n"
     );
 }
@@ -140,14 +140,17 @@ fn ternary_and_boolean_value() {
 fn prev_computes_step_delta() {
     // The headline use case: difference between successive rows. Row 1 is 0.
     assert_eq!(
-        run_checked("add d price - prev(price) | cols d", NUM),
+        run_checked("add d = price - prev(price) | cols d", NUM),
         "d\n0\n10\n-15\n"
     );
 }
 
 #[test]
 fn rownum_is_one_based() {
-    assert_eq!(run_checked("add n rownum() | cols n", NUM), "n\n1\n2\n3\n");
+    assert_eq!(
+        run_checked("add n = rownum() | cols n", NUM),
+        "n\n1\n2\n3\n"
+    );
 }
 
 #[test]
@@ -156,20 +159,20 @@ fn prev_after_a_reshaping_cols_uses_the_new_layout() {
     // wider row), so the previous row is snapshotted in the post-cols layout.
     let input = "A,B,C,D\n1,99,10,x\n2,99,30,y\n3,99,25,z\n";
     assert_eq!(
-        run_checked("cols A,C | add Q C - prev(C) | cols Q", input),
+        run_checked("cols A,C | add Q = C - prev(C) | cols Q", input),
         "Q\n0\n20\n-5\n"
     );
     // Same for a rename before the add.
     let input = "a,b\n1,5\n2,12\n3,4\n";
     assert_eq!(
-        run_checked("rename b=val | add d val - prev(val) | cols d", input),
+        run_checked("rename b=val | add d = val - prev(val) | cols d", input),
         "d\n0\n7\n-8\n"
     );
 }
 
 #[test]
 fn delta_appends_step_differences() {
-    // `delta` is sugar for `add C_delta C - prev(C)` per column.
+    // `delta` is sugar for `add C_delta = C - prev(C)` per column.
     assert_eq!(
         run_checked("delta price | cols price_delta", NUM),
         "price_delta\n0\n10\n-15\n"
@@ -178,7 +181,7 @@ fn delta_appends_step_differences() {
     assert_eq!(
         run_checked("delta price qty | cols price_delta,qty_delta", NUM),
         run_checked(
-            "add price_delta price - prev(price) | add qty_delta qty - prev(qty) \
+            "add price_delta = price - prev(price) | add qty_delta = qty - prev(qty) \
              | cols price_delta,qty_delta",
             NUM
         ),
@@ -219,10 +222,10 @@ fn stateful_add_is_thread_independent_over_a_file() {
         content.push_str(&format!("{i},{}\n", (i * 31) % 97));
     }
     let path = temp_csv(&content);
-    let serial = run("add d val - prev(val)", &content, 1).unwrap();
+    let serial = run("add d = val - prev(val)", &content, 1).unwrap();
     for n in [1usize, 2, 3, 5, 8, 16] {
         assert_eq!(
-            run_file_str("add d val - prev(val)", &path, n),
+            run_file_str("add d = val - prev(val)", &path, n),
             serial,
             "threads={n}"
         );
@@ -236,10 +239,10 @@ fn pure_add_shards_identically_over_a_file() {
         content.push_str(&format!("{i},{}\n", i % 13));
     }
     let path = temp_csv(&content);
-    let serial = run("add t val * 2 + 1", &content, 1).unwrap();
+    let serial = run("add t = val * 2 + 1", &content, 1).unwrap();
     for n in [1usize, 2, 4, 8, 16] {
         assert_eq!(
-            run_file_str("add t val * 2 + 1", &path, n),
+            run_file_str("add t = val * 2 + 1", &path, n),
             serial,
             "threads={n}"
         );
@@ -248,18 +251,18 @@ fn pure_add_shards_identically_over_a_file() {
 
 #[test]
 fn divide_by_zero_aborts() {
-    assert!(run("add x price / 0", NUM, 1).is_err());
+    assert!(run("add x = price / 0", NUM, 1).is_err());
 }
 
 #[test]
 fn non_numeric_in_arithmetic_aborts() {
     let input = "a\nhello\n";
-    assert!(run("add x a * 2", input, 1).is_err());
+    assert!(run("add x = a * 2", input, 1).is_err());
 }
 
 #[test]
 fn unknown_function_is_a_compile_error() {
-    assert!(csvm::parse::parse("add x frobnicate(price)").is_err());
+    assert!(csvm::parse::parse("add x = frobnicate(price)").is_err());
 }
 
 #[test]
@@ -267,7 +270,7 @@ fn add_then_select_on_the_new_column() {
     // The new numeric column is usable by a later numeric comparison.
     assert_eq!(
         run_checked(
-            "add total price * qty | select total >= 30 | cols total",
+            "add total = price * qty | select total >= 30 | cols total",
             NUM
         ),
         "total\n30\n40\n"

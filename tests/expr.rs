@@ -72,7 +72,7 @@ price,qty
 #[test]
 fn sqrt_of_a_column() {
     assert_eq!(
-        run_checked("add r sqrt(price * qty) | cols r", NUM),
+        run_checked("add r = sqrt(price * qty) | cols r", NUM),
         "r\n5.477226\n6.324555\n4.472136\n"
     );
 }
@@ -80,7 +80,7 @@ fn sqrt_of_a_column() {
 #[test]
 fn pow_is_binary() {
     assert_eq!(
-        run_checked("add p pow(qty, 2) | cols p", NUM),
+        run_checked("add p = pow(qty, 2) | cols p", NUM),
         "p\n9\n4\n16\n"
     );
 }
@@ -88,11 +88,11 @@ fn pow_is_binary() {
 #[test]
 fn pow_wrong_arity_is_a_compile_error() {
     // Specifically an arity error, not "unknown function".
-    let e = csvm::parse::parse("add p pow(qty)")
+    let e = csvm::parse::parse("add p = pow(qty)")
         .unwrap_err()
         .to_string();
     assert!(e.contains("argument"), "unexpected error: {e}");
-    let e = csvm::parse::parse("add p sqrt(qty, 2)")
+    let e = csvm::parse::parse("add p = sqrt(qty, 2)")
         .unwrap_err()
         .to_string();
     assert!(e.contains("argument"), "unexpected error: {e}");
@@ -102,11 +102,11 @@ fn pow_wrong_arity_is_a_compile_error() {
 fn exp_and_log_family() {
     let input = "x\n1\n8\n100\n";
     assert_eq!(
-        run_checked("add l log(exp(x)) | cols l", input),
+        run_checked("add l = log(exp(x)) | cols l", input),
         "l\n1\n8\n100\n"
     );
     assert_eq!(
-        run_checked("add l2 log2(x) | add l10 log10(x) | cols l2,l10", input),
+        run_checked("add l2 = log2(x) | add l10 = log10(x) | cols l2,l10", input),
         "l2,l10\n0,0\n3,0.90309\n6.643856,2\n"
     );
 }
@@ -115,7 +115,7 @@ fn exp_and_log_family() {
 fn sign_of_a_column() {
     let input = "x\n5\n-3.2\n0\n";
     assert_eq!(
-        run_checked("add s sign(x) | cols s", input),
+        run_checked("add s = sign(x) | cols s", input),
         "s\n1\n-1\n0\n"
     );
 }
@@ -125,7 +125,7 @@ fn sqrt_of_negative_is_nan_not_an_abort() {
     // Domain edges follow IEEE (like stats' non-finite policy), so a negative
     // doesn't kill the run; NaN renders via the non-finite fallback.
     assert_eq!(
-        run_checked("add r sqrt(x) | cols r", "x\n-1\n4\n"),
+        run_checked("add r = sqrt(x) | cols r", "x\n-1\n4\n"),
         "r\nNaN\n2\n"
     );
 }
@@ -149,7 +149,7 @@ fn deeply_nested_expressions_parse_in_linear_time() {
     let t = std::time::Instant::now();
     let deep = format!("select {}a + b{} > 0", "(".repeat(24), ")".repeat(24));
     csvm::parse::parse(&deep).unwrap();
-    let calls = format!("add x {}a{}", "abs(".repeat(24), ")".repeat(24));
+    let calls = format!("add x = {}a{}", "abs(".repeat(24), ")".repeat(24));
     csvm::parse::parse(&calls).unwrap();
     assert!(
         t.elapsed() < std::time::Duration::from_secs(1),
@@ -188,7 +188,7 @@ fn bool_equality_in_a_ternary_test() {
     let input = "grid_active,grid_reactive\n5,3\n-2,4\n-1,-1\n";
     assert_eq!(
         run_checked(
-            "add side ((grid_active >= 0.0) == (grid_reactive >= 0.0)) ? 'leading' : 'lagging' \
+            "add side = ((grid_active >= 0.0) == (grid_reactive >= 0.0)) ? 'leading' : 'lagging' \
              | cols side",
             input
         ),
@@ -201,11 +201,11 @@ fn parenthesized_bool_as_a_value() {
     // Bare parens at expression end already worked; a bool value followed by
     // more expression (concat) needs the paren-bool-as-value grammar fix.
     assert_eq!(
-        run_checked("add ok (price > 8) | cols ok", NUM),
+        run_checked("add ok = (price > 8) | cols ok", NUM),
         "ok\nt\nt\nf\n"
     );
     assert_eq!(
-        run_checked("add s (price > 8) ++ '!' | cols s", NUM),
+        run_checked("add s = (price > 8) ++ '!' | cols s", NUM),
         "s\nt!\nt!\nf!\n"
     );
 }
@@ -213,7 +213,7 @@ fn parenthesized_bool_as_a_value() {
 #[test]
 fn add_bool_of_computed_comparison() {
     assert_eq!(
-        run_checked("add big price * qty > 25 | cols big", NUM),
+        run_checked("add big = price * qty > 25 | cols big", NUM),
         "big\nt\nt\nf\n"
     );
 }
@@ -243,7 +243,7 @@ fn coalesce_result_type_follows_the_data() {
     // aborted on text data.
     let input = "a,b,thresh\nbanana,,apple\n,10,20\n";
     assert_eq!(
-        run_checked("add c coalesce(a, b) | select c > thresh | cols c", input),
+        run_checked("add c = coalesce(a, b) | select c > thresh | cols c", input),
         "c\nbanana\n"
     );
 }
@@ -258,7 +258,7 @@ fn select_arithmetic_on_non_numeric_aborts() {
     );
 }
 
-// --- add column typing ------------------------------------------------------
+// --- add column = typing ------------------------------------------------------
 
 #[test]
 fn add_ternary_column_types_later_comparisons_numeric() {
@@ -266,17 +266,20 @@ fn add_ternary_column_types_later_comparisons_numeric() {
     // against it compares numerically (01 == 1), not lexically.
     let input = "x,y\n5,01\n-1,02\n";
     assert_eq!(
-        run_checked("add flag x > 0 ? 1 : 0 | select flag == y | cols x", input),
+        run_checked(
+            "add flag = x > 0 ? 1 : 0 | select flag == y | cols x",
+            input
+        ),
         "x\n5\n"
     );
 }
 
 #[test]
 fn add_column_copy_inherits_explicit_type_overrides() {
-    // A num()-typed column is a type signal that survives `add z a`: the copy
+    // A num()-typed column is a type signal that survives `add z = a`: the copy
     // is strictly numeric, so text on the other side aborts.
     let e = run(
-        "add a num(a) | add z a | select z > name",
+        "add a = num(a) | add z = a | select z > name",
         "a,name\n1,apple\n",
         1,
     )
@@ -289,7 +292,7 @@ fn add_column_copy_inherits_explicit_type_overrides() {
     let input = "id,other\n9,100\n20,3\n";
     assert_eq!(
         run_checked(
-            "add id str(id) | add id2 id | select id2 > other | cols id",
+            "add id = str(id) | add id2 = id | select id2 > other | cols id",
             input
         ),
         "id\n9\n"
@@ -381,12 +384,12 @@ fn num_casts_and_normalises() {
     // number (007 -> 7, 1e3 -> 1000, blank -> 0) and a non-number aborts.
     let input = "id,qty\n1,007\n2,1e3\n3,\n";
     assert_eq!(
-        run_checked("add qty num(qty)", input),
+        run_checked("add qty = num(qty)", input),
         "id,qty\n1,7\n2,1000\n3,0\n"
     );
-    let err = run("add qty num(qty)", "id,qty\n1,x\n", 1).unwrap_err();
+    let err = run("add qty = num(qty)", "id,qty\n1,x\n", 1).unwrap_err();
     assert!(err.contains("non-numeric value 'x'"), "{err}");
-    assert!(run("add q num(qty, qty)", input, 1).is_err()); // unary
+    assert!(run("add q = num(qty, qty)", input, 1).is_err()); // unary
 }
 
 #[test]
@@ -400,15 +403,15 @@ fn num_makes_an_equality_numeric() {
 
 #[test]
 fn num_and_str_type_the_column_they_replace() {
-    // `add n num(n)` types the column numeric, so a bare sort on it is
-    // numeric; `add n str(n)` pins it lexical.
+    // `add n = num(n)` types the column numeric, so a bare sort on it is
+    // numeric; `add n = str(n)` pins it lexical.
     let input = "n\n10\n9\n100\n";
     assert_eq!(
-        run_checked("add n num(n) | sort n", input),
+        run_checked("add n = num(n) | sort n", input),
         "n\n9\n10\n100\n"
     );
     assert_eq!(
-        run_checked("add n str(n) | sort n", input),
+        run_checked("add n = str(n) | sort n", input),
         "n\n10\n100\n9\n"
     );
 }
@@ -417,8 +420,8 @@ fn num_and_str_type_the_column_they_replace() {
 fn str_keeps_text_and_formats_numbers() {
     let input = "n\n2.50\n";
     assert_eq!(
-        run_checked("add s str(n) | add t str(n * 2)", input),
+        run_checked("add s = str(n) | add t = str(n * 2)", input),
         "n,s,t\n2.50,2.50,5\n"
     );
-    assert_eq!(run_checked("add k str(3.50)", input), "n,k\n2.50,3.5\n");
+    assert_eq!(run_checked("add k = str(3.50)", input), "n,k\n2.50,3.5\n");
 }

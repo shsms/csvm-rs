@@ -80,7 +80,7 @@ pub struct Cmp {
 }
 
 /// A column's known type: the static type of the `add` expression that
-/// produced it (`add c num(c)` pins `c` numeric, `str()` text), or what a
+/// produced it (`add c = num(c)` pins `c` numeric, `str()` text), or what a
 /// reducing stage knows about its output (see `Plan::resolve`). A column
 /// read from the input is untyped, `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,7 +306,7 @@ pub enum ValExpr {
     Concat(Vec<ValExpr>),
     /// A built-in function call.
     Func(Func, Vec<ValExpr>),
-    /// A boolean expression used as a value (`add ok amount > 0`); renders
+    /// A boolean expression used as a value (`add ok = amount > 0`); renders
     /// csvm-style `t`/`f`.
     Bool(Box<BoolExpr>),
     /// `test ? then : else` — reuses the `select` boolean expression for `test`.
@@ -504,8 +504,8 @@ impl AddStmt {
         types: &mut Vec<Option<ColType>>,
     ) -> Result<(), Error> {
         // Resolve the expression against the *current* header first, so a
-        // replacing `add price price * 1.1` sees the old `price`, and an
-        // appending `add total amount * qty` can't reference itself.
+        // replacing `add price = price * 1.1` sees the old `price`, and an
+        // appending `add total = amount * qty` can't reference itself.
         self.expr.resolve(header, types)?;
         // The new column carries the expression's static type.
         let ty = self.expr.static_type(&|c| types[c.pos]);
@@ -1971,7 +1971,7 @@ mod tests {
         // position-keyed map: an `add` expression's type (`num()`/`str()`
         // included) and a replace-in-place re-typing the column. An explicit
         // flag wins.
-        let mut plan = crate::parse::parse("add z str(z) | sort a=s b z z=n").unwrap();
+        let mut plan = crate::parse::parse("add z = str(z) | sort a=s b z z=n").unwrap();
         plan.resolve(&["a".into(), "b".into(), "z".into()]).unwrap();
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
@@ -1980,9 +1980,9 @@ mod tests {
         use SortMode::{Auto, Lexical, Numeric};
         assert_eq!(modes, [Lexical, Auto, Lexical, Numeric]);
         for (script, expect) in [
-            ("add s a ++ 'x' | sort s", Lexical),
-            ("add a num(a) | add a a ++ 'x' | sort a", Lexical),
-            ("add n a * 2 | sort n", Numeric),
+            ("add s = a ++ 'x' | sort s", Lexical),
+            ("add a = num(a) | add a = a ++ 'x' | sort a", Lexical),
+            ("add n = a * 2 | sort n", Numeric),
         ] {
             let mut plan = crate::parse::parse(script).unwrap();
             plan.resolve(&["a".into()]).unwrap();
@@ -1993,7 +1993,7 @@ mod tests {
         }
         // A compare against a num()-typed column becomes numeric at resolve,
         // and its string literal is folded into a number then.
-        let mut plan = crate::parse::parse("add c num(c) | select c == '5'").unwrap();
+        let mut plan = crate::parse::parse("add c = num(c) | select c == '5'").unwrap();
         plan.resolve(&["c".into()]).unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()

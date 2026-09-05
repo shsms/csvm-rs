@@ -77,7 +77,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `fn name(a,b) { … }` | define a reusable pipeline fragment; call as `name(x,y)` |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
-| `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
+| `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
 | `delta [-s SUF] a,b` | append `col_delta = col - prev(col)` per column (shorthand) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
@@ -109,11 +109,11 @@ A few things worth knowing up front:
   a string lexical — `amount > 1000` just works, and numbers print correctly with
   no cast. A bare `sort col` auto-detects too: cells that are numbers sort
   numerically and first, the rest lexically (`col=n` / `col=s` force one mode).
-  To pin a column explicitly, convert it in place: `add c num(c)` (a non-number
-  aborts) or `add c str(c)`. Empty coerces to `0`; a non-numeric value where a
+  To pin a column explicitly, convert it in place: `add c = num(c)` (a non-number
+  aborts) or `add c = str(c)`. Empty coerces to `0`; a non-numeric value where a
   number is required aborts the run.
-- **`add` / `delta`** compute columns: `add total amount * qty`, and
-  `add rate amount - prev(amount)` — or the shorthand `delta amount` — for the
+- **`add` / `delta`** compute columns: `add total = amount * qty`, and
+  `add rate = amount - prev(amount)` — or the shorthand `delta amount` — for the
   step-to-step difference. An `add` using `prev()`/`rownum()` runs ordered and
   single-threaded, so its output is identical at any `-n`; a pure `add` shards.
 
@@ -157,7 +157,7 @@ csvm 'select flag == "t" && (amount > 0 || qty > 0) | cols -v flag' input.csv
 csvm 'select amount > 0 | sort amount=nr' input.csv
 
 # computed column, then a step-to-step delta
-csvm 'add total amount * qty | delta total | fmt' input.csv
+csvm 'add total = amount * qty | delta total | fmt' input.csv
 
 # inner join on a key, then sort the result
 csvm 'join prices.csv on sku | sort price=nr | head' sales.csv
@@ -194,7 +194,7 @@ csvm 'color red amount < 0 | fmt' input.csv
 `--explain` shows the compiled, resolved plan:
 
 ```
-$ csvm --explain "add amount num(amount) | select amount > 0 | sort amount=r | cols -v flag" input.csv
+$ csvm --explain "add amount = num(amount) | select amount > 0 | sort amount=r | cols -v flag" input.csv
 stage 1 (transform):
   1.1 add amount[3] = (num amount[3])
   1.2 select (> amount[3] 0 :num)

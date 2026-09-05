@@ -39,7 +39,7 @@ git history; this file is the "what next / what was decided" scratchpad.
   carries rows through the merge as their serialized line, so a =Field::Num=
   produced upstream (=num()=, =add=, parquet) reaches a statement *after* the
   sort as its six-decimal =format_num= text (=apply_post_to_line=, =exec.rs=),
-  while the materialized path keeps the full value. =add v num(v) | sort v |
+  while the materialized path keeps the full value. =add v = num(v) | sort v |
   select v > 1.0000002= can therefore differ between the two paths. The key
   itself is exact since 2026-09-05 (spilled key + line records). Fix: a
   round-trip number format for the sort blob, re-formatted at output.
@@ -114,7 +114,7 @@ error.
 ** DONE Conversion commands replaced by =num()= / =str()= casts
 Shipped 2026-09-05: =to-num= / =to-str= are gone. Conversions were already
 implicit; their one remaining job, pinning a column's type in place, is now
-=add c num(c)= / =add c str(c)= — the casts type their result, and =add=
+=add c = num(c)= / =add c = str(c)= — the casts type their result, and =add=
 carries its expression's type. =num()= also fixes the case auto never
 covered, numeric equality between two untyped columns (=select num(a) ==
 b=). With the commands gone the parser stopped tracking column types by
@@ -173,7 +173,7 @@ assuming numeric.
 Original design notes (kept for the deferred parts):
 Append a new column =NAME= computed per row from a value expression over the
 existing columns. If =NAME= already exists, replace it in place (so
-=add price round(price * 1.1)= works). Appends at the end otherwise; reorder
+=add price = round(price * 1.1)= works). Appends at the end otherwise; reorder
 with =cols= afterward.
 
 Implementation: extend the =select= expression parser so the grammar yields a
@@ -184,35 +184,35 @@ evaluated per row — no interpreter in the hot path, same as today.
 ** Categories + examples
 *** Arithmetic (=+ - * / %=, parens, precedence)
 #+begin_src sh
-add total   amount * qty
-add net     gross - tax
-add margin  (price - cost) / price * 100
-add price   price * 1.1            # replaces 'price' in place
+add total = amount * qty
+add net = gross - tax
+add margin = (price - cost) / price * 100
+add price = price * 1.1            # replaces 'price' in place
 #+end_src
 *** Functions (a small standard set)
 #+begin_src sh
-add a   round(price)          # round / floor / ceil / abs
-add lo  min(bid, ask)         # min / max
-add n   len(name)             # string length
-add g   upper(grp)            # upper / lower / trim
-add v   coalesce(nick, name)  # first non-empty
-add k   int(price)            # truncate / parse to integer
+add a = round(price)          # round / floor / ceil / abs
+add lo = min(bid, ask)         # min / max
+add n = len(name)             # string length
+add g = upper(grp)            # upper / lower / trim
+add v = coalesce(nick, name)  # first non-empty
+add k = int(price)            # truncate / parse to integer
 #+end_src
 *** Strings (concat + extraction; use =++= or =concat()=, never overload =+=)
 #+begin_src sh
-add full  first ++ ' ' ++ last
-add dom   split(email, '@', 1)      # nth part
-add area  match(phone, '(\d{3})')   # regex capture group
+add full = first ++ ' ' ++ last
+add dom = split(email, '@', 1)      # nth part
+add area = match(phone, '(\d{3})')   # regex capture group
 #+end_src
 *** Conditional (ternary, reusing the bool expression for the test)
 #+begin_src sh
-add tier  amount > 1000 ? 'big' : 'small'
-add sign  amount < 0 ? 'debit' : 'credit'
+add tier = amount > 1000 ? 'big' : 'small'
+add sign = amount < 0 ? 'debit' : 'credit'
 #+end_src
 *** Constants & metadata (tags; useful before a concat)
 #+begin_src sh
-add source  'january.csv'    # constant column
-add rownum  rownum()         # 1-based row index
+add source = 'january.csv'    # constant column
+add rownum = rownum()         # 1-based row index
 #+end_src
 
 ** Design decisions to make
@@ -222,7 +222,7 @@ add rownum  rownum()         # 1-based row index
   always numeric and unambiguous.
 - Replace vs append when =NAME= exists: lean *replace* (enables in-place
   transforms). Alternative: =add= must be new, a separate =set= must exist.
-- Booleans: should =add ok amount > 0= yield ='t'/'f'= or =1/0=? (csvm-ish: t/f.)
+- Booleans: should =add ok = amount > 0= yield ='t'/'f'= or =1/0=? (csvm-ish: t/f.)
 - Errors: divide-by-zero / non-numeric in arithmetic — abort with a message
   (consistent with =to-num=) rather than yielding empty. Lean abort.
 - Starter function set: round, floor, ceil, abs, min, max, len, upper, lower,

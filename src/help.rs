@@ -212,7 +212,7 @@ operands stay lexical.",
 cell: cells that parse as numbers order numerically and come first (a blank reads as 0, as in \
 select), the rest follow lexically — so an all-numeric column sorts numerically with no flag, \
 and a mixed one never aborts. NaN and inf are numbers, as for num(). =n forces numeric (a \
-non-number aborts), =s forces lexical; a column typed by add (`add c num(c)`, `str()`) \
+non-number aborts), =s forces lexical; a column typed by add (`add c = num(c)`, `str()`) \
 defaults to the matching mode. See `csvm help types`.",
         examples: &["csvm 'sort region score=nr' data.csv"],
     },
@@ -369,10 +369,10 @@ plus each right's non-key columns; a clashing right name is suffixed _r.",
         aliases: &[],
         summary: "append a computed column",
         synopsis: &[
-            "add NAME EXPR   append a column = EXPR, or replace NAME in place if it exists",
+            "add NAME = EXPR append a column, or replace NAME in place if it exists",
             "                (NAME may also be a 1-based position of an existing column;",
             "                in EXPR a bare integer is a number, so backtick a position",
-            "                there: add 2 num(`2`))",
+            "                there: add 2 = num(`2`))",
         ],
         detail: "EXPR is a value expression over the row: arithmetic (+ - * / %, parens), \
 string concat with ++, the functions round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/\
@@ -382,8 +382,8 @@ prev(col) is col's value in the previous row \
 index — both make the run single-threaded and in input order. A bare comparison yields t/f. \
 Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm help expr`.",
         examples: &[
-            "csvm 'add rate amount - prev(amount)' data.csv",
-            "csvm 'add total price * qty | add tier total > 1000 ? \"big\" : \"small\"' data.csv",
+            "csvm 'add rate = amount - prev(amount)' data.csv",
+            "csvm 'add total = price * qty | add tier = total > 1000 ? \"big\" : \"small\"' data.csv",
         ],
     },
     CmdHelp {
@@ -395,7 +395,7 @@ Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm 
             "delta -s SUF COLS  use suffix SUF instead of _delta",
         ],
         detail: "Shorthand for the common cross-row difference: `delta a b` is exactly \
-`add a_delta a - prev(a) | add b_delta b - prev(b)`. Like any prev()-based add it runs \
+`add a_delta = a - prev(a) | add b_delta = b - prev(b)`. Like any prev()-based add it runs \
 single-threaded and in input order, so its output is independent of -n; the first row's \
 delta is 0.",
         examples: &[
@@ -502,7 +502,7 @@ arithmetic, a numeric function, num()); else lexical if either side is staticall
 string literal, ++ concat, a bool, str()); else two untyped operands auto-detect per row for \
 an ordering (< > <= >=) — numeric if both sides parse as numbers, else lexical — while == / != \
 stay lexical. A numeric side thus wins over a string side. To pin a column, convert it in \
-place: `add c num(c)` makes c numeric (a non-number aborts) and `add c str(c)` makes it \
+place: `add c = num(c)` makes c numeric (a non-number aborts) and `add c = str(c)` makes it \
 text; a column added by `add` carries its expression's static type — including one inherited \
 from a typed column or from a ternary whose branches agree — so later comparisons against it \
 behave the same as against the expression itself, and the pin follows the column by position \

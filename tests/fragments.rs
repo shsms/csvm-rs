@@ -29,7 +29,7 @@ fn power_factor_pipeline_with_fragments() {
     let reactive = temp_csv("timestamp,metric,value\n1,q,3\n2,q,4\n");
     let script = format!(
         "fn prep(n) {{ rename value=n | cols -v metric }}\n\
-         fn pf(t, a, r) {{ add t abs(a) / sqrt(a*a + r*r) }}\n\
+         fn pf(t, a, r) {{ add t = abs(a) / sqrt(a*a + r*r) }}\n\
          prep(active)\n\
          join (prep(reactive)) {} on timestamp\n\
          pf(pf_col, active, reactive)",

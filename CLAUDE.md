@@ -31,7 +31,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 | `!cols(a, b)`                    | `cols -v a,b`                                 |
 | `select(a == 't' && b != '0')`   | `select a == 't' && b != '0'`                 |
 | `sort(a, b:r)`                   | `sort a b=r`                                  |
-| `to_num(a)` / `to_str(a)`        | `add a num(a)` / `add a str(a)` (rarely needed) |
+| `to_num(a)` / `to_str(a)`        | `add a = num(a)` / `add a = str(a)` (rarely needed) |
 
 - **`cols`** keeps/reorders the named columns; **`cols -v`** keeps everything
   *except* them (like `cut --complement`). Columns can also be referenced by
@@ -83,7 +83,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   before every non-number, a blank reading as 0 as in `select`'s auto; text
   follows lexically; NaN/inf are numbers — a total
   order, so it streams and shards without sampling types, and a mixed column
-  never aborts), `=n` or a column typed numeric (`add c num(c)`) is `Numeric`
+  never aborts), `=n` or a column typed numeric (`add c = num(c)`) is `Numeric`
   (a non-number aborts), `=s` or a column typed text is `Lexical`. The
   external sort's encoded key
   (`encode_key` in `sort.rs`) prefixes an auto key with a one-byte tag
@@ -200,11 +200,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (`src/color.rs`); `--color auto|always|never` gates emission (auto = TTY).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
-- **`add NAME EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`
+- **`add NAME = EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`
   in place if it already exists (`AddStmt.pos`; `NAME` may also be a 1-based
   position of an existing column, like any other column reference, and the
   header keeps that column's name; inside `EXPR` a bare integer is a number
-  literal, so a position there is backticked: ``add 2 num(`2`)``). On a
+  literal, so a position there is backticked: ``add 2 = num(`2`)``). On a
   ragged row the replaced cell is padded into place (a missing cell reads as
   blank, so `num()` gives 0). `EXPR` is a *value* expression
   (`ValExpr` in `plan.rs`): arithmetic (`+ - * / %`), `++` concat, the function
@@ -212,7 +212,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   upper/lower/trim/coalesce/num/str` — the math functions follow IEEE at
   domain edges, `sqrt(-1)` = NaN, no abort; div/mod-by-zero still aborts;
   `num(x)` casts to a number and aborts on a non-number, `str(x)` casts to
-  text, and each types its result so `add c num(c)` pins column `c`), a
+  text, and each types its result so `add c = num(c)` pins column `c`), a
   `?:` ternary
   (reusing `BoolExpr` for the test), constants, and `prev(col)`/`rownum()`. It reuses the `select` tokenizer
   (`lex_expr`, extended with arithmetic operators + context-sensitive sign) and a
@@ -225,7 +225,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   column carries the expression's **static type** (numeric / text / untyped,
   `ValExpr::static_type` — including a type inherited from a typed column or
   a `?:` whose branches agree; `num(x)` is numeric and `str(x)` text, so
-  `add c num(c)` is how a column is pinned), so later comparisons against it
+  `add c = num(c)` is how a column is pinned), so later comparisons against it
   are typed the same as against the expression itself.
 - **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
   stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
@@ -272,7 +272,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (needs a raster dep) and a scatter density colour ramp are the remaining
   follow-ups (`todo.org`).
 - There are no conversion commands: `to-num`/`to-str` (and the underscore
-  spellings) are rejected with a hint pointing at `add c num(c)` / `str()`.
+  spellings) are rejected with a hint pointing at `add c = num(c)` / `str()`.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
   **or a newline** (so a multi-line `-f` script is one stage per line, no
@@ -290,7 +290,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 csvm requires explicit `to_num` before numeric comparison/sort and `to_str`
 before output. csvm-rs makes these implicit, and has no conversion commands:
 the casts `num(x)` / `str(x)` in an `add` are the only explicit type signal
-(`add c num(c)` converts `c` in place and pins it numeric).
+(`add c = num(c)` converts `c` in place and pins it numeric).
 
 Each comparison resolves to one of three modes at compile time (`CmpMode` in
 `plan.rs`, decided by `CmpMode::decide` from the operands' **static types** —
@@ -307,7 +307,7 @@ str(qty) | sort 2`, a rename in between, a `cols` reorder, a `group` on the
 column. A non-numeric literal in a numeric compare is therefore reported at
 resolve time: still before any row is read, but after the input is opened.
 The three checks below run **in order**, so a numeric signal wins
-over a string one (`add c str(c) | select c > 5` is still `Numeric` — the
+over a string one (`add c = str(c) | select c > 5` is still `Numeric` — the
 numeric literal decides). `sort` mirrors this per key with its own `SortMode`
 (a bare `sort c` auto-detects per cell; `=n`/`=s` or a typed column pin it at
 resolve time — see the `sort` bullet above):
@@ -327,9 +327,9 @@ resolve time — see the `sort` bullet above):
   compared `"100" < "9"` as text. It's reproducible (a function of the two
   values, not a sampled type) and never aborts; the successful `f64` parses are
   reused so the common all-numeric case costs the same as an explicit cast.
-  Pin a genuinely-text column back to lexical with `add c str(c)`.
+  Pin a genuinely-text column back to lexical with `add c = str(c)`.
 - Numbers always serialize correctly on output — no `str()` needed to print.
-- `add c num(c)` / `add c str(c)` are the explicit **type overrides**,
+- `add c = num(c)` / `add c = str(c)` are the explicit **type overrides**,
   affecting later column-vs-column comparisons and the default sort mode for
   that column.
 
