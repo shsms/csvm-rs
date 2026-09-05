@@ -109,17 +109,22 @@ fn parse_num_soft(s: &str) -> Option<f64> {
 
 /// Format a number the way csvm does: six decimal places, then trim trailing
 /// zeros and a trailing decimal point. So `25.0 -> "25"`, `25.5 -> "25.5"`,
-/// `0.1 -> "0.1"`. Non-finite values fall back to Rust's default rendering.
+/// `0.1 -> "0.1"`. NaN and inf print as `NaN`, `inf` and `-inf`.
 pub fn format_num(n: f64) -> String {
-    if !n.is_finite() {
-        return n.to_string();
-    }
-    let mut s = format!("{n:.6}");
-    // "{:.6}" always emits a '.', so trimming the fractional zeros and then the
-    // dot can never eat into the integer part.
-    let end = s.trim_end_matches('0').trim_end_matches('.').len();
-    s.truncate(end);
+    let mut s = String::new();
+    format_num_into(n, &mut s);
     s
+}
+
+/// [`format_num`] appended to `buf` (no allocation once `buf` has room).
+pub fn format_num_into(n: f64, buf: &mut String) {
+    use std::fmt::Write;
+    // A finite "{:.6}" always emits a '.', so trimming the fractional zeros
+    // and then the dot can never eat into the integer part or the text
+    // before it; NaN/inf render as is and have nothing to trim.
+    write!(buf, "{n:.6}").unwrap();
+    let end = buf.trim_end_matches('0').trim_end_matches('.').len();
+    buf.truncate(end);
 }
 
 #[cfg(test)]
@@ -137,6 +142,24 @@ mod tests {
         assert_eq!(format_num(0.0), "0");
         // 1/3 -> six decimals, no trailing-zero trim needed
         assert_eq!(format_num(1.0 / 3.0), "0.333333");
+    }
+
+    #[test]
+    fn format_num_into_appends() {
+        // Trimming stops at the appended number's own decimal point, so a
+        // prefix ending in `0` survives; NaN/inf have nothing to trim.
+        let mut s = String::from("x=");
+        format_num_into(25.0, &mut s);
+        assert_eq!(s, "x=25");
+        let mut s = String::from("10");
+        format_num_into(0.0, &mut s);
+        assert_eq!(s, "100");
+        let mut s = String::from("n=");
+        format_num_into(f64::NAN, &mut s);
+        assert_eq!(s, "n=NaN");
+        let mut s = String::new();
+        format_num_into(f64::INFINITY, &mut s);
+        assert_eq!(s, "inf");
     }
 
     #[test]
