@@ -434,13 +434,15 @@ fn profile_rows(stats: &StatsStmt, accs: &[ColStats]) -> Vec<OwnedRow> {
         .collect()
 }
 
-/// Per-group state: the key cells (emitted verbatim, in first-seen order) and a
-/// [`ColStats`] per *distinct* aggregated column plus a row counter (for a bare
-/// `count`). One per distinct key — O(groups × aggregated-cols) memory.
+/// Per-group state: the key cells (emitted verbatim, in first-seen order), a
+/// row counter (for a bare `count`), a [`ColStats`] per *distinct* aggregated
+/// column, and the value set per *distinct* `count_distinct` column. One per
+/// distinct key — O(groups × aggregated-cols) memory, plus the distinct values.
 struct GroupAcc {
     key: OwnedRow,
     rows: u64,
     stats: Vec<ColStats>,
+    distinct: Vec<HashSet<String>>,
 }
 
 /// Where one aggregate reads a group's state.
@@ -450,16 +452,21 @@ enum Slot {
     Rows,
     /// An index into `GroupAcc::stats`.
     Stats(usize),
+    /// An index into `GroupAcc::distinct`.
+    Distinct(usize),
 }
 
 /// `group … | agg …` reducer. The per-key sibling of [`build_colstats`]:
 /// folds rows into per-group accumulators keyed by the CSV-encoded key cells,
 /// preserving first-seen order. Aggregates sharing a column share one
-/// `ColStats` (deduped by position).
+/// `ColStats` / value set (deduped by position).
 struct Grouper<'a> {
     g: &'a GroupStmt,
-    /// Distinct aggregated column positions (a bare `count` contributes none).
+    /// Distinct `ColStats` column positions (a bare `count` and
+    /// `count_distinct` contribute none).
     stat_positions: Vec<usize>,
+    /// Distinct `count_distinct` column positions.
+    distinct_positions: Vec<usize>,
     /// For each agg, where it reads a group's state.
     agg_slot: Vec<Slot>,
     index: HashMap<String, usize>,
@@ -468,6 +475,8 @@ struct Grouper<'a> {
     /// cells and their CSV encoding; only cloned into a group on first sight.
     keysel: OwnedRow,
     keybuf: String,
+    /// A numeric cell's text for the `count_distinct` sets.
+    numbuf: String,
 }
 
 impl<'a> Grouper<'a> {
@@ -480,22 +489,28 @@ impl<'a> Grouper<'a> {
             })
         }
         let mut stat_positions: Vec<usize> = Vec::new();
+        let mut distinct_positions: Vec<usize> = Vec::new();
         let agg_slot = g
             .aggs
             .iter()
-            .map(|a| match a.pos {
-                None => Slot::Rows,
-                Some(p) => Slot::Stats(slot_of(&mut stat_positions, p)),
+            .map(|a| match (a.func, a.pos) {
+                (_, None) => Slot::Rows,
+                (AggFunc::CountDistinct, Some(p)) => {
+                    Slot::Distinct(slot_of(&mut distinct_positions, p))
+                }
+                (_, Some(p)) => Slot::Stats(slot_of(&mut stat_positions, p)),
             })
             .collect();
         Grouper {
             g,
             stat_positions,
+            distinct_positions,
             agg_slot,
             index: HashMap::new(),
             groups: Vec::new(),
             keysel: Vec::new(),
             keybuf: String::new(),
+            numbuf: String::new(),
         }
     }
 
@@ -522,6 +537,11 @@ impl<'a> Grouper<'a> {
                         .iter()
                         .map(|_| ColStats::new())
                         .collect(),
+                    distinct: self
+                        .distinct_positions
+                        .iter()
+                        .map(|_| HashSet::new())
+                        .collect(),
                 });
                 i
             }
@@ -534,13 +554,32 @@ impl<'a> Grouper<'a> {
                 None => acc.stats[slot].update(&Field::Str("")),
             }
         }
+        for (slot, &p) in self.distinct_positions.iter().enumerate() {
+            // The cell's text, without allocating for a number: the set is
+            // probed first, so only a new value is copied in.
+            let cell: &str = match row.get(p) {
+                Some(Field::Str(s)) => s,
+                Some(Field::Owned(s)) => s,
+                Some(Field::Num(n)) => {
+                    self.numbuf.clear();
+                    crate::field::format_num_into(*n, &mut self.numbuf);
+                    &self.numbuf
+                }
+                None => "",
+            };
+            // Empty cells are skipped, as `count(col)` skips them.
+            if !cell.is_empty() && !acc.distinct[slot].contains(cell) {
+                acc.distinct[slot].insert(cell.to_string());
+            }
+        }
     }
 
     /// Fold another shard's partial `Grouper` into this one, preserving
-    /// first-seen order: keys already present accumulate (rows + a per-column
-    /// [`ColStats::merge`]), keys new to this accumulator are appended in the
-    /// other's first-seen order. Both share the same `GroupStmt`, so the `stats`
-    /// vectors line up slot-for-slot. The reduce mirror of [`Self::update`];
+    /// first-seen order: keys already present accumulate (rows, a per-column
+    /// [`ColStats::merge`], a union of the distinct values), keys new to this
+    /// accumulator are appended in the other's first-seen order. Both share the
+    /// same `GroupStmt`, so the `stats` and `distinct` vectors line up
+    /// slot-for-slot. The reduce mirror of [`Self::update`];
     /// merging in file order makes the merged result match a single pass (modulo
     /// the ~1-ULP `sum`/`mean`/`stddev` drift any parallel reduction has, since
     /// the float combine sums in a different order — like sharded `stats`).
@@ -554,6 +593,9 @@ impl<'a> Grouper<'a> {
                     dst.rows += acc.rows;
                     for (d, s) in dst.stats.iter_mut().zip(&acc.stats) {
                         d.merge(s);
+                    }
+                    for (d, s) in dst.distinct.iter_mut().zip(acc.distinct) {
+                        d.extend(s);
                     }
                 }
                 None => {
@@ -592,10 +634,12 @@ fn agg_value(func: AggFunc, slot: Slot, acc: &GroupAcc) -> Field<'static> {
     let stats = match slot {
         // Bare `count` counts rows; `count(col)` counts non-empty cells.
         Slot::Rows => return Field::Num(acc.rows as f64),
+        Slot::Distinct(i) => return Field::Num(acc.distinct[i].len() as f64),
         Slot::Stats(i) => &acc.stats[i],
     };
     match func {
         AggFunc::Count => Field::Num(stats.count() as f64),
+        AggFunc::CountDistinct => unreachable!("count_distinct reads a Distinct slot"),
         AggFunc::Min => stats.min_field(),
         AggFunc::Max => stats.max_field(),
         AggFunc::Sum => num_or_blank(stats, ColStats::sum),
@@ -2897,6 +2941,31 @@ mod tests {
     }
 
     #[test]
+    fn count_distinct_counts_unique_non_empty_cells() {
+        // Empty cells are skipped (like count(col)); repeats count once.
+        let input = "g,v\nx,1\nx,\nx,3\nx,1\ny,1\n";
+        let out = run_str("agg count_distinct(v), count(v) by g", input).unwrap();
+        assert_eq!(out, "g,v_count_distinct,v_count\nx,2,3\ny,1,1\n");
+        // A group of only empties has no distinct value.
+        let out = run_str("agg n=count_distinct(v) by g", "g,v\nx,\n").unwrap();
+        assert_eq!(out, "g,n\nx,0\n");
+    }
+
+    #[test]
+    fn count_distinct_keys_a_number_by_its_output_text() {
+        // A typed number's identity is its output text, as it is for a `by`
+        // key and for `uniq`: `1` and `1.0` are one value, and so are two
+        // values that agree to six decimals. As text they stay apart.
+        let input = "g,v\nx,1\nx,1.0\nx,1.00000021\nx,1.00000019\nx,2\n";
+        let out = run_str("agg count_distinct(v) by g", input).unwrap();
+        assert_eq!(out, "g,v_count_distinct\nx,5\n");
+        let out = run_str("add v = num(v) | agg count_distinct(v) by g", input).unwrap();
+        assert_eq!(out, "g,v_count_distinct\nx,2\n");
+        let out = run_str("add v = num(v) | agg count by v | agg count", input).unwrap();
+        assert_eq!(out, "count\n2\n");
+    }
+
+    #[test]
     fn group_composes_with_sort_and_fmt() {
         let out = run_str("agg sum(countZ) by fieldA | sort countZ_sum=nr", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
@@ -2914,13 +2983,15 @@ mod tests {
         // differ by ~1 ULP (the sharded reduce sums in a different order), so
         // compare those within a tiny relative tolerance. First-seen group order
         // (EU, US, APAC — the order keys first appear in the file) must match.
+        // Prices repeat within a group across shards, so the distinct count is
+        // a real union (and well below the non-empty count).
         let mut csv = String::from("region,price\n");
         for i in 0..900 {
             let region = ["EU", "US", "APAC"][i % 3];
             let price = if i % 11 == 0 {
                 String::new()
             } else {
-                format!("{:.2}", (i % 400) as f64 * 0.97)
+                format!("{:.2}", (i % 37) as f64 * 0.97)
             };
             csv.push_str(&format!("{region},{price}\n"));
         }
@@ -2930,7 +3001,7 @@ mod tests {
 
         let run_threads = |threads: usize| -> String {
             let mut plan =
-                parse("agg count, sum(price), mean(price), min(price), max(price), stddev(price) by region")
+                parse("agg count, count_distinct(price), sum(price), mean(price), min(price), max(price), stddev(price) by region")
                     .unwrap();
             let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
             let out_header = plan.resolve(&header).unwrap();
@@ -2981,6 +3052,8 @@ mod tests {
         assert_eq!(sr[1][0], "EU");
         assert_eq!(sr[2][0], "US");
         assert_eq!(sr[3][0], "APAC");
+        // 300 rows per region, 37 distinct prices.
+        assert_eq!(&sr[1][1..3], ["300", "37"]);
     }
 
     #[test]

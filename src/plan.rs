@@ -375,12 +375,15 @@ pub struct StatsStmt {
     pub positions: Vec<usize>,
 }
 
-/// An aggregate function applied per group. Each maps onto a [`ColStats`] field
-/// (`crate::stats`), so the group accumulator reuses the `stats` profiler.
+/// An aggregate function applied per group. All but `count_distinct` map onto
+/// a [`ColStats`] field (`crate::stats`), so the group accumulator reuses the
+/// `stats` profiler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AggFunc {
     /// `count` (no column) counts rows; `count(col)` counts non-empty cells.
     Count,
+    /// `count_distinct(col)` counts the distinct non-empty cells.
+    CountDistinct,
     Sum,
     Min,
     Max,
@@ -393,6 +396,7 @@ impl AggFunc {
     pub fn name(self) -> &'static str {
         match self {
             AggFunc::Count => "count",
+            AggFunc::CountDistinct => "count_distinct",
             AggFunc::Sum => "sum",
             AggFunc::Min => "min",
             AggFunc::Max => "max",

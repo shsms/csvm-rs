@@ -1560,6 +1560,7 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
     };
     let func = match func_name {
         "count" => AggFunc::Count,
+        "count_distinct" => AggFunc::CountDistinct,
         "sum" => AggFunc::Sum,
         "min" => AggFunc::Min,
         "max" => AggFunc::Max,
@@ -2410,6 +2411,8 @@ mod tests {
     fn agg_rejects_bad_specs() {
         assert!(parse("agg frobnicate(x)").is_err()); // unknown function
         assert!(parse("agg sum").is_err()); // sum needs a column
+        assert!(parse("agg count_distinct").is_err()); // so does count_distinct
+        assert!(parse("agg count_distinct(x) by g").is_ok());
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
         assert!(parse("agg count by").is_err()); // no keys
