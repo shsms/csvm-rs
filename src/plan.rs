@@ -704,6 +704,8 @@ pub enum Stage {
     Tail(usize),
     /// Keep all but the last `n` rows (`head -n -N`).
     DropLast(usize),
+    /// Drop the first `n` rows (`tail -n +N` skips `N-1`).
+    Skip(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
     /// Reduce to one row per distinct key (`group … | agg …`). Blocking.
@@ -1615,7 +1617,7 @@ impl Plan {
                     }
                 }
                 Stage::Sort(s) => s.resolve(&header, &types)?,
-                Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) => {} // no columns to resolve
+                Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) | Stage::Skip(_) => {} // no columns to resolve
                 Stage::Stats(s) => {
                     s.resolve(&mut header)?;
                     types = STATS_TYPES.to_vec();

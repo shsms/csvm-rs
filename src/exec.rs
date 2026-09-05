@@ -149,9 +149,10 @@ fn run_body<R: BufRead, W: Write + Send>(
     if plan_has_stateful_expr(plan) {
         return run_staged_in_memory(plan, opts, input, output);
     }
-    // `head` with no sort streams single-threaded and stops early.
-    if let Some((pre, n, post)) = head_only_shape(plan) {
-        return stream_head(pre, n, post, opts.chunk_size, input, output);
+    // A `tail +N` / `head` window with no sort streams single-threaded and
+    // stops early.
+    if let Some((pre, skip, limit, post)) = window_shape(plan) {
+        return stream_window(pre, skip, limit, post, opts.chunk_size, input, output);
     }
     // `stats` reduces the stream to a tiny profile; stream the input through it
     // (O(columns) memory) and run any following stages over that profile.
@@ -173,56 +174,51 @@ fn run_body<R: BufRead, W: Write + Send>(
     }
 }
 
-/// If the plan is `[Transform?, Head(n), Transform?]` with no sort, return the
-/// pre-head statements, the limit, and the post-head statements.
-fn head_only_shape(plan: &Plan) -> Option<(&[Stmt], usize, &[Stmt])> {
-    if plan.stages.iter().any(|s| {
-        matches!(
-            s,
-            Stage::Sort(_)
-                | Stage::Stats(_)
-                | Stage::Tail(_)
-                | Stage::DropLast(_)
-                | Stage::Uniq(_)
-                | Stage::Group(_)
-                | Stage::Join(_)
-        )
-    }) {
-        return None;
-    }
-    let heads: Vec<usize> = plan
-        .stages
-        .iter()
-        .enumerate()
-        .filter(|(_, s)| matches!(s, Stage::Head(_)))
-        .map(|(i, _)| i)
-        .collect();
-    let [hi] = heads[..] else { return None };
-    let Stage::Head(n) = plan.stages[hi] else {
-        return None;
+/// If the plan is `[Transform?, Skip?, Head?, Transform?]` with at least one
+/// of the window stages, return the pre-window statements, the rows to skip,
+/// the limit (`usize::MAX` for none), and the post-window statements.
+fn window_shape(plan: &Plan) -> Option<(&[Stmt], usize, usize, &[Stmt])> {
+    let (pre, rest) = match plan.stages.as_slice() {
+        [Stage::Transform(p), rest @ ..] => (p.as_slice(), rest),
+        rest => (&[][..], rest),
     };
-    Some((
-        transform_stmts(&plan.stages[..hi]),
-        n,
-        transform_stmts(&plan.stages[hi + 1..]),
-    ))
+    let (skip, rest) = match rest {
+        [Stage::Skip(n), rest @ ..] => (Some(*n), rest),
+        rest => (None, rest),
+    };
+    let (limit, rest) = match rest {
+        [Stage::Head(n), rest @ ..] => (Some(*n), rest),
+        rest => (None, rest),
+    };
+    let post = match rest {
+        [] => &[][..],
+        [Stage::Transform(p)] => p.as_slice(),
+        _ => return None,
+    };
+    if skip.is_none() && limit.is_none() {
+        return None; // no window stage: a lone transform has its own paths
+    }
+    Some((pre, skip.unwrap_or(0), limit.unwrap_or(usize::MAX), post))
 }
 
-/// Stream `[pre | head n | post]` single-threaded, stopping once `n` rows have
-/// reached the head. Reads only as much input as it needs (via
+/// Stream `[pre | skip | head limit | post]` single-threaded, dropping the
+/// first `skip` rows that survive `pre` and stopping once `limit` more have
+/// passed. Reads only as much input as it needs (via
 /// [`next_chunk_available`]) so it emits and stops promptly on a stream rather
 /// than blocking for a full chunk.
-fn stream_head<R: BufRead, W: Write>(
+fn stream_window<R: BufRead, W: Write>(
     pre: &[Stmt],
-    n: usize,
+    skip: usize,
+    limit: usize,
     post: &[Stmt],
     chunk_size: usize,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let mut taken = 0usize;
+    let end = skip.saturating_add(limit);
+    let mut seen = 0usize; // rows that survived `pre`
     let mut out_buf = String::new();
-    while taken < n {
+    while seen < end {
         let Some(chunk) = next_chunk_available(input, chunk_size)? else {
             break;
         };
@@ -230,12 +226,15 @@ fn stream_head<R: BufRead, W: Write>(
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
         csv::parse_chunk(&chunk, |row| {
-            if err.is_some() || taken >= n {
+            if err.is_some() || seen >= end {
                 return;
             }
             match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
                 Ok(true) => {
-                    taken += 1;
+                    seen += 1;
+                    if seen <= skip {
+                        return;
+                    }
                     match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
                         Ok(true) => csv::write_row(&mut out_buf, row),
                         Ok(false) => {}
@@ -1206,11 +1205,17 @@ fn run_staged<R: BufRead, W: Write>(
     let has_buffered = plan.stages.iter().any(|s| {
         matches!(
             s,
-            Stage::Tail(_) | Stage::DropLast(_) | Stage::Uniq(_) | Stage::Group(_) | Stage::Join(_)
+            Stage::Tail(_)
+                | Stage::DropLast(_)
+                | Stage::Skip(_)
+                | Stage::Uniq(_)
+                | Stage::Group(_)
+                | Stage::Join(_)
         )
     });
     // The streaming sort path handles exactly one sort and no head/stats/
-    // tail/drop-last/uniq/join; anything else materializes and runs stage by stage.
+    // tail/drop-last/skip/uniq/join; anything else materializes and runs stage
+    // by stage.
     if sort_count != 1 || has_head || has_stats || has_buffered {
         return run_staged_in_memory(plan, opts, input, output);
     }
@@ -1385,6 +1390,9 @@ fn apply_stages_over_rows(
                 rows.drain(..drop);
             }
             Stage::DropLast(n) => rows.truncate(rows.len().saturating_sub(*n)),
+            Stage::Skip(n) => {
+                rows.drain(..(*n).min(rows.len()));
+            }
             Stage::Uniq(u) => dedup_rows(&mut rows, &u.positions),
             Stage::Stats(s) => {
                 let accs = build_colstats(&s.positions, &rows);
@@ -2092,6 +2100,12 @@ pub fn describe(plan: &Plan) -> String {
             Stage::DropLast(limit) => {
                 out.push_str(&format!(
                     "stage {n} (drop-last):\n  {n}.1 drop last {limit} (head -n -{limit})\n"
+                ));
+            }
+            Stage::Skip(count) => {
+                out.push_str(&format!(
+                    "stage {n} (skip):\n  {n}.1 skip {count} (tail -n +{})\n",
+                    count + 1
                 ));
             }
             Stage::Uniq(u) => {
