@@ -404,9 +404,11 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   in-memory fallback still fill large chunks via `next_chunk` (they must read
   all input before emitting, so batching wins there).
 - `sort` is a blocking stage handled by a **parallel external merge sort**
-  (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; `-n`
-  workers each parse + apply the pre-sort statements, **serialize each row to
-  bytes once**, compute an **order-preserving encoded key**, and sort their
+  (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; up to
+  `-n` workers (capped so their `2 × workers` in-flight blocks, 1 MiB each at
+  least, fit `--sort-buffer`) each parse + apply the pre-sort statements,
+  **serialize each row to bytes once**, compute an **order-preserving encoded
+  key**, and sort their
   block into a run (kept in memory, or spilled to a temp file past the budget).
   A single-threaded binary-heap k-way merge then picks the smallest key and
   emits the row's already-serialized line bytes via a callback — no per-field

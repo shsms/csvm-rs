@@ -41,7 +41,8 @@ options (--flag VALUE or --flag=VALUE):
   -n, --threads N      worker threads for a seekable file (default: 1)
   -t, --temp-dir DIR   directory for sort spill files (default: system temp)
       --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
-      --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M)
+      --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;
+                       also caps sort workers at SZ / 2M)
       --color WHEN     auto (TTY only) | always | never
       --print-engine   print the compiled plan and exit
   -h, --help           show this help

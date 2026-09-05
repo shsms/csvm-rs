@@ -39,6 +39,11 @@ pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
 /// opens more than this many files and the heap stays small.
 const DEFAULT_FANOUT: usize = 32;
 
+/// Smallest raw input block a sort worker is handed; the worker count is
+/// capped so `2 * workers` of them fit the budget. A higher floor keeps the
+/// run count (temp files, merge levels) down.
+const MIN_BLOCK: usize = 1 << 20;
+
 /// Process-global run-file counter so concurrent sorters never collide on a
 /// temp file name (csvm uses the same trick).
 static RUN_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -165,10 +170,15 @@ impl Sorter {
         temp_dir: PathBuf,
         budget: usize,
     ) -> Self {
-        let threads = threads.max(1);
         let budget = budget.max(1);
-        let block_size = (budget / (2 * threads)).clamp(4 << 20, 64 << 20);
-        Self::with_params(sort, pre, threads, temp_dir, budget, block_size)
+        // Up to `2 * workers` raw blocks are in flight, so with the block-size
+        // floor a large thread count would exceed the budget: cap the workers
+        // at what the budget holds. The merge width is not bound by it.
+        let workers = threads.clamp(1, (budget / (2 * MIN_BLOCK)).max(1));
+        let block_size = (budget / (2 * workers)).clamp(MIN_BLOCK, 64 << 20);
+        let mut sorter = Self::with_params(sort, pre, workers, temp_dir, budget, block_size);
+        sorter.threads = threads.max(1);
+        sorter
     }
 
     /// Like [`Sorter::new`] but with an explicit block size (tests push blocks
@@ -231,6 +241,12 @@ impl Sorter {
     /// The block size the caller should read input in.
     pub fn block_size(&self) -> usize {
         self.block_size
+    }
+
+    /// Run-generation workers (the merge width is `threads`).
+    #[cfg(test)]
+    fn workers(&self) -> usize {
+        self.workers.len()
     }
 
     /// Hand one input block to a worker (one block becomes one run).
@@ -685,6 +701,30 @@ mod tests {
     }
 
     #[test]
+    fn block_size_follows_the_budget_and_thread_count() {
+        let s = SortStmt {
+            keys: vec![key(0, false, SortMode::Numeric)],
+        };
+        let block = |threads, budget| {
+            Sorter::new(&s, &[], threads, std::env::temp_dir(), budget).block_size()
+        };
+        // Two blocks per worker in flight share the budget.
+        assert_eq!(block(8, 256 << 20), 16 << 20);
+        assert_eq!(block(64, 256 << 20), 2 << 20);
+        // Floor and ceiling.
+        assert_eq!(block(4, 1 << 20), MIN_BLOCK);
+        assert_eq!(block(64, 1 << 20), MIN_BLOCK);
+        assert_eq!(block(1, 1 << 30), 64 << 20);
+        // Workers are capped so their in-flight blocks fit the budget; the
+        // merge width stays as requested.
+        let sorter = Sorter::new(&s, &[], 64, std::env::temp_dir(), 4 << 20);
+        assert_eq!((sorter.workers(), sorter.threads), (2, 64));
+        let sorter = Sorter::new(&s, &[], 4, std::env::temp_dir(), 1 << 20);
+        assert_eq!((sorter.workers(), sorter.threads), (1, 4));
+        let sorter = Sorter::new(&s, &[], 8, std::env::temp_dir(), 256 << 20);
+        assert_eq!((sorter.workers(), sorter.threads), (8, 8));
+    }
+
     fn string_keys() {
         let s = SortStmt {
             keys: vec![key(0, false, SortMode::Lexical)],
