@@ -251,6 +251,14 @@ impl<'a> Builder<'a> {
         for item in self.items.drain(..) {
             match item {
                 Item::Stmt(s) => transform.push(s),
+                Item::Stage(Stage::Skip(n)) => {
+                    flush(&mut transform, &mut stages);
+                    push_window(&mut stages, n, None);
+                }
+                Item::Stage(Stage::Head(n)) => {
+                    flush(&mut transform, &mut stages);
+                    push_window(&mut stages, 0, Some(n));
+                }
                 Item::Stage(stage) => {
                     flush(&mut transform, &mut stages);
                     stages.push(stage);
@@ -1506,6 +1514,33 @@ fn parse_scale(s: &str) -> Result<f64, Error> {
         .ok_or_else(|| err(format!("-s/--scale expects a positive number, got `{s}`")))
 }
 
+/// Push a window (`tail +N` is `skip` rows, `head N` a `limit`), folding it
+/// into the window the stages end with: a run of `head` / `tail +N` stages
+/// is one window, kept as `[Skip(a)?, Head(l)?]`. `skip a | head l | skip b`
+/// is `skip a+b | head l-b`, and a second `head` keeps the smaller limit. A
+/// `Skip(0)` is dropped once there is a limit (a bare one stays, as `tail +1`
+/// on its own).
+fn push_window(stages: &mut Vec<Stage>, skip: usize, limit: Option<usize>) {
+    let (prev_skip, prev_limit, start) = match stages.as_slice() {
+        [.., Stage::Skip(a), Stage::Head(l)] => (*a, Some(*l), stages.len() - 2),
+        [.., Stage::Skip(a)] => (*a, None, stages.len() - 1),
+        [.., Stage::Head(l)] => (0, Some(*l), stages.len() - 1),
+        _ => (0, None, stages.len()),
+    };
+    let limit = match (prev_limit.map(|l| l.saturating_sub(skip)), limit) {
+        (Some(l), Some(m)) => Some(l.min(m)),
+        (l, m) => l.or(m),
+    };
+    let skip = prev_skip.saturating_add(skip);
+    stages.truncate(start);
+    if skip > 0 || limit.is_none() {
+        stages.push(Stage::Skip(skip));
+    }
+    if let Some(l) = limit {
+        stages.push(Stage::Head(l));
+    }
+}
+
 /// `s` without one pair of surrounding quotes (`'`, `"` or backticks), if it
 /// has one; the items of [`split_specs`] keep theirs. Stricter than
 /// [`take_token`]: text after the closing quote, or an unterminated quote,
@@ -2560,6 +2595,39 @@ mod tests {
                 .resolve(&header[1..])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn adjacent_windows_fold_into_one() {
+        // `skip a | head l | skip b` is `skip a+b | head l-b`; `head` after
+        // `head` keeps the smaller; a transform in between stops the fold.
+        let stages = |s: &str| parse(s).unwrap().stages;
+        assert!(matches!(
+            stages("head 5 | tail +2")[..],
+            [Stage::Skip(1), Stage::Head(4)]
+        ));
+        assert!(matches!(stages("tail +3 | tail +2")[..], [Stage::Skip(3)]));
+        assert!(matches!(stages("head 5 | head 3")[..], [Stage::Head(3)]));
+        assert!(matches!(
+            stages("tail +2 | head 3 | tail +2 | head 5")[..],
+            [Stage::Skip(2), Stage::Head(2)]
+        ));
+        assert!(matches!(
+            stages("head 2 | tail +5")[..],
+            [Stage::Skip(4), Stage::Head(0)]
+        ));
+        // Skips add without overflowing.
+        let huge = format!("tail +{0} | tail +{0}", usize::MAX);
+        assert!(matches!(stages(&huge)[..], [Stage::Skip(usize::MAX)]));
+        assert!(matches!(
+            stages("head 5 | cols a | tail +2")[..],
+            [Stage::Head(5), Stage::Transform(_), Stage::Skip(1)]
+        ));
+        // A window from a fragment folds too.
+        assert!(matches!(
+            stages("fn t2() { tail +2 }\nhead 5 | t2()")[..],
+            [Stage::Skip(1), Stage::Head(4)]
+        ));
     }
 
     #[test]

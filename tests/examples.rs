@@ -449,6 +449,11 @@ fn tail_plus_n_starts_at_row_n() {
         .chain((1..=200).map(|i| format!("{i}\n")))
         .collect();
     assert_eq!(run_checked("tail +150 | head 2", &long), "id\n150\n151\n");
+    assert_eq!(
+        run_checked("head 152 | tail +150", &long),
+        "id\n150\n151\n152\n"
+    );
+    assert_eq!(run_checked("head 2 | tail +5", &long), "id\n");
     // After a sort it skips in sorted order (countZ desc: ids 4,1,5,2,3).
     assert_eq!(
         run_checked("sort countZ=nr | tail +4 | cols id", INPUT),

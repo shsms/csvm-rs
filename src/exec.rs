@@ -205,9 +205,10 @@ impl Window {
         inside
     }
 
-    /// Whether the window is full, so no later row can be admitted.
+    /// Whether the window is full, so no later row can be admitted (at once
+    /// when the limit is 0, whatever the skip).
     fn done(&self) -> bool {
-        self.seen >= self.skip.saturating_add(self.limit)
+        self.limit == 0 || self.seen >= self.skip.saturating_add(self.limit)
     }
 }
 
@@ -2589,6 +2590,29 @@ mod tests {
     }
 
     #[test]
+    fn a_window_with_nothing_to_admit_reads_no_input() {
+        // `head 2 | tail +5` folds to skip 4, limit 0: done before it
+        // reads, whatever the skip.
+        assert!(Window::new(1 << 40, 0).done());
+        assert!(!Window::new(1 << 40, 1).done());
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                panic!("the window read input")
+            }
+        }
+        impl BufRead for Unreadable {
+            fn fill_buf(&mut self) -> io::Result<&[u8]> {
+                panic!("the window read input")
+            }
+            fn consume(&mut self, _: usize) {}
+        }
+        let mut out = Vec::new();
+        stream_window(&[], Window::new(4, 0), &[], 64, &mut Unreadable, &mut out).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
     fn window_shape_covers_skip_head_and_a_bare_skip() {
         let shape = |script: &str| {
             let mut plan = crate::parse::parse(script).unwrap();
@@ -2597,6 +2621,8 @@ mod tests {
                 .map(|(pre, w, post)| (pre.len(), w.skip, w.limit, post.len()))
         };
         assert_eq!(shape("tail +3 | head 2"), Some((0, 2, 2, 0)));
+        // The reverse order folds at parse time, so it streams too.
+        assert_eq!(shape("head 5 | tail +2"), Some((0, 1, 4, 0)));
         assert_eq!(
             shape("select id > 1 | head 2 | cols id"),
             Some((1, 0, 2, 1))
