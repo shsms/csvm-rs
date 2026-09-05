@@ -885,6 +885,53 @@ mod tests {
     }
 
     #[test]
+    fn typed_rows_survive_a_spill() {
+        // With the typed format a number comes back exact through the spilled
+        // key + row records, not as its six-decimal text.
+        let mut plan = crate::parse::parse("add v = num(v) | sort v=nr").unwrap();
+        plan.resolve(&["v".to_string(), "tag".to_string()]).unwrap();
+        let [
+            crate::plan::Stage::Transform(pre),
+            crate::plan::Stage::Sort(sort),
+        ] = plan.stages.as_slice()
+        else {
+            panic!("unexpected plan shape");
+        };
+        let mut s = Sorter::with_params(
+            sort,
+            pre,
+            LineFormat::Typed,
+            4,
+            std::env::temp_dir(),
+            1,
+            1 << 20,
+        );
+        for line in ["1.00000010,a", "1.00000030,b", "1.00000020,c"] {
+            s.push_block(format!("{line}\n"));
+        }
+        let mut out = Vec::new();
+        s.finish()
+            .unwrap()
+            .for_each_line(|row| {
+                let row = decode_row(row).unwrap();
+                let Field::Num(v) = row[0] else {
+                    panic!("not a number: {:?}", row[0]);
+                };
+                out.push((v, row[1].as_str().into_owned()));
+                Ok(ControlFlow::Continue(()))
+            })
+            .unwrap();
+        assert_eq!(
+            out,
+            [
+                (1.00000030, "b".into()),
+                (1.00000020, "c".into()),
+                (1.00000010, "a".into())
+            ]
+        );
+    }
+
+    #[test]
     fn string_keys() {
         let s = SortStmt {
             keys: vec![key(0, false, SortMode::Lexical)],
