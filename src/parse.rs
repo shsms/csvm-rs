@@ -1354,34 +1354,49 @@ fn joins_at_eq(c: char, after_eq: bool, rest: &str) -> bool {
     c.is_whitespace() && (after_eq || rest.trim_start().starts_with('='))
 }
 
-/// Split an argument string into items on commas and whitespace, respecting
-/// quotes; surrounding quotes are stripped from each item. Single quotes, double
-/// quotes, and backticks all quote, so a column name with a comma/space (or just
-/// for consistency with `select`'s backticks) can be written `` `odd, name` ``.
-/// An unquoted `=` binds tighter than whitespace: `a = b` is one item.
-fn split_list(s: &str) -> Vec<String> {
+/// Split an argument string into items on commas and whitespace outside
+/// quotes (`'`, `"` and backticks all quote, so a column name with a
+/// comma/space can be written `` `odd, name` ``). With `keep_quotes` the
+/// quote characters stay in the item, else they are stripped; with
+/// `nest_parens` a `func(a, b)` group is one item. An unquoted `=` binds
+/// tighter than whitespace: `a = b` is one item.
+fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
+    let mut depth = 0i32;
     let mut in_item = false;
     // The last character pushed was an unquoted `=`.
     let mut after_eq = false;
     for (i, c) in s.char_indices() {
         match quote {
-            Some(q) if c == q => quote = None,
+            Some(q) if c == q => {
+                quote = None;
+                if keep_quotes {
+                    cur.push(c);
+                }
+            }
             Some(_) => cur.push(c),
             None if c == '"' || c == '\'' || c == '`' => {
                 quote = Some(c);
                 in_item = true;
                 after_eq = false;
+                if keep_quotes {
+                    cur.push(c);
+                }
             }
-            None if c == ',' || c.is_whitespace() => {
+            None if depth == 0 && (c == ',' || c.is_whitespace()) => {
                 if in_item && !joins_at_eq(c, after_eq, &s[i..]) {
                     out.push(std::mem::take(&mut cur));
                     in_item = false;
                 }
             }
             None => {
+                if nest_parens && c == '(' {
+                    depth += 1;
+                } else if nest_parens && c == ')' {
+                    depth -= 1;
+                }
                 cur.push(c);
                 in_item = true;
                 after_eq = c == '=';
@@ -1392,6 +1407,18 @@ fn split_list(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+/// A column/argument list: [`split_items`] with the quotes stripped.
+fn split_list(s: &str) -> Vec<String> {
+    split_items(s, false, false)
+}
+
+/// An `agg` argument: [`split_items`] keeping `func(col)` groups and quoted
+/// names intact, quotes included, so `by` can be told from `'by'` and a
+/// trailing `=` is known to be unquoted.
+fn split_specs(s: &str) -> Vec<String> {
+    split_items(s, true, true)
 }
 
 /// Replace each parameter, wherever it appears in `body` as a whole
@@ -1497,42 +1524,6 @@ fn split_off_by(s: &str) -> (&str, Option<&str>) {
         }
     }
     (s.trim(), None)
-}
-
-/// Split an `agg` spec list on top-level commas/whitespace, keeping `func(col)`
-/// groups intact.
-fn split_specs(s: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut in_tick = false;
-    for (i, c) in s.char_indices() {
-        match c {
-            '`' => {
-                in_tick = !in_tick;
-                cur.push(c);
-            }
-            '(' if !in_tick => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' if !in_tick => {
-                depth -= 1;
-                cur.push(c);
-            }
-            c if depth == 0 && !in_tick && (c == ',' || c.is_whitespace()) => {
-                // Backticks stay in `cur` here, so a trailing `=` is unquoted.
-                if !cur.is_empty() && !joins_at_eq(c, cur.ends_with('='), &s[i..]) {
-                    out.push(std::mem::take(&mut cur));
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
 }
 
 /// Parse one aggregate spec: `func` (only `count` may omit a column),
