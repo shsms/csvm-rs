@@ -137,6 +137,7 @@ enum Item {
     Head(usize),
     Tail(usize),
     DropLast(usize),
+    Skip(usize),
     Stats(StatsStmt),
     Uniq(UniqStmt),
     Group(GroupStmt),
@@ -199,6 +200,10 @@ impl<'a> Builder<'a> {
                 Item::DropLast(n) => {
                     flush(&mut transform, &mut stages);
                     stages.push(Stage::DropLast(n));
+                }
+                Item::Skip(n) => {
+                    flush(&mut transform, &mut stages);
+                    stages.push(Stage::Skip(n));
                 }
                 Item::Stats(s) => {
                     flush(&mut transform, &mut stages);
@@ -376,20 +381,22 @@ impl<'a> Builder<'a> {
         // A positive count keeps the first N rows; a negative one (`head -n -N`)
         // keeps all but the last N (coreutils' behaviour).
         match parse_count(rest, "head")? {
-            n if n >= 0 => self.items.push(Item::Head(n as usize)),
-            n => self.items.push(Item::DropLast(n.unsigned_abs() as usize)),
+            Count::Rows(n) if n >= 0 => self.items.push(Item::Head(n as usize)),
+            Count::Rows(n) => self.items.push(Item::DropLast(n.unsigned_abs() as usize)),
+            Count::From(_) => return Err(err("head doesn't support +N (that is tail's form)")),
         }
         Ok(())
     }
 
     /// `tail [N]` keeps the last N rows reaching it (a blocking stage; default
-    /// 10). Same count spellings as `head`, but no negative form.
+    /// 10). Same count spellings as `head`, but no negative form; `tail +N`
+    /// (`-n +N`) prints from row N on, a streaming skip of the first N-1.
     fn parse_tail(&mut self, rest: &str) -> Result<(), Error> {
-        let n = parse_count(rest, "tail")?;
-        if n < 0 {
-            return Err(err("tail doesn't support a negative count"));
+        match parse_count(rest, "tail")? {
+            Count::Rows(n) if n >= 0 => self.items.push(Item::Tail(n as usize)),
+            Count::Rows(_) => return Err(err("tail doesn't support a negative count")),
+            Count::From(n) => self.items.push(Item::Skip(n.saturating_sub(1))),
         }
-        self.items.push(Item::Tail(n as usize));
         Ok(())
     }
 
@@ -948,20 +955,34 @@ impl<'a> Builder<'a> {
 /// Rows kept by `head`/`tail` when no count is given (bash defaults to 10).
 const DEFAULT_ROWS: usize = 10;
 
-/// Parse the (possibly negative) row count shared by `head`/`tail`: no argument
-/// ⇒ +10; a bare count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`,
-/// `--lines=20`), or the obsolete `-N` (`head -20`, positive). A reduced text
-/// that itself starts with `-` (i.e. `-n -N` / `--lines=-N`) is *negative* —
-/// `head` reads that as "all but the last N"; `tail` rejects it. Byte mode
+/// A `head`/`tail` row count.
+enum Count {
+    /// `N` rows; negative is `head`'s "all but the last N".
+    Rows(i64),
+    /// `+N`: from row N on (coreutils' `tail -n +N`).
+    From(usize),
+}
+
+/// Parse the row count shared by `head`/`tail`: no argument ⇒ 10; a bare
+/// count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the
+/// obsolete `-N` (`head -20`, positive). A reduced text that itself starts
+/// with `-` (i.e. `-n -N` / `--lines=-N`) is *negative*, and one that starts
+/// with `+` is [`Count::From`]; each verb decides what it accepts. Byte mode
 /// (`-c`) is not supported. `verb` names the command in errors.
-fn parse_count(rest: &str, verb: &str) -> Result<i64, Error> {
+fn parse_count(rest: &str, verb: &str) -> Result<Count, Error> {
     let rest = rest.trim();
     if rest.is_empty() {
-        return Ok(DEFAULT_ROWS as i64);
+        return Ok(Count::Rows(DEFAULT_ROWS as i64));
     }
-    head_count_text(rest)
-        .parse::<i64>()
-        .map_err(|_| err(format!("{verb} expects a row count, got '{rest}'")))
+    let bad = || err(format!("{verb} expects a row count, got '{rest}'"));
+    let text = head_count_text(rest);
+    match text.strip_prefix('+') {
+        Some(from) if from.bytes().all(|b| b.is_ascii_digit()) => {
+            from.parse().map(Count::From).map_err(|_| bad())
+        }
+        Some(_) => Err(bad()),
+        None => text.parse().map(Count::Rows).map_err(|_| bad()),
+    }
 }
 
 /// Reduce a `head` argument to its numeric text, accepting bash's spellings:
@@ -2334,6 +2355,34 @@ mod tests {
         ));
         // tail has no negative form.
         assert!(parse("tail -n -3").is_err());
+    }
+
+    #[test]
+    fn tail_plus_n_is_from_row_n() {
+        // coreutils' `tail -n +N` prints from row N on: skip the first N-1.
+        assert!(matches!(
+            parse("tail +3").unwrap().stages[0],
+            Stage::Skip(2)
+        ));
+        assert!(matches!(
+            parse("tail -n +3").unwrap().stages[0],
+            Stage::Skip(2)
+        ));
+        assert!(matches!(
+            parse("tail --lines=+1").unwrap().stages[0],
+            Stage::Skip(0)
+        ));
+        // `+0` is the whole input, as in coreutils.
+        assert!(matches!(
+            parse("tail +0").unwrap().stages[0],
+            Stage::Skip(0)
+        ));
+        // head has no `+N` form.
+        let err = parse("head +3").unwrap_err().to_string();
+        assert!(err.contains("head"), "{err}");
+        assert!(parse("tail +x").is_err());
+        assert!(parse("tail ++3").is_err());
+        assert!(parse("tail +").is_err());
     }
 
     #[test]

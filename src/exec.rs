@@ -2517,6 +2517,51 @@ mod tests {
     }
 
     #[test]
+    fn window_shape_covers_skip_head_and_a_bare_skip() {
+        let shape = |script: &str| {
+            let mut plan = crate::parse::parse(script).unwrap();
+            plan.resolve(&["id".to_string()]).unwrap();
+            window_shape(&plan).map(|(pre, skip, limit, post)| (pre.len(), skip, limit, post.len()))
+        };
+        assert_eq!(shape("tail +3 | head 2"), Some((0, 2, 2, 0)));
+        assert_eq!(
+            shape("select id > 1 | head 2 | cols id"),
+            Some((1, 0, 2, 1))
+        );
+        // `tail +1` is a no-op window; it still streams rather than materializing.
+        assert_eq!(shape("tail +1"), Some((0, 0, usize::MAX, 0)));
+        // A lone transform has its own paths; a window after a sort does not stream.
+        assert_eq!(shape("cols id"), None);
+        assert_eq!(shape("sort id | head 2"), None);
+    }
+
+    #[test]
+    fn tail_plus_n_skips_the_first_rows() {
+        // `tail +3` prints from row 3 on (ids 3 and 4).
+        assert_eq!(
+            run_str("tail +3", INPUT).unwrap(),
+            "id,fieldA,countZ\n3,t,0\n4,t,9\n"
+        );
+        // Counts rows reaching it, after a filter (fieldA == 't' -> ids 1,3,4).
+        assert_eq!(
+            run_str("select fieldA == 't' | tail +2", INPUT).unwrap(),
+            "id,fieldA,countZ\n3,t,0\n4,t,9\n"
+        );
+        // Composes with head as a window, and with a filter after it.
+        assert_eq!(
+            run_str("tail +2 | head 2 | select countZ == 0", INPUT).unwrap(),
+            "id,fieldA,countZ\n2,f,0\n3,t,0\n"
+        );
+        // Skipping everything leaves the header.
+        assert_eq!(run_str("tail +99", INPUT).unwrap(), "id,fieldA,countZ\n");
+        // A sort before it is honoured (skip happens after the sort).
+        assert_eq!(
+            run_str("sort countZ=nr | tail +3", INPUT).unwrap(),
+            "id,fieldA,countZ\n2,f,0\n3,t,0\n"
+        );
+    }
+
+    #[test]
     fn missing_column_is_an_error() {
         assert!(matches!(
             run_str("cols nope", INPUT),
