@@ -22,9 +22,9 @@ use crate::error::Error;
 use crate::field::Field;
 use crate::graph::Histogram;
 use crate::plan::{
-    AggFunc, AggSpec, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind,
-    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
-    ValExpr, apply_stmts,
+    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphSpec,
+    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
+    apply_stmts,
 };
 use crate::sort::Sorter;
 use crate::stats::ColStats;
@@ -443,6 +443,15 @@ struct GroupAcc {
     stats: Vec<ColStats>,
 }
 
+/// Where one aggregate reads a group's state.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// A bare `count`: the row counter.
+    Rows,
+    /// An index into `GroupAcc::stats`.
+    Stats(usize),
+}
+
 /// `group … | agg …` reducer. The per-key sibling of [`build_colstats`]:
 /// folds rows into per-group accumulators keyed by the CSV-encoded key cells,
 /// preserving first-seen order. Aggregates sharing a column share one
@@ -451,8 +460,8 @@ struct Grouper<'a> {
     g: &'a GroupStmt,
     /// Distinct aggregated column positions (a bare `count` contributes none).
     stat_positions: Vec<usize>,
-    /// For each agg, the slot into a group's `stats`, or `None` for a bare `count`.
-    agg_slot: Vec<Option<usize>>,
+    /// For each agg, where it reads a group's state.
+    agg_slot: Vec<Slot>,
     index: HashMap<String, usize>,
     groups: Vec<GroupAcc>,
     /// Per-row scratch reused across rows (cleared, not reallocated) — the key
@@ -463,20 +472,20 @@ struct Grouper<'a> {
 
 impl<'a> Grouper<'a> {
     fn new(g: &'a GroupStmt) -> Self {
+        // The slot of `p` in `positions`, appending it on first sight.
+        fn slot_of(positions: &mut Vec<usize>, p: usize) -> usize {
+            positions.iter().position(|&q| q == p).unwrap_or_else(|| {
+                positions.push(p);
+                positions.len() - 1
+            })
+        }
         let mut stat_positions: Vec<usize> = Vec::new();
         let agg_slot = g
             .aggs
             .iter()
-            .map(|a| {
-                a.pos.map(|p| {
-                    stat_positions
-                        .iter()
-                        .position(|&q| q == p)
-                        .unwrap_or_else(|| {
-                            stat_positions.push(p);
-                            stat_positions.len() - 1
-                        })
-                })
+            .map(|a| match a.pos {
+                None => Slot::Rows,
+                Some(p) => Slot::Stats(slot_of(&mut stat_positions, p)),
             })
             .collect();
         Grouper {
@@ -566,11 +575,10 @@ impl<'a> Grouper<'a> {
         } = self;
         groups
             .into_iter()
-            .map(|acc| {
-                let mut row = acc.key;
-                for (a, slot) in g.aggs.iter().zip(&agg_slot) {
-                    let stats = slot.map(|s| &acc.stats[s]);
-                    row.push(agg_value(a, stats, acc.rows));
+            .map(|mut acc| {
+                let mut row = std::mem::take(&mut acc.key);
+                for (a, &slot) in g.aggs.iter().zip(&agg_slot) {
+                    row.push(agg_value(a.func, slot, &acc));
                 }
                 row
             })
@@ -580,25 +588,27 @@ impl<'a> Grouper<'a> {
 
 /// One aggregate's output cell. Numeric aggregates over a text/empty column are
 /// blank (the same policy `stats` uses).
-fn agg_value(a: &AggSpec, stats: Option<&ColStats>, rows: u64) -> Field<'static> {
-    match a.func {
+fn agg_value(func: AggFunc, slot: Slot, acc: &GroupAcc) -> Field<'static> {
+    let stats = match slot {
         // Bare `count` counts rows; `count(col)` counts non-empty cells.
-        AggFunc::Count => match stats {
-            Some(s) => Field::Num(s.count() as f64),
-            None => Field::Num(rows as f64),
-        },
-        AggFunc::Min => stats.map_or(Field::Str(""), ColStats::min_field),
-        AggFunc::Max => stats.map_or(Field::Str(""), ColStats::max_field),
+        Slot::Rows => return Field::Num(acc.rows as f64),
+        Slot::Stats(i) => &acc.stats[i],
+    };
+    match func {
+        AggFunc::Count => Field::Num(stats.count() as f64),
+        AggFunc::Min => stats.min_field(),
+        AggFunc::Max => stats.max_field(),
         AggFunc::Sum => num_or_blank(stats, ColStats::sum),
         AggFunc::Mean => num_or_blank(stats, ColStats::mean),
-        AggFunc::Stddev => stats.map_or(Field::Str(""), ColStats::stddev_field),
+        AggFunc::Stddev => stats.stddev_field(),
     }
 }
 
-fn num_or_blank(stats: Option<&ColStats>, f: fn(&ColStats) -> f64) -> Field<'static> {
-    match stats {
-        Some(s) if s.has_numeric() => Field::Num(f(s)),
-        _ => Field::Str(""),
+fn num_or_blank(stats: &ColStats, f: fn(&ColStats) -> f64) -> Field<'static> {
+    if stats.has_numeric() {
+        Field::Num(f(stats))
+    } else {
+        Field::Str("")
     }
 }
 
