@@ -1054,10 +1054,9 @@ impl BoolExpr {
         }
     }
 
-    /// Resolve column names to positions and, for a comparison, pin its mode
-    /// from `types` (the columns' known types by position): the parser
-    /// decided by name alone, so a column typed under another spelling (a
-    /// position, a later rename) is only known here.
+    /// Resolve column names to positions and decide each comparison's mode
+    /// from the operands and `types` (the columns' known types by position);
+    /// the parser leaves every compare `Auto`, so this is the one decision.
     fn resolve(&mut self, header: &[String], types: &[Option<ColType>]) -> Result<(), Error> {
         match self {
             BoolExpr::And(es) | BoolExpr::Or(es) => {
@@ -1069,8 +1068,6 @@ impl BoolExpr {
             BoolExpr::Cmp(c) => {
                 c.lhs.resolve(header, types)?;
                 c.rhs.resolve(header, types)?;
-                // The parser decided by name alone; every type it knew is in
-                // `types` too, so this only ever pins further.
                 c.retype(&|r| types[r.pos])?;
             }
             BoolExpr::Match { col, .. } => col.resolve(header)?,
@@ -1649,10 +1646,10 @@ impl Plan {
         let mut header = input_header.to_vec();
         // The columns' known types, kept in step with `header`: `to-num` /
         // `to-str` / `add` set them, `cols` reorders them, `group` keeps its
-        // keys' and types its aggregates, `stats` types its profile columns, a
-        // join keeps the left side's and leaves the right untyped. Sort keys
-        // and comparisons pin their mode from this, so a type follows the
-        // column however it is spelled.
+        // keys' and types its aggregates, `stats` types its profile columns,
+        // a join keeps the left side's and leaves the right untyped. Sort
+        // keys and comparisons pin their mode from this, so a type follows
+        // the column however it is spelled.
         let mut types: Vec<Option<ColType>> = vec![None; header.len()];
         for stage in &mut self.stages {
             match stage {
@@ -2012,6 +2009,45 @@ mod tests {
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column { name, .. } if name == "nope"));
+    }
+
+    #[test]
+    fn modes_are_pinned_from_column_types_at_resolve() {
+        // The parser leaves every column untyped; resolve pins from the
+        // position-keyed map: to-str/to-num, an `add` expression's type, and
+        // a replace-in-place re-typing the column. An explicit flag wins.
+        let mut plan = crate::parse::parse("to-str z | sort a=s b z z=n").unwrap();
+        plan.resolve(&["a".into(), "b".into(), "z".into()]).unwrap();
+        let Stage::Sort(s) = &plan.stages[1] else {
+            panic!()
+        };
+        let modes: Vec<SortMode> = s.keys.iter().map(|k| k.mode).collect();
+        use SortMode::{Auto, Lexical, Numeric};
+        assert_eq!(modes, [Lexical, Auto, Lexical, Numeric]);
+        for (script, expect) in [
+            ("add s a ++ 'x' | sort s", Lexical),
+            ("to-num a | add a a ++ 'x' | sort a", Lexical),
+            ("add n a * 2 | sort n", Numeric),
+        ] {
+            let mut plan = crate::parse::parse(script).unwrap();
+            plan.resolve(&["a".into()]).unwrap();
+            let Stage::Sort(s) = &plan.stages[1] else {
+                panic!()
+            };
+            assert_eq!(s.keys[0].mode, expect, "{script}");
+        }
+        // A compare against a to-num column becomes numeric at resolve, and
+        // its string literal is folded into a number then.
+        let mut plan = crate::parse::parse("to-num c | select c == '5'").unwrap();
+        plan.resolve(&["c".into()]).unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
+            panic!()
+        };
+        assert_eq!(c.mode, CmpMode::Numeric);
+        assert!(matches!(c.rhs, ValExpr::Num(n) if n == 5.0));
     }
 
     #[test]

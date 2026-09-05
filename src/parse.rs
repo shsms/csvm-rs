@@ -12,16 +12,15 @@
 //! it produces is the same plain-Rust IR the executor runs — no interpreter in
 //! the hot path.
 //!
-//! Column *types* (`Str`/`Num`) are tracked left-to-right so comparisons go
-//! numeric implicitly: against a number literal, or against a column an earlier
-//! `to-num` marked numeric.
-
-use std::collections::HashMap;
+//! Comparison and sort modes are decided here from what an expression says on
+//! its own (a number literal, arithmetic, a string literal); column types are
+//! not known yet, so `Plan::resolve` decides again with the types it tracks
+//! by position.
 
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef, ColType,
+    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
     JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage,
     StatsStmt, Stmt, UniqStmt, ValExpr,
@@ -109,7 +108,6 @@ struct Builder<'a> {
     /// Current fragment-expansion depth; `MAX_FN_DEPTH` stops recursion.
     depth: usize,
     items: Vec<Item>,
-    col_types: HashMap<String, ColType>,
     output: OutputFormat,
     /// Column names from a `hdr` command, for headerless input.
     header: Option<Vec<String>>,
@@ -125,21 +123,10 @@ impl<'a> Builder<'a> {
             fns,
             depth,
             items: Vec::new(),
-            col_types: HashMap::new(),
             output: OutputFormat::Csv,
             header: None,
             colors: Vec::new(),
             graph: None,
-        }
-    }
-
-    /// The default [`SortMode`] for a column: pinned by an earlier `to-num` /
-    /// `to-str`, else auto-detected per cell.
-    fn default_sort_mode(&self, name: &str) -> SortMode {
-        match self.col_types.get(name) {
-            Some(ColType::Num) => SortMode::Numeric,
-            Some(ColType::Str) => SortMode::Lexical,
-            None => SortMode::Auto,
         }
     }
 
@@ -683,11 +670,7 @@ impl<'a> Builder<'a> {
             return Err(err("color expects a condition expression"));
         }
         let toks = lex_expr(expr_src)?;
-        let mut parser = ExprParser {
-            toks,
-            pos: 0,
-            types: &self.col_types,
-        };
+        let mut parser = ExprParser { toks, pos: 0 };
         let expr = parser.parse()?;
         // Colour rules render from the buffered output rows, where there is no
         // previous-row/rownum context to read. (Checked here rather than at
@@ -792,10 +775,6 @@ impl<'a> Builder<'a> {
         if names.is_empty() {
             return Err(err("to-num/to-str expects at least one column"));
         }
-        for n in &names {
-            self.col_types
-                .insert(n.clone(), if to_num { ColType::Num } else { ColType::Str });
-        }
         let conv = ConvStmt {
             names,
             positions: Vec::new(),
@@ -823,23 +802,9 @@ impl<'a> Builder<'a> {
             return Err(err("add expects an expression after the column name"));
         }
         let toks = lex_expr(expr_src.trim())?;
-        let mut parser = ExprParser {
-            toks,
-            pos: 0,
-            types: &self.col_types,
-        };
+        let mut parser = ExprParser { toks, pos: 0 };
         let expr = parser.parse_value_top()?;
         let stateful = expr.is_stateful();
-        // Track the new column's type so later comparisons can go numeric
-        // implicitly (a data-dependent expression leaves it untyped).
-        match parser.static_type(&expr) {
-            Some(t) => {
-                self.col_types.insert(name.clone(), t);
-            }
-            None => {
-                self.col_types.remove(&name);
-            }
-        }
         self.items.push(Item::Stmt(Stmt::Add(AddStmt {
             name,
             expr,
@@ -876,8 +841,6 @@ impl<'a> Builder<'a> {
                 lhs: Box::new(ValExpr::Col(ColRef::new(c.clone()))),
                 rhs: Box::new(ValExpr::Prev(ColRef::new(c))),
             };
-            // A delta is numeric, so later comparisons on it coerce implicitly.
-            self.col_types.insert(name.clone(), ColType::Num);
             self.items.push(Item::Stmt(Stmt::Add(AddStmt {
                 name,
                 expr,
@@ -901,7 +864,7 @@ impl<'a> Builder<'a> {
                 return Err(err("sort spec is missing a column name"));
             }
             let mut key = SortKey {
-                mode: self.default_sort_mode(&name),
+                mode: SortMode::Auto,
                 name,
                 pos: 0,
                 descending: false,
@@ -942,11 +905,7 @@ impl<'a> Builder<'a> {
             return Err(err("select expects an expression"));
         }
         let toks = lex_expr(expr_src)?;
-        let mut parser = ExprParser {
-            toks,
-            pos: 0,
-            types: &self.col_types,
-        };
+        let mut parser = ExprParser { toks, pos: 0 };
         let expr = parser.parse()?;
         let expr = if negate {
             BoolExpr::Not(Box::new(expr))
@@ -1726,10 +1685,9 @@ fn lex_number(cs: &[char], i: &mut usize, toks: &mut Vec<ETok>) -> Result<(), Er
 
 // --- expression parser (recursive descent) ----------------------------------
 
-struct ExprParser<'a> {
+struct ExprParser {
     toks: Vec<ETok>,
     pos: usize,
-    types: &'a HashMap<String, ColType>,
 }
 
 /// A parsed subexpression that is either a boolean or a value. The unified
@@ -1740,7 +1698,7 @@ enum BV {
     V(ValExpr),
 }
 
-impl ExprParser<'_> {
+impl ExprParser {
     /// The token at the cursor, quoted, for an error message — or "end of
     /// expression" when the cursor is past the last token.
     fn here(&self) -> String {
@@ -1895,26 +1853,13 @@ impl ExprParser<'_> {
             _ => unreachable!("filtered above"),
         };
         let rhs = self.parse_concat()?;
-        // Precedence: a statically numeric operand (a number literal,
-        // arithmetic, a numeric function, a `to-num` column) wins; else a
-        // statically string operand (a literal, concat, a bool value, a
-        // `to-str` column) compares lexically; else two untyped operands auto-
-        // detect per row for the orderings, and stay lexical for `==`/`!=`.
-        let mut cmp = Cmp {
+        // The mode is decided in `Plan::resolve`, where column types are known.
+        Ok(BV::B(BoolExpr::Cmp(Cmp {
             op: cmp_op,
             lhs,
             rhs,
             mode: CmpMode::Auto,
-        };
-        cmp.retype(&|c| self.types.get(&c.name).copied())?;
-        Ok(BV::B(BoolExpr::Cmp(cmp)))
-    }
-
-    /// The static type of a value expression ([`ValExpr::static_type`]), with
-    /// column leaves looked up in the tracked `to-num` / `to-str` / `add`
-    /// types by name.
-    fn static_type(&self, e: &ValExpr) -> Option<ColType> {
-        e.static_type(&|c| self.types.get(&c.name).copied())
+        })))
     }
 
     // --- value expressions (for `add`) --------------------------------------
@@ -2114,7 +2059,6 @@ fn check_arity(func: Func, n: usize) -> Result<(), Error> {
     }
 }
 
-/// In a numeric comparison, a string literal is parsed at parse time.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2151,18 +2095,21 @@ mod tests {
         let BoolExpr::Cmp(eq) = &parts[0] else {
             panic!()
         };
-        assert_eq!(eq.mode, CmpMode::String);
+        // Modes are decided at resolve time (see `modes_are_pinned_from_column_types_at_resolve`).
+        assert_eq!(eq.mode, CmpMode::Auto);
         let BoolExpr::Cmp(gt) = &parts[1] else {
             panic!()
         };
-        assert_eq!(gt.mode, CmpMode::Numeric);
+        assert_eq!(gt.mode, CmpMode::Auto);
     }
 
     #[test]
     fn select_untyped_ordering_is_auto_equality_is_string() {
         // Two bare columns: an ordering auto-detects per row; `==`/`!=` stay
-        // lexical (numeric equality on floats is fragile).
-        let plan = parse("select qty > stock && a == b && a != b").unwrap();
+        // lexical (numeric equality on floats is fragile). Decided at resolve.
+        let mut plan = parse("select qty > stock && a == b && a != b").unwrap();
+        plan.resolve(&["qty".into(), "stock".into(), "a".into(), "b".into()])
+            .unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2180,8 +2127,10 @@ mod tests {
     }
 
     #[test]
-    fn to_str_pins_ordering_lexical() {
-        // `to-str` opts a column back out of the numeric auto-detect.
+    fn column_types_are_left_to_resolve() {
+        // The parser decides no modes: every compare is `Auto` until
+        // `Plan::resolve` decides from the operands and the column types it
+        // tracks by position; a string literal stays a literal until then.
         let plan = parse("to-str qty | select qty > stock").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
@@ -2189,11 +2138,7 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
             panic!()
         };
-        assert_eq!(c.mode, CmpMode::String);
-    }
-
-    #[test]
-    fn to_num_makes_compare_numeric() {
+        assert_eq!(c.mode, CmpMode::Auto);
         let plan = parse("to-num c | select c == '5'").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
@@ -2201,8 +2146,8 @@ mod tests {
         let Stmt::Select(BoolExpr::Cmp(c)) = &stmts[1] else {
             panic!()
         };
-        assert_eq!(c.mode, CmpMode::Numeric);
-        assert!(matches!(c.rhs, ValExpr::Num(n) if n == 5.0));
+        assert_eq!(c.mode, CmpMode::Auto);
+        assert!(matches!(&c.rhs, ValExpr::Str(s) if s == "5"));
     }
 
     #[test]
@@ -2212,7 +2157,7 @@ mod tests {
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
         };
-        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Numeric); // c: =r, numeric from to-num
+        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Auto); // c: =r (typed at resolve)
         assert!(!s.keys[1].descending && s.keys[1].mode == SortMode::Auto); // a: default
         assert!(s.keys[2].descending && s.keys[2].mode == SortMode::Numeric); // id: =nr
 
@@ -2226,16 +2171,16 @@ mod tests {
     }
 
     #[test]
-    fn sort_mode_flags_and_column_types() {
-        // `=s` pins lexical; a to-str column defaults to lexical; `=n` on a
-        // to-str column still wins (an explicit flag beats the tracked type).
+    fn sort_mode_flags() {
+        // `=s` pins lexical and `=n` numeric; a bare key is auto until
+        // `Plan::resolve` sees the column's type.
         let plan = parse("to-str z | sort a=s b z z=n").unwrap();
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
         };
         assert_eq!(s.keys[0].mode, SortMode::Lexical); // a=s
-        assert_eq!(s.keys[1].mode, SortMode::Auto); // b: untyped
-        assert_eq!(s.keys[2].mode, SortMode::Lexical); // z: to-str
+        assert_eq!(s.keys[1].mode, SortMode::Auto); // b
+        assert_eq!(s.keys[2].mode, SortMode::Auto); // z: typed at resolve
         assert_eq!(s.keys[3].mode, SortMode::Numeric); // z=n
         assert!(s.keys.iter().all(|k| !k.descending));
         // `=sr` combines like `=nr`.
@@ -2248,18 +2193,6 @@ mod tests {
         // Unknown flags still error, naming the accepted set.
         let err = parse("sort a=x").unwrap_err().to_string();
         assert!(err.contains("unknown sort flag 'x'"), "{err}");
-        // A column typed by `add` inherits the mode too: a string expression
-        // sorts lexically, and a replace-in-place re-types the column.
-        let plan = parse("add s a ++ 'x' | sort s").unwrap();
-        let Stage::Sort(s) = &plan.stages[1] else {
-            panic!()
-        };
-        assert_eq!(s.keys[0].mode, SortMode::Lexical);
-        let plan = parse("to-num a | add a a ++ 'x' | sort a").unwrap();
-        let Stage::Sort(s) = &plan.stages[1] else {
-            panic!()
-        };
-        assert_eq!(s.keys[0].mode, SortMode::Lexical);
     }
 
     #[test]
@@ -2535,7 +2468,8 @@ mod tests {
     fn backtick_quoted_column_name() {
         // A hyphenated name isn't a bare identifier; backticks make it a column
         // ref (an Ident), not a string literal.
-        let plan = parse(r#"select `frequenz-app-edge` != """#).unwrap();
+        let mut plan = parse(r#"select `frequenz-app-edge` != """#).unwrap();
+        plan.resolve(&["frequenz-app-edge".into()]).unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2544,7 +2478,7 @@ mod tests {
         };
         let ValExpr::Col(col) = &c.lhs else { panic!() };
         assert_eq!(col.name, "frequenz-app-edge");
-        assert_eq!(c.mode, CmpMode::String); // RHS is a string literal
+        assert_eq!(c.mode, CmpMode::String); // RHS is a string literal (decided at resolve)
         assert!(matches!(&c.rhs, ValExpr::Str(s) if s.is_empty()));
     }
 
