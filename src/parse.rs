@@ -587,15 +587,15 @@ impl<'a> Builder<'a> {
     /// gives the keys, and without it the whole input is one group.
     fn parse_agg(&mut self, rest: &str) -> Result<(), Error> {
         let (specs, by) = split_off_by(rest);
-        if specs.is_empty() {
-            return Err(err(
-                "agg expects at least one aggregate, e.g. agg sum(amount)",
-            ));
-        }
         let aggs = split_specs(specs)
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
+        if aggs.is_empty() {
+            return Err(err(
+                "agg expects at least one aggregate, e.g. agg sum(amount)",
+            ));
+        }
         // `by COLS` gives the keys; without it, one global aggregate row.
         let keys = match by {
             Some(k) => {
@@ -1473,27 +1473,28 @@ fn parse_scale(s: &str) -> Result<f64, Error> {
         .ok_or_else(|| err(format!("-s/--scale expects a positive number, got `{s}`")))
 }
 
-/// Split an `agg` argument at a top-level (paren-depth-0) `by` keyword into the
-/// aggregate specs and the optional grouping-key list. `func(col)` parens are
-/// skipped so a column couldn't accidentally swallow the keyword.
+/// Split an `agg` argument at a top-level `by` keyword — outside `func(col)`
+/// parens and backticks, with a separator (blank or comma) or the end on both
+/// sides — into the aggregate specs and the optional grouping-key list.
 fn split_off_by(s: &str) -> (&str, Option<&str>) {
-    let b = s.as_bytes();
+    let separates = |c: char| c == ',' || c.is_whitespace();
     let mut depth = 0i32;
-    let mut i = 0;
-    while i < b.len() {
-        match b[i] {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b'b' if depth == 0
-                && (i == 0 || b[i - 1].is_ascii_whitespace())
+    let mut in_tick = false;
+    for (i, c) in s.char_indices() {
+        match c {
+            '`' => in_tick = !in_tick,
+            '(' if !in_tick => depth += 1,
+            ')' if !in_tick => depth -= 1,
+            'b' if depth == 0
+                && !in_tick
+                && s[..i].chars().next_back().is_none_or(separates)
                 && s[i..].starts_with("by")
-                && b.get(i + 2).is_none_or(u8::is_ascii_whitespace) =>
+                && s[i + 2..].chars().next().is_none_or(separates) =>
             {
                 return (s[..i].trim(), Some(s[i + 2..].trim()));
             }
             _ => {}
         }
-        i += 1;
     }
     (s.trim(), None)
 }
@@ -1511,11 +1512,11 @@ fn split_specs(s: &str) -> Vec<String> {
                 in_tick = !in_tick;
                 cur.push(c);
             }
-            '(' => {
+            '(' if !in_tick => {
                 depth += 1;
                 cur.push(c);
             }
-            ')' => {
+            ')' if !in_tick => {
                 depth -= 1;
                 cur.push(c);
             }
@@ -2403,6 +2404,53 @@ mod tests {
     }
 
     #[test]
+    fn agg_by_keyword_splits_on_any_blank() {
+        // The `by` keyword is found by any Unicode blank around it, like the
+        // items themselves (a no-break space is two bytes).
+        let plan = parse("agg count(a)\u{a0}by\u{a0}g,\u{2003}h").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["g", "h"]);
+        // `by` inside a name or a call is not the keyword.
+        let plan = parse("agg count(by) by baby").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["baby"]);
+        assert_eq!(g.aggs[0].col.as_deref(), Some("by"));
+        // A `b` at the end, or `by` glued to a multi-byte char, is not the
+        // keyword; a multi-byte key after it is fine.
+        assert!(parse("agg count(x) b").is_err());
+        assert!(parse("agg count(x) byé").is_err());
+        let plan = parse("agg count(x) by bé").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["bé"]);
+        // A comma is a separator too, as it is between items.
+        let plan = parse("agg count(x),by,g").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["g"]);
+        // Nor is a `by` (or a paren) inside a backticked name.
+        let plan = parse("agg `a (b` = sum(x), c = max(x) by g").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["g"]);
+        let names: Vec<_> = g.aggs.iter().map(|a| a.name.as_deref()).collect();
+        assert_eq!(names, [Some("a (b"), Some("c")]);
+        let plan = parse("agg `sales by region` = sum(x) by g").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["g"]);
+        assert_eq!(g.aggs[0].name.as_deref(), Some("sales by region"));
+    }
+
+    #[test]
     fn exponent_literals_lex_as_numbers() {
         assert!(parse("add v = 1e3 + 2.5E-3 - 1e+2").is_ok());
         assert!(parse("select price > 1e3").is_ok());
@@ -2446,6 +2494,8 @@ mod tests {
         assert!(parse("agg count_distinct(x) by g").is_ok());
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
+        assert!(parse("agg ,").is_err()); // still none
+        assert!(parse("agg , , by g").is_err());
         assert!(parse("agg count by").is_err()); // no keys
         assert!(parse("agg =sum(x)").is_err()); // empty name
         assert!(parse("agg total=").is_err()); // name without an aggregate
