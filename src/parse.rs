@@ -67,47 +67,70 @@ pub(crate) const COMMANDS: &[&str] = &[
     "add", "agg", "graph", "fn",
 ];
 
-/// Names a `fn` may not take: every command, every alias, `fn` itself, and
-/// the removed commands (kept reserved so their hint stays reachable).
-const RESERVED: &[&str] = &[
-    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "colour", "rename", "fmt",
-    "hdr", "join", "add", "delta", "group", "agg", "graph", "fn", "to-num", "to_num", "to-str",
-    "to_str",
+/// A command that was removed, with the advice that replaces a use of it.
+/// The advice is built from the arguments the script gave, so the error
+/// alone is enough to rewrite the script.
+struct Removed {
+    name: &'static str,
+    advice: fn(&str) -> String,
+}
+
+const REMOVED: &[Removed] = &[
+    Removed {
+        name: "to-num",
+        advice: num_cast_advice,
+    },
+    Removed {
+        name: "to_num",
+        advice: num_cast_advice,
+    },
+    Removed {
+        name: "to-str",
+        advice: str_cast_advice,
+    },
+    Removed {
+        name: "to_str",
+        advice: str_cast_advice,
+    },
+    Removed {
+        name: "delta",
+        advice: delta_advice,
+    },
+    Removed {
+        name: "group",
+        advice: group_advice,
+    },
+    Removed {
+        name: "hdr",
+        advice: hdr_advice,
+    },
 ];
 
-/// `delta` was shorthand for a stateful `add` per column; spell that out.
-fn removed_delta_hint(args: &str) -> Error {
-    let cols: Vec<String> = split_list(args)
-        .into_iter()
-        .filter(|c| c != "-s" && !c.starts_with("-s"))
-        .collect();
-    let stages: Vec<String> = if cols.is_empty() {
-        vec!["add COL_delta = COL - prev(COL)".to_string()]
-    } else {
-        cols.iter()
-            .map(|c| format!("add {c}_delta = {c} - prev({c})"))
-            .collect()
-    };
-    err(format!(
-        "delta was removed: write the difference with add, e.g. `{}`",
-        stages.join(" | ")
-    ))
+/// The error for a removed command, or `None` if `cmd` is not one.
+pub(crate) fn removed(cmd: &str, args: &str) -> Option<Error> {
+    let r = REMOVED.iter().find(|r| r.name == cmd)?;
+    Some(err(format!("{cmd} was removed: {}", (r.advice)(args))))
 }
 
-/// The cast that replaced a removed conversion command, if `cmd` is one.
-fn removed_cast(cmd: &str) -> Option<&'static str> {
-    match cmd {
-        "to-num" | "to_num" => Some("num"),
-        "to-str" | "to_str" => Some("str"),
-        _ => None,
-    }
+/// Whether `name` is taken by a command, an alias, or a removed command
+/// (kept reserved so its hint stays reachable), so a `fn` may not use it.
+fn is_reserved(name: &str) -> bool {
+    name == "colour" || COMMANDS.contains(&name) || REMOVED.iter().any(|r| r.name == name)
 }
 
-/// The error for a removed conversion command, spelling out the `add` that
-/// does the same for each column it named. Inside the expression a name that
-/// is not a bare identifier (a position, a name with spaces) is
-/// backtick-quoted; as the `add` target only a name with spaces needs that.
-fn removed_hint(cmd: &str, cast: &str, args: &str) -> Error {
+fn num_cast_advice(args: &str) -> String {
+    cast_advice("num", args)
+}
+
+fn str_cast_advice(args: &str) -> String {
+    cast_advice("str", args)
+}
+
+/// The `add` that does what a removed conversion command did, per column.
+/// Inside the expression a name that is not a bare identifier (a position,
+/// a name with spaces) is backtick-quoted; as the `add` target only a name
+/// with spaces needs that.
+fn cast_advice(cast: &str, args: &str) -> String {
     let cols = split_list(args);
     let stages: Vec<String> = if cols.is_empty() {
         vec![format!("add COL = {cast}(COL)")]
@@ -128,10 +151,45 @@ fn removed_hint(cmd: &str, cast: &str, args: &str) -> Error {
             })
             .collect()
     };
-    err(format!(
-        "{cmd} was removed: convert with add, e.g. `{}`",
+    format!("convert with add, e.g. `{}`", stages.join(" | "))
+}
+
+/// `delta [-s SUF] COLS` was a stateful `add` per column; spell that out.
+fn delta_advice(args: &str) -> String {
+    let mut cols = Vec::new();
+    let mut toks = split_list(args).into_iter();
+    while let Some(t) = toks.next() {
+        if t == "-s" {
+            toks.next(); // the suffix
+        } else if !t.starts_with("-s") {
+            cols.push(t);
+        }
+    }
+    let stages: Vec<String> = if cols.is_empty() {
+        vec!["add COL_delta = COL - prev(COL)".to_string()]
+    } else {
+        cols.iter()
+            .map(|c| format!("add {c}_delta = {c} - prev({c})"))
+            .collect()
+    };
+    format!(
+        "write the difference with add, e.g. `{}`",
         stages.join(" | ")
-    ))
+    )
+}
+
+fn group_advice(args: &str) -> String {
+    let keys = args.trim();
+    format!(
+        "give the keys to agg, e.g. `agg count by {}`",
+        if keys.is_empty() { "COLS" } else { keys }
+    )
+}
+
+fn hdr_advice(_: &str) -> String {
+    "name a headerless input's columns with `--header a,b,c` on the command line \
+     (`--header -` auto-names them c1, c2, …)"
+        .to_string()
 }
 
 /// How deep fragment expansion may nest before it is treated as runaway
@@ -258,8 +316,8 @@ impl<'a> Builder<'a> {
             return match fns.get(name) {
                 Some(def) => self.expand_fragment(name, def, args),
                 None => {
-                    if let Some(cast) = removed_cast(name) {
-                        return Err(removed_hint(name, cast, args));
+                    if let Some(e) = removed(name, args) {
+                        return Err(e);
                     }
                     let mut cands: Vec<String> = fns.keys().cloned().collect();
                     cands.extend(COMMANDS.iter().map(|s| s.to_string()));
@@ -271,8 +329,8 @@ impl<'a> Builder<'a> {
             };
         }
         let (cmd, rest) = split_first_word(stage);
-        if let Some(cast) = removed_cast(cmd) {
-            return Err(removed_hint(cmd, cast, rest));
+        if let Some(e) = removed(cmd, rest) {
+            return Err(e);
         }
         let result = match cmd {
             "cols" => self.parse_cols(rest),
@@ -281,14 +339,6 @@ impl<'a> Builder<'a> {
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
-            "group" => Err(err(format!(
-                "group was removed: give the keys to agg, e.g. `agg count by {}`",
-                if rest.trim().is_empty() {
-                    "COLS"
-                } else {
-                    rest.trim()
-                }
-            ))),
             "agg" => self.parse_agg(rest),
             "graph" => self.parse_graph(rest),
             "uniq" => self.parse_uniq(rest),
@@ -296,12 +346,7 @@ impl<'a> Builder<'a> {
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
             "add" => self.parse_add(rest),
-            "delta" => Err(removed_delta_hint(rest)),
             "fmt" => self.parse_fmt(rest),
-            "hdr" => Err(err(
-                "hdr was removed: name a headerless input's columns with `--header a,b,c` on the \
-                 command line (`--header -` auto-names them c1, c2, …)",
-            )),
             "fn" => Err(err("fn definitions must come before the first stage")),
             other => Err(err(if self.fns.contains_key(other) {
                 format!(
@@ -1156,7 +1201,7 @@ fn parse_prologue(script: &str) -> Result<(FnTable, &str), Error> {
                 "fn: `{name}` is not a valid name (bare identifier)"
             )));
         }
-        if RESERVED.contains(&name) {
+        if is_reserved(name) {
             return Err(err(format!("fn `{name}` collides with a built-in command")));
         }
         let params_text = params_text
@@ -3023,8 +3068,11 @@ mod tests {
             err.contains("add a_delta = a - prev(a) | add b_delta = b - prev(b)"),
             "{err}"
         );
+        // `-s SUF` (and `-sSUF`) is a flag, not a column.
         let err = parse("delta -s _change a").unwrap_err().to_string();
-        assert!(err.contains("add a_delta = a - prev(a)"), "{err}");
+        assert!(err.contains("`add a_delta = a - prev(a)`"), "{err}");
+        let err = parse("delta -s_change a").unwrap_err().to_string();
+        assert!(err.contains("`add a_delta = a - prev(a)`"), "{err}");
         assert!(
             parse("delta")
                 .unwrap_err()
@@ -3169,12 +3217,18 @@ mod tests {
     }
 
     #[test]
-    fn reserved_covers_every_command() {
-        // A new command added to COMMANDS must also be fn-reserved, or a
-        // user fragment could shadow it.
-        for c in COMMANDS {
-            assert!(RESERVED.contains(c), "`{c}` missing from RESERVED");
+    fn fn_may_not_take_a_command_or_removed_name() {
+        // A user fragment may shadow neither a command nor a removed one
+        // (whose hint must stay reachable).
+        for name in ["cols", "colour", "delta", "group", "hdr", "to_num"] {
+            let err = parse(&format!("fn {name}(a) {{ head }}\n{name}(a)"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("collides"), "{name}: {err}");
         }
+        // A removed command called as a fragment gets the same hint.
+        let err = parse("delta(a)").unwrap_err().to_string();
+        assert!(err.contains("add a_delta = a - prev(a)"), "{err}");
     }
 
     #[test]

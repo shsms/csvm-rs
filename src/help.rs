@@ -135,8 +135,12 @@ fn find_topic(name: &str) -> Option<&'static Topic> {
     TOPICS.iter().find(|t| t.name == name)
 }
 
-/// Message for an unknown `csvm help` topic, with a near-match suggestion.
+/// Message for an unknown `csvm help` topic: the pointer for a removed
+/// command, else a near-match suggestion.
 fn unknown(t: &str) -> String {
+    if let Some(e) = crate::parse::removed(t, "") {
+        return e.to_string();
+    }
     let mut names: Vec<&str> = Vec::new();
     for c in COMMANDS {
         names.push(c.name);
@@ -550,6 +554,14 @@ mod tests {
         assert!(render(Some("colour")).unwrap().contains("color —")); // alias resolves
         assert!(render(Some("colors")).unwrap().contains("magenta")); // topic
         assert!(render(None).unwrap().contains("commands")); // overview
+    }
+
+    #[test]
+    fn help_for_a_removed_command_points_at_its_replacement() {
+        let msg = render(Some("group")).unwrap_err();
+        assert!(msg.contains("agg count by"), "{msg}");
+        let msg = render(Some("hdr")).unwrap_err();
+        assert!(msg.contains("--header"), "{msg}");
     }
 
     #[test]
