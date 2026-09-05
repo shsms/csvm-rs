@@ -704,9 +704,9 @@ mod tests {
 
     #[test]
     fn auto_keys_numbers_first_then_text() {
-        // Auto: cells that parse as numbers order numerically and come first;
-        // the rest (text, and the empty cell) follow in lexical order. Spilled
-        // runs (budget 1) must agree with the in-memory encoding.
+        // Auto: cells that parse as numbers order numerically and come first
+        // (a blank reads as 0, as in select); text follows in lexical order.
+        // Spilled runs (budget 1) must agree with the in-memory encoding.
         let s = SortStmt {
             keys: vec![key(0, false, SortMode::Auto)],
         };
@@ -714,7 +714,7 @@ mod tests {
         for budget in [1usize << 30, 1] {
             assert_eq!(
                 sort_lines(&s, &lines, 4, budget),
-                ["-1.5", "9", "10", "100", "", "a", "b"]
+                ["-1.5", "", "9", "10", "100", "a", "b"]
             );
         }
         // Descending reverses the whole order, tag included.
@@ -723,7 +723,7 @@ mod tests {
         };
         assert_eq!(
             sort_lines(&s, &lines, 4, 1),
-            ["b", "a", "", "100", "10", "9", "-1.5"]
+            ["b", "a", "100", "10", "9", "", "-1.5"]
         );
     }
 

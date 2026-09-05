@@ -204,10 +204,9 @@ operands stay lexical.",
             "sort COL=nr ...        flags: n numeric, s lexical (string), r reverse (also COL:nr)",
         ],
         detail: "Keys are applied left to right; the sort is stable. A bare column auto-detects per \
-cell: cells that parse as numbers order numerically and come first, the rest (text, empty) \
-follow lexically — so an all-numeric column sorts numerically with no flag, and a mixed one \
-never aborts. A blank is text here (select's auto reads it as 0); NaN and inf are numbers, as \
-for to-num. =n forces numeric (a non-number aborts), =s forces lexical; a to-num / to-str \
+cell: cells that parse as numbers order numerically and come first (a blank reads as 0, as in \
+select), the rest follow lexically — so an all-numeric column sorts numerically with no flag, \
+and a mixed one never aborts. NaN and inf are numbers, as for to-num. =n forces numeric (a non-number aborts), =s forces lexical; a to-num / to-str \
 column defaults to the matching mode. See `csvm help types`.",
         examples: &["csvm 'sort region score=nr' data.csv"],
     },
@@ -516,8 +515,8 @@ while == / != stay lexical. A numeric literal or to-num thus wins over a to-str 
 added by `add` carries its expression's static type — including one inherited from a to-num/\
 to-str column or from a ternary whose branches agree — so later comparisons against it behave \
 the same as against the expression itself. Sort follows the same idea per key: a bare `sort col` \
-auto-detects per cell (numbers numerically and first, then text lexically; an empty cell counts \
-as text), =n / to-num forces numeric, =s / to-str forces lexical. Empty cells coerce to 0 in \
+auto-detects per cell (numbers numerically and first, then text lexically; a blank reads as 0, \
+as in select), =n / to-num forces numeric, =s / to-str forces lexical. Empty cells coerce to 0 in \
 numeric context; a non-numeric cell in a strictly-numeric \
 op aborts the run (auto falls back to lexical instead). Numbers always serialize correctly on \
 output — no to-str needed just to print.",

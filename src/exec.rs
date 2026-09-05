@@ -2459,10 +2459,11 @@ mod tests {
             run_str("to-str n | sort n", input).unwrap(),
             "n\n10\n100\n9\n"
         );
-        // A mixed column never aborts under auto: numbers first (numeric),
-        // then the rest lexically — while =n still rejects the text cell.
+        // A mixed column never aborts under auto: numbers first (numeric, a
+        // blank reading as 0), then the rest lexically — while =n still
+        // rejects the text cell.
         let mixed = "n\nx\n10\n\n9\n";
-        assert_eq!(run_str("sort n", mixed).unwrap(), "n\n9\n10\n\nx\n");
+        assert_eq!(run_str("sort n", mixed).unwrap(), "n\n\n9\n10\nx\n");
         assert!(run_str("sort n=n", mixed).is_err());
     }
 

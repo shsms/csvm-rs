@@ -78,8 +78,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `s` (lexical / string), and/or `r` (reverse) — e.g. `amount=nr`. Multi-key,
   stable. Each key has a `SortMode` (`plan.rs`): a bare column is `Auto`
   (decided per *cell*: a cell that parses as a number orders numerically and
-  before every non-number; text and empty cells follow lexically, so unlike
-  `select`'s auto a blank is text, not 0; NaN/inf are numbers — a total
+  before every non-number, a blank reading as 0 as in `select`'s auto; text
+  follows lexically; NaN/inf are numbers — a total
   order, so it streams and shards without sampling types, and a mixed column
   never aborts), `=n` or a `to-num` column is `Numeric` (a non-number aborts),
   `=s` or a `to-str` column is `Lexical`. The external sort's encoded key

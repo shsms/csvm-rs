@@ -143,11 +143,11 @@ fn sort_auto_on_the_in_memory_path_keeps_cell_text() {
     let input = "n\nx\n10\n\n9\n1.0000001\n";
     assert_eq!(
         run_checked("sort n | tail 5", input),
-        "n\n1.0000001\n9\n10\n\nx\n"
+        "n\n\n1.0000001\n9\n10\nx\n"
     );
     assert_eq!(
         run_checked("sort n=r | tail 5", input),
-        "n\nx\n\n10\n9\n1.0000001\n"
+        "n\nx\n10\n9\n1.0000001\n\n"
     );
     // Two auto keys behind a numeric one: the cached numbers must line up
     // with the auto keys, not with the key list.

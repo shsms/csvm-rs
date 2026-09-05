@@ -57,6 +57,17 @@ impl<'a> Field<'a> {
         }
     }
 
+    /// [`Field::coerce_num`] without the error value: empty is `0.0`, text is
+    /// `None`. The per-row "soft" numeric read, so it never allocates.
+    #[inline]
+    pub fn num_soft(&self) -> Option<f64> {
+        match self {
+            Field::Num(n) => Some(*n),
+            Field::Str(s) => parse_num_soft(s),
+            Field::Owned(s) => parse_num_soft(s),
+        }
+    }
+
     /// The cell as a number, or `None` when it is empty or not a number — the
     /// strict form of [`Field::coerce_num`], which reads empty as `0.0`.
     #[inline]
@@ -82,11 +93,18 @@ impl<'a> Field<'a> {
 
 #[inline]
 fn parse_num(s: &str) -> Result<f64, NumError> {
+    parse_num_soft(s).ok_or_else(|| NumError(s.to_owned()))
+}
+
+/// [`parse_num`] without the error value: empty is `0.0`, text is `None`.
+#[inline]
+fn parse_num_soft(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
-        return Ok(0.0);
+        Some(0.0)
+    } else {
+        t.parse::<f64>().ok()
     }
-    t.parse::<f64>().map_err(|_| NumError(s.to_owned()))
 }
 
 /// Format a number the way csvm does: six decimal places, then trim trailing
@@ -131,6 +149,15 @@ mod tests {
             Field::Str("hello").coerce_num(),
             Err(NumError("hello".into()))
         );
+    }
+
+    #[test]
+    fn num_soft_reads_blank_as_zero_and_text_as_none() {
+        assert_eq!(Field::Str("").num_soft(), Some(0.0));
+        assert_eq!(Field::Str("  ").num_soft(), Some(0.0));
+        assert_eq!(Field::Str(" 5 ").num_soft(), Some(5.0));
+        assert_eq!(Field::Str("hello").num_soft(), None);
+        assert_eq!(Field::Num(3.5).num_soft(), Some(3.5));
     }
 
     #[test]

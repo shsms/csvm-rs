@@ -91,8 +91,8 @@ now carries a three-way =SortMode= (=plan.rs=): a bare column is =Auto=, =a=n= /
 =to-num= pins =Numeric=, and the new =a=s= / =to-str= pins =Lexical=. Auto is
 decided per *cell* rather than per column, because the external sort streams
 and cannot sample types first: a cell that parses as a number orders
-numerically and before every non-number; text and empty cells follow
-lexically. That is a total order, so it is reproducible at any =-n= and a
+numerically and before every non-number (a blank reads as 0, as in =select=);
+text follows lexically. That is a total order, so it is reproducible at any =-n= and a
 mixed column never aborts. =encode_key= (=sort.rs=) prefixes an auto key with
 a one-byte tag and =SortStmt::compare= applies the same rule, so the external
 and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
