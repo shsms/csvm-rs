@@ -1685,6 +1685,71 @@ mod tests {
         ));
     }
 
+    /// Resolve a `cols` (`exclude: false`) or `cols -v` (`exclude: true`)
+    /// statement over `header`: the kept positions and the reshaped header.
+    fn project(
+        exclude: bool,
+        specs: &[&str],
+        header: &[&str],
+    ) -> Result<(Vec<usize>, Vec<String>), Error> {
+        let mut p = ProjectStmt {
+            exclude,
+            names: specs.iter().map(|s| s.to_string()).collect(),
+            positions: vec![],
+        };
+        let mut h: Vec<String> = header.iter().map(|s| s.to_string()).collect();
+        p.resolve(&mut h).map(|()| (p.positions, h))
+    }
+
+    const ABCD: &[&str] = &["a", "b", "c", "d"];
+
+    #[test]
+    fn cols_expands_index_and_name_ranges() {
+        let keep = |specs: &[&str]| project(false, specs, ABCD);
+        // Integer range, name range, mixed range, and a range beside a name.
+        assert_eq!(keep(&["2-3"]).unwrap().0, vec![1, 2]);
+        assert_eq!(keep(&["b:c"]).unwrap().0, vec![1, 2]);
+        assert_eq!(keep(&["1:c"]).unwrap().0, vec![0, 1, 2]);
+        assert_eq!(
+            keep(&["d", "1-2"]).unwrap(),
+            (vec![3, 0, 1], vec!["d".to_string(), "a".into(), "b".into()])
+        );
+        // A backwards or out-of-range range is an error.
+        let err = keep(&["c:b"]).unwrap_err().to_string();
+        assert!(err.contains("range c:b"), "{err}");
+        let err = keep(&["3-9"]).unwrap_err().to_string();
+        assert!(err.contains("out of range"), "{err}");
+        // A column literally named like a range is still a name.
+        assert_eq!(project(false, &["1-2"], &["x", "1-2"]).unwrap().0, vec![1]);
+    }
+
+    #[test]
+    fn drop_cols_accepts_indices_and_ranges() {
+        assert_eq!(
+            project(true, &["1", "c:d"], ABCD).unwrap(),
+            (vec![1], vec!["b".to_string()])
+        );
+    }
+
+    #[test]
+    fn drop_cols_rejects_a_bad_index_or_range_but_ignores_a_name() {
+        let exclude = |specs: &[&str]| project(true, specs, ABCD).map(|(p, _)| p);
+        // An unknown name is ignored (nothing dropped) — the csvm rule.
+        assert_eq!(exclude(&["nope"]).unwrap(), vec![0, 1, 2, 3]);
+        // A bad index or a backwards range is a script bug: error, not a no-op.
+        let err = exclude(&["9"]).unwrap_err().to_string();
+        assert!(err.contains("column index 9 is out of range"), "{err}");
+        let err = exclude(&["d:a"]).unwrap_err().to_string();
+        assert!(err.contains("range d:a runs backwards"), "{err}");
+        let err = exclude(&["2-9"]).unwrap_err().to_string();
+        assert!(err.contains("out of range"), "{err}");
+        // An unknown name *inside a range* is not an ignorable bare name; the
+        // error names the spec as typed and keeps the missing-column detail.
+        let err = exclude(&["a:nope"]).unwrap_err().to_string();
+        assert!(err.contains("range a:nope"), "{err}");
+        assert!(err.contains("column not found: nope"), "{err}");
+    }
+
     #[test]
     fn drop_cols_keeps_complement() {
         let mut p = ProjectStmt {
