@@ -328,6 +328,28 @@ fn fmt_mixes_numeric_and_text_justification() {
 // Headerless input: every line is data; `hdr` supplies the column names.
 const HEADERLESS: &str = "1,alice,100\n2,bob,200\n3,carol,300\n";
 
+/// Four columns for the positional-reference tests: `2` is `qty`, `4` is `name`.
+const POSITIONAL: &str = "id,qty,stock,name\n1,100,50,alice\n2,9,20,bob\n";
+
+#[test]
+fn columns_by_position_and_range() {
+    // Positional references (1-based) and ranges work wherever a column is
+    // named; the resolver is shared, so sort sees them too. The auto-named
+    // header from --no-header (`c1,c2,…`) is what makes this useful.
+    let input = POSITIONAL;
+    assert_eq!(run_checked("cols 4,1", input), "name,id\nalice,1\nbob,2\n");
+    assert_eq!(
+        run_checked("cols 2,3 | sort 1", input),
+        "qty,stock\n9,20\n100,50\n"
+    );
+    let err = run("cols 5", input, 1).unwrap_err();
+    assert!(err.contains("column index 5 is out of range"), "{err}");
+    // In an expression a bare integer is a literal; a backticked one is a
+    // column position.
+    assert_eq!(run_checked("select `2` > 20 | cols id", input), "id\n1\n");
+    assert_eq!(run_checked("select 2 > 20", input), "id,qty,stock,name\n");
+}
+
 #[test]
 fn hdr_prepends_header_all_lines_are_data() {
     // The first input line is data, not a header — it survives to the output.

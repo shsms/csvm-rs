@@ -15,6 +15,12 @@ pub enum Error {
         name: String,
         available: Vec<String>,
     },
+    /// A column referenced by position (a bare integer) is outside the header.
+    /// Carries the text as typed and the columns there are.
+    ColumnIndex {
+        index: String,
+        available: Vec<String>,
+    },
     /// A numeric operation reached a non-numeric value at runtime.
     Num(NumError),
     /// I/O failure reading input or writing output.
@@ -34,6 +40,12 @@ impl fmt::Display for Error {
                 }
                 write!(f, " — have: {}", preview(available))
             }
+            Error::ColumnIndex { index, available } => write!(
+                f,
+                "column index {index} is out of range — have {} columns ({})",
+                available.len(),
+                preview(available)
+            ),
             Error::Num(e) => write!(f, "{e}"),
             Error::Io(e) => write!(f, "{e}"),
             Error::Other(msg) => write!(f, "{msg}"),
@@ -63,7 +75,7 @@ pub fn did_you_mean<'a, S: AsRef<str>>(target: &str, candidates: &'a [S]) -> Opt
 
 /// A short list of `names` for an error message: all of them if few, else the
 /// first several with a "+N more" tail.
-fn preview(names: &[String]) -> String {
+pub(crate) fn preview(names: &[String]) -> String {
     const SHOW: usize = 8;
     if names.len() <= SHOW {
         names.join(", ")

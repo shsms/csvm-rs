@@ -770,14 +770,36 @@ fn join_key_err(e: Error) -> Error {
     }
 }
 
+/// Resolve one column reference: a header name, else — when no column has
+/// that name and the text is a bare integer — a 1-based position. The name
+/// always wins, so a column literally called `2` is never shadowed.
 fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
-    header
-        .iter()
-        .position(|h| h == name)
-        .ok_or_else(|| Error::Column {
-            name: name.to_owned(),
-            available: header.to_vec(),
-        })
+    if let Some(p) = header.iter().position(|h| h == name) {
+        return Ok(p);
+    }
+    if let Some(i) = parse_index(name) {
+        return i
+            .checked_sub(1)
+            .filter(|&p| p < header.len())
+            .ok_or_else(|| Error::ColumnIndex {
+                index: name.to_owned(),
+                available: header.to_vec(),
+            });
+    }
+    Err(Error::Column {
+        name: name.to_owned(),
+        available: header.to_vec(),
+    })
+}
+
+/// A bare unsigned integer (digits only: no sign, no whitespace), or `None`.
+/// A value too large for `usize` saturates, so it is still read as a
+/// position (and reported out of range), never as a name.
+fn parse_index(s: &str) -> Option<usize> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some(s.parse().unwrap_or(usize::MAX))
 }
 
 /// View a row cell as text, treating an out-of-range index as empty (rows can
@@ -1574,6 +1596,41 @@ mod tests {
             unreachable!()
         };
         assert_eq!(cref.pos, 1);
+    }
+
+    #[test]
+    fn resolve_col_falls_back_to_a_1_based_index() {
+        let header: Vec<String> = ["a", "b", "2"].map(String::from).to_vec();
+        assert_eq!(resolve_col("b", &header).unwrap(), 1);
+        // A name wins over an index when both could apply.
+        assert_eq!(resolve_col("2", &header).unwrap(), 2);
+        // No such name: a bare integer is a 1-based position.
+        assert_eq!(resolve_col("1", &header).unwrap(), 0);
+        assert_eq!(resolve_col("3", &header).unwrap(), 2);
+        // Out of range (or zero) names the problem, not "column not found".
+        let err = resolve_col("4", &header).unwrap_err().to_string();
+        assert!(err.contains("column index 4 is out of range"), "{err}");
+        assert!(err.contains("3 columns"), "{err}");
+        let err = resolve_col("0", &header).unwrap_err().to_string();
+        assert!(err.contains("column index 0 is out of range"), "{err}");
+        // Digits too large for a position are still a position, not a name.
+        let err = resolve_col("99999999999999999999999", &header)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("column index 99999999999999999999999 is out of range"),
+            "{err}"
+        );
+        // An empty spec is a name, not a saturated position.
+        assert!(matches!(
+            resolve_col("", &header),
+            Err(Error::Column { .. })
+        ));
+        // Anything else is still the plain missing-column error.
+        assert!(matches!(
+            resolve_col("zz", &header),
+            Err(Error::Column { name, .. }) if name == "zz"
+        ));
     }
 
     #[test]
