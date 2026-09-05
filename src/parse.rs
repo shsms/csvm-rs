@@ -592,11 +592,7 @@ impl<'a> Builder<'a> {
                 "agg expects at least one aggregate, e.g. agg sum(amount)",
             ));
         }
-        let toks = split_specs(specs);
-        if toks.iter().any(|t| t == "=") {
-            return Err(err("agg: write NAME=FN(col) without spaces around `=`"));
-        }
-        let aggs = toks
+        let aggs = split_specs(specs)
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1351,25 +1347,36 @@ fn parse_join_keys(spec_list: &str, keys: &mut Vec<(String, String)>) -> Result<
     Ok(())
 }
 
+/// True when the separator `c` sits next to an unquoted `=` and so does not
+/// end an item (`a = b` is the one item `a=b`): `after_eq` says the item so
+/// far ends in one, `rest` is the text from `c` on.
+fn joins_at_eq(c: char, after_eq: bool, rest: &str) -> bool {
+    c.is_whitespace() && (after_eq || rest.trim_start().starts_with('='))
+}
+
 /// Split an argument string into items on commas and whitespace, respecting
 /// quotes; surrounding quotes are stripped from each item. Single quotes, double
 /// quotes, and backticks all quote, so a column name with a comma/space (or just
 /// for consistency with `select`'s backticks) can be written `` `odd, name` ``.
+/// An unquoted `=` binds tighter than whitespace: `a = b` is one item.
 fn split_list(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
     let mut in_item = false;
-    for c in s.chars() {
+    // The last character pushed was an unquoted `=`.
+    let mut after_eq = false;
+    for (i, c) in s.char_indices() {
         match quote {
             Some(q) if c == q => quote = None,
             Some(_) => cur.push(c),
             None if c == '"' || c == '\'' || c == '`' => {
                 quote = Some(c);
                 in_item = true;
+                after_eq = false;
             }
             None if c == ',' || c.is_whitespace() => {
-                if in_item {
+                if in_item && !joins_at_eq(c, after_eq, &s[i..]) {
                     out.push(std::mem::take(&mut cur));
                     in_item = false;
                 }
@@ -1377,6 +1384,7 @@ fn split_list(s: &str) -> Vec<String> {
             None => {
                 cur.push(c);
                 in_item = true;
+                after_eq = c == '=';
             }
         }
     }
@@ -1497,7 +1505,7 @@ fn split_specs(s: &str) -> Vec<String> {
     let mut cur = String::new();
     let mut depth = 0i32;
     let mut in_tick = false;
-    for c in s.chars() {
+    for (i, c) in s.char_indices() {
         match c {
             '`' => {
                 in_tick = !in_tick;
@@ -1512,7 +1520,8 @@ fn split_specs(s: &str) -> Vec<String> {
                 cur.push(c);
             }
             c if depth == 0 && !in_tick && (c == ',' || c.is_whitespace()) => {
-                if !cur.is_empty() {
+                // Backticks stay in `cur` here, so a trailing `=` is unquoted.
+                if !cur.is_empty() && !joins_at_eq(c, cur.ends_with('='), &s[i..]) {
                     out.push(std::mem::take(&mut cur));
                 }
             }
@@ -2418,9 +2427,52 @@ mod tests {
         assert!(parse("agg count by").is_err()); // no keys
         assert!(parse("agg =sum(x)").is_err()); // empty name
         assert!(parse("agg total=").is_err()); // name without an aggregate
-        let err = parse("agg total = sum(x)").unwrap_err().to_string();
-        assert!(err.contains("without spaces"), "{err}");
         assert!(parse("agg `odd name`=sum(x)").is_ok());
+    }
+
+    #[test]
+    fn spaces_around_equals_do_not_split_an_argument() {
+        // `=` binds tighter than the argument separator in every list, so the
+        // three assignment sites agree with `add NAME = EXPR`.
+        let plan = parse("agg total = sum(x), n=count by g").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.aggs[0].name.as_deref(), Some("total"));
+        assert_eq!(g.aggs[1].name.as_deref(), Some("n"));
+        let plan = parse("rename a = b, `odd name` =c, d= e").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Rename(r) = &stmts[0] else { panic!() };
+        let pairs: Vec<(&str, &str)> = r
+            .pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        assert_eq!(pairs, [("a", "b"), ("odd name", "c"), ("d", "e")]);
+        let plan = parse("sort a = nr b").unwrap();
+        let Stage::Sort(s) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(s.keys.len(), 2);
+        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Numeric);
+        assert_eq!(s.keys[1].name, "b");
+        // A `join` key pair too.
+        assert!(parse("join r.csv on id = rid").is_ok());
+        // Any Unicode blank between items separates or joins the same way
+        // (a no-break space is two bytes; the `by` keyword itself still needs
+        // ASCII blanks around it).
+        let plan = parse("cols a\u{a0}b | rename a\u{a0}=\u{a0}c").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Cols(p) = &stmts[0] else { panic!() };
+        assert_eq!(p.names, ["a", "b"]);
+        assert!(parse("agg count(a)\u{a0}sum(b) by g").is_ok());
+        // A dangling `=` is still an error, not a silent key.
+        assert!(parse("rename a =").is_err());
+        assert!(parse("agg sum(x) =").is_err());
     }
 
     #[test]
