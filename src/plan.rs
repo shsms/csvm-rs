@@ -1388,23 +1388,44 @@ impl SortStmt {
         Ok(())
     }
 
-    /// Positions whose values must be converted to numbers before sorting.
-    pub fn numeric_positions(&self) -> impl Iterator<Item = usize> + '_ {
-        self.keys
-            .iter()
-            .filter(|k| k.mode == SortMode::Numeric)
-            .map(|k| k.pos)
+    /// Every key orders as text: [`SortStmt::compare`] then never reads a
+    /// key slice, so a caller can skip [`SortStmt::row_key`] and pass `&[]`.
+    pub fn all_lexical(&self) -> bool {
+        self.keys.iter().all(|k| k.mode == SortMode::Lexical)
     }
 
-    /// Compare two rows by the sort keys. Numeric keys are assumed already
-    /// converted to numbers (see [`SortStmt::numeric_positions`]).
+    /// The numbers behind `row`'s numeric and auto keys, one entry per key in
+    /// key order (`None` for a lexical key), parsed once so
+    /// [`SortStmt::compare`] never re-reads a cell for them and the cell's
+    /// text is never rewritten. A non-number under a numeric key is an error,
+    /// as for `to-num`.
+    pub fn row_key(&self, row: &[Field]) -> Result<Box<[Option<f64>]>, Error> {
+        self.keys
+            .iter()
+            .map(|k| match k.mode {
+                SortMode::Numeric => cell_num(row, k.pos).map(Some),
+                SortMode::Auto => Ok(auto_num(row, k.pos)),
+                SortMode::Lexical => Ok(None),
+            })
+            .collect()
+    }
+
+    /// Compare two rows by the sort keys, reading their numbers from `an` /
+    /// `bn` (the rows' [`SortStmt::row_key`]s).
     #[inline]
-    pub fn compare(&self, a: &[Field], b: &[Field]) -> Ordering {
-        for k in &self.keys {
+    pub fn compare(
+        &self,
+        a: &[Field],
+        an: &[Option<f64>],
+        b: &[Field],
+        bn: &[Option<f64>],
+    ) -> Ordering {
+        for (i, k) in self.keys.iter().enumerate() {
+            // A numeric key always has a number in its slot, so it is the
+            // (Some, Some) case of the auto rule.
             let ord = match k.mode {
-                SortMode::Numeric => num_of(a, k.pos).total_cmp(&num_of(b, k.pos)),
                 SortMode::Lexical => cell_str(a, k.pos).cmp(&cell_str(b, k.pos)),
-                SortMode::Auto => match (auto_num(a, k.pos), auto_num(b, k.pos)) {
+                SortMode::Numeric | SortMode::Auto => match (an[i], bn[i]) {
                     (Some(x), Some(y)) => x.total_cmp(&y),
                     (Some(_), None) => Ordering::Less,
                     (None, Some(_)) => Ordering::Greater,
@@ -1417,15 +1438,6 @@ impl SortStmt {
             }
         }
         Ordering::Equal
-    }
-}
-
-#[inline]
-fn num_of(row: &[Field], pos: usize) -> f64 {
-    match row.get(pos) {
-        Some(Field::Num(n)) => *n,
-        Some(f) => f.coerce_num().unwrap_or(0.0),
-        None => 0.0,
     }
 }
 
@@ -1797,16 +1809,19 @@ mod tests {
             }],
         };
         let row = |s: &str| vec![Field::Owned(s.to_string())];
+        let cmp = |a: &[Field], b: &[Field]| {
+            s.compare(a, &s.row_key(a).unwrap(), b, &s.row_key(b).unwrap())
+        };
         // Two numbers: numeric (lexically "10" < "9").
-        assert_eq!(s.compare(&row("10"), &row("9")), Ordering::Greater);
+        assert_eq!(cmp(&row("10"), &row("9")), Ordering::Greater);
         // A number sorts before any text, including the empty cell.
-        assert_eq!(s.compare(&row("5"), &row("abc")), Ordering::Less);
-        assert_eq!(s.compare(&row("5"), &row("")), Ordering::Less);
+        assert_eq!(cmp(&row("5"), &row("abc")), Ordering::Less);
+        assert_eq!(cmp(&row("5"), &row("")), Ordering::Less);
         // Two non-numbers: lexical.
-        assert_eq!(s.compare(&row(""), &row("abc")), Ordering::Less);
-        assert_eq!(s.compare(&row("b"), &row("a")), Ordering::Greater);
+        assert_eq!(cmp(&row(""), &row("abc")), Ordering::Less);
+        assert_eq!(cmp(&row("b"), &row("a")), Ordering::Greater);
         // A pre-converted number is still a number.
-        assert_eq!(s.compare(&[Field::Num(2.0)], &row("10")), Ordering::Less);
+        assert_eq!(cmp(&[Field::Num(2.0)], &row("10")), Ordering::Less);
     }
 
     #[test]
@@ -1822,6 +1837,7 @@ mod tests {
         // numeric: 10 > 9 (lexically "10" < "9", so this proves numeric mode)
         let a = vec![Field::Num(10.0)];
         let b = vec![Field::Num(9.0)];
-        assert_eq!(s.compare(&a, &b), Ordering::Less); // descending: bigger first
+        let (ka, kb) = (s.row_key(&a).unwrap(), s.row_key(&b).unwrap());
+        assert_eq!(s.compare(&a, &ka, &b, &kb), Ordering::Less); // descending: bigger first
     }
 }

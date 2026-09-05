@@ -84,8 +84,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   never aborts), `=n` or a `to-num` column is `Numeric` (a non-number aborts),
   `=s` or a `to-str` column is `Lexical`. The external sort's encoded key
   (`encode_key` in `sort.rs`) prefixes an auto key with a one-byte tag
-  (number / text) and the in-memory comparator (`SortStmt::compare`) applies
-  the same rule via `plan::auto_num`, so both paths agree byte for byte.
+  (number / text), and the in-memory path parses the same cell once through
+  `SortStmt::row_key` (`plan::auto_num`) before `SortStmt::compare` orders
+  it, so both paths agree byte for byte.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort, else truncates in the materialized

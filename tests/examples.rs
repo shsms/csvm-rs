@@ -136,6 +136,28 @@ fn sort_auto_agrees_with_select_on_the_same_column() {
 }
 
 #[test]
+fn sort_auto_on_the_in_memory_path_keeps_cell_text() {
+    // A blocking stage (`tail`) routes the sort through the in-memory path,
+    // which caches each auto key's number instead of converting the cell, so
+    // the order is the auto order and the cell text is untouched.
+    let input = "n\nx\n10\n\n9\n1.0000001\n";
+    assert_eq!(
+        run_checked("sort n | tail 5", input),
+        "n\n1.0000001\n9\n10\n\nx\n"
+    );
+    assert_eq!(
+        run_checked("sort n=r | tail 5", input),
+        "n\nx\n\n10\n9\n1.0000001\n"
+    );
+    // Two auto keys behind a numeric one: the cached numbers must line up
+    // with the auto keys, not with the key list.
+    let input = "k,a,b\n1,x,2\n1,10,1\n1,9,\n2,b,c\n1,10,0\n1,x,1\n";
+    let expected = "k,a,b\n1,9,\n1,10,0\n1,10,1\n1,x,1\n1,x,2\n2,b,c\n";
+    assert_eq!(run_checked("sort k=n a b", input), expected);
+    assert_eq!(run_checked("sort k=n a b | tail 6", input), expected);
+}
+
+#[test]
 fn sort_auto_treats_nan_and_inf_as_numbers_like_to_num() {
     // f64 parsing accepts NaN and inf, as `to-num` does, so auto orders them
     // as numbers (NaN last among them, per total_cmp) before any text.
@@ -152,6 +174,16 @@ fn sort_of_a_string_typed_add_column_is_lexical() {
         run_checked("add s qty ++ '' | sort s | cols s", input),
         "s\n10\n100\n9\n"
     );
+}
+
+#[test]
+fn numeric_sort_keeps_cell_text_on_every_path() {
+    // `=n` orders by value but must not rewrite the cell (007 stays 007), on
+    // the external path and on the in-memory path a blocking stage forces.
+    let input = "id,qty\na,007\nb,1e3\nc,\nd,2.50\n";
+    let expected = "id,qty\nc,\nd,2.50\na,007\nb,1e3\n";
+    assert_eq!(run_checked("sort qty=n", input), expected);
+    assert_eq!(run_checked("sort qty=n | uniq", input), expected);
 }
 
 #[test]

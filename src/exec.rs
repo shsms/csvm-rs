@@ -1572,17 +1572,20 @@ fn materialize<R: BufRead>(chunk_size: usize, input: &mut R) -> Result<Vec<Owned
     Ok(rows)
 }
 
-/// Convert the numeric sort-key columns once, then stable-sort.
-fn sort_rows(sort: &SortStmt, rows: &mut [OwnedRow]) -> Result<(), Error> {
-    let numeric: Vec<usize> = sort.numeric_positions().collect();
-    for row in rows.iter_mut() {
-        for &p in &numeric {
-            if let Some(f) = row.get_mut(p) {
-                *f = Field::Num(f.coerce_num()?);
-            }
-        }
+/// Parse each row's numeric and auto keys once, then stable-sort. A cell is
+/// never rewritten: a `=n` key's text (`007`) reaches the output as typed,
+/// exactly as on the external path.
+fn sort_rows(sort: &SortStmt, rows: &mut Vec<OwnedRow>) -> Result<(), Error> {
+    if sort.all_lexical() {
+        rows.sort_by(|a, b| sort.compare(a, &[], b, &[]));
+        return Ok(());
     }
-    rows.sort_by(|a, b| sort.compare(a, b));
+    let mut keyed: Vec<(Box<[Option<f64>]>, OwnedRow)> = Vec::with_capacity(rows.len());
+    for r in rows.drain(..) {
+        keyed.push((sort.row_key(&r)?, r));
+    }
+    keyed.sort_by(|(ka, a), (kb, b)| sort.compare(a, ka, b, kb));
+    rows.extend(keyed.into_iter().map(|(_, r)| r));
     Ok(())
 }
 
