@@ -448,6 +448,7 @@ NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
         summary: "value expressions for `add`",
         body: "  arithmetic:  + - * / %  and parens   (numeric; coerces operands)\n  \
 unary minus: -x\n  \
+numbers:     as in a cell: 1.5  .5  1e-3  inf  NaN   (backtick a column named inf)\n  \
 concat:      a ++ b ++ c        (string; never use + for text)\n  \
 ternary:     TEST ? A : B        (TEST is a select-style comparison)\n  \
 boolean:     a bare comparison yields t / f\n  \

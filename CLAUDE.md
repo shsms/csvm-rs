@@ -60,11 +60,15 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   type however a later stage spells it.
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
-  `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
-  words). Operands of the six comparisons are full **value expressions** (the
+  `!(…)`), `&&`, `||`, `!`, parens. No word operators, and the only reserved
+  words are the number words `inf`/`infinity`/`nan` (any case; a
+  `ValExpr::Word` that resolves against a header with a column of that name
+  fails, pointing at backticks).
+  Operands of the six comparisons are full **value expressions** (the
   `add` grammar below the ternary): bare identifiers are columns (backtick-quote
   a name that isn't a bare identifier, e.g. `` `frequenz-app-edge` ``), numbers
-  are numeric literals, `'…'`/`"…"` are string literals, and arithmetic
+  are numeric literals as in a cell (`1.5`, `.5`, `1e-3`, `inf`, `NaN`),
+  `'…'`/`"…"` are string literals, and arithmetic
   (`select price * qty >= 30`), functions (`abs(x) > 1`), and parenthesized
   boolean subexpressions compared as `t`/`f` (`(a >= 0) == (b >= 0)`) all work
   (`Cmp` holds two `ValExpr`s; leaf operands take allocation-free fast paths,
@@ -109,7 +113,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   coreutils' "from row N on": a `Stage::Skip(N-1)` that streams through the
   same window path as `head` (`[pre | skip | head | post]`), so `tail +N |
   head M` stops early, and counts over the merge output after a `sort` like
-  `head`; elsewhere it drains in the materialized path.
+  `head`; elsewhere it drains in the materialized path. Adjacent `head` /
+  `tail +N` stages fold into one window when the plan is built
+  (`push_window` in `parse.rs`: `skip a | head l | skip b` is `skip a+b |
+  head l-b`), so `head 5 | tail +2` streams too.
 - **`uniq [cols]`** drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
   pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is
@@ -135,7 +142,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   streaming path.
 - **`agg [NAME=]FN(col),… [by COLS]`** reduces to one row per distinct key —
   the per-key sibling of `stats` (which reduces globally). `by COLS` gives the
-  keys; without it `agg` emits a single global row. Functions are
+  keys; without it `agg` emits a single global row. The whole argument is
+  one item list (`split_specs`, quote-aware for `'`, `"` and backticks; an
+  open quote is an error); `by` is the first item that is exactly the bare
+  word, and the keys, the column inside a call and the `NAME =` half are
+  unquoted alike (`split_name_eq` takes the same three quotes, for `add`
+  too). Functions are
   `count/count_distinct/sum/min/max/mean/stddev` (a bare `count` counts rows;
   `count(col)` counts non-empty cells, `count_distinct(col)` the distinct
   ones, told apart by their output text like a `by` key, so a typed number
