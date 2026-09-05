@@ -1730,6 +1730,17 @@ fn lex_number(cs: &[char], i: &mut usize, toks: &mut Vec<ETok>) -> Result<(), Er
     while *i < cs.len() && (cs[*i].is_ascii_digit() || cs[*i] == '.') {
         *i += 1;
     }
+    // An exponent: `e`/`E`, an optional sign, digits (`1e3`, `2.5E-3`). The
+    // float parse below rejects a malformed one such as `1e`.
+    if matches!(cs.get(*i), Some('e' | 'E')) {
+        *i += 1;
+        if matches!(cs.get(*i), Some('+' | '-')) {
+            *i += 1;
+        }
+        while *i < cs.len() && cs[*i].is_ascii_digit() {
+            *i += 1;
+        }
+    }
     let text: String = cs[start..*i].iter().collect();
     let n = text
         .parse::<f64>()
@@ -2389,6 +2400,17 @@ mod tests {
         assert!(parse("tail +x").is_err());
         assert!(parse("tail ++3").is_err());
         assert!(parse("tail +").is_err());
+    }
+
+    #[test]
+    fn exponent_literals_lex_as_numbers() {
+        assert!(parse("add v = 1e3 + 2.5E-3 - 1e+2").is_ok());
+        assert!(parse("select price > 1e3").is_ok());
+        // A malformed exponent is an invalid number, not a silent `1`.
+        for bad in ["add v = 1e", "add v = 1e+", "add v = 1e-x"] {
+            let err = parse(bad).unwrap_err().to_string();
+            assert!(err.contains("invalid number"), "{bad}: {err}");
+        }
     }
 
     #[test]

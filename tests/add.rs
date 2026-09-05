@@ -80,6 +80,19 @@ fn arithmetic_appends_a_numeric_column() {
 }
 
 #[test]
+fn exponent_literals() {
+    assert_eq!(
+        run_checked("add v = price * 1e3 + qty * 2.5E-3 - 1e+2 | cols v", NUM),
+        "v\n9900.0075\n19900.005\n4900.01\n"
+    );
+    // An exponent past the f64 range overflows to inf, as a cell would.
+    assert_eq!(
+        run_checked("add v = 1e400 | add w = -1e400 | cols v,w", NUM),
+        "v,w\ninf,-inf\ninf,-inf\ninf,-inf\n"
+    );
+}
+
+#[test]
 fn precedence_and_parens() {
     // (price - qty) * 2, not price - qty*2
     assert_eq!(
