@@ -83,7 +83,8 @@ Each stage is a command with comma- or space-separated arguments:
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
 | `graph scatter X Y` / `line X Y` | braille scatter/line plot, multi-series (sink) |
 
-Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
+Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`),
+and an `=` may have spaces around it (`rename a = b`, `agg total = sum(x)`).
 A `#` outside quotes starts a comment to end of line. A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age ``. A bare integer
 that is not a column name is a 1-based position, in any command that names a

@@ -52,7 +52,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   output and `--explain` show `qty`, not `2`. Join keys and `rename`'s
   source name still echo the spec text.
   Backticks are stripped before resolution (`split_list`), so they do not
-  force a name reading. Column types are tracked by position in
+  force a name reading. In every argument list an unquoted `=` binds
+  tighter than whitespace (`rename a = b` is one pair), so the assignment
+  sites (`rename`, `add`, `agg`, `sort` flags, `join` keys) all accept spaces
+  around it. Column types are tracked by position in
   `Plan::resolve` (see *Implicit conversions*), so a typed column keeps its
   type however a later stage spells it.
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),

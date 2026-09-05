@@ -14,11 +14,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
-- =NAME = EXPR= with spaces works in =add= because it splits the name before
-  tokenizing, but =agg total = sum(x)=, =rename a = b= and =sort a = n= split
-  on whitespace first (=agg= at least says so). The general fix is one rule
-  in =split_list= / =split_specs=: === binds tighter than the argument
-  separator, so spaces around a top-level === never split a token.
 - Fold adjacent =head= / =tail +N= stages into one window at parse time
   (=skip a | head l | skip b= is =skip a+b, head l-b=), so =head 5 | tail +2=
   streams too; today only the =[skip | head]= order does (=window_shape=).
@@ -81,6 +76,11 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE Spaces around === in every argument list
+Shipped 2026-09-05: an unquoted === binds tighter than whitespace in
+=split_list= / =split_specs=, so =agg total = sum(x)=, =rename a = b=,
+=sort a = nr= and =join … on a = b= read like =add NAME = EXPR=.
 
 ** DONE =count_distinct(col)= in =agg=
 Shipped 2026-09-05: one =HashSet= per group and column, merged by union, so
