@@ -889,9 +889,8 @@ impl<'a> Builder<'a> {
     fn parse_sort(&mut self, rest: &str) -> Result<(), Error> {
         let mut keys = Vec::new();
         for spec in split_list(rest) {
-            // `col=flags` or `col:flags` — `:` is accepted alongside `=` (it
-            // reads better and matches the original csvm's `b:r`).
-            let (name, flags) = match spec.split_once(['=', ':']) {
+            // `col=flags`.
+            let (name, flags) = match spec.split_once('=') {
                 Some((n, f)) => (n.to_string(), f),
                 None => (spec, ""),
             };
@@ -2238,13 +2237,13 @@ mod tests {
         assert!(!s.keys[1].descending && s.keys[1].mode == SortMode::Auto); // a: default
         assert!(s.keys[2].descending && s.keys[2].mode == SortMode::Numeric); // id: =nr
 
-        // `:` is an accepted alternative to `=` for the flags.
+        // `=` is the only flag separator: `a:nr` is a column name.
         let plan = parse("sort a:nr b").unwrap();
         let Stage::Sort(s) = &plan.stages[0] else {
             panic!()
         };
-        assert!(s.keys[0].descending && s.keys[0].mode == SortMode::Numeric); // a: :nr
-        assert!(!s.keys[1].descending && s.keys[1].mode == SortMode::Auto); // b: default
+        assert_eq!(s.keys[0].name, "a:nr");
+        assert!(!s.keys[0].descending && s.keys[0].mode == SortMode::Auto);
     }
 
     #[test]

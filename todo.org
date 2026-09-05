@@ -37,8 +37,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
   distinct item separator, removes the trap.
-- =sort= accepts both =col=nr= and =col:nr=. Harmless, but one fewer thing to
-  document; consider dropping =:=.
 
 ** TODO Correctness / edges
 - Post-sort statements see output-rounded numbers: the streaming sort path

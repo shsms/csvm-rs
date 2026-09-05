@@ -205,7 +205,7 @@ operands stay lexical.",
         summary: "stable multi-key sort",
         synopsis: &[
             "sort COL ...           sort by each column (auto: numbers numerically, then text)",
-            "sort COL=nr ...        flags: n numeric, s lexical (string), r reverse (also COL:nr)",
+            "sort COL=nr ...        flags: n numeric, s lexical (string), r reverse",
         ],
         detail: "Keys are applied left to right; the sort is stable. A bare column auto-detects per \
 cell: cells that parse as numbers order numerically and come first (a blank reads as 0, as in \
