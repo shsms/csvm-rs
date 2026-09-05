@@ -101,6 +101,25 @@ fn a_quoted_name_loses_its_quotes() {
 }
 
 #[test]
+fn a_column_named_like_a_number_word_needs_backticks() {
+    let input = "inf,x\n1,2\n";
+    let err = run("select inf > 1", input, 1).unwrap_err();
+    assert!(err.contains("`inf` is the number here"), "{err}");
+    assert_eq!(run_checked("select `inf` > 1", input), "inf,x\n");
+}
+
+#[test]
+fn cell_style_number_literals() {
+    assert_eq!(
+        run_checked(
+            "add v = .5 * price | add w = -inf | add n = NaN | cols v,w,n",
+            NUM
+        ),
+        "v,w,n\n5,-inf,NaN\n10,-inf,NaN\n2.5,-inf,NaN\n"
+    );
+}
+
+#[test]
 fn precedence_and_parens() {
     // (price - qty) * 2, not price - qty*2
     assert_eq!(

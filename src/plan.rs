@@ -292,6 +292,9 @@ pub enum ValExpr {
     /// A column's cell value.
     Col(ColRef),
     Num(f64),
+    /// A bare word read as a number (`inf`, `nan`). Resolve turns it into
+    /// `Num`, or fails when a column has that name.
+    Word(String, f64),
     Str(String),
     /// Unary minus.
     Neg(Box<ValExpr>),
@@ -1123,7 +1126,7 @@ impl ValExpr {
     pub fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<Field<'static>, Error> {
         Ok(match self {
             ValExpr::Col(c) => cell_field(row, c.pos),
-            ValExpr::Num(n) => Field::Num(*n),
+            ValExpr::Num(n) | ValExpr::Word(_, n) => Field::Num(*n),
             ValExpr::Str(s) => Field::Owned(s.clone()),
             ValExpr::Neg(e) => Field::Num(-e.eval(row, ctx)?.coerce_num()?),
             ValExpr::Arith { op, lhs, rhs } => {
@@ -1182,7 +1185,7 @@ impl ValExpr {
     fn cmp_num(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
         match self {
             ValExpr::Col(c) => cell_num(row, c.pos),
-            ValExpr::Num(n) => Ok(*n),
+            ValExpr::Num(n) | ValExpr::Word(_, n) => Ok(*n),
             // A numeric comparison never carries a `Str` operand (compile-time
             // normalization parses string literals), but coerce defensively.
             ValExpr::Str(s) => Field::Str(s).coerce_num().map_err(Error::Num),
@@ -1205,7 +1208,7 @@ impl ValExpr {
         Ok(match self {
             ValExpr::Col(c) => cell_str(row, c.pos),
             ValExpr::Str(s) => std::borrow::Cow::Borrowed(s.as_str()),
-            ValExpr::Num(n) => std::borrow::Cow::Owned(format_num(*n)),
+            ValExpr::Num(n) | ValExpr::Word(_, n) => std::borrow::Cow::Owned(format_num(*n)),
             e => std::borrow::Cow::Owned(e.cmp_str_compound(row, ctx)?),
         })
     }
@@ -1226,7 +1229,9 @@ impl ValExpr {
             // A column leaf uses the allocation-free read; the same rule as
             // `cell_num` (blank is 0), without building an error per text cell.
             ValExpr::Col(c) => Ok(auto_num(row, c.pos)),
-            ValExpr::Num(_) | ValExpr::Str(_) => Ok(self.cmp_num(row, ctx).ok()),
+            ValExpr::Num(_) | ValExpr::Word(..) | ValExpr::Str(_) => {
+                Ok(self.cmp_num(row, ctx).ok())
+            }
             e => e.cmp_num_soft_compound(row, ctx),
         }
     }
@@ -1244,9 +1249,11 @@ impl ValExpr {
     /// branches agree.
     pub fn static_type(&self, col: &dyn Fn(&ColRef) -> Option<ColType>) -> Option<ColType> {
         match self {
-            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
-                Some(ColType::Num)
-            }
+            ValExpr::Num(_)
+            | ValExpr::Word(..)
+            | ValExpr::Neg(_)
+            | ValExpr::Arith { .. }
+            | ValExpr::Rownum => Some(ColType::Num),
             ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(ColType::Str),
             // `coalesce` passes its arguments through, so its type depends on
             // the data; every other function returns a fixed type.
@@ -1270,6 +1277,17 @@ impl ValExpr {
         match self {
             ValExpr::Col(c) | ValExpr::Prev(c) => c.resolve(header)?,
             ValExpr::Num(_) | ValExpr::Str(_) | ValExpr::Rownum => {}
+            // The word is the number unless a column is named so, which
+            // would otherwise silently read as the constant.
+            ValExpr::Word(w, n) => {
+                if header.contains(w) {
+                    return Err(Error::Compile(format!(
+                        "`{w}` is the number here, but a column has that name; write it in \
+                         backticks for the column, or num('{w}') for the number"
+                    )));
+                }
+                *self = ValExpr::Num(*n);
+            }
             ValExpr::Neg(e) => e.resolve(header, types)?,
             ValExpr::Arith { lhs, rhs, .. } => {
                 lhs.resolve(header, types)?;
@@ -1295,7 +1313,7 @@ impl ValExpr {
     pub fn is_stateful(&self) -> bool {
         match self {
             ValExpr::Prev(_) | ValExpr::Rownum => true,
-            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Str(_) => false,
+            ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Word(..) | ValExpr::Str(_) => false,
             ValExpr::Bool(b) => b.is_stateful(),
             ValExpr::Neg(e) => e.is_stateful(),
             ValExpr::Arith { lhs, rhs, .. } => lhs.is_stateful() || rhs.is_stateful(),

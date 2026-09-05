@@ -2281,6 +2281,7 @@ fn fmt_valexpr(e: &ValExpr) -> String {
     match e {
         ValExpr::Col(c) => format!("{}[{}]", c.name, c.pos),
         ValExpr::Num(n) => n.to_string(),
+        ValExpr::Word(w, _) => w.clone(),
         ValExpr::Str(s) => format!("{s:?}"),
         ValExpr::Neg(e) => format!("(neg {})", fmt_valexpr(e)),
         ValExpr::Arith { op, lhs, rhs } => {

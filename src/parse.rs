@@ -1580,6 +1580,8 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
 enum ETok {
     Ident(String),
     Num(f64),
+    /// A bare word that is a number (`inf`, `nan`), kept with its text.
+    Word(String, f64),
     Str(String),
     Sym(&'static str),
 }
@@ -1659,9 +1661,7 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             // position (expression start, or right after an operator/`(`). After
             // a value it is the binary add/subtract operator — so `amount - 5`
             // subtracts, while `a > -5` compares against negative five.
-            '-' | '+'
-                if !ends_value(&toks) && cs.get(i + 1).is_some_and(|d| d.is_ascii_digit()) =>
-            {
+            '-' | '+' if !ends_value(&toks) && starts_number(&cs[i + 1..]) => {
                 lex_number(&cs, &mut i, &mut toks)?;
             }
             // Arithmetic / value-expression operators (used by `add`).
@@ -1673,13 +1673,19 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             '?' => push_sym(&mut toks, "?", &mut i),
             ':' => push_sym(&mut toks, ":", &mut i),
             ',' => push_sym(&mut toks, ",", &mut i),
-            c if c.is_ascii_digit() => lex_number(&cs, &mut i, &mut toks)?,
+            _ if starts_number(&cs[i..]) => lex_number(&cs, &mut i, &mut toks)?,
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_' || cs[i] == '.') {
                     i += 1;
                 }
-                toks.push(ETok::Ident(cs[start..i].iter().collect()));
+                let word: String = cs[start..i].iter().collect();
+                // `inf`, `infinity` and `nan` (any case) are numbers, as in a
+                // cell; a column with such a name needs backticks.
+                match word.parse::<f64>() {
+                    Ok(n) => toks.push(ETok::Word(word, n)),
+                    Err(_) => toks.push(ETok::Ident(word)),
+                }
             }
             other => return Err(err(format!("unexpected character '{other}' in expression"))),
         }
@@ -1692,7 +1698,7 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
 fn ends_value(toks: &[ETok]) -> bool {
     matches!(
         toks.last(),
-        Some(ETok::Num(_) | ETok::Ident(_) | ETok::Str(_) | ETok::Sym(")"))
+        Some(ETok::Num(_) | ETok::Word(..) | ETok::Ident(_) | ETok::Str(_) | ETok::Sym(")"))
     )
 }
 
@@ -1703,6 +1709,15 @@ fn push_sym(toks: &mut Vec<ETok>, s: &'static str, i: &mut usize) {
 fn push2(toks: &mut Vec<ETok>, s: &'static str, i: &mut usize) {
     toks.push(ETok::Sym(s));
     *i += 2;
+}
+
+/// Whether a number literal starts here: a digit, or `.` then a digit.
+fn starts_number(cs: &[char]) -> bool {
+    match cs {
+        [d, ..] if d.is_ascii_digit() => true,
+        ['.', d, ..] => d.is_ascii_digit(),
+        _ => false,
+    }
 }
 
 fn lex_number(cs: &[char], i: &mut usize, toks: &mut Vec<ETok>) -> Result<(), Error> {
@@ -1752,7 +1767,7 @@ impl ExprParser {
     /// expression" when the cursor is past the last token.
     fn here(&self) -> String {
         match self.toks.get(self.pos) {
-            Some(ETok::Ident(s)) | Some(ETok::Str(s)) => format!("'{s}'"),
+            Some(ETok::Ident(s)) | Some(ETok::Str(s)) | Some(ETok::Word(s, _)) => format!("'{s}'"),
             Some(ETok::Num(n)) => format!("'{}'", crate::field::format_num(*n)),
             Some(ETok::Sym(s)) => format!("'{s}'"),
             None => "end of expression".to_string(),
@@ -2027,6 +2042,10 @@ impl ExprParser {
             Some(ETok::Num(n)) => {
                 self.pos += 1;
                 Ok(ValExpr::Num(n))
+            }
+            Some(ETok::Word(w, n)) => {
+                self.pos += 1;
+                Ok(ValExpr::Word(w, n))
             }
             Some(ETok::Str(s)) => {
                 self.pos += 1;
@@ -2481,6 +2500,66 @@ mod tests {
         assert_eq!(a.name, "n n");
         let err = parse("add 'x = 1").unwrap_err().to_string();
         assert!(err.contains("unterminated quoted column name"), "{err}");
+    }
+
+    #[test]
+    fn number_literals_match_the_cell_grammar() {
+        // `.5`, `inf` and `NaN` are numbers in a cell, so they are literals
+        // here too (any case, with a sign); a column with such a name needs
+        // backticks.
+        assert!(parse("add v = .5 + -.25 * 2.").is_ok());
+        for lit in ["inf", "Infinity", "NaN", "nan"] {
+            let mut plan = parse(&format!("add v = {lit}")).unwrap();
+            plan.resolve(&["x".to_string()]).unwrap();
+            let Stage::Transform(stmts) = &plan.stages[0] else {
+                panic!()
+            };
+            let Stmt::Add(a) = &stmts[0] else { panic!() };
+            assert!(matches!(a.expr, ValExpr::Num(_)), "{lit}: {:?}", a.expr);
+        }
+        assert!(parse("select x > inf").is_ok());
+        assert!(parse("add v = infx").is_ok()); // a column, not a literal
+        // A column of that name is an error, not a silent constant; in
+        // backticks it is the column.
+        let header = ["inf".to_string(), "x".to_string()];
+        let err = parse("select inf > 1")
+            .unwrap()
+            .resolve(&header)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("`inf` is the number here"),
+            "{err}"
+        );
+        assert!(parse("select `inf` > 1").unwrap().resolve(&header).is_ok());
+        assert!(parse("cols inf").unwrap().resolve(&header).is_ok());
+        // Checked where the word is used, against the live header: a
+        // column made earlier counts, one dropped before does not, an
+        // expression that does not use the word is not affected, and colour
+        // rules count too.
+        assert!(
+            parse("rename x = nan | select nan > 1")
+                .unwrap()
+                .resolve(&header)
+                .is_err()
+        );
+        assert!(
+            parse("cols x | select x > inf")
+                .unwrap()
+                .resolve(&header)
+                .is_ok()
+        );
+        assert!(
+            parse("color red inf > 1")
+                .unwrap()
+                .resolve(&header)
+                .is_err()
+        );
+        assert!(
+            parse("add v = inf | rename x = inf | select v > 1")
+                .unwrap()
+                .resolve(&header[1..])
+                .is_ok()
+        );
     }
 
     #[test]
