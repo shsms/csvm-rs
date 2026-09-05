@@ -81,7 +81,7 @@ fn select_string_equality() {
 
 #[test]
 fn select_implicit_numeric() {
-    // No to-num: a comparison against a number is numeric. -2 is not > 0.
+    // No cast: a comparison against a number is numeric. -2 is not > 0.
     assert_eq!(
         run_checked(
             "select fieldA == 't' && (countZ > 0 || countA > 0) | cols id",
@@ -92,11 +92,11 @@ fn select_implicit_numeric() {
 }
 
 #[test]
-fn explicit_to_num_to_str_roundtrip() {
-    // to-num then to-str canonicalizes the number but is otherwise transparent.
+fn num_then_str_roundtrip() {
+    // num() then str() canonicalizes the number but is otherwise transparent.
     assert_eq!(
         run_checked(
-            "to-num countA | select countA > 0 | to-str countA | cols id,countA",
+            "add countA num(countA) | select countA > 0 | add countA str(countA) | cols id,countA",
             INPUT
         ),
         "id,countA\n1,3\n4,7\n"
@@ -158,8 +158,8 @@ fn sort_auto_on_the_in_memory_path_keeps_cell_text() {
 }
 
 #[test]
-fn sort_auto_treats_nan_and_inf_as_numbers_like_to_num() {
-    // f64 parsing accepts NaN and inf, as `to-num` does, so auto orders them
+fn sort_auto_treats_nan_and_inf_as_numbers_like_num() {
+    // f64 parsing accepts NaN and inf, as `num()` does, so auto orders them
     // as numbers (NaN last among them, per total_cmp) before any text.
     let input = "n\nNaN\n5\nabc\ninf\n-inf\n";
     assert_eq!(run_checked("sort n", input), "n\n-inf\n5\ninf\nNaN\nabc\n");
@@ -188,49 +188,57 @@ fn numeric_sort_keeps_cell_text_on_every_path() {
 
 #[test]
 fn column_types_follow_the_column_not_its_spelling() {
-    // to-num / to-str pin a column by position at resolve time, so the pin
-    // holds however the column is later named: by position, by name, after
-    // a rename, or after cols reorders it.
+    // A column typed by `add … num()/str()` is pinned by position at resolve
+    // time, so the pin holds however the column is later named: by position,
+    // by name, after a rename, or after cols reorders it.
     let input = "id,qty\n1,10\n2,9\n3,100\n";
     let lexical = "id,qty\n1,10\n3,100\n2,9\n";
-    assert_eq!(run_checked("to-str 2 | sort qty", input), lexical);
-    assert_eq!(run_checked("to-str qty | sort 2", input), lexical);
+    assert_eq!(run_checked("add qty str(qty) | sort 2", input), lexical);
     assert_eq!(
-        run_checked("to-str qty | cols qty,id | sort 1 | cols id,qty", input),
+        run_checked(
+            "add qty str(qty) | cols qty,id | sort 1 | cols id,qty",
+            input
+        ),
         lexical
     );
     assert_eq!(
-        run_checked("to-num qty | rename qty=n | sort n | rename n=qty", input),
+        run_checked(
+            "add qty num(qty) | rename qty=n | sort n | rename n=qty",
+            input
+        ),
         "id,qty\n2,9\n1,10\n3,100\n"
     );
-    // The same for comparisons: a to-num column makes == numeric.
+    // The same for comparisons: a num()-typed column makes == numeric ...
     let pair = "a,b\n1000,1e3\n10,9\n9,10\n";
     assert_eq!(
-        run_checked("to-num 1 | select a == b", pair),
+        run_checked("add a num(a) | select a == b", pair),
         "a,b\n1000,1e3\n"
     );
-    // ... and a to-str column makes an ordering lexical ("9" > "10").
-    assert_eq!(run_checked("to-str 1 | select a > b", pair), "a,b\n9,10\n");
+    // ... and a str()-typed column makes an ordering lexical ("9" > "10").
+    assert_eq!(
+        run_checked("add a str(a) | select a > b", pair),
+        "a,b\n9,10\n"
+    );
     // A group key keeps its column's type, so the pin survives the reduce.
     assert_eq!(
         run_checked(
-            "to-str 2 | group qty | agg count | sort qty | cols qty",
+            "add qty str(qty) | group qty | agg count | sort qty | cols qty",
             input
         ),
         "qty\n10\n100\n9\n"
     );
     // ... but a type never leaks onto another column that takes its position
     // after a reduce: `region` stays untyped (text) although `amount` at
-    // position 1 was to-num'd, and the stats `field` column is text.
+    // position 1 was typed numeric, and the stats `field` column is text.
     assert_eq!(
         run_checked(
-            "to-num 1 | group region | agg count | sort region",
+            "add amount num(amount) | group region | agg count | sort region",
             "amount,region\n10,west\n9,east\n100,north\n"
         ),
         "region,count\neast,1\nnorth,1\nwest,1\n"
     );
     assert_eq!(
-        run_checked("to-num id | stats | sort field | cols field", input),
+        run_checked("add id num(id) | stats | sort field | cols field", input),
         "field\nid\nqty\n"
     );
     // An `add` column carries its expression's static type, appended or
@@ -240,12 +248,12 @@ fn column_types_follow_the_column_not_its_spelling() {
         "id,qty,lbl\n1,10,10\n3,100,100\n2,9,9\n"
     );
     assert_eq!(
-        run_checked("to-num qty | add qty upper(qty) | sort 2", input),
+        run_checked("add qty num(qty) | add qty upper(qty) | sort 2", input),
         "id,qty\n1,10\n3,100\n2,9\n"
     );
-    // A literal that cannot be a number is a compile error however the
-    // to-num column is spelled, even inside a colour rule ...
-    let err = run("to-num 2 | color red qty == 'x'", input, 1).unwrap_err();
+    // A literal that cannot be a number is a compile error, even inside a
+    // colour rule ...
+    let err = run("add qty num(qty) | color red qty == 'x'", input, 1).unwrap_err();
     assert!(err.contains("non-numeric literal 'x'"), "{err}");
     // ... while a colour rule whose column is gone from the output is still
     // dropped, whether it named the column or gave its position.

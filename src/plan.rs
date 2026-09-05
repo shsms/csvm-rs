@@ -1998,7 +1998,8 @@ mod tests {
     #[test]
     fn unknown_column_errors() {
         let mut plan = Plan {
-            stages: vec![Stage::Transform(vec![Stmt::ToNum(ConvStmt {
+            stages: vec![Stage::Transform(vec![Stmt::Cols(ProjectStmt {
+                exclude: false,
                 names: vec!["nope".into()],
                 positions: vec![],
             })])],
@@ -2014,9 +2015,10 @@ mod tests {
     #[test]
     fn modes_are_pinned_from_column_types_at_resolve() {
         // The parser leaves every column untyped; resolve pins from the
-        // position-keyed map: to-str/to-num, an `add` expression's type, and
-        // a replace-in-place re-typing the column. An explicit flag wins.
-        let mut plan = crate::parse::parse("to-str z | sort a=s b z z=n").unwrap();
+        // position-keyed map: an `add` expression's type (`num()`/`str()`
+        // included) and a replace-in-place re-typing the column. An explicit
+        // flag wins.
+        let mut plan = crate::parse::parse("add z str(z) | sort a=s b z z=n").unwrap();
         plan.resolve(&["a".into(), "b".into(), "z".into()]).unwrap();
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
@@ -2026,7 +2028,7 @@ mod tests {
         assert_eq!(modes, [Lexical, Auto, Lexical, Numeric]);
         for (script, expect) in [
             ("add s a ++ 'x' | sort s", Lexical),
-            ("to-num a | add a a ++ 'x' | sort a", Lexical),
+            ("add a num(a) | add a a ++ 'x' | sort a", Lexical),
             ("add n a * 2 | sort n", Numeric),
         ] {
             let mut plan = crate::parse::parse(script).unwrap();
@@ -2036,9 +2038,9 @@ mod tests {
             };
             assert_eq!(s.keys[0].mode, expect, "{script}");
         }
-        // A compare against a to-num column becomes numeric at resolve, and
-        // its string literal is folded into a number then.
-        let mut plan = crate::parse::parse("to-num c | select c == '5'").unwrap();
+        // A compare against a num()-typed column becomes numeric at resolve,
+        // and its string literal is folded into a number then.
+        let mut plan = crate::parse::parse("add c num(c) | select c == '5'").unwrap();
         plan.resolve(&["c".into()]).unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()

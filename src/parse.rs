@@ -2131,7 +2131,7 @@ mod tests {
         // The parser decides no modes: every compare is `Auto` until
         // `Plan::resolve` decides from the operands and the column types it
         // tracks by position; a string literal stays a literal until then.
-        let plan = parse("to-str qty | select qty > stock").unwrap();
+        let plan = parse("add qty str(qty) | select qty > stock").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2139,7 +2139,7 @@ mod tests {
             panic!()
         };
         assert_eq!(c.mode, CmpMode::Auto);
-        let plan = parse("to-num c | select c == '5'").unwrap();
+        let plan = parse("add c num(c) | select c == '5'").unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!()
         };
@@ -2152,7 +2152,7 @@ mod tests {
 
     #[test]
     fn sort_flags_and_stage_split() {
-        let plan = parse("to-num c | select c > 0 | sort c=r a id=nr").unwrap();
+        let plan = parse("add c num(c) | select c > 0 | sort c=r a id=nr").unwrap();
         assert_eq!(plan.stages.len(), 2);
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
@@ -2174,7 +2174,7 @@ mod tests {
     fn sort_mode_flags() {
         // `=s` pins lexical and `=n` numeric; a bare key is auto until
         // `Plan::resolve` sees the column's type.
-        let plan = parse("to-str z | sort a=s b z z=n").unwrap();
+        let plan = parse("add z str(z) | sort a=s b z z=n").unwrap();
         let Stage::Sort(s) = &plan.stages[1] else {
             panic!()
         };

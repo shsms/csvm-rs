@@ -95,10 +95,10 @@ fn pipeline(c: &mut Criterion) {
         // Two bare columns ordered with `>` → the per-row auto-detect path. It
         // parses two columns (vs select_numeric's one col + literal), so it runs
         // a bit lower; the auto-detect branch itself is ~free (wall-clock: auto
-        // tracks an explicit `to-num … | >` within noise).
+        // tracks an explicit `num(…) >` within noise).
         ("select_auto", "select amount > id"),
         ("select_regex", "select name =~ '^name1'"),
-        ("to_num", "to-num amount"),
+        ("num_cast", "add amount num(amount)"),
         ("sort_numeric", "sort amount=n"),
         ("sort_lexical", "sort region=s"),
         // Auto (the bare-column default): a text key pays a failed number parse

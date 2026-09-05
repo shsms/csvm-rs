@@ -287,10 +287,10 @@ fn add_ternary_column_types_later_comparisons_numeric() {
 
 #[test]
 fn add_column_copy_inherits_explicit_type_overrides() {
-    // An explicit to-num is a type signal that survives `add z a`: the copy is
-    // strictly numeric, so text on the other side aborts.
+    // A num()-typed column is a type signal that survives `add z a`: the copy
+    // is strictly numeric, so text on the other side aborts.
     let e = run(
-        "to-num a | add z a | select z > name",
+        "add a num(a) | add z a | select z > name",
         "a,name\n1,apple\n",
         1,
     )
@@ -299,11 +299,11 @@ fn add_column_copy_inherits_explicit_type_overrides() {
         e.contains("non-numeric value 'apple'"),
         "unexpected error: {e}"
     );
-    // And to-str pins the copy lexical instead of per-row auto-detect.
+    // And str() pins the copy lexical instead of per-row auto-detect.
     let input = "id,other\n9,100\n20,3\n";
     assert_eq!(
         run_checked(
-            "to-str id | add id2 id | select id2 > other | cols id",
+            "add id str(id) | add id2 id | select id2 > other | cols id",
             input
         ),
         "id\n9\n"

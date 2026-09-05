@@ -2419,7 +2419,7 @@ mod tests {
             run_str("select fieldA == 't'", INPUT).unwrap(),
             "id,fieldA,countZ\n1,t,5\n3,t,0\n4,t,9\n"
         );
-        // Implicit numeric: no to-num needed.
+        // Implicit numeric: no cast needed.
         assert_eq!(
             run_str("select fieldA == 't' && countZ > 0", INPUT).unwrap(),
             "id,fieldA,countZ\n1,t,5\n4,t,9\n"
@@ -2453,10 +2453,10 @@ mod tests {
         assert_eq!(run_str("sort n=n", input).unwrap(), "n\n9\n10\n100\n");
         // auto (default) detects an all-numeric column: same order, no =n.
         assert_eq!(run_str("sort n", input).unwrap(), "n\n9\n10\n100\n");
-        // lexical, forced with =s (or a to-str): "10" < "100" < "9"
+        // lexical, forced with =s (or a str() column): "10" < "100" < "9"
         assert_eq!(run_str("sort n=s", input).unwrap(), "n\n10\n100\n9\n");
         assert_eq!(
-            run_str("to-str n | sort n", input).unwrap(),
+            run_str("add n str(n) | sort n", input).unwrap(),
             "n\n10\n100\n9\n"
         );
         // A mixed column never aborts under auto: numbers first (numeric, a
@@ -2560,10 +2560,11 @@ mod tests {
 
     #[test]
     fn describe_shows_header_names_for_positional_refs() {
-        let mut plan = parse("to-num 3 | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
+        let mut plan =
+            parse("add countZ num(`3`) | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
-        assert!(d.contains("to-num [\"countZ\"]"), "{d}");
+        assert!(d.contains("add countZ[2] = (num countZ[2])"), "{d}");
         assert!(d.contains("(> fieldA[1] 0 :num)"), "{d}");
         assert!(d.contains("sort fieldA[1] auto"), "{d}");
         assert!(d.contains("uniq by [\"countZ\"]"), "{d}");
@@ -2572,15 +2573,17 @@ mod tests {
 
     #[test]
     fn describe_shows_modes_pinned_at_resolve_time() {
-        // A positional to-str / to-num pins the column, and the pin shows in
-        // the engine dump even though the parser could not know the name.
-        let mut plan = parse("to-str 2 | to-num 1 | sort fieldA id | select id == countZ").unwrap();
+        // A str()/num()-typed column pins later keys and compares on it, and
+        // the pin shows in the engine dump.
+        let mut plan =
+            parse("add fieldA str(fieldA) | add id num(id) | sort fieldA id | select id == countZ")
+                .unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("sort fieldA[1] lexical, id[0] numeric"), "{d}");
         assert!(d.contains("(== id[0] countZ[2] :num)"), "{d}");
         // A colour predicate resolves against the output types too.
-        let mut plan = parse("to-num 2 | color red countZ > id").unwrap();
+        let mut plan = parse("add countZ num(countZ) | color red countZ > id").unwrap();
         let _ = plan.resolve(&["id".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("countZ[1] id[0] :num"), "{d}");
