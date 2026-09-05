@@ -5,20 +5,9 @@
 
 use csvm::exec::{self, RunOpts};
 use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-static SEQ: AtomicU32 = AtomicU32::new(0);
-
-fn temp_csv(content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "csvm_join_{}_{}.csv",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&path, content).unwrap();
-    path
-}
+mod common;
+use common::temp_csv;
 
 /// Run `script` over `left` (a streamed input), driving the same steps as the
 /// binary: parse, prepare joins (reads right files), resolve, run.

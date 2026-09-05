@@ -3,20 +3,9 @@
 
 use csvm::exec::{self, RunOpts};
 use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-static SEQ: AtomicU32 = AtomicU32::new(0);
-
-fn temp_csv(content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "csvm_fragments_{}_{}.csv",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&path, content).unwrap();
-    path
-}
+mod common;
+use common::temp_csv;
 
 fn run(script: &str, input: &str) -> Result<String, String> {
     let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;

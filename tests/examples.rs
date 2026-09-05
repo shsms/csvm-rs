@@ -5,8 +5,9 @@
 
 use csvm::exec::{self, RunOpts};
 use std::io::BufReader;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+
+mod common;
+use common::temp_csv;
 
 const INPUT: &str = "\
 id,fieldA,fieldB,countA,countZ
@@ -297,18 +298,6 @@ fn quoted_fields_roundtrip() {
     );
 }
 
-static SEQ: AtomicU32 = AtomicU32::new(0);
-
-fn temp_csv(content: &str) -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "csvm_it_{}_{}.csv",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::write(&path, content).unwrap();
-    path
-}
-
 fn run_file_str(script: &str, path: &std::path::Path, threads: usize) -> String {
     let mut plan = csvm::parse::parse(script).unwrap();
     let (header, data_start, file_len) = match plan.input_header.as_deref() {
@@ -366,7 +355,6 @@ fn sharded_file_matches_serial_for_many_thread_counts() {
             );
         }
     }
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -378,7 +366,6 @@ fn sharded_file_no_trailing_newline() {
     for n in [1usize, 2, 4, 8] {
         assert_eq!(run_file_str("cols id,v", &path, n), serial, "threads={n}");
     }
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -530,6 +517,16 @@ fn positional_refs_emit_the_real_column_names() {
 }
 
 #[test]
+fn fixture_files_are_removed_when_dropped() {
+    let path = {
+        let fixture = temp_csv("a\n1\n");
+        assert!(fixture.exists());
+        fixture.to_path_buf()
+    };
+    assert!(!path.exists());
+}
+
+#[test]
 fn hdr_prepends_header_all_lines_are_data() {
     // The first input line is data, not a header — it survives to the output.
     assert_eq!(
@@ -558,7 +555,6 @@ fn hdr_sharded_file_matches_serial() {
     let parallel = run_file_str("hdr id,name,amount | select id >= 2", &path, 4);
     assert_eq!(serial, parallel);
     assert_eq!(serial, "id,name,amount\n2,bob,200\n3,carol,300\n");
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]
