@@ -75,11 +75,7 @@ impl ColStats {
         }
 
         if self.numeric {
-            let v = match f {
-                Field::Num(n) => Some(*n),
-                _ => s.as_ref().trim().parse::<f64>().ok(),
-            };
-            match v {
+            match f.num_opt() {
                 // A finite value folds into the aggregates.
                 Some(v) if v.is_finite() => {
                     self.nnum += 1;

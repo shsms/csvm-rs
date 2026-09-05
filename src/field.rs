@@ -57,6 +57,17 @@ impl<'a> Field<'a> {
         }
     }
 
+    /// The cell as a number, or `None` when it is empty or not a number — the
+    /// strict form of [`Field::coerce_num`], which reads empty as `0.0`.
+    #[inline]
+    pub fn num_opt(&self) -> Option<f64> {
+        match self {
+            Field::Num(n) => Some(*n),
+            Field::Str(s) => s.trim().parse().ok(),
+            Field::Owned(s) => s.trim().parse().ok(),
+        }
+    }
+
     /// Detach from the chunk buffer so the field can outlive it (used when a row
     /// crosses a thread or stage boundary, e.g. into a `sort`).
     #[inline]
@@ -120,6 +131,19 @@ mod tests {
             Field::Str("hello").coerce_num(),
             Err(NumError("hello".into()))
         );
+    }
+
+    #[test]
+    fn num_opt_is_strict_about_empty_and_text() {
+        assert_eq!(Field::Str("").num_opt(), None);
+        assert_eq!(Field::Str("  ").num_opt(), None);
+        assert_eq!(Field::Str("hello").num_opt(), None);
+        assert_eq!(Field::Str(" 5 ").num_opt(), Some(5.0));
+        assert_eq!(Field::Owned("1e3".into()).num_opt(), Some(1000.0));
+        assert_eq!(Field::Num(3.5).num_opt(), Some(3.5));
+        // Non-finite values parse as numbers, as they do for coerce_num.
+        assert!(Field::Str("NaN").num_opt().is_some_and(f64::is_nan));
+        assert_eq!(Field::Str("inf").num_opt(), Some(f64::INFINITY));
     }
 
     #[test]
