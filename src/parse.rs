@@ -529,7 +529,6 @@ impl<'a> Builder<'a> {
         self.items.push(Item::Stats(StatsStmt {
             cols: split_list(rest),
             positions: Vec::new(),
-            names: Vec::new(),
         }));
         Ok(())
     }

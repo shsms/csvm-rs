@@ -34,8 +34,9 @@ fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
     };
     let mut out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;
-    // `fmt` aligns the final output (main does this; mirror it here). Colour off.
-    if plan.output == csvm::plan::OutputFormat::Aligned {
+    // `fmt` aligns the final output and `graph` draws it (main does this;
+    // mirror it here). Colour off.
+    if plan.output == csvm::plan::OutputFormat::Aligned || plan.graph.is_some() {
         let mut aligned = Vec::new();
         exec::render(&out, &plan, false, &mut aligned).map_err(|e| e.to_string())?;
         out = aligned;
@@ -364,6 +365,34 @@ fn columns_by_position_and_range() {
     // column position.
     assert_eq!(run_checked("select `2` > 20 | cols id", input), "id\n1\n");
     assert_eq!(run_checked("select 2 > 20", input), "id,qty,stock,name\n");
+}
+
+#[test]
+fn positional_refs_title_charts_with_the_column_name() {
+    let input = POSITIONAL;
+    let bar = run("graph bar 4,2", input, 1).unwrap();
+    assert_eq!(bar.lines().next(), Some("qty"), "{bar}");
+    let line = run("graph line 1,2", input, 1).unwrap();
+    assert_eq!(line.lines().next(), Some("qty vs id"), "{line}");
+}
+
+#[test]
+fn positional_refs_emit_the_real_column_names() {
+    // Stages that put a column's name into the output (group keys, agg names,
+    // the stats `field` column) must use the header name, not the spec text.
+    let input = POSITIONAL;
+    assert_eq!(
+        run_checked("group 4", input),
+        "name,count\nalice,1\nbob,1\n"
+    );
+    assert_eq!(
+        run_checked("agg sum(2) by 4", input),
+        "name,qty_sum\nalice,100\nbob,9\n"
+    );
+    assert_eq!(
+        run_checked("stats 2,3 | cols field", input),
+        "field\nqty\nstock\n"
+    );
 }
 
 #[test]

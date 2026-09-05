@@ -395,7 +395,7 @@ fn build_colstats(positions: &[usize], rows: &[OwnedRow]) -> Vec<ColStats> {
 /// Turn finalized accumulators into the profile rows (one per profiled column).
 fn profile_rows(stats: &StatsStmt, accs: &[ColStats]) -> Vec<OwnedRow> {
     stats
-        .names
+        .cols
         .iter()
         .zip(accs)
         .map(|(name, a)| a.to_row(name))
@@ -2104,7 +2104,7 @@ pub fn describe(plan: &Plan) -> String {
                 out.push_str(&format!("stage {n} (stats):\n"));
                 out.push_str(&format!(
                     "  {n}.1 stats {:?} (positions {:?})\n",
-                    s.names, s.positions
+                    s.cols, s.positions
                 ));
             }
             Stage::Group(g) => {
@@ -2552,6 +2552,18 @@ mod tests {
         assert!(d.contains("(> countZ[2] 0 :num)"), "{d}");
         assert!(d.contains("(== fieldA[1] id[0] :str)"), "{d}");
         assert!(d.contains("(^= fieldA[1] \"t\")"), "{d}");
+    }
+
+    #[test]
+    fn describe_shows_header_names_for_positional_refs() {
+        let mut plan = parse("to-num 3 | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
+        let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("to-num [\"countZ\"]"), "{d}");
+        assert!(d.contains("(> fieldA[1] 0 :num)"), "{d}");
+        assert!(d.contains("sort fieldA[1] auto"), "{d}");
+        assert!(d.contains("uniq by [\"countZ\"]"), "{d}");
+        assert!(d.contains("keys [\"id\"]"), "{d}");
     }
 
     #[test]

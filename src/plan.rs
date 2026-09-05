@@ -29,6 +29,9 @@ impl ColRef {
     }
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         self.pos = resolve_col(&self.name, header)?;
+        // Carry the header name, so a chart title or `--print-engine` shows
+        // `qty` for a column given by position.
+        self.name = header[self.pos].clone();
         Ok(())
     }
 }
@@ -322,9 +325,10 @@ pub struct SortStmt {
 /// their indices; the output header becomes [`STATS_SCHEMA`].
 #[derive(Clone, Debug)]
 pub struct StatsStmt {
+    /// The profiled columns: the specs as written until [`Plan::resolve`],
+    /// then the header names (every column when the list was empty).
     pub cols: Vec<String>,
     pub positions: Vec<usize>,
-    pub names: Vec<String>,
 }
 
 /// An aggregate function applied per group. Each maps onto a [`ColStats`] field
@@ -381,14 +385,16 @@ impl GroupStmt {
     /// Resolve key and aggregated columns, then reshape the header to
     /// `keys ++ agg names` so downstream `sort`/`cols`/`fmt` compose.
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
-        self.key_positions = self
-            .keys
-            .iter()
-            .map(|n| resolve_col(n, header))
-            .collect::<Result<_, _>>()?;
+        self.key_positions = resolve_cols(&mut self.keys, header)?;
         for a in &mut self.aggs {
             a.pos = match &a.col {
-                Some(c) => Some(resolve_col(c, header)?),
+                Some(c) => {
+                    let pos = resolve_col(c, header)?;
+                    // Name the output after the header column, so a positional
+                    // spec (`sum(2)`) still yields `qty_sum`.
+                    a.name = format!("{}_{}", header[pos], a.func.name());
+                    Some(pos)
+                }
                 None => None,
             };
         }
@@ -417,13 +423,21 @@ pub struct UniqStmt {
 impl UniqStmt {
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         // Empty `cols` ⇒ empty positions ⇒ dedup on the whole row.
-        self.positions = self
-            .cols
-            .iter()
-            .map(|n| resolve_col(n, header))
-            .collect::<Result<_, _>>()?;
+        self.positions = resolve_cols(&mut self.cols, header)?;
         Ok(())
     }
+}
+
+/// Resolve `names` to positions and rewrite them to the header names, so a
+/// statement given a column by position shows the real name in
+/// `--print-engine` (and, for `group` / `stats`, in the output header).
+fn resolve_cols(names: &mut Vec<String>, header: &[String]) -> Result<Vec<usize>, Error> {
+    let positions = names
+        .iter()
+        .map(|n| resolve_col(n, header))
+        .collect::<Result<Vec<_>, _>>()?;
+    *names = positions.iter().map(|&p| header[p].clone()).collect();
+    Ok(positions)
 }
 
 /// `add NAME EXPR`: append (or, if `NAME` already exists, replace in place) a
@@ -1344,11 +1358,7 @@ impl ProjectStmt {
 
 impl ConvStmt {
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
-        self.positions = self
-            .names
-            .iter()
-            .map(|n| resolve_col(n, header))
-            .collect::<Result<_, _>>()?;
+        self.positions = resolve_cols(&mut self.names, header)?;
         Ok(())
     }
 }
@@ -1359,14 +1369,10 @@ impl StatsStmt {
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
         if self.cols.is_empty() {
             self.positions = (0..header.len()).collect();
-            self.names = header.clone();
+            self.cols = header.clone();
         } else {
-            self.positions = self
-                .cols
-                .iter()
-                .map(|n| resolve_col(n, header))
-                .collect::<Result<_, _>>()?;
-            self.names = self.cols.clone();
+            // The `field` column shows the header name even for a positional spec.
+            self.positions = resolve_cols(&mut self.cols, header)?;
         }
         *header = STATS_SCHEMA.iter().map(|s| s.to_string()).collect();
         Ok(())
@@ -1377,6 +1383,7 @@ impl SortStmt {
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         for k in &mut self.keys {
             k.pos = resolve_col(&k.name, header)?;
+            k.name = header[k.pos].clone();
         }
         Ok(())
     }
