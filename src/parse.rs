@@ -206,17 +206,11 @@ struct FnDef {
 
 type FnTable = std::collections::HashMap<String, FnDef>;
 
+/// One parsed command: a statement, which joins the surrounding run into a
+/// `Transform` stage, or a stage of its own.
 enum Item {
     Stmt(Stmt),
-    Sort(SortStmt),
-    Head(usize),
-    Tail(usize),
-    DropLast(usize),
-    Skip(usize),
-    Stats(StatsStmt),
-    Uniq(UniqStmt),
-    Group(GroupStmt),
-    Join(JoinStmt),
+    Stage(Stage),
 }
 
 struct Builder<'a> {
@@ -245,7 +239,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Group the flat item list into stages: runs of statements become a
-    /// `Transform`; each `sort` and `head` is isolated into its own stage.
+    /// `Transform`; every other item is already a stage of its own.
     fn take_plan(&mut self) -> Plan {
         let mut stages = Vec::new();
         let mut transform: Vec<Stmt> = Vec::new();
@@ -257,41 +251,9 @@ impl<'a> Builder<'a> {
         for item in self.items.drain(..) {
             match item {
                 Item::Stmt(s) => transform.push(s),
-                Item::Sort(s) => {
+                Item::Stage(stage) => {
                     flush(&mut transform, &mut stages);
-                    stages.push(Stage::Sort(s));
-                }
-                Item::Head(n) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Head(n));
-                }
-                Item::Tail(n) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Tail(n));
-                }
-                Item::DropLast(n) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::DropLast(n));
-                }
-                Item::Skip(n) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Skip(n));
-                }
-                Item::Stats(s) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Stats(s));
-                }
-                Item::Uniq(u) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Uniq(u));
-                }
-                Item::Group(g) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Group(g));
-                }
-                Item::Join(j) => {
-                    flush(&mut transform, &mut stages);
-                    stages.push(Stage::Join(j));
+                    stages.push(stage);
                 }
             }
         }
@@ -431,8 +393,10 @@ impl<'a> Builder<'a> {
         // A positive count keeps the first N rows; a negative one (`head -n -N`)
         // keeps all but the last N (coreutils' behaviour).
         match parse_count(rest, "head")? {
-            Count::Rows(n) if n >= 0 => self.items.push(Item::Head(n as usize)),
-            Count::Rows(n) => self.items.push(Item::DropLast(n.unsigned_abs() as usize)),
+            Count::Rows(n) if n >= 0 => self.items.push(Item::Stage(Stage::Head(n as usize))),
+            Count::Rows(n) => self
+                .items
+                .push(Item::Stage(Stage::DropLast(n.unsigned_abs() as usize))),
             Count::From(_) => return Err(err("head doesn't support +N (that is tail's form)")),
         }
         Ok(())
@@ -443,9 +407,11 @@ impl<'a> Builder<'a> {
     /// (`-n +N`) prints from row N on, a streaming skip of the first N-1.
     fn parse_tail(&mut self, rest: &str) -> Result<(), Error> {
         match parse_count(rest, "tail")? {
-            Count::Rows(n) if n >= 0 => self.items.push(Item::Tail(n as usize)),
+            Count::Rows(n) if n >= 0 => self.items.push(Item::Stage(Stage::Tail(n as usize))),
             Count::Rows(_) => return Err(err("tail doesn't support a negative count")),
-            Count::From(n) => self.items.push(Item::Skip(n.saturating_sub(1))),
+            Count::From(n) => self
+                .items
+                .push(Item::Stage(Stage::Skip(n.saturating_sub(1)))),
         }
         Ok(())
     }
@@ -454,10 +420,10 @@ impl<'a> Builder<'a> {
     /// by the whole row, or by the named key columns. Global (not adjacent), so
     /// no pre-sort is required.
     fn parse_uniq(&mut self, rest: &str) -> Result<(), Error> {
-        self.items.push(Item::Uniq(UniqStmt {
+        self.items.push(Item::Stage(Stage::Uniq(UniqStmt {
             cols: split_list(rest),
             positions: Vec::new(),
-        }));
+        })));
         Ok(())
     }
 
@@ -601,7 +567,8 @@ impl<'a> Builder<'a> {
             }
         }
 
-        self.items.extend(stmts.into_iter().map(Item::Join));
+        self.items
+            .extend(stmts.into_iter().map(|j| Item::Stage(Stage::Join(j))));
         Ok(())
     }
 
@@ -609,10 +576,10 @@ impl<'a> Builder<'a> {
     /// named): a blocking stage that reduces the input to one summary row per
     /// column.
     fn parse_stats(&mut self, rest: &str) -> Result<(), Error> {
-        self.items.push(Item::Stats(StatsStmt {
+        self.items.push(Item::Stage(Stage::Stats(StatsStmt {
             cols: split_list(rest),
             positions: Vec::new(),
-        }));
+        })));
         Ok(())
     }
 
@@ -644,11 +611,11 @@ impl<'a> Builder<'a> {
             }
             None => Vec::new(),
         };
-        self.items.push(Item::Group(GroupStmt {
+        self.items.push(Item::Stage(Stage::Group(GroupStmt {
             keys,
             key_positions: Vec::new(),
             aggs,
-        }));
+        })));
         Ok(())
     }
 
@@ -927,7 +894,7 @@ impl<'a> Builder<'a> {
         if keys.is_empty() {
             return Err(err("sort expects at least one column"));
         }
-        self.items.push(Item::Sort(SortStmt { keys }));
+        self.items.push(Item::Stage(Stage::Sort(SortStmt { keys })));
         Ok(())
     }
 
