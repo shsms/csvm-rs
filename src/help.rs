@@ -361,7 +361,7 @@ plus each right's non-key columns; a clashing right name is suffixed _r.",
         synopsis: &["add NAME EXPR   append (or, if NAME exists, replace) a column = EXPR"],
         detail: "EXPR is a value expression over the row: arithmetic (+ - * / %, parens), \
 string concat with ++, the functions round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/\
-sign/min/max/len/upper/lower/trim/coalesce, a ternary TEST ? A : B, and constants. \
+sign/min/max/len/upper/lower/trim/coalesce/num/str, a ternary TEST ? A : B, and constants. \
 prev(col) is col's value in the previous row \
 (the current cell on the first row, so a delta is 0 there) and rownum() is the 1-based row \
 index — both make the run single-threaded and in input order. A bare comparison yields t/f. \
@@ -494,7 +494,9 @@ pow             (numeric, 2 args)\n               \
 min max         (numeric, 1+ args)\n               \
 len             (length of text)\n               \
 upper lower trim (text, 1 arg)\n               \
-coalesce        (first non-empty, 1+ args)\n  \
+coalesce        (first non-empty, 1+ args)\n               \
+num str         (casts, 1 arg: num aborts on a non-number and types the\n                                        \
+result numeric; str formats a number as on output and types it text)\n  \
 cross-row:   prev(col)   col in the previous row (current cell on row 1)\n               \
 rownum()    1-based row index\n\n\
 The same value grammar works as a comparison operand in select / ternary tests, \
@@ -552,6 +554,18 @@ mod tests {
                 crate::parse::COMMANDS.contains(&c.name),
                 "documented command `{}` is not in the parser's command list",
                 c.name
+            );
+        }
+    }
+
+    #[test]
+    fn help_documents_every_function() {
+        let body = find_topic("expr").unwrap().body;
+        for name in crate::plan::Func::NAMES {
+            assert!(
+                body.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|w| w == *name),
+                "function `{name}` is undocumented in `help expr`"
             );
         }
     }

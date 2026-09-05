@@ -212,6 +212,10 @@ pub enum Func {
     Lower,
     Trim,
     Coalesce,
+    /// Cast to a number (a non-number aborts); types the result numeric.
+    Num,
+    /// Cast to text (a number formats as on output); types the result text.
+    Str,
 }
 
 impl Func {
@@ -237,6 +241,8 @@ impl Func {
             Func::Lower => "lower",
             Func::Trim => "trim",
             Func::Coalesce => "coalesce",
+            Func::Num => "num",
+            Func::Str => "str",
         }
     }
 
@@ -262,6 +268,8 @@ impl Func {
             "lower" => Func::Lower,
             "trim" => Func::Trim,
             "coalesce" => Func::Coalesce,
+            "num" => Func::Num,
+            "str" => Func::Str,
             _ => return None,
         })
     }
@@ -269,7 +277,7 @@ impl Func {
     /// Every function name, for the "did you mean …?" hint on a typo.
     pub const NAMES: &'static [&'static str] = &[
         "round", "floor", "ceil", "abs", "int", "sqrt", "pow", "exp", "log", "log10", "log2",
-        "sign", "min", "max", "len", "upper", "lower", "trim", "coalesce",
+        "sign", "min", "max", "len", "upper", "lower", "trim", "coalesce", "num", "str",
     ];
 }
 
@@ -1149,9 +1157,10 @@ impl ValExpr {
         })
     }
 
-    /// A comparison operand as a number. Leaf shortcuts keep the hot path
-    /// allocation-free (a bare column or literal never builds a `Field`); the
-    /// compound fallback is outlined so these stay small enough to inline.
+    /// A comparison operand (or a numeric function's argument) as a number.
+    /// Leaf shortcuts keep the hot path allocation-free (a bare column or
+    /// literal never builds a `Field`); the compound fallback is outlined so
+    /// these stay small enough to inline.
     #[inline]
     fn cmp_num(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
         match self {
@@ -1225,11 +1234,13 @@ impl ValExpr {
             // `coalesce` passes its arguments through, so its type depends on
             // the data; every other function returns a fixed type.
             ValExpr::Func(Func::Coalesce, _) => None,
-            ValExpr::Func(f, _) => Some(if matches!(f, Func::Upper | Func::Lower | Func::Trim) {
-                ColType::Str
-            } else {
-                ColType::Num
-            }),
+            ValExpr::Func(f, _) => Some(
+                if matches!(f, Func::Upper | Func::Lower | Func::Trim | Func::Str) {
+                    ColType::Str
+                } else {
+                    ColType::Num
+                },
+            ),
             ValExpr::Col(c) | ValExpr::Prev(c) => col(c),
             ValExpr::Cond { then_, else_, .. } => {
                 let t = then_.static_type(col);
@@ -1288,7 +1299,8 @@ fn eval_func(
     row: &[Field],
     ctx: &EvalCtx,
 ) -> Result<Field<'static>, Error> {
-    let num = |e: &ValExpr| -> Result<f64, Error> { Ok(e.eval(row, ctx)?.coerce_num()?) };
+    // `cmp_num` reads a column leaf without building a `Field` (this runs per row).
+    let num = |e: &ValExpr| -> Result<f64, Error> { e.cmp_num(row, ctx) };
     Ok(match f {
         Func::Round => Field::Num(num(&args[0])?.round()),
         Func::Floor => Field::Num(num(&args[0])?.floor()),
@@ -1312,6 +1324,11 @@ fn eval_func(
         Func::Upper => Field::Owned(args[0].eval(row, ctx)?.as_str().to_uppercase()),
         Func::Lower => Field::Owned(args[0].eval(row, ctx)?.as_str().to_lowercase()),
         Func::Trim => Field::Owned(args[0].eval(row, ctx)?.as_str().trim().to_owned()),
+        Func::Num => Field::Num(num(&args[0])?),
+        Func::Str => match args[0].eval(row, ctx)? {
+            Field::Num(n) => Field::Owned(format_num(n)),
+            text => text, // already owned text: no second copy
+        },
         Func::Min | Func::Max => {
             let mut acc = num(&args[0])?;
             for a in &args[1..] {

@@ -389,3 +389,51 @@ fn color_predicate_rejects_stateful_expressions() {
         "unexpected error: {e}"
     );
 }
+
+#[test]
+fn num_casts_and_normalises() {
+    // num() reads the cell as a number, so the output is the normalised
+    // number (007 -> 7, 1e3 -> 1000, blank -> 0) and a non-number aborts.
+    let input = "id,qty\n1,007\n2,1e3\n3,\n";
+    assert_eq!(
+        run_checked("add qty num(qty)", input),
+        "id,qty\n1,7\n2,1000\n3,0\n"
+    );
+    let err = run("add qty num(qty)", "id,qty\n1,x\n", 1).unwrap_err();
+    assert!(err.contains("non-numeric value 'x'"), "{err}");
+    assert!(run("add q num(qty, qty)", input, 1).is_err()); // unary
+}
+
+#[test]
+fn num_makes_an_equality_numeric() {
+    // == between two untyped columns is lexical; num() on either side makes
+    // the whole comparison numeric.
+    let input = "a,b\n1000,1e3\n10,9\n";
+    assert_eq!(run_checked("select a == b", input), "a,b\n");
+    assert_eq!(run_checked("select num(a) == b", input), "a,b\n1000,1e3\n");
+}
+
+#[test]
+fn num_and_str_type_the_column_they_replace() {
+    // `add n num(n)` types the column numeric, so a bare sort on it is
+    // numeric; `add n str(n)` pins it lexical.
+    let input = "n\n10\n9\n100\n";
+    assert_eq!(
+        run_checked("add n num(n) | sort n", input),
+        "n\n9\n10\n100\n"
+    );
+    assert_eq!(
+        run_checked("add n str(n) | sort n", input),
+        "n\n10\n100\n9\n"
+    );
+}
+
+#[test]
+fn str_keeps_text_and_formats_numbers() {
+    let input = "n\n2.50\n";
+    assert_eq!(
+        run_checked("add s str(n) | add t str(n * 2)", input),
+        "n,s,t\n2.50,2.50,5\n"
+    );
+    assert_eq!(run_checked("add k str(3.50)", input), "n,k\n2.50,3.5\n");
+}

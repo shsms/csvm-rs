@@ -193,8 +193,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   in place if it already exists (`AddStmt.pos`). `EXPR` is a *value* expression
   (`ValExpr` in `plan.rs`): arithmetic (`+ - * / %`), `++` concat, the function
   set (`round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/sign/min/max/len/
-  upper/lower/trim/coalesce` — the math functions follow IEEE at domain edges,
-  `sqrt(-1)` = NaN, no abort; div/mod-by-zero still aborts), a `?:` ternary
+  upper/lower/trim/coalesce/num/str` — the math functions follow IEEE at
+  domain edges, `sqrt(-1)` = NaN, no abort; div/mod-by-zero still aborts;
+  `num(x)` casts to a number and aborts on a non-number, `str(x)` casts to
+  text, and each types its result so `add c num(c)` pins column `c`), a
+  `?:` ternary
   (reusing `BoolExpr` for the test), constants, and `prev(col)`/`rownum()`. It reuses the `select` tokenizer
   (`lex_expr`, extended with arithmetic operators + context-sensitive sign) and a
   sibling recursive-descent parser (`ExprParser::parse_value`). `eval` takes an
