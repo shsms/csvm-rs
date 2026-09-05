@@ -64,17 +64,17 @@ fn err(msg: impl Into<String>) -> Error {
 /// Known command names, for the "did you mean …?" hint on an unknown verb and
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
-    "cols", "cut", "select", "where", "filter", "sort", "head", "tail", "stats", "uniq", "color",
-    "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg", "graph", "fn",
+    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "hdr",
+    "join", "add", "delta", "group", "agg", "graph", "fn",
 ];
 
 /// Names a `fn` may not take: every command, every alias, `fn` itself, and
 /// the removed conversion commands (kept reserved so their hint stays
 /// reachable).
 const RESERVED: &[&str] = &[
-    "cols", "cut", "select", "where", "filter", "sort", "head", "tail", "stats", "uniq", "dedup",
-    "color", "colour", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg", "graph",
-    "plot", "fn", "to-num", "to_num", "to-str", "to_str",
+    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "colour", "rename", "fmt",
+    "hdr", "join", "add", "delta", "group", "agg", "graph", "fn", "to-num", "to_num", "to-str",
+    "to_str",
 ];
 
 /// The cast that replaced a removed conversion command, if `cmd` is one.
@@ -262,16 +262,16 @@ impl<'a> Builder<'a> {
             return Err(removed_hint(cmd, cast, rest));
         }
         let result = match cmd {
-            "cols" | "cut" => self.parse_cols(rest),
-            "select" | "where" | "filter" => self.parse_select(rest),
+            "cols" => self.parse_cols(rest),
+            "select" => self.parse_select(rest),
             "sort" => self.parse_sort(rest),
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
             "group" => self.parse_group(rest),
             "agg" => self.parse_agg(rest),
-            "graph" | "plot" => self.parse_graph(rest),
-            "uniq" | "dedup" => self.parse_uniq(rest),
+            "graph" => self.parse_graph(rest),
+            "uniq" => self.parse_uniq(rest),
             "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
@@ -400,7 +400,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `uniq [cols]` (alias `dedup`) drops duplicate rows, keeping the first —
+    /// `uniq [cols]` drops duplicate rows, keeping the first —
     /// by the whole row, or by the named key columns. Global (not adjacent), so
     /// no pre-sort is required.
     fn parse_uniq(&mut self, rest: &str) -> Result<(), Error> {
@@ -2441,7 +2441,6 @@ mod tests {
         assert_eq!(g.cols[0].name, "amount");
         assert_eq!(g.opts.bins, Some(12));
         assert_eq!(g.opts.title.as_deref(), Some("Spread"));
-        assert!(parse("plot hist x").unwrap().graph.is_some()); // `plot` alias
     }
 
     #[test]
@@ -2514,30 +2513,22 @@ mod tests {
             panic!()
         };
         assert!(u.cols.is_empty()); // whole-row
-
-        let plan = parse("dedup a,b").unwrap(); // alias
-        let Stage::Uniq(u) = &plan.stages[0] else {
-            panic!()
-        };
-        assert_eq!(u.cols, ["a", "b"]);
     }
 
     #[test]
     fn command_aliases() {
-        // where/filter alias select; cut aliases cols.
-        for s in ["select a > 0", "where a > 0", "filter a > 0"] {
-            let plan = parse(s).unwrap();
-            let Stage::Transform(stmts) = &plan.stages[0] else {
-                panic!()
-            };
-            assert!(matches!(stmts[0], Stmt::Select(_)), "{s}");
+        // Only `colour` remains; the old aliases are plain unknown commands.
+        assert!(parse("colour red a > 0").is_ok());
+        for s in [
+            "where a > 0",
+            "filter a > 0",
+            "cut a,b",
+            "dedup a",
+            "plot hist a",
+        ] {
+            let err = parse(s).unwrap_err().to_string();
+            assert!(err.contains("unknown command"), "{s}: {err}");
         }
-        let plan = parse("cut a,b").unwrap();
-        let Stage::Transform(stmts) = &plan.stages[0] else {
-            panic!()
-        };
-        let Stmt::Cols(p) = &stmts[0] else { panic!() };
-        assert_eq!(p.names, ["a", "b"]);
     }
 
     #[test]

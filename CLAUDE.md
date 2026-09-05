@@ -107,7 +107,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   same window path as `head` (`[pre | skip | head | post]`), so `tail +N |
   head M` stops early, and counts over the merge output after a `sort` like
   `head`; elsewhere it drains in the materialized path.
-- **`uniq [cols]`** (alias `dedup`) drops duplicate rows keeping the first, by
+- **`uniq [cols]`** drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
   pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is
   the CSV-encoded cells (`dedup_rows` in `exec.rs`, a `HashSet`).
@@ -238,7 +238,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
-- **`graph KIND COL [flags]`** (alias `plot`) is a terminal-chart **sink**: it
+- **`graph KIND COL [flags]`** is a terminal-chart **sink**: it
   draws from the columns reaching it instead of emitting CSV, so it must be the
   *last* command (the parser rejects anything after it). Plan metadata
   (`Plan.graph`, `GraphSpec` in `plan.rs`), not a stage — like `fmt`/`color` it

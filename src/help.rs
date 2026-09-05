@@ -152,7 +152,7 @@ fn unknown(t: &str) -> String {
 pub const COMMANDS: &[CmdHelp] = &[
     CmdHelp {
         name: "cols",
-        aliases: &["cut"],
+        aliases: &[],
         summary: "keep or drop columns",
         synopsis: &[
             "cols A,B,C      keep these columns, in this order",
@@ -176,7 +176,7 @@ In `cols -v` an unknown name is ignored, but a bad position or range is an error
     },
     CmdHelp {
         name: "select",
-        aliases: &["where", "filter"],
+        aliases: &[],
         summary: "keep or drop matching rows",
         synopsis: &[
             "select EXPR     keep rows where EXPR is true",
@@ -240,7 +240,7 @@ tail +N streams, and stops early with a head after it.",
     },
     CmdHelp {
         name: "uniq",
-        aliases: &["dedup"],
+        aliases: &[],
         summary: "drop duplicate rows, keep the first",
         synopsis: &[
             "uniq            dedup whole rows",
@@ -292,7 +292,7 @@ named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-
     },
     CmdHelp {
         name: "graph",
-        aliases: &["plot"],
+        aliases: &[],
         summary: "draw a terminal chart (sink)",
         synopsis: &[
             "graph hist COL              distribution of a numeric column",
@@ -583,7 +583,7 @@ mod tests {
                 .unwrap()
                 .contains("merge one or more CSVs")
         );
-        assert!(render(Some("cut")).unwrap().contains("cols —")); // alias resolves
+        assert!(render(Some("colour")).unwrap().contains("color —")); // alias resolves
         assert!(render(Some("colors")).unwrap().contains("magenta")); // topic
         assert!(render(None).unwrap().contains("commands")); // overview
     }
