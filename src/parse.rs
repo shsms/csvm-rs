@@ -572,7 +572,11 @@ impl<'a> Builder<'a> {
                 "agg expects at least one aggregate, e.g. agg sum(amount)",
             ));
         }
-        let aggs = split_specs(specs)
+        let toks = split_specs(specs);
+        if toks.iter().any(|t| t == "=") {
+            return Err(err("agg: write NAME=FN(col) without spaces around `=`"));
+        }
+        let aggs = toks
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1493,7 +1497,7 @@ fn count_rows_agg() -> AggSpec {
         func: AggFunc::Count,
         col: None,
         pos: None,
-        name: "count".to_string(),
+        name: None,
     }
 }
 
@@ -1528,8 +1532,13 @@ fn split_specs(s: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut depth = 0i32;
+    let mut in_tick = false;
     for c in s.chars() {
         match c {
+            '`' => {
+                in_tick = !in_tick;
+                cur.push(c);
+            }
             '(' => {
                 depth += 1;
                 cur.push(c);
@@ -1538,7 +1547,7 @@ fn split_specs(s: &str) -> Vec<String> {
                 depth -= 1;
                 cur.push(c);
             }
-            c if depth == 0 && (c == ',' || c.is_whitespace()) => {
+            c if depth == 0 && !in_tick && (c == ',' || c.is_whitespace()) => {
                 if !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                 }
@@ -1552,9 +1561,26 @@ fn split_specs(s: &str) -> Vec<String> {
     out
 }
 
-/// Parse one aggregate spec: `func` (only `count` may omit a column) or
-/// `func(col)`. The output column is named `col_func` (`amount_sum`), or `count`.
+/// Parse one aggregate spec: `func` (only `count` may omit a column),
+/// `func(col)`, or `NAME=func(col)`. A given `NAME` is the output column;
+/// otherwise the name is left unset for resolve to default to `col_func`
+/// (`amount_sum`), or `count`.
 fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
+    // `NAME=FN(col)` names the output column.
+    let (given, tok) = match split_name_eq(tok)? {
+        (name, _, Some(spec)) => {
+            if name.is_empty() {
+                return Err(err(format!("agg: `{tok}` has an empty output name")));
+            }
+            (Some(name), spec.trim())
+        }
+        (_, _, None) => (None, tok.trim()),
+    };
+    if tok.is_empty() {
+        return Err(err(
+            "agg: `NAME=` needs an aggregate, e.g. total=sum(amount)",
+        ));
+    }
     let (func_name, col) = match tok.find('(') {
         Some(open) => {
             let inner = tok[open + 1..]
@@ -1583,15 +1609,11 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
             "agg: {func_name} needs a column, e.g. {func_name}(col)"
         )));
     }
-    let name = match &col {
-        Some(c) => format!("{c}_{}", func.name()),
-        None => "count".to_string(),
-    };
     Ok(AggSpec {
         func,
         col,
         pos: None,
-        name,
+        name: given,
     })
 }
 
@@ -2405,8 +2427,10 @@ mod tests {
             panic!("expected a group stage");
         };
         assert_eq!(g.keys, ["region"]);
-        let names: Vec<&str> = g.aggs.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, ["amount_sum", "amount_mean"]);
+        assert!(g.aggs.iter().all(|a| a.name.is_none())); // default names, at resolve
+        let mut plan = plan;
+        let out = plan.resolve(&["amount".into(), "region".into()]).unwrap();
+        assert_eq!(out, ["region", "amount_sum", "amount_mean"]);
         // `by` supplies keys directly; a bare `group` keeps its default count.
         assert!(matches!(
             parse("agg count by a,b").unwrap().stages[0],
@@ -2427,6 +2451,11 @@ mod tests {
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
         assert!(parse("group").is_err()); // no keys
+        assert!(parse("agg =sum(x)").is_err()); // empty name
+        assert!(parse("agg total=").is_err()); // name without an aggregate
+        let err = parse("agg total = sum(x)").unwrap_err().to_string();
+        assert!(err.contains("without spaces"), "{err}");
+        assert!(parse("agg `odd name`=sum(x)").is_ok());
     }
 
     #[test]

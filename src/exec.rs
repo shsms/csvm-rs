@@ -2117,9 +2117,12 @@ pub fn describe(plan: &Plan) -> String {
                 let aggs: Vec<String> = g
                     .aggs
                     .iter()
-                    .map(|a| match &a.col {
-                        Some(c) => format!("{}={}({c})", a.name, a.func.name()),
-                        None => format!("{}={}", a.name, a.func.name()),
+                    .map(|a| {
+                        let spec = match &a.col {
+                            Some(c) => format!("{}({c})", a.func.name()),
+                            None => a.func.name().to_string(),
+                        };
+                        format!("{}={spec}", a.name.as_deref().unwrap_or("?"))
                     })
                     .collect();
                 out.push_str(&format!("  {n}.2 agg {aggs:?}\n"));
@@ -2822,6 +2825,41 @@ mod tests {
     fn agg_global_with_no_keys_is_one_row() {
         let out = run_str("agg count, sum(countZ)", INPUT).unwrap();
         assert_eq!(out, "count,countZ_sum\n4,14\n");
+    }
+
+    #[test]
+    fn agg_names_an_output_with_name_equals() {
+        // `NAME=FN(col)` names the output column; the default stays col_fn.
+        let out = run_str(
+            "agg total=sum(countZ), n=count, mean(countZ) by fieldA",
+            INPUT,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "fieldA,total,n,countZ_mean\nt,14,3,4.666667\nf,0,1,0\n"
+        );
+        // A given name survives a positional column spec too.
+        let out = run_str("agg total=sum(3) by fieldA", INPUT).unwrap();
+        assert_eq!(out, "fieldA,total\nt,14\nf,0\n");
+        // Two aggregates (or a key and an aggregate) may not share a name.
+        let err = run_str("agg a=sum(countZ), a=count by fieldA", INPUT).unwrap_err();
+        assert!(err.to_string().contains("`a` is given twice"), "{err}");
+        let err = run_str("agg fieldA=count by fieldA", INPUT).unwrap_err();
+        assert!(err.to_string().contains("given twice"), "{err}");
+    }
+
+    #[test]
+    fn describe_shows_resolved_aggregate_names() {
+        let mut plan = parse("agg total=sum(3), count by 2").unwrap();
+        plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()])
+            .unwrap();
+        let d = describe(&plan);
+        assert!(d.contains("keys [\"fieldA\"]"), "{d}");
+        assert!(
+            d.contains("[\"total=sum(countZ)\", \"count=count\"]"),
+            "{d}"
+        );
     }
 
     #[test]

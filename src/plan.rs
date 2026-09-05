@@ -409,8 +409,10 @@ pub struct AggSpec {
     pub func: AggFunc,
     pub col: Option<String>,
     pub pos: Option<usize>,
-    /// Output column name (`amount_sum`, or `count` for a bare count).
-    pub name: String,
+    /// The output column name: the `NAME=` the spec gave, else (from
+    /// resolve on) `col_func` after the header column (`amount_sum`), or
+    /// `count` for a bare count.
+    pub name: Option<String>,
 }
 
 /// `group COLS` + `agg FNS`: reduce the input to one row per distinct key,
@@ -430,20 +432,30 @@ impl GroupStmt {
     /// `keys ++ agg names` so downstream `sort`/`cols`/`fmt` compose.
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
         self.key_positions = resolve_cols(&mut self.keys, header)?;
-        for a in &mut self.aggs {
-            a.pos = match &a.col {
-                Some(c) => {
-                    let pos = resolve_col(c, header)?;
-                    // Name the output after the header column, so a positional
-                    // spec (`sum(2)`) still yields `qty_sum`.
-                    a.name = format!("{}_{}", header[pos], a.func.name());
-                    Some(pos)
-                }
-                None => None,
-            };
-        }
         let mut out = self.keys.clone();
-        out.extend(self.aggs.iter().map(|a| a.name.clone()));
+        for a in &mut self.aggs {
+            a.pos = a
+                .col
+                .as_deref()
+                .map(|c| resolve_col(c, header))
+                .transpose()?;
+            // The column and the default name follow the header, so a
+            // positional spec (`sum(2)`) shows and yields `qty_sum`.
+            if let Some(pos) = a.pos {
+                a.col = Some(header[pos].clone());
+            }
+            let name = a.name.take().unwrap_or_else(|| match a.pos {
+                Some(pos) => format!("{}_{}", header[pos], a.func.name()),
+                None => "count".to_string(),
+            });
+            if out.contains(&name) {
+                return Err(Error::Compile(format!(
+                    "agg: output column `{name}` is given twice; name each aggregate with NAME="
+                )));
+            }
+            out.push(name.clone());
+            a.name = Some(name);
+        }
         *header = out;
         Ok(())
     }

@@ -280,15 +280,16 @@ Followed by agg, the aggregates replace that count. The per-key sibling of stats
         aliases: &[],
         summary: "aggregate rows per group",
         synopsis: &[
-            "agg FN(col),... [by COLS]",
+            "agg [NAME=]FN(col),... [by COLS]",
             "  FN: count sum min max mean stddev   (count alone counts rows)",
+            "  NAME=: name the output column (default col_func, e.g. amount_sum)",
             "  by COLS: keys, or fuse with a preceding group; neither ⇒ one global row",
         ],
-        detail: "Reduces to one row per key: the key columns then one column per aggregate, \
-named col_func (e.g. amount_sum), or count. sum/mean/stddev are blank for a non-numeric column.",
+        detail: "Reduces to one row per key: the key columns then one column per aggregate. \
+sum/mean/stddev are blank for a non-numeric column.",
         examples: &[
             "csvm 'group region | agg count, mean(amount) | fmt' sales.csv",
-            "csvm 'agg sum(amount) by region,product' sales.csv",
+            "csvm 'agg total=sum(amount) by region,product' sales.csv",
         ],
     },
     CmdHelp {

@@ -136,7 +136,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   or `agg … by COLS` carries its own keys, or `agg` with neither emits a single
   global row. Functions are `count/sum/min/max/mean/stddev` (a bare `count`
   counts rows; `count(col)` counts non-empty cells); output cols are named
-  `col_func` (`amount_sum`) or `count`. `sum/mean/stddev` are blank for a
+  `col_func` (`amount_sum`) or `count`, or whatever a `NAME=FN(col)` spec
+  gives (`AggSpec.name`). `sum/mean/stddev` are blank for a
   non-numeric column (same policy as `stats`). A blocking, reducing stage
   (`Stage::Group`, `GroupStmt`/`AggSpec`/`AggFunc` in `plan.rs`): the `Grouper`
   in `exec.rs` folds rows into a `HashMap<key, GroupAcc>` keeping first-seen

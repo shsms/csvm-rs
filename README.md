@@ -72,7 +72,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |
-| `agg FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev) |
+| `agg [NAME=]FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev); `NAME=` names the output |
 | `join [(SUB)] FILE on KEYS, …` | merge right-side files in by key (inner/left/right/full) |
 | `fn name(a,b) { … }` | define a reusable pipeline fragment; call as `name(x,y)` |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
