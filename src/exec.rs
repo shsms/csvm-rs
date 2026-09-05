@@ -169,7 +169,9 @@ fn run_body<R: BufRead, W: Write + Send>(
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
         }
-        [Stage::Transform(stmts)] => stream_transform(stmts, opts.chunk_size, input, output),
+        [Stage::Transform(stmts)] => {
+            stream_window(stmts, 0, usize::MAX, &[], opts.chunk_size, input, output)
+        }
         _ => run_staged(plan, opts, input, output),
     }
 }
@@ -776,39 +778,6 @@ fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error
     let mut buf = String::new();
     csv::write_row(&mut buf, &row);
     output.write_all(buf.as_bytes())?;
-    Ok(())
-}
-
-/// Stream a single transform stage: parse a chunk, apply, serialize, write.
-/// Reads via [`next_chunk_available`] so output flows as input arrives rather
-/// than only after a full chunk buffers (matters on a live or slow stream).
-fn stream_transform<R: BufRead, W: Write>(
-    stmts: &[Stmt],
-    chunk_size: usize,
-    input: &mut R,
-    output: &mut W,
-) -> Result<(), Error> {
-    let mut out_buf = String::new();
-    while let Some(chunk) = next_chunk_available(input, chunk_size)? {
-        out_buf.clear();
-        let mut scratch: Vec<Field> = Vec::new();
-        let mut err: Option<Error> = None;
-        csv::parse_chunk(&chunk, |row| {
-            if err.is_some() {
-                return;
-            }
-            match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
-                Ok(true) => csv::write_row(&mut out_buf, row),
-                Ok(false) => {}
-                Err(e) => err = Some(e),
-            }
-        });
-        if let Some(e) = err {
-            return Err(e);
-        }
-        output.write_all(out_buf.as_bytes())?;
-        output.flush()?; // don't let a live/slow stream's output sit in the BufWriter
-    }
     Ok(())
 }
 

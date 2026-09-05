@@ -391,7 +391,9 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
-  (`head` and a lone transform) read via `next_chunk_available` (a single `read`
+  (`head`, `tail +N`, and a lone transform: the window paths through
+  `stream_window`, a lone transform with `-n>1` through
+  `stream_transform_parallel`) read via `next_chunk_available` (a single `read`
   completed to a line boundary) and flush output per chunk, so a slow or
   unbounded stream emits promptly instead of stalling until a 1 MB buffer fills
   (which made `head` hang and `select` withhold output). `sort` and the
