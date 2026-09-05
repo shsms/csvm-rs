@@ -171,45 +171,44 @@ fn prev_after_a_reshaping_cols_uses_the_new_layout() {
 }
 
 #[test]
-fn delta_appends_step_differences() {
-    // `delta` is sugar for `add C_delta = C - prev(C)` per column.
+fn step_differences_with_prev() {
     assert_eq!(
-        run_checked("delta price | cols price_delta", NUM),
+        run_checked(
+            "add price_delta = price - prev(price) | cols price_delta",
+            NUM
+        ),
         "price_delta\n0\n10\n-15\n"
     );
-    // Multiple columns, and equivalence to the explicit add form.
     assert_eq!(
-        run_checked("delta price qty | cols price_delta,qty_delta", NUM),
         run_checked(
             "add price_delta = price - prev(price) | add qty_delta = qty - prev(qty) \
              | cols price_delta,qty_delta",
             NUM
         ),
+        "price_delta,qty_delta\n0,0\n10,-1\n-15,2\n"
     );
 }
 
 #[test]
-fn delta_custom_suffix() {
-    assert_eq!(
-        run_checked("delta -s _change price | cols price_change", NUM),
-        "price_change\n0\n10\n-15\n"
+fn delta_command_points_at_add() {
+    let err = run("delta price", NUM, 1).unwrap_err();
+    assert!(
+        err.contains("add price_delta = price - prev(price)"),
+        "{err}"
     );
 }
 
 #[test]
-fn delta_is_thread_independent_over_a_file() {
+fn step_difference_is_thread_independent_over_a_file() {
     let mut content = String::from("id,val\n");
     for i in 0..3000u32 {
         content.push_str(&format!("{i},{}\n", (i * 17) % 89));
     }
     let path = temp_csv(&content);
-    let serial = run("delta val | cols val_delta", &content, 1).unwrap();
+    let script = "add val_delta = val - prev(val) | cols val_delta";
+    let serial = run(script, &content, 1).unwrap();
     for n in [1usize, 2, 4, 8, 16] {
-        assert_eq!(
-            run_file_str("delta val | cols val_delta", &path, n),
-            serial,
-            "threads={n}"
-        );
+        assert_eq!(run_file_str(script, &path, n), serial, "threads={n}");
     }
 }
 

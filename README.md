@@ -78,7 +78,6 @@ Each stage is a command with comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
-| `delta [-s SUF] a,b` | append `col_delta = col - prev(col)` per column (shorthand) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL VALUE` | one horizontal bar per row (sink; use after group-by) |
@@ -112,10 +111,10 @@ A few things worth knowing up front:
   To pin a column explicitly, convert it in place: `add c = num(c)` (a non-number
   aborts) or `add c = str(c)`. Empty coerces to `0`; a non-numeric value where a
   number is required aborts the run.
-- **`add` / `delta`** compute columns: `add total = amount * qty`, and
-  `add rate = amount - prev(amount)` — or the shorthand `delta amount` — for the
-  step-to-step difference. An `add` using `prev()`/`rownum()` runs ordered and
-  single-threaded, so its output is identical at any `-n`; a pure `add` shards.
+- **`add`** computes columns: `add total = amount * qty`, and
+  `add rate = amount - prev(amount)` for the step-to-step difference. An `add`
+  using `prev()`/`rownum()` runs ordered and single-threaded, so its output is
+  identical at any `-n`; a pure `add` shards.
 
 ### Long pipelines: script files
 
@@ -132,7 +131,8 @@ csvm -f pipeline.csvm data.csv
 rename value=a
 select a > 1000
 join (rename value=b) b.csv on key
-delta a b                  # a_delta, b_delta
+add a_delta = a - prev(a)
+add b_delta = b - prev(b)
 color -g a b a_delta b_delta
 cols key a a_delta b b_delta
 fmt
@@ -157,7 +157,7 @@ csvm 'select flag == "t" && (amount > 0 || qty > 0) | cols -v flag' input.csv
 csvm 'select amount > 0 | sort amount=nr' input.csv
 
 # computed column, then a step-to-step delta
-csvm 'add total = amount * qty | delta total | fmt' input.csv
+csvm 'add total = amount * qty | add total_delta = total - prev(total) | fmt' input.csv
 
 # inner join on a key, then sort the result
 csvm 'join prices.csv on sku | sort price=nr | head' sales.csv

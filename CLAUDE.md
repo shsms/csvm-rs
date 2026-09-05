@@ -164,7 +164,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `on` — the item's own, or the shared trailing one; `join_key_err` in
   `plan.rs` hints on the continuation-appended ones). Multiple
   items desugar to one `JoinStmt`/`Stage::Join` per file, left to right — pure
-  parser-level sugar (like `delta`), identical to chaining single joins; flags
+  parser-level sugar, identical to chaining single joins; flags
   apply to every item. A blocking stage: the right `FILE` is run through its optional
   parenthesized sub-`Plan` (a full recursive pipeline — this is the "DAG" node),
   materialized, and built into a `HashMap<key, Vec<right_row_idx>>`; the left rows
@@ -228,9 +228,6 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   a `?:` whose branches agree; `num(x)` is numeric and `str(x)` text, so
   `add c = num(c)` is how a column is pinned), so later comparisons against it
   are typed the same as against the expression itself.
-- **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
-  stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
-  default `_delta`), so it shares all of `add`'s machinery and guarantees.
 - **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
