@@ -496,16 +496,26 @@ pub struct AddStmt {
 }
 
 impl AddStmt {
-    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+    fn resolve(
+        &mut self,
+        header: &mut Vec<String>,
+        types: &mut Vec<Option<ColType>>,
+    ) -> Result<(), Error> {
         // Resolve the expression against the *current* header first, so a
         // replacing `add price price * 1.1` sees the old `price`, and an
         // appending `add total amount * qty` can't reference itself.
-        self.expr.resolve(header)?;
+        self.expr.resolve(header, types)?;
+        // The new column carries the expression's static type.
+        let ty = self.expr.static_type(&|c| types[c.pos]);
         match header.iter().position(|h| h == &self.name) {
-            Some(i) => self.pos = Some(i),
+            Some(i) => {
+                self.pos = Some(i);
+                types[i] = ty;
+            }
             None => {
                 self.pos = None;
                 header.push(self.name.clone());
+                types.push(ty);
             }
         }
         Ok(())
@@ -738,10 +748,10 @@ pub enum ColorRule {
 }
 
 impl ColorRule {
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+    fn resolve(&mut self, header: &[String], types: &[Option<ColType>]) -> Result<(), Error> {
         match self {
             ColorRule::Predicate { scope, expr, .. } => {
-                expr.resolve(header)?;
+                expr.resolve(header, types)?;
                 if let ColorScope::Cell(c) = scope {
                     c.resolve(header)?;
                 }
@@ -1023,17 +1033,24 @@ impl BoolExpr {
         }
     }
 
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+    /// Resolve column names to positions and, for a comparison, pin its mode
+    /// from `types` (the columns' known types by position): the parser
+    /// decided by name alone, so a column typed under another spelling (a
+    /// position, a later rename) is only known here.
+    fn resolve(&mut self, header: &[String], types: &[Option<ColType>]) -> Result<(), Error> {
         match self {
             BoolExpr::And(es) | BoolExpr::Or(es) => {
                 for e in es {
-                    e.resolve(header)?;
+                    e.resolve(header, types)?;
                 }
             }
-            BoolExpr::Not(e) => e.resolve(header)?,
+            BoolExpr::Not(e) => e.resolve(header, types)?,
             BoolExpr::Cmp(c) => {
-                c.lhs.resolve(header)?;
-                c.rhs.resolve(header)?;
+                c.lhs.resolve(header, types)?;
+                c.rhs.resolve(header, types)?;
+                // The parser decided by name alone; every type it knew is in
+                // `types` too, so this only ever pins further.
+                c.retype(&|r| types[r.pos])?;
             }
             BoolExpr::Match { col, .. } => col.resolve(header)?,
             BoolExpr::Affix { col, .. } => col.resolve(header)?,
@@ -1221,25 +1238,25 @@ impl ValExpr {
         }
     }
 
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+    fn resolve(&mut self, header: &[String], types: &[Option<ColType>]) -> Result<(), Error> {
         match self {
             ValExpr::Col(c) | ValExpr::Prev(c) => c.resolve(header)?,
             ValExpr::Num(_) | ValExpr::Str(_) | ValExpr::Rownum => {}
-            ValExpr::Neg(e) => e.resolve(header)?,
+            ValExpr::Neg(e) => e.resolve(header, types)?,
             ValExpr::Arith { lhs, rhs, .. } => {
-                lhs.resolve(header)?;
-                rhs.resolve(header)?;
+                lhs.resolve(header, types)?;
+                rhs.resolve(header, types)?;
             }
             ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
                 for p in parts {
-                    p.resolve(header)?;
+                    p.resolve(header, types)?;
                 }
             }
-            ValExpr::Bool(b) => b.resolve(header)?,
+            ValExpr::Bool(b) => b.resolve(header, types)?,
             ValExpr::Cond { test, then_, else_ } => {
-                test.resolve(header)?;
-                then_.resolve(header)?;
-                else_.resolve(header)?;
+                test.resolve(header, types)?;
+                then_.resolve(header, types)?;
+                else_.resolve(header, types)?;
             }
         }
         Ok(())
@@ -1389,21 +1406,39 @@ impl Stmt {
     }
 
     /// Resolve column names to positions against `header`, and reshape `header`
-    /// for downstream statements when this statement reshapes the row.
-    fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
+    /// (and `types`, the columns' known types by position) for downstream
+    /// statements when this statement reshapes the row.
+    fn resolve(
+        &mut self,
+        header: &mut Vec<String>,
+        types: &mut Vec<Option<ColType>>,
+    ) -> Result<(), Error> {
+        let conv = match self {
+            Stmt::ToNum(_) => Some(ColType::Num),
+            Stmt::ToStr(_) => Some(ColType::Str),
+            _ => None,
+        };
         match self {
-            Stmt::Cols(p) => p.resolve(header),
-            Stmt::Select(expr) => expr.resolve(header),
-            Stmt::ToNum(c) | Stmt::ToStr(c) => c.resolve(header),
+            Stmt::Cols(p) => {
+                p.resolve(header)?;
+                *types = p.positions.iter().map(|&i| types[i]).collect();
+            }
+            Stmt::Select(expr) => expr.resolve(header, types)?,
+            Stmt::ToNum(c) | Stmt::ToStr(c) => {
+                c.resolve(header)?;
+                for &i in &c.positions {
+                    types[i] = conv;
+                }
+            }
             Stmt::Rename(r) => {
                 for (from, to) in &r.pairs {
                     let pos = resolve_col(from, header)?;
                     header[pos] = to.clone();
                 }
-                Ok(())
             }
-            Stmt::Add(a) => a.resolve(header),
+            Stmt::Add(a) => a.resolve(header, types)?,
         }
+        Ok(())
     }
 
     /// Whether this statement reads cross-row state (a stateful `add` or a
@@ -1450,6 +1485,19 @@ impl ConvStmt {
     }
 }
 
+/// The [`STATS_SCHEMA`] columns' types, in schema order (the length is tied
+/// to the schema, so a new profile column must be typed here too).
+const STATS_TYPES: [Option<ColType>; STATS_SCHEMA.len()] = [
+    Some(ColType::Str), // field
+    Some(ColType::Num), // count
+    Some(ColType::Num), // empty
+    None,               // min: follows the column
+    None,               // max
+    Some(ColType::Num), // sum
+    Some(ColType::Num), // mean
+    Some(ColType::Num), // stddev
+];
+
 impl StatsStmt {
     /// Resolve the profiled columns (empty list ⇒ all) and reshape the header to
     /// the profile schema for downstream stages.
@@ -1467,10 +1515,19 @@ impl StatsStmt {
 }
 
 impl SortStmt {
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
+    /// Resolve the keys and pin an auto key whose column has a known type
+    /// (`types`, by position): the parser only saw the spelling.
+    fn resolve(&mut self, header: &[String], types: &[Option<ColType>]) -> Result<(), Error> {
         for k in &mut self.keys {
             k.pos = resolve_col(&k.name, header)?;
             k.name = header[k.pos].clone();
+            if k.mode == SortMode::Auto {
+                k.mode = match types[k.pos] {
+                    Some(ColType::Num) => SortMode::Numeric,
+                    Some(ColType::Str) => SortMode::Lexical,
+                    None => SortMode::Auto,
+                };
+            }
         }
         Ok(())
     }
@@ -1560,26 +1617,67 @@ impl Plan {
     /// output header (the input header reshaped by any `cols`/`drop-cols`).
     pub fn resolve(&mut self, input_header: &[String]) -> Result<Vec<String>, Error> {
         let mut header = input_header.to_vec();
+        // The columns' known types, kept in step with `header`: `to-num` /
+        // `to-str` / `add` set them, `cols` reorders them, `group` keeps its
+        // keys' and types its aggregates, `stats` types its profile columns, a
+        // join keeps the left side's and leaves the right untyped. Sort keys
+        // and comparisons pin their mode from this, so a type follows the
+        // column however it is spelled.
+        let mut types: Vec<Option<ColType>> = vec![None; header.len()];
         for stage in &mut self.stages {
             match stage {
                 Stage::Transform(stmts) => {
                     for s in stmts {
-                        s.resolve(&mut header)?;
+                        s.resolve(&mut header, &mut types)?;
                     }
                 }
-                Stage::Sort(s) => s.resolve(&header)?,
+                Stage::Sort(s) => s.resolve(&header, &types)?,
                 Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) => {} // no columns to resolve
-                Stage::Stats(s) => s.resolve(&mut header)?,
+                Stage::Stats(s) => {
+                    s.resolve(&mut header)?;
+                    types = STATS_TYPES.to_vec();
+                }
                 Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
-                Stage::Group(g) => g.resolve(&mut header)?,
-                Stage::Join(j) => j.resolve(&mut header)?,
+                Stage::Group(g) => {
+                    let old = std::mem::take(&mut types);
+                    g.resolve(&mut header)?;
+                    // A key keeps its column's type; count/sum/mean/stddev are
+                    // numbers; min/max follow their column.
+                    let aggs = g.aggs.iter().map(|a| match a.func {
+                        AggFunc::Min | AggFunc::Max => a.pos.and_then(|p| old[p]),
+                        _ => Some(ColType::Num),
+                    });
+                    types = g
+                        .key_positions
+                        .iter()
+                        .map(|&i| old[i])
+                        .chain(aggs)
+                        .collect();
+                }
+                Stage::Join(j) => {
+                    j.resolve(&mut header)?;
+                    types.resize(header.len(), None); // left columns keep their types
+                }
             }
         }
         // Colour is cosmetic and resolves against the *output* header, so a rule
         // naming a column that didn't survive to the output (e.g. dropped by a
         // later `cols`) is simply inert — skip it rather than aborting the run.
-        // (Row-level colour errors are already ignored in `compute_styles`.)
-        self.colors.retain_mut(|rule| rule.resolve(&header).is_ok());
+        // (Row-level colour errors are already ignored in `compute_styles`.) Any
+        // other failure is a real compile error and still aborts.
+        let mut failed = None;
+        self.colors
+            .retain_mut(|rule| match rule.resolve(&header, &types) {
+                Ok(()) => true,
+                Err(Error::Column { .. } | Error::ColumnIndex { .. }) => false,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    false
+                }
+            });
+        if let Some(e) = failed {
+            return Err(e);
+        }
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
             for c in &mut g.cols {
