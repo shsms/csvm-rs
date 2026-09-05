@@ -284,3 +284,16 @@ fn explicit_dotted_key_gets_no_hint() {
     assert!(err.contains("column not found"), "got: {err}");
     assert!(!err.contains("did you forget"), "got: {err}");
 }
+
+#[test]
+fn join_keeps_the_left_columns_types() {
+    // A to-str on the left side (by position) still pins a sort after the
+    // join; the right side's columns arrive untyped.
+    let right = temp_csv("id,tag\n1,a\n2,b\n3,c\n");
+    let out = run(
+        &format!("to-str 2 | join {} on id | sort qty", right.display()),
+        "id,qty\n1,10\n2,9\n3,100\n",
+    )
+    .unwrap();
+    assert_eq!(out, "id,qty,tag\n1,10,a\n3,100,c\n2,9,b\n");
+}

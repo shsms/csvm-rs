@@ -2571,6 +2571,28 @@ mod tests {
     }
 
     #[test]
+    fn describe_shows_modes_pinned_at_resolve_time() {
+        // A positional to-str / to-num pins the column, and the pin shows in
+        // the engine dump even though the parser could not know the name.
+        let mut plan = parse("to-str 2 | to-num 1 | sort fieldA id | select id == countZ").unwrap();
+        let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("sort fieldA[1] lexical, id[0] numeric"), "{d}");
+        assert!(d.contains("(== id[0] countZ[2] :num)"), "{d}");
+        // A colour predicate resolves against the output types too.
+        let mut plan = parse("to-num 2 | color red countZ > id").unwrap();
+        let _ = plan.resolve(&["id".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("countZ[1] id[0] :num"), "{d}");
+        // The stats profile columns are typed, so a compare between two of
+        // them is numeric, not auto.
+        let mut plan = parse("stats | select count > empty").unwrap();
+        let _ = plan.resolve(&["id".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("(> count[1] empty[2] :num)"), "{d}");
+    }
+
+    #[test]
     fn stats_profiles_every_column() {
         let out = run_str("stats", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();

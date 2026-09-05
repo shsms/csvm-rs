@@ -187,6 +187,79 @@ fn numeric_sort_keeps_cell_text_on_every_path() {
 }
 
 #[test]
+fn column_types_follow_the_column_not_its_spelling() {
+    // to-num / to-str pin a column by position at resolve time, so the pin
+    // holds however the column is later named: by position, by name, after
+    // a rename, or after cols reorders it.
+    let input = "id,qty\n1,10\n2,9\n3,100\n";
+    let lexical = "id,qty\n1,10\n3,100\n2,9\n";
+    assert_eq!(run_checked("to-str 2 | sort qty", input), lexical);
+    assert_eq!(run_checked("to-str qty | sort 2", input), lexical);
+    assert_eq!(
+        run_checked("to-str qty | cols qty,id | sort 1 | cols id,qty", input),
+        lexical
+    );
+    assert_eq!(
+        run_checked("to-num qty | rename qty=n | sort n | rename n=qty", input),
+        "id,qty\n2,9\n1,10\n3,100\n"
+    );
+    // The same for comparisons: a to-num column makes == numeric.
+    let pair = "a,b\n1000,1e3\n10,9\n9,10\n";
+    assert_eq!(
+        run_checked("to-num 1 | select a == b", pair),
+        "a,b\n1000,1e3\n"
+    );
+    // ... and a to-str column makes an ordering lexical ("9" > "10").
+    assert_eq!(run_checked("to-str 1 | select a > b", pair), "a,b\n9,10\n");
+    // A group key keeps its column's type, so the pin survives the reduce.
+    assert_eq!(
+        run_checked(
+            "to-str 2 | group qty | agg count | sort qty | cols qty",
+            input
+        ),
+        "qty\n10\n100\n9\n"
+    );
+    // ... but a type never leaks onto another column that takes its position
+    // after a reduce: `region` stays untyped (text) although `amount` at
+    // position 1 was to-num'd, and the stats `field` column is text.
+    assert_eq!(
+        run_checked(
+            "to-num 1 | group region | agg count | sort region",
+            "amount,region\n10,west\n9,east\n100,north\n"
+        ),
+        "region,count\neast,1\nnorth,1\nwest,1\n"
+    );
+    assert_eq!(
+        run_checked("to-num id | stats | sort field | cols field", input),
+        "field\nid\nqty\n"
+    );
+    // An `add` column carries its expression's static type, appended or
+    // replaced in place, so a positional key on it sorts by that type.
+    assert_eq!(
+        run_checked("add lbl upper(qty) | sort 3", input),
+        "id,qty,lbl\n1,10,10\n3,100,100\n2,9,9\n"
+    );
+    assert_eq!(
+        run_checked("to-num qty | add qty upper(qty) | sort 2", input),
+        "id,qty\n1,10\n3,100\n2,9\n"
+    );
+    // A literal that cannot be a number is a compile error however the
+    // to-num column is spelled, even inside a colour rule ...
+    let err = run("to-num 2 | color red qty == 'x'", input, 1).unwrap_err();
+    assert!(err.contains("non-numeric literal 'x'"), "{err}");
+    // ... while a colour rule whose column is gone from the output is still
+    // dropped, whether it named the column or gave its position.
+    assert_eq!(
+        run_checked("color red `2` > 5 | cols id", input),
+        "id\n1\n2\n3\n"
+    );
+    assert_eq!(
+        run_checked("color red qty > 5 | cols id", input),
+        "id\n1\n2\n3\n"
+    );
+}
+
+#[test]
 fn sort_multi_key_lexical_then_reverse() {
     // forward by fieldA, then reverse by id (lexical) within ties
     assert_eq!(
