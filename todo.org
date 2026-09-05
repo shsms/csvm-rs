@@ -18,11 +18,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   each line (length-prefixed) and read them back in the merge — which also
   removes the per-line re-parse — or serialize spilled numbers round-trip.
 ** TODO Feature ideas
-- Default =-n= to the core count (=std::thread::available_parallelism=). Today
-  threads default to 1, so the headline benefit needs =-n 8= every time. Output
-  is =-n=-independent except the documented ~1-ULP float drift in sharded
-  =stats=/=group=, so the change is low risk; =-n 1= stays as the explicit
-  escape hatch.
 - String and date functions in =add= (deferred from the original =add= design,
   below): =split(s, sep, i)=, regex =match(s, re)= (first capture) and =sub=,
   and =epoch(ts)= exposing =src/datetime.rs= so a timestamp column becomes a
@@ -65,9 +60,11 @@ git history; this file is the "what next / what was decided" scratchpad.
   select v > 1.0000002= can therefore differ between the two paths. The key
   itself is exact since 2026-09-05 (spilled key + line records). Fix: a
   round-trip number format for the sort blob, re-formatted at output.
-- Sharded =stats= / =group= reduce in =-n= ranges, so the documented ~1-ULP
-  float drift is now the default behaviour (threads default to the core
-  count since 2026-09-05) and can differ between machines. Decoupling the
+- Sharded =stats= / =group= reduce in =-n= ranges, so the documented
+  low-order-digit float drift of =sum=/=mean=/=stddev= (hundreds of ULP on a
+  few hundred thousand rows) is now the default behaviour (threads default
+  to the core count since 2026-09-05) and can differ between machines; =-n
+  1= is the reproducible run. Decoupling the
   shard count from the worker count (=shard_ranges= picking a count from
   file size) would make the output thread-count independent.
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
@@ -102,6 +99,11 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE =-n= defaults to the core count
+Shipped 2026-09-05 (=resolve_threads= in =cli.rs=, =available_parallelism=).
+Output is =-n=-independent except the documented low-order float drift in
+sharded =stats=/=group=; =-n 1= is the explicit serial run.
 
 ** DONE =tail +N= starts at row N
 Shipped 2026-09-05: =tail -n +3= used to mean =tail 3= (the count parser

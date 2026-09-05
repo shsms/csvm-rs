@@ -38,7 +38,8 @@ options (--flag VALUE or --flag=VALUE):
       --no-header      input has no header; name columns c1, c2, ...
       --format FMT     input format: csv (default) | parquet (auto by extension;
                        parquet needs a build with --features parquet)
-  -n, --threads N      worker threads for a seekable file (default: 1)
+  -n, --threads N      worker threads, at most 1024 (default: the core count;
+                       -n 1 = serial, and bit-reproducible float sums in stats/agg)
   -t, --temp-dir DIR   directory for sort spill files (default: system temp)
       --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
       --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;

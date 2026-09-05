@@ -37,7 +37,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `SCRIPT`           | the pipeline (first positional; required unless `-f`)       |
 | `INPUT`            | input file (optional next positional; default stdin, `-` ⇒ stdin) |
 | `-o, --output OUT` | output file (default: stdout)                               |
-| `-n, --threads N`  | worker threads (default: 1; `<=0` ⇒ 1)                      |
+| `-n, --threads N`  | worker threads (default: the core count; `<=0` ⇒ 1, `>1024` ⇒ 1024) |
 | `-f, --file FILE`  | read the pipeline from `FILE` (awk-style; then `SCRIPT` is omitted) |
 | `-t, --temp-dir`   | directory for sort spill files (default: system temp)       |
 | `--chunk-size SIZE`| input chunk size; `K`/`M`/`G` suffix ok (default: 1 000 000) |
@@ -51,7 +51,8 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 Long options also accept the `--flag=value` form (e.g. `--color=always`).
 
 The first input line is the header; columns are referenced by name. For a
-seekable file, `-n N` shards the work across N threads. A streaming input
+seekable file, the work is sharded across `-n` threads (the core count by
+default; `-n 1` runs serially). A streaming input
 (stdin) emits output as rows arrive rather than buffering a full chunk first.
 
 ## The command language

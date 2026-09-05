@@ -119,11 +119,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   but are skipped from the aggregates (still counted as non-empty) so they don't
   poison sum/mean/stddev; `select`/`sort`/`num()` still accept them. `ColStats`
   is deliberately presentation-free so `fmt`'s value-colouring can reuse it.
-  Over a **seekable file with `-n>1`**, `stats` shards: each worker builds a
-  partial `ColStats` over its byte range and `ColStats::merge` (Welford parallel
-  combine) folds them. Counts/`min`/`max` are exact; floating `sum`/`mean`/
-  `stddev` may differ from the `-n1` result by ~1 ULP (parallel reduction sums
-  in a different order). stdin / `-n1` use the single-pass streaming path.
+  Over a **seekable file with `-n>1`** (the default, since `-n` is the core
+  count), `stats` shards: each worker builds a partial `ColStats` over its
+  byte range and `ColStats::merge` (Welford parallel combine) folds them.
+  Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may differ from
+  the `-n1` result in their low-order digits (the parallel reduction sums in
+  a different order, and the gap grows with the row count), so pass `-n 1`
+  for bit-reproducible float aggregates. stdin / `-n1` use the single-pass
+  streaming path.
 - **`group COLS`** + **`agg FN(col),… [by COLS]`** reduce to one row per distinct
   key — the per-key sibling of `stats` (which reduces globally). `group` sets the
   keys; a following `agg` fuses with it (replacing `group`'s placeholder `count`),
@@ -141,8 +144,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `-n>1`** shards — each worker builds a partial `Grouper` over its byte range
   and `Grouper::merge` folds them in file order (so first-seen group order is
   preserved). Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may
-  differ from `-n1` by ~1 ULP (parallel reduction order), the same caveat as
-  sharded `stats`. A `group` combined with a `sort` (or another blocking stage)
+  differ from `-n1` in their low-order digits (parallel reduction order), the
+  same caveat as sharded `stats`. A `group` combined with a `sort` (or another blocking stage)
   still takes the in-memory path.
 - **`join [FLAGS] ITEM[, ITEM…]`** (`ITEM := [(SUBPIPELINE)] FILE [on KEYS]`)
   merges one or more right-side CSVs in by key. Items are separated by
@@ -439,7 +442,9 @@ or alias) a command's forms + example, `csvm help TOPIC` the `operators`/
 `colors`/`types`/`sizes` pages; a test cross-checks the registry against
 `parse::COMMANDS` so the help can't drift (the overview's command list is
 generated from it). Usage errors show only the brief synopsis. Defaults:
-stdin/stdout, threads = 1,
+stdin/stdout, threads = the core count (`available_parallelism`, capped at
+1024 like any `-n`; `-n 1` is the explicit serial run, and the one that makes
+sharded `stats`/`group` float aggregates bit-reproducible),
 chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)

@@ -56,6 +56,21 @@ const DEFAULT_CHUNK_SIZE: usize = 1_000_000;
 /// In-memory budget before `sort` spills a run to a temp file.
 pub const DEFAULT_SORT_BUFFER: usize = 256 << 20;
 
+/// Most worker threads a run gets, whether `-n` asked for more or the
+/// machine has more cores.
+const MAX_THREADS: usize = 1024;
+
+/// The worker count for `-n`: the request when positive (capped at
+/// [`MAX_THREADS`]), else 1; `cores` (the machine's core count) when no `-n`
+/// was given.
+fn resolve_threads(requested: Option<i64>, cores: usize) -> usize {
+    match requested {
+        Some(n) if n >= 1 => usize::try_from(n).map_or(MAX_THREADS, |n| n.min(MAX_THREADS)),
+        Some(_) => 1,
+        None => cores.clamp(1, MAX_THREADS),
+    }
+}
+
 /// Parse a byte size: a plain integer, or one with a binary `K`/`M`/`G` suffix
 /// (case-insensitive, powers of 1024 — matching the `256 MiB` default). Returns
 /// `i64` so a non-positive value can fall back to the default at the call site.
@@ -200,13 +215,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         return Err("too many arguments (expected [SCRIPT] [INPUT])".to_string());
     }
 
-    // Default to single-threaded (like csvm): the parallel path only pays off
-    // for heavier per-row work, and stdin can't be sharded. Users opt in with
-    // `-n`. A non-positive count clamps to 1.
-    let threads = match threads {
-        Some(n) if n >= 1 => n as usize,
-        _ => 1,
-    };
+    // Default to the core count; `-n 1` is the explicit single-threaded
+    // escape hatch. A non-positive count clamps to 1.
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let threads = resolve_threads(threads, cores);
 
     Ok(Parsed::Run(Box::new(Args {
         script,
@@ -250,7 +262,7 @@ mod tests {
         let a = args(&["cols a"]).unwrap();
         assert_eq!(a.script, "cols a");
         assert_eq!(a.in_file, None);
-        assert_eq!(a.threads, 1);
+        assert!(a.threads >= 1);
         assert_eq!(a.chunk_size, DEFAULT_CHUNK_SIZE);
         assert!(!a.print_engine);
     }
@@ -351,7 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn non_positive_threads_clamp_to_one() {
+    fn threads_default_to_the_core_count_and_clamp_to_one() {
+        assert_eq!(resolve_threads(None, 8), 8);
+        assert_eq!(resolve_threads(None, 1), 1);
+        assert_eq!(resolve_threads(Some(4), 1), 4);
+        assert_eq!(resolve_threads(Some(0), 8), 1);
+        assert_eq!(resolve_threads(Some(-3), 8), 1);
+        assert_eq!(resolve_threads(Some(1 << 40), 8), MAX_THREADS);
+        assert_eq!(resolve_threads(Some(i64::MAX), 8), MAX_THREADS);
         assert_eq!(args(&["-n", "0", "cols a"]).unwrap().threads, 1);
         assert_eq!(args(&["-n", "-3", "cols a"]).unwrap().threads, 1);
     }
