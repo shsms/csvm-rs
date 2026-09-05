@@ -12,13 +12,15 @@
 //! line bytes. A block is a contiguous input range, so its sequence number
 //! keeps the merge stable (the role csvm's `orig_chunk_id` plays).
 //!
-//! Small inputs never touch disk; larger ones spill sorted runs to temp files.
-//! The merge is single-level (multi-level merge is left for a later pass).
+//! Small inputs never touch disk; larger ones spill sorted runs to temp files
+//! as key + line records, so a spilled key is exactly the one computed from
+//! the live row (re-deriving it from the serialized line would round numbers
+//! to six decimals). With many runs the merge is multi-level.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -73,7 +75,8 @@ enum RunData {
         lines: Vec<(u32, u32)>,
         keys: Vec<Box<[u8]>>,
     },
-    /// Sorted rows spilled to a temp file (one CSV line each, already sorted).
+    /// Sorted rows spilled to a temp file, one [`write_record`] each, so the
+    /// merge reads the key back instead of re-deriving it from the line.
     File(TempRun),
 }
 
@@ -151,7 +154,6 @@ struct WorkerCtx {
 /// the pre-sort statements, serializes + key-encodes, and sorts its block into
 /// a run. [`Sorter::finish`] joins the workers and merges.
 pub struct Sorter {
-    sort: Arc<SortStmt>,
     block_size: usize,
     threads: usize,
     temp_dir: PathBuf,
@@ -219,7 +221,6 @@ impl Sorter {
         }
 
         Sorter {
-            sort,
             block_size,
             threads,
             temp_dir,
@@ -276,8 +277,8 @@ impl Sorter {
         }
         // Multi-level merge: with more than `fanout` runs, merge groups of them
         // into larger runs first (in parallel) so the final merge is bounded.
-        let runs = consolidate(runs, &self.sort, self.threads, &self.temp_dir, self.fanout)?;
-        Merge::new(runs, Arc::clone(&self.sort))
+        let runs = consolidate(runs, self.threads, &self.temp_dir, self.fanout)?;
+        Merge::new(runs)
     }
 }
 
@@ -286,7 +287,6 @@ impl Sorter {
 /// level are merged in parallel across `threads` workers.
 fn consolidate(
     mut runs: Vec<Run>,
-    sort: &Arc<SortStmt>,
     threads: usize,
     temp_dir: &Path,
     fanout: usize,
@@ -303,19 +303,14 @@ fn consolidate(
             }
             groups.push(group);
         }
-        runs = merge_groups(groups, sort, threads, temp_dir)?;
+        runs = merge_groups(groups, threads, temp_dir)?;
     }
     runs.sort_by_key(|r| r.seq);
     Ok(runs)
 }
 
 /// Merge each group of runs into one spilled run, across `threads` workers.
-fn merge_groups(
-    groups: Vec<Vec<Run>>,
-    sort: &Arc<SortStmt>,
-    threads: usize,
-    temp_dir: &Path,
-) -> Result<Vec<Run>, Error> {
+fn merge_groups(groups: Vec<Vec<Run>>, threads: usize, temp_dir: &Path) -> Result<Vec<Run>, Error> {
     let (work_tx, work_rx) = unbounded::<Vec<Run>>();
     for group in groups {
         let _ = work_tx.send(group);
@@ -327,10 +322,9 @@ fn merge_groups(
         for _ in 0..threads.max(1) {
             let work_rx = work_rx.clone();
             let res_tx = res_tx.clone();
-            let sort = Arc::clone(sort);
             scope.spawn(move || {
                 while let Ok(group) = work_rx.recv() {
-                    if res_tx.send(merge_group(group, &sort, temp_dir)).is_err() {
+                    if res_tx.send(merge_group(group, temp_dir)).is_err() {
                         break;
                     }
                 }
@@ -354,19 +348,14 @@ fn merge_groups(
 
 /// Merge one group of runs into a single spilled run. Its `seq` is the group's
 /// minimum, so consolidated runs stay in input order (keeping the sort stable).
-fn merge_group(group: Vec<Run>, sort: &Arc<SortStmt>, temp_dir: &Path) -> Result<Run, Error> {
+fn merge_group(group: Vec<Run>, temp_dir: &Path) -> Result<Run, Error> {
     let seq = group.iter().map(|r| r.seq).min().unwrap_or(0);
-    let file_seq = RUN_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
-    let path = temp_dir.join(format!("csvm.{}.{}.tmp", std::process::id(), file_seq));
-    let mut writer = BufWriter::new(File::create(&path)?);
-    Merge::new(group, Arc::clone(sort))?.for_each_line(|line| {
-        writer.write_all(line)?;
-        Ok(())
+    let file = write_run(temp_dir, |w| {
+        Merge::new(group)?.for_each_record(|key, line| write_record(w, key, line))
     })?;
-    writer.flush()?;
     Ok(Run {
         seq,
-        data: RunData::File(TempRun { path }),
+        data: RunData::File(file),
     })
 }
 
@@ -418,11 +407,14 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
 
     // Materialize the sorted order so the merge can stream sequentially.
     let lines_sorted: Vec<(u32, u32)> = order.iter().map(|&i| lines[i as usize]).collect();
-    let bytes = blob.len() + keys.iter().map(|k| k.len() + 16).sum::<usize>();
+    let keys_sorted: Vec<Box<[u8]>> = order
+        .iter()
+        .map(|&i| std::mem::take(&mut keys[i as usize]))
+        .collect();
+    let bytes = blob.len() + keys_sorted.iter().map(|k| k.len() + 16).sum::<usize>();
 
     let prev = ctx.in_mem.fetch_add(bytes, AtomicOrdering::Relaxed);
     if prev + bytes <= ctx.budget {
-        let keys_sorted: Vec<Box<[u8]>> = order.iter().map(|&i| keys[i as usize].clone()).collect();
         Ok(Run {
             seq,
             data: RunData::Mem {
@@ -433,7 +425,7 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
         })
     } else {
         ctx.in_mem.fetch_sub(bytes, AtomicOrdering::Relaxed);
-        let file = spill(&blob, &lines_sorted, &ctx.temp_dir)?;
+        let file = spill(&blob, &lines_sorted, &keys_sorted, &ctx.temp_dir)?;
         Ok(Run {
             seq,
             data: RunData::File(file),
@@ -441,16 +433,67 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
     }
 }
 
-/// Write a run's lines (already in sorted order) to a fresh temp file.
-fn spill(blob: &[u8], lines: &[(u32, u32)], temp_dir: &Path) -> Result<TempRun, Error> {
+/// Write a run's rows (already in sorted order) to a fresh temp file.
+fn spill(
+    blob: &[u8],
+    lines: &[(u32, u32)],
+    keys: &[Box<[u8]>],
+    temp_dir: &Path,
+) -> Result<TempRun, Error> {
+    write_run(temp_dir, |w| {
+        for (&(start, end), key) in lines.iter().zip(keys) {
+            write_record(w, key, &blob[start as usize..end as usize])?;
+        }
+        Ok(())
+    })
+}
+
+/// Create a fresh run file under `temp_dir`, let `write` fill it, and return
+/// it. The file is owned from creation, so it is removed on an error too.
+fn write_run<F>(temp_dir: &Path, write: F) -> Result<TempRun, Error>
+where
+    F: FnOnce(&mut BufWriter<File>) -> Result<(), Error>,
+{
     let seq = RUN_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
     let path = temp_dir.join(format!("csvm.{}.{}.tmp", std::process::id(), seq));
     let mut writer = BufWriter::new(File::create(&path)?);
-    for &(start, end) in lines {
-        writer.write_all(&blob[start as usize..end as usize])?;
-    }
+    let run = TempRun { path };
+    write(&mut writer)?;
     writer.flush()?;
-    Ok(TempRun { path })
+    Ok(run)
+}
+
+/// Append one spilled row: the two lengths (u32, little-endian), the encoded
+/// key, then the CSV line. Length-prefixed because a key can hold any byte.
+fn write_record<W: Write>(writer: &mut W, key: &[u8], line: &[u8]) -> Result<(), Error> {
+    writer.write_all(&(key.len() as u32).to_le_bytes())?;
+    writer.write_all(&(line.len() as u32).to_le_bytes())?;
+    writer.write_all(key)?;
+    writer.write_all(line)?;
+    Ok(())
+}
+
+/// Read one spilled row written by [`write_record`] into `key` and `line`;
+/// `false` at end of file, with both left empty.
+fn read_record(
+    reader: &mut BufReader<File>,
+    key: &mut Vec<u8>,
+    line: &mut Vec<u8>,
+) -> Result<bool, Error> {
+    if reader.fill_buf()?.is_empty() {
+        key.clear();
+        line.clear();
+        return Ok(false);
+    }
+    let mut lens = [0u8; 8];
+    reader.read_exact(&mut lens)?;
+    let key_len = u32::from_le_bytes(lens[..4].try_into().unwrap()) as usize;
+    let line_len = u32::from_le_bytes(lens[4..].try_into().unwrap()) as usize;
+    key.resize(key_len, 0);
+    reader.read_exact(key)?;
+    line.resize(line_len, 0);
+    reader.read_exact(line)?;
+    Ok(true)
 }
 
 // --- the merge --------------------------------------------------------------
@@ -460,18 +503,17 @@ fn spill(blob: &[u8], lines: &[(u32, u32)], temp_dir: &Path) -> Result<TempRun, 
 pub struct Merge {
     sources: Vec<Source>,
     heap: BinaryHeap<Reverse<HeapKey>>,
-    sort: Arc<SortStmt>,
 }
 
 impl Merge {
-    fn new(runs: Vec<Run>, sort: Arc<SortStmt>) -> Result<Self, Error> {
+    fn new(runs: Vec<Run>) -> Result<Self, Error> {
         let mut sources: Vec<Source> = runs
             .into_iter()
             .map(Source::new)
             .collect::<Result<_, _>>()?;
         let mut heap = BinaryHeap::with_capacity(sources.len());
         for (idx, source) in sources.iter_mut().enumerate() {
-            if let Some(key) = source.key(&sort)? {
+            if let Some(key) = source.next_key(Vec::new())? {
                 heap.push(Reverse(HeapKey {
                     key,
                     seq: source.seq,
@@ -479,22 +521,26 @@ impl Merge {
                 }));
             }
         }
-        Ok(Merge {
-            sources,
-            heap,
-            sort,
-        })
+        Ok(Merge { sources, heap })
     }
 
     /// Drive the merge, calling `emit` with each row's line bytes in order.
-    pub fn for_each_line<F>(mut self, mut emit: F) -> Result<(), Error>
+    pub fn for_each_line<F>(self, mut emit: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<(), Error>,
     {
+        self.for_each_record(|_, line| emit(line))
+    }
+
+    /// Drive the merge, calling `emit` with each row's encoded key and line
+    /// bytes in order (an intermediate merge writes both back out).
+    fn for_each_record<F>(mut self, mut emit: F) -> Result<(), Error>
+    where
+        F: FnMut(&[u8], &[u8]) -> Result<(), Error>,
+    {
         while let Some(Reverse(item)) = self.heap.pop() {
-            emit(self.sources[item.idx].current_line())?;
-            self.sources[item.idx].advance()?;
-            if let Some(key) = self.sources[item.idx].key(&self.sort)? {
+            emit(&item.key, self.sources[item.idx].current_line())?;
+            if let Some(key) = self.sources[item.idx].next_key(item.key)? {
                 self.heap.push(Reverse(HeapKey {
                     key,
                     seq: item.seq,
@@ -509,7 +555,7 @@ impl Merge {
 /// Heap entry: a run's current encoded key. Ordered by key bytes, then by run
 /// sequence so equal keys keep input order (stability).
 struct HeapKey {
-    key: Box<[u8]>,
+    key: Vec<u8>,
     seq: u64,
     idx: usize,
 }
@@ -531,7 +577,8 @@ impl PartialEq for HeapKey {
 }
 impl Eq for HeapKey {}
 
-/// One run being consumed by the merge. Holds the current line's bytes and key.
+/// One run being consumed by the merge. [`Source::next_key`] steps to a row
+/// and hands out its key; [`Source::current_line`] is that row's bytes.
 struct Source {
     seq: u64,
     kind: SourceKind,
@@ -542,11 +589,13 @@ enum SourceKind {
         blob: Vec<u8>,
         lines: Vec<(u32, u32)>,
         keys: Vec<Box<[u8]>>,
-        pos: usize,
+        /// Index of the next row to step to; the current row is `next - 1`.
+        next: usize,
     },
     File {
         reader: BufReader<File>,
         _run: TempRun,
+        /// The current row's line; empty once the run is exhausted.
         line: Vec<u8>,
     },
 }
@@ -558,87 +607,47 @@ impl Source {
                 blob,
                 lines,
                 keys,
-                pos: 0,
+                next: 0,
             },
-            RunData::File(temp) => {
-                let mut reader = BufReader::new(File::open(&temp.path)?);
-                let mut line = Vec::new();
-                read_line(&mut reader, &mut line)?; // prime the first line
-                SourceKind::File {
-                    reader,
-                    _run: temp,
-                    line,
-                }
-            }
+            RunData::File(temp) => SourceKind::File {
+                reader: BufReader::new(File::open(&temp.path)?),
+                _run: temp,
+                line: Vec::new(),
+            },
         };
         Ok(Source { seq: run.seq, kind })
     }
 
-    /// The encoded key of the current row, or `None` if the run is exhausted.
-    /// Must be called exactly once per row (Mem keys are moved out).
-    fn key(&mut self, sort: &SortStmt) -> Result<Option<Box<[u8]>>, Error> {
+    /// Step to the next row and return its encoded key, or `None` once the
+    /// run is exhausted. `spent` is the key buffer the merge just emitted; a
+    /// file run reads the next key into it, so the merge allocates nothing
+    /// per row.
+    fn next_key(&mut self, mut spent: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         match &mut self.kind {
             SourceKind::Mem {
-                keys, pos, lines, ..
-            } => Ok((*pos < lines.len()).then(|| std::mem::take(&mut keys[*pos]))),
-            SourceKind::File { line, .. } => {
-                if line.is_empty() {
-                    Ok(None)
-                } else {
-                    encode_file_line(line, sort).map(Some)
-                }
+                keys, next, lines, ..
+            } => {
+                let key = keys.get_mut(*next).map(|k| std::mem::take(k).into_vec());
+                *next = (*next + 1).min(lines.len());
+                Ok(key)
+            }
+            SourceKind::File { reader, line, .. } => {
+                Ok(read_record(reader, &mut spent, line)?.then_some(spent))
             }
         }
     }
 
-    /// The current row's line bytes (valid until the next [`Source::advance`]).
+    /// The current row's line bytes (valid until the next [`Source::next_key`]).
     fn current_line(&self) -> &[u8] {
         match &self.kind {
             SourceKind::Mem {
-                blob, lines, pos, ..
+                blob, lines, next, ..
             } => {
-                let (start, end) = lines[*pos];
+                let (start, end) = lines[*next - 1];
                 &blob[start as usize..end as usize]
             }
             SourceKind::File { line, .. } => line,
         }
-    }
-
-    /// Advance to the next row (call [`Source::key`] afterwards for its key).
-    fn advance(&mut self) -> Result<(), Error> {
-        match &mut self.kind {
-            SourceKind::Mem { pos, .. } => {
-                *pos += 1;
-                Ok(())
-            }
-            SourceKind::File { reader, line, .. } => read_line(reader, line),
-        }
-    }
-}
-
-/// Read one line (including its newline) into `buf`; `buf` is empty at EOF.
-fn read_line(reader: &mut BufReader<File>, buf: &mut Vec<u8>) -> Result<(), Error> {
-    buf.clear();
-    reader.read_until(b'\n', buf)?;
-    Ok(())
-}
-
-/// Parse a spilled line and encode its sort key.
-fn encode_file_line(line: &[u8], sort: &SortStmt) -> Result<Box<[u8]>, Error> {
-    let text = std::str::from_utf8(line)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-    let mut key = Vec::new();
-    let mut err = None;
-    csv::parse_chunk(text, |row| {
-        if err.is_none()
-            && let Err(e) = encode_key(row, sort, &mut key)
-        {
-            err = Some(e);
-        }
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(key.into()),
     }
 }
 
@@ -657,7 +666,17 @@ mod tests {
     }
 
     fn sort_lines(sort: &SortStmt, lines: &[&str], threads: usize, budget: usize) -> Vec<String> {
-        let mut s = Sorter::with_params(sort, &[], threads, std::env::temp_dir(), budget, 1 << 20);
+        sort_lines_with(sort, &[], lines, threads, budget)
+    }
+
+    fn sort_lines_with(
+        sort: &SortStmt,
+        pre: &[Stmt],
+        lines: &[&str],
+        threads: usize,
+        budget: usize,
+    ) -> Vec<String> {
+        let mut s = Sorter::with_params(sort, pre, threads, std::env::temp_dir(), budget, 1 << 20);
         for line in lines {
             s.push_block(format!("{line}\n"));
         }
@@ -725,6 +744,33 @@ mod tests {
         assert_eq!((sorter.workers(), sorter.threads), (8, 8));
     }
 
+    #[test]
+    fn spilled_runs_keep_full_key_precision() {
+        // `add v num(v)` makes the sort key a `Field::Num`, which serializes
+        // with six decimals. The spilled order must still be the in-memory
+        // order, so values that differ past the sixth decimal (and the
+        // stability of ties) cannot depend on `--sort-buffer`.
+        let mut plan = crate::parse::parse("add v num(v) | sort v=nr").unwrap();
+        plan.resolve(&["v".to_string(), "tag".to_string()]).unwrap();
+        let [
+            crate::plan::Stage::Transform(pre),
+            crate::plan::Stage::Sort(sort),
+        ] = plan.stages.as_slice()
+        else {
+            panic!("unexpected plan shape");
+        };
+        let lines = [
+            "1.00000010,a",
+            "1.00000030,b",
+            "1.00000020,c",
+            "1.00000025,d",
+        ];
+        let expected = ["1,b", "1,d", "1,c", "1,a"];
+        assert_eq!(sort_lines_with(sort, pre, &lines, 4, 1 << 30), expected);
+        assert_eq!(sort_lines_with(sort, pre, &lines, 4, 1), expected);
+    }
+
+    #[test]
     fn string_keys() {
         let s = SortStmt {
             keys: vec![key(0, false, SortMode::Lexical)],

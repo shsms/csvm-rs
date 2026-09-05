@@ -412,7 +412,9 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   least, fit `--sort-buffer`) each parse + apply the pre-sort statements,
   **serialize each row to bytes once**, compute an **order-preserving encoded
   key**, and sort their
-  block into a run (kept in memory, or spilled to a temp file past the budget).
+  block into a run (kept in memory, or spilled to a temp file past the budget
+  as length-prefixed key + line records, so the merge never re-derives a key
+  from the six-decimal serialized line).
   A single-threaded binary-heap k-way merge then picks the smallest key and
   emits the row's already-serialized line bytes via a callback — no per-field
   allocation, no re-serialization on output. A block is a contiguous input

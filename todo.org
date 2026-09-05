@@ -6,17 +6,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 
 * Open items
 
-** TODO Bugs
-- Spilled sort runs lose float precision (pre-existing, found in review
-  2026-09-05): an in-memory run keeps keys encoded from the live =Field= values,
-  but a run spilled past =--sort-buffer= keeps only the serialized line, and
-  =encode_file_line= (=sort.rs=) re-derives the key from that 6-decimal
-  =format_num= text. Two values that differ past the sixth decimal are ordered
-  in memory but tie after a spill, so the order (and stability) changes with
-  =--sort-buffer= / =-n= whenever an upstream stage produced =Field::Num=
-  (=num()=, =add=, parquet). Fix: spill the already-computed key bytes with
-  each line (length-prefixed) and read them back in the merge — which also
-  removes the per-line re-parse — or serialize spilled numbers round-trip.
 ** TODO Feature ideas
 - String and date functions in =add= (deferred from the original =add= design,
   below): =split(s, sep, i)=, regex =match(s, re)= (first capture) and =sub=,
@@ -99,6 +88,14 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE Spilled sort runs keep the full key
+Shipped 2026-09-05: a run spilled past =--sort-buffer= used to keep only the
+serialized line and re-derive its key from the six-decimal =format_num= text,
+so two =Field::Num= values differing past the sixth decimal tied after a
+spill and the order changed with the buffer size. A spilled row is now a
+length-prefixed key + line record (=write_record= / =read_record= in
+=sort.rs=), which also drops the per-line re-parse in the merge.
 
 ** DONE =-n= defaults to the core count
 Shipped 2026-09-05 (=resolve_threads= in =cli.rs=, =available_parallelism=).
