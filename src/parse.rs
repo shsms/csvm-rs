@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
-    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
+    AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef, ColType,
     ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
     JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage,
     StatsStmt, Stmt, UniqStmt, ValExpr,
@@ -90,12 +90,6 @@ struct FnDef {
 }
 
 type FnTable = std::collections::HashMap<String, FnDef>;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ColType {
-    Str,
-    Num,
-}
 
 enum Item {
     Stmt(Stmt),
@@ -839,11 +833,8 @@ impl<'a> Builder<'a> {
         // Track the new column's type so later comparisons can go numeric
         // implicitly (a data-dependent expression leaves it untyped).
         match parser.static_type(&expr) {
-            Some(true) => {
-                self.col_types.insert(name.clone(), ColType::Num);
-            }
-            Some(false) => {
-                self.col_types.insert(name.clone(), ColType::Str);
+            Some(t) => {
+                self.col_types.insert(name.clone(), t);
             }
             None => {
                 self.col_types.remove(&name);
@@ -1903,64 +1894,27 @@ impl ExprParser<'_> {
             ">=" => CmpOp::Ge,
             _ => unreachable!("filtered above"),
         };
-        let mut lhs = lhs;
-        let mut rhs = self.parse_concat()?;
+        let rhs = self.parse_concat()?;
         // Precedence: a statically numeric operand (a number literal,
         // arithmetic, a numeric function, a `to-num` column) wins; else a
         // statically string operand (a literal, concat, a bool value, a
         // `to-str` column) compares lexically; else two untyped operands auto-
         // detect per row for the orderings, and stay lexical for `==`/`!=`.
-        let (lt, rt) = (self.static_type(&lhs), self.static_type(&rhs));
-        let mode = if lt == Some(true) || rt == Some(true) {
-            CmpMode::Numeric
-        } else if lt == Some(false) || rt == Some(false) {
-            CmpMode::String
-        } else {
-            match cmp_op {
-                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge => CmpMode::Auto,
-                CmpOp::Eq | CmpOp::Ne => CmpMode::String,
-            }
-        };
-        if mode == CmpMode::Numeric {
-            lhs = numericize(lhs)?;
-            rhs = numericize(rhs)?;
-        }
-        Ok(BV::B(BoolExpr::Cmp(Cmp {
+        let mut cmp = Cmp {
             op: cmp_op,
             lhs,
             rhs,
-            mode,
-        })))
+            mode: CmpMode::Auto,
+        };
+        cmp.retype(&|c| self.types.get(&c.name).copied())?;
+        Ok(BV::B(BoolExpr::Cmp(cmp)))
     }
 
-    /// The static type of a value expression, for the comparison-mode decision
-    /// and the `add` column type: `Some(true)` numeric, `Some(false)` string,
-    /// `None` data-dependent. Column (and `prev`) leaves consult the tracked
-    /// `to-num`/`to-str` types; a `?:` is typed only if both branches agree.
-    fn static_type(&self, e: &ValExpr) -> Option<bool> {
-        match e {
-            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
-                Some(true)
-            }
-            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(false),
-            // `coalesce` passes its arguments through, so its type depends on
-            // the data; every other function returns a fixed type.
-            ValExpr::Func(Func::Coalesce, _) => None,
-            ValExpr::Func(f, _) => Some(!matches!(f, Func::Upper | Func::Lower | Func::Trim)),
-            ValExpr::Col(c) | ValExpr::Prev(c) => match self.types.get(&c.name) {
-                Some(ColType::Num) => Some(true),
-                Some(ColType::Str) => Some(false),
-                None => None,
-            },
-            ValExpr::Cond { then_, else_, .. } => {
-                let t = self.static_type(then_);
-                if t == self.static_type(else_) {
-                    t
-                } else {
-                    None
-                }
-            }
-        }
+    /// The static type of a value expression ([`ValExpr::static_type`]), with
+    /// column leaves looked up in the tracked `to-num` / `to-str` / `add`
+    /// types by name.
+    fn static_type(&self, e: &ValExpr) -> Option<ColType> {
+        e.static_type(&|c| self.types.get(&c.name).copied())
     }
 
     // --- value expressions (for `add`) --------------------------------------
@@ -2161,18 +2115,6 @@ fn check_arity(func: Func, n: usize) -> Result<(), Error> {
 }
 
 /// In a numeric comparison, a string literal is parsed at parse time.
-fn numericize(e: ValExpr) -> Result<ValExpr, Error> {
-    match e {
-        ValExpr::Str(s) => match s.trim().parse::<f64>() {
-            Ok(n) => Ok(ValExpr::Num(n)),
-            Err(_) => Err(err(format!(
-                "non-numeric literal '{s}' in numeric comparison"
-            ))),
-        },
-        other => Ok(other),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -79,6 +79,49 @@ pub struct Cmp {
     pub mode: CmpMode,
 }
 
+/// A column's known type: set by `to-num` / `to-str`, or by the static type
+/// of the `add` expression that produced it. An untyped column is `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColType {
+    Str,
+    Num,
+}
+
+impl CmpMode {
+    /// The mode for `op` from the operands' static types: a numeric side wins,
+    /// else a string side compares lexically, else two untyped sides
+    /// auto-detect per row for an ordering and stay lexical for `==` / `!=`.
+    pub fn decide(op: CmpOp, lt: Option<ColType>, rt: Option<ColType>) -> CmpMode {
+        if lt == Some(ColType::Num) || rt == Some(ColType::Num) {
+            CmpMode::Numeric
+        } else if lt == Some(ColType::Str) || rt == Some(ColType::Str) {
+            CmpMode::String
+        } else {
+            match op {
+                CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge => CmpMode::Auto,
+                CmpOp::Eq | CmpOp::Ne => CmpMode::String,
+            }
+        }
+    }
+}
+
+/// Fold a string literal into the number it spells, for a numeric comparison;
+/// a literal that is not a number is a compile error. Anything else is left
+/// as it is.
+pub(crate) fn numericize(e: &mut ValExpr) -> Result<(), Error> {
+    if let ValExpr::Str(s) = e {
+        match s.trim().parse::<f64>() {
+            Ok(n) => *e = ValExpr::Num(n),
+            Err(_) => {
+                return Err(Error::Compile(format!(
+                    "non-numeric literal '{s}' in numeric comparison"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Which end of the cell a substring test anchors to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AffixKind {
@@ -884,6 +927,22 @@ pub(crate) fn cell_num(row: &[Field], pos: usize) -> Result<f64, Error> {
 }
 
 impl Cmp {
+    /// Decide the mode from the operands' static types (`col` gives a column
+    /// leaf's known type) and, for a numeric compare, fold string literals
+    /// into numbers — a literal that is not a number is a compile error.
+    pub fn retype(&mut self, col: &dyn Fn(&ColRef) -> Option<ColType>) -> Result<(), Error> {
+        self.mode = CmpMode::decide(
+            self.op,
+            self.lhs.static_type(col),
+            self.rhs.static_type(col),
+        );
+        if self.mode == CmpMode::Numeric {
+            numericize(&mut self.lhs)?;
+            numericize(&mut self.rhs)?;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<bool, Error> {
         let ord = match self.mode {
@@ -1134,6 +1193,32 @@ impl ValExpr {
         // `?` on eval: a hard error (bad arithmetic, div by zero) still aborts;
         // only the final coercion is soft.
         Ok(self.eval(row, ctx)?.coerce_num().ok())
+    }
+
+    /// The static type of a value expression, for the comparison-mode decision
+    /// and the `add` column type: `None` is data-dependent. `col` gives a
+    /// column (or `prev`) leaf's known type; a `?:` is typed only if both
+    /// branches agree.
+    pub fn static_type(&self, col: &dyn Fn(&ColRef) -> Option<ColType>) -> Option<ColType> {
+        match self {
+            ValExpr::Num(_) | ValExpr::Neg(_) | ValExpr::Arith { .. } | ValExpr::Rownum => {
+                Some(ColType::Num)
+            }
+            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(ColType::Str),
+            // `coalesce` passes its arguments through, so its type depends on
+            // the data; every other function returns a fixed type.
+            ValExpr::Func(Func::Coalesce, _) => None,
+            ValExpr::Func(f, _) => Some(if matches!(f, Func::Upper | Func::Lower | Func::Trim) {
+                ColType::Str
+            } else {
+                ColType::Num
+            }),
+            ValExpr::Col(c) | ValExpr::Prev(c) => col(c),
+            ValExpr::Cond { then_, else_, .. } => {
+                let t = then_.static_type(col);
+                if t == else_.static_type(col) { t } else { None }
+            }
+        }
     }
 
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
