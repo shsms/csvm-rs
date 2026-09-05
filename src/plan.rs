@@ -515,9 +515,12 @@ impl AddStmt {
         self.expr.resolve(header, types)?;
         // The new column carries the expression's static type.
         let ty = self.expr.static_type(&|c| types[c.pos]);
-        match header.iter().position(|h| h == &self.name) {
+        // The target names an existing column to replace in place — by name,
+        // or by position like any other column reference — else a new one.
+        match resolve_col_opt(&self.name, header)? {
             Some(i) => {
                 self.pos = Some(i);
+                self.name = header[i].clone();
                 types[i] = ty;
             }
             None => {
@@ -866,6 +869,16 @@ fn resolve_col(name: &str, header: &[String]) -> Result<usize, Error> {
     })
 }
 
+/// [`resolve_col`] with an unknown *name* as `Ok(None)`. A position out of
+/// range is still an error: a bare integer is never taken as a new name.
+fn resolve_col_opt(name: &str, header: &[String]) -> Result<Option<usize>, Error> {
+    match resolve_col(name, header) {
+        Ok(p) => Ok(Some(p)),
+        Err(Error::Column { .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// A bare unsigned integer (digits only: no sign, no whitespace), or `None`.
 /// A value too large for `usize` saturates, so it is still read as a
 /// position (and reported out of range), never as a name.
@@ -896,9 +909,9 @@ fn resolve_col_spec(spec: &str, header: &[String], unknown: Unknown) -> Result<V
         return Ok(vec![p]);
     }
     let Some((lo, hi)) = range_bounds(spec) else {
-        return match (resolve_col(spec, header), unknown) {
-            (Err(Error::Column { .. }), Unknown::Ignore) => Ok(Vec::new()),
-            (r, _) => r.map(|p| vec![p]),
+        return match unknown {
+            Unknown::Ignore => Ok(resolve_col_opt(spec, header)?.into_iter().collect()),
+            Unknown::Error => resolve_col(spec, header).map(|p| vec![p]),
         };
     };
     // An endpoint error names the whole spec: the user typed `us:east`, not `us`.

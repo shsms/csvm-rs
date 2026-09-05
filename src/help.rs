@@ -161,7 +161,8 @@ pub const COMMANDS: &[CmdHelp] = &[
         detail: "Reorders to the listed order. Names may be comma- or space-separated; \
 backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`. A bare \
 integer that is not a column name is a 1-based position (handy with --no-header's c1, c2, …), \
-and that works wherever a column is named — sort, group, agg, stats — not just here. Inside an \
+and that works wherever a column is named — sort, group, agg, stats, add's target — not just \
+here. Inside an \
 expression a bare integer is a number literal, so backtick it there: select `3` > 0. A range \
 expands in header order; an exact column name always wins over a position or range reading. \
 In `cols -v` an unknown name is ignored, but a bad position or range is an error.",
@@ -358,7 +359,12 @@ plus each right's non-key columns; a clashing right name is suffixed _r.",
         name: "add",
         aliases: &[],
         summary: "append a computed column",
-        synopsis: &["add NAME EXPR   append (or, if NAME exists, replace) a column = EXPR"],
+        synopsis: &[
+            "add NAME EXPR   append a column = EXPR, or replace NAME in place if it exists",
+            "                (NAME may also be a 1-based position of an existing column;",
+            "                in EXPR a bare integer is a number, so backtick a position",
+            "                there: add 2 num(`2`))",
+        ],
         detail: "EXPR is a value expression over the row: arithmetic (+ - * / %, parens), \
 string concat with ++, the functions round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/\
 sign/min/max/len/upper/lower/trim/coalesce/num/str, a ternary TEST ? A : B, and constants. \
@@ -503,7 +509,8 @@ The same value grammar works as a comparison operand in select / ternary tests, 
 so `select price * qty >= 30`, `abs(x) > 1`, and `(a >= 0) == (b >= 0)` all parse. \
 prev() / rownum() make the run single-threaded and in input order (also from a select). \
 Divide/modulo by zero, or arithmetic on a non-number, aborts the run. \
-If NAME already exists, add replaces it in place; otherwise it is appended.",
+If NAME already exists, add replaces it in place; otherwise it is appended (a bare integer \
+NAME is a 1-based position and must be in range, see `csvm help add`).",
     },
     Topic {
         name: "types",

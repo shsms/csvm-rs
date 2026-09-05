@@ -459,6 +459,10 @@ fn columns_by_position_and_range() {
     // error too, not a silent no-op (only an unknown bare name is ignored).
     let err = run("cols -v 2-9", input, 1).unwrap_err();
     assert!(err.contains("out of range"), "{err}");
+    let err = run("cols -v 9", input, 1).unwrap_err();
+    assert!(err.contains("column index 9 is out of range"), "{err}");
+    // A column literally named `7` wins over the (non-existent) position 7.
+    assert_eq!(run_checked("cols -v 7", "id,7\n1,x\n"), "id\n1\n");
     let err = run("cols -v qty:nope", input, 1).unwrap_err();
     assert!(err.contains("range qty:nope"), "{err}");
     assert!(err.contains("column not found: nope"), "{err}");
@@ -554,4 +558,36 @@ fn unknown_column_errors() {
 fn bad_script_is_a_parse_error() {
     let err = run("frobnicate a", INPUT, 1).unwrap_err();
     assert!(err.contains("unknown command"), "got: {err}");
+}
+
+#[test]
+fn add_can_name_its_target_by_position() {
+    // `add` takes its target by position like any other column reference:
+    // the column is replaced in place (the header keeps its name) and typed
+    // by the expression, so a later bare sort on it is pinned.
+    let input = "id,qty\n1,10\n2,9\n3,100\n";
+    assert_eq!(
+        run_checked("add 2 str(`2`) | sort qty", input),
+        "id,qty\n1,10\n3,100\n2,9\n"
+    );
+    assert_eq!(
+        run_checked("add 2 num(`2`) | sort qty", input),
+        "id,qty\n2,9\n1,10\n3,100\n"
+    );
+    // A column literally named `7` wins over the (non-existent) position 7.
+    assert_eq!(
+        run_checked("add 7 num(qty) * 2", "7,qty\nx,10\n"),
+        "7,qty\n20,10\n"
+    );
+}
+
+#[test]
+fn add_rejects_a_position_that_is_out_of_range() {
+    // A bare integer target is a position, so one past the header is an
+    // error like anywhere else, not a new column named after the number.
+    let input = "id,qty\n1,10\n";
+    let err = run("add 7 num(qty)", input, 1).unwrap_err();
+    assert!(err.contains("column index 7 is out of range"), "{err}");
+    let err = run("add 0 num(qty)", input, 1).unwrap_err();
+    assert!(err.contains("column index 0 is out of range"), "{err}");
 }

@@ -190,7 +190,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`add NAME EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`
-  in place if it already exists (`AddStmt.pos`). `EXPR` is a *value* expression
+  in place if it already exists (`AddStmt.pos`; `NAME` may also be a 1-based
+  position of an existing column, like any other column reference, and the
+  header keeps that column's name; inside `EXPR` a bare integer is a number
+  literal, so a position there is backticked: ``add 2 num(`2`)``). On a
+  ragged row the replaced cell is padded into place (a missing cell reads as
+  blank, so `num()` gives 0). `EXPR` is a *value* expression
   (`ValExpr` in `plan.rs`): arithmetic (`+ - * / %`), `++` concat, the function
   set (`round/floor/ceil/abs/int/sqrt/pow/exp/log/log10/log2/sign/min/max/len/
   upper/lower/trim/coalesce/num/str` — the math functions follow IEEE at

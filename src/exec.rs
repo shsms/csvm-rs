@@ -2584,6 +2584,11 @@ mod tests {
         let _ = plan.resolve(&["id".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("countZ[1] id[0] :num"), "{d}");
+        // `add` can name its target by position; the dump shows the column.
+        let mut plan = parse("add 2 num(`2`)").unwrap();
+        let _ = plan.resolve(&["id".into(), "qty".into()]);
+        let d = describe(&plan);
+        assert!(d.contains("add qty[1] = (num qty[1])"), "{d}");
         // The stats profile columns are typed, so a compare between two of
         // them is numeric, not auto.
         let mut plan = parse("stats | select count > empty").unwrap();
