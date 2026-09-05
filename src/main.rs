@@ -64,7 +64,7 @@ fn run() -> Result<(), String> {
         sort_buffer: args.sort_buffer,
     };
 
-    let (mut source, header) = open_source(&args, plan.input_header.as_deref())?;
+    let (mut source, header) = open_source(&args)?;
     // Joins need each right file's header to resolve; read them (IO) first.
     exec::prepare_joins(&mut plan).map_err(|e| e.to_string())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
@@ -113,33 +113,32 @@ fn color_enabled(when: cli::ColorWhen, out_file: Option<&str>) -> bool {
     }
 }
 
-/// Open the input and determine its header. With `input_header` (from a `hdr`
-/// command) the input has no header line: the supplied names are the header and
-/// the whole input is data. Otherwise the first line is read as the header.
-fn open_source(
-    args: &cli::Args,
-    input_header: Option<&[String]>,
-) -> Result<(Source, Vec<String>), String> {
+/// Open the input and determine its header. With `--header` the input has no
+/// header line: the given (or auto) names are the header and the whole input
+/// is data. Otherwise the first line is read as the header.
+fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     // Parquet carries its own typed schema, so it bypasses the CSV header logic
     // (and, without the feature, reports the build hint before anything else).
     if input_format(args) == cli::InputFormat::Parquet {
-        return open_parquet(args, input_header);
+        return open_parquet(args);
     }
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
-            let (header, data_start, file_len) = if let Some(h) = input_header {
-                let len = std::fs::metadata(path)
-                    .map_err(|e| format!("cannot stat '{path}': {e}"))?
-                    .len();
-                (h.to_vec(), 0, len)
-            } else if args.no_header {
-                // Peek the first line only to count columns; it is data, so the
-                // data region starts at byte 0.
-                let (first, _data_start, file_len) =
-                    exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
-                (auto_header(first.len()), 0, file_len)
-            } else {
-                exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?
+            let (header, data_start, file_len) = match &args.header {
+                Some(cli::Header::Named(h)) => {
+                    let len = std::fs::metadata(path)
+                        .map_err(|e| format!("cannot stat '{path}': {e}"))?
+                        .len();
+                    (h.clone(), 0, len)
+                }
+                Some(cli::Header::Auto) => {
+                    // Peek the first line only to count columns; it is data, so
+                    // the data region starts at byte 0.
+                    let (first, _data_start, file_len) =
+                        exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
+                    (auto_header(first.len()), 0, file_len)
+                }
+                None => exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?,
             };
             let source = Source::File {
                 path: PathBuf::from(path),
@@ -150,10 +149,10 @@ fn open_source(
         }
         None => {
             let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin()));
-            if let Some(h) = input_header {
-                return Ok((Source::Stream(reader), h.to_vec()));
+            if let Some(cli::Header::Named(h)) = &args.header {
+                return Ok((Source::Stream(reader), h.clone()));
             }
-            if args.no_header {
+            if args.header == Some(cli::Header::Auto) {
                 // Read the first line to count columns, then chain it back in
                 // front of the rest so the whole stream is processed as data.
                 let mut first = Vec::new();
@@ -173,7 +172,7 @@ fn open_source(
     }
 }
 
-/// Auto-generated column names for `--no-header`: `c1, c2, …, cn`.
+/// Auto-generated column names for `--header -`: `c1, c2, …, cn`.
 fn auto_header(n: usize) -> Vec<String> {
     (1..=n).map(|i| format!("c{i}")).collect()
 }
@@ -197,23 +196,19 @@ fn input_format(args: &cli::Args) -> cli::InputFormat {
 }
 
 /// Resolve a parquet input to a `Source` and its schema header. Parquet needs a
-/// seekable file (footer metadata) and ignores `hdr`/`--no-header` (the schema
-/// is the header). Without the feature this returns the build hint immediately,
-/// so a missing build is reported ahead of any other argument problem.
+/// seekable file (footer metadata) and rejects `--header` (the schema is the
+/// header). Without the feature this returns the build hint immediately, so a
+/// missing build is reported ahead of any other argument problem.
 #[cfg(feature = "parquet")]
-fn open_parquet(
-    args: &cli::Args,
-    input_header: Option<&[String]>,
-) -> Result<(Source, Vec<String>), String> {
+fn open_parquet(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     let path = args
         .in_file
         .as_deref()
         .filter(|p| *p != "-")
         .ok_or_else(|| "parquet input must be a seekable file, not stdin".to_string())?;
-    if input_header.is_some() || args.no_header {
+    if args.header.is_some() {
         return Err(
-            "hdr / --no-header don't apply to parquet input (it carries a typed schema)"
-                .to_string(),
+            "--header doesn't apply to parquet input (it carries a typed schema)".to_string(),
         );
     }
     let header = csvm::parquet::read_header(Path::new(path)).map_err(|e| e.to_string())?;
@@ -226,10 +221,7 @@ fn open_parquet(
 }
 
 #[cfg(not(feature = "parquet"))]
-fn open_parquet(
-    _args: &cli::Args,
-    _input_header: Option<&[String]>,
-) -> Result<(Source, Vec<String>), String> {
+fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     Err("parquet input requires building csvm with --features parquet".to_string())
 }
 

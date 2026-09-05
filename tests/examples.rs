@@ -19,11 +19,21 @@ id,fieldA,fieldB,countA,countZ
 ";
 
 fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
+    run_with_header(script, input, None, threads)
+}
+
+/// Like [`run`]; with `header`, the input has no header line and these are
+/// its column names (the `--header` flag).
+fn run_with_header(
+    script: &str,
+    input: &str,
+    header: Option<&[&str]>,
+    threads: usize,
+) -> Result<String, String> {
     let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(input.as_bytes());
-    // With `hdr`, the input has no header line; the supplied names are the header.
-    let header = match plan.input_header.as_deref() {
-        Some(h) => h.to_vec(),
+    let header = match header {
+        Some(h) => h.iter().map(|s| s.to_string()).collect(),
         None => exec::read_header(&mut reader).map_err(|e| e.to_string())?,
     };
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
@@ -47,8 +57,12 @@ fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
 
 /// Run single-threaded and multi-threaded; assert identical, and return it.
 fn run_checked(script: &str, input: &str) -> String {
-    let serial = run(script, input, 1).expect("serial run failed");
-    let parallel = run(script, input, 4).expect("parallel run failed");
+    run_checked_with_header(script, input, None)
+}
+
+fn run_checked_with_header(script: &str, input: &str, header: Option<&[&str]>) -> String {
+    let serial = run_with_header(script, input, header, 1).expect("serial run failed");
+    let parallel = run_with_header(script, input, header, 4).expect("parallel run failed");
     assert_eq!(
         serial, parallel,
         "thread count changed the output for: {script}"
@@ -299,9 +313,23 @@ fn quoted_fields_roundtrip() {
 }
 
 fn run_file_str(script: &str, path: &std::path::Path, threads: usize) -> String {
+    run_file_with_header(script, path, None, threads)
+}
+
+/// Like [`run_file_str`]; with `header`, the whole file is data.
+fn run_file_with_header(
+    script: &str,
+    path: &std::path::Path,
+    header: Option<&[&str]>,
+    threads: usize,
+) -> String {
     let mut plan = csvm::parse::parse(script).unwrap();
-    let (header, data_start, file_len) = match plan.input_header.as_deref() {
-        Some(h) => (h.to_vec(), 0, std::fs::metadata(path).unwrap().len()),
+    let (header, data_start, file_len) = match header {
+        Some(h) => (
+            h.iter().map(|s| s.to_string()).collect(),
+            0,
+            std::fs::metadata(path).unwrap().len(),
+        ),
         None => exec::read_header_from_path(path).unwrap(),
     };
     let out_header = plan.resolve(&header).unwrap();
@@ -436,15 +464,16 @@ fn fmt_right_justifies_numeric_columns() {
 #[test]
 fn fmt_mixes_numeric_and_text_justification() {
     // numeric, text, numeric: id and amount right-justified, name left.
-    let out = run_checked("hdr id,name,amount | fmt", HEADERLESS);
+    let out = run_checked_with_header("fmt", HEADERLESS, Some(HEADER));
     assert_eq!(
         out,
         "id  name   amount\n 1  alice     100\n 2  bob       200\n 3  carol     300\n"
     );
 }
 
-// Headerless input: every line is data; `hdr` supplies the column names.
+// Headerless input: every line is data; `--header` supplies the column names.
 const HEADERLESS: &str = "1,alice,100\n2,bob,200\n3,carol,300\n";
+const HEADER: &[&str] = &["id", "name", "amount"];
 
 /// Four columns for the positional-reference tests: `2` is `qty`, `4` is `name`.
 const POSITIONAL: &str = "id,qty,stock,name\n1,100,50,alice\n2,9,20,bob\n";
@@ -453,7 +482,7 @@ const POSITIONAL: &str = "id,qty,stock,name\n1,100,50,alice\n2,9,20,bob\n";
 fn columns_by_position_and_range() {
     // Positional references (1-based) and ranges work wherever a column is
     // named; the resolver is shared, so sort sees them too. The auto-named
-    // header from --no-header (`c1,c2,…`) is what makes this useful.
+    // header from `--header -` (`c1,c2,…`) is what makes this useful.
     let input = POSITIONAL;
     assert_eq!(run_checked("cols 4,1", input), "name,id\nalice,1\nbob,2\n");
     assert_eq!(
@@ -462,7 +491,7 @@ fn columns_by_position_and_range() {
     );
     assert_eq!(run_checked("cols -v 2:name", input), "id\n1\n2\n");
     assert_eq!(
-        run_checked("hdr a,b,c,d | cols 1,b:3", input),
+        run_checked_with_header("cols 1,b:3", input, Some(&["a", "b", "c", "d"])),
         "a,b,c\nid,qty,stock\n1,100,50\n2,9,20\n"
     );
     let err = run("cols 5", input, 1).unwrap_err();
@@ -527,46 +556,37 @@ fn fixture_files_are_removed_when_dropped() {
 }
 
 #[test]
-fn hdr_prepends_header_all_lines_are_data() {
+fn header_flag_prepends_header_all_lines_are_data() {
     // The first input line is data, not a header — it survives to the output.
     assert_eq!(
-        run_checked("hdr id,name,amount", HEADERLESS),
+        run_checked_with_header("cols id,name,amount", HEADERLESS, Some(HEADER)),
         "id,name,amount\n1,alice,100\n2,bob,200\n3,carol,300\n"
     );
 }
 
 #[test]
-fn hdr_columns_usable_downstream() {
-    // Names from `hdr` are referenceable; numeric compare works (no header eaten).
+fn header_flag_columns_usable_downstream() {
+    // The given names are referenceable; numeric compare works (no header eaten).
     assert_eq!(
-        run_checked(
-            "hdr id,name,amount | select amount > 150 | cols name",
-            HEADERLESS
-        ),
+        run_checked_with_header("select amount > 150 | cols name", HEADERLESS, Some(HEADER)),
         "name\nbob\ncarol\n"
     );
 }
 
 #[test]
-fn hdr_sharded_file_matches_serial() {
+fn header_flag_sharded_file_matches_serial() {
     // Sharded file path (data_start = 0): first line is data in every shard split.
     let path = temp_csv(HEADERLESS);
-    let serial = run_file_str("hdr id,name,amount | select id >= 2", &path, 1);
-    let parallel = run_file_str("hdr id,name,amount | select id >= 2", &path, 4);
+    let serial = run_file_with_header("select id >= 2", &path, Some(HEADER), 1);
+    let parallel = run_file_with_header("select id >= 2", &path, Some(HEADER), 4);
     assert_eq!(serial, parallel);
     assert_eq!(serial, "id,name,amount\n2,bob,200\n3,carol,300\n");
 }
 
 #[test]
-fn hdr_must_be_first() {
-    let err = run("select amount > 0 | hdr id,name,amount", HEADERLESS, 1).unwrap_err();
-    assert!(err.contains("must be the first"), "got: {err}");
-}
-
-#[test]
-fn hdr_only_once() {
-    let err = run("hdr a,b,c | hdr d,e,f", HEADERLESS, 1).unwrap_err();
-    assert!(err.contains("only once"), "got: {err}");
+fn hdr_command_points_at_the_flag() {
+    let err = run("hdr id,name,amount", HEADERLESS, 1).unwrap_err();
+    assert!(err.contains("--header a,b,c"), "got: {err}");
 }
 
 #[test]

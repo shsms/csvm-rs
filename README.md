@@ -42,7 +42,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `-t, --temp-dir`   | directory for sort spill files (default: system temp)       |
 | `--chunk-size SIZE`| input chunk size; `K`/`M`/`G` suffix ok (default: 1 000 000) |
 | `--sort-buffer SIZE`| in-memory budget before `sort` spills; `K`/`M`/`G` ok (default 256 MiB) |
-| `--no-header`      | input has no header row; columns are named `c1, c2, …`      |
+| `--header NAMES`   | input has no header row; `a,b,c` names the columns, `-` names them `c1, c2, …` |
 | `--color WHEN`     | `auto` (TTY only), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE` |
 | `--explain`   | print the compiled plan and exit                            |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
@@ -79,7 +79,6 @@ Each stage is a command with comma- or space-separated arguments:
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME EXPR`    | append a computed column (replaces `NAME` in place if it exists) |
 | `delta [-s SUF] a,b` | append `col_delta = col - prev(col)` per column (shorthand) |
-| `hdr a,b,c`        | supply column names for headerless input (must come first) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL VALUE` | one horizontal bar per row (sink; use after group-by) |
@@ -90,7 +89,7 @@ Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 A `#` outside quotes starts a comment to end of line. A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age ``. A bare integer
 that is not a column name is a 1-based position, in any command that names a
-column (`sort 2=nr`, `group 1`); with `--no-header` that is the natural way in.
+column (`sort 2=nr`, `group 1`); with `--header -` that is the natural way in.
 
 ### Per-command detail
 

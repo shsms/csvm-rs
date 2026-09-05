@@ -1409,10 +1409,7 @@ pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
             prepare_joins(&mut j.right_plan)?;
-            let in_header = match &j.right_plan.input_header {
-                Some(h) => h.clone(),
-                None => read_header_from_path(Path::new(&j.file))?.0,
-            };
+            let in_header = read_header_from_path(Path::new(&j.file))?.0;
             j.right_header = j.right_plan.resolve(&in_header)?;
         }
     }
@@ -1425,13 +1422,7 @@ pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
 /// the smaller one, so the extra serialize/parse is cheap and reuses all paths.
 fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>, Error> {
     let path = Path::new(&j.file);
-    let (data_start, file_len) = match &j.right_plan.input_header {
-        Some(_) => (0, std::fs::metadata(path)?.len()),
-        None => {
-            let (_, ds, fl) = read_header_from_path(path)?;
-            (ds, fl)
-        }
-    };
+    let (_, data_start, file_len) = read_header_from_path(path)?;
     let mut buf: Vec<u8> = Vec::new();
     run_file(
         &j.right_plan,
@@ -2071,9 +2062,6 @@ fn write_csv_colored<W: Write>(
 /// the column positions each one resolved to.
 pub fn describe(plan: &Plan) -> String {
     let mut out = String::new();
-    if let Some(h) = &plan.input_header {
-        out.push_str(&format!("input header (hdr): {h:?}\n"));
-    }
     for (i, stage) in plan.stages.iter().enumerate() {
         let n = i + 1;
         match stage {

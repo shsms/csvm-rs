@@ -29,10 +29,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   bare =group X= as a count — and the fusion rule carries its own non-fusable
   error cases. Pick one primary form and demote the rest to documented aliases
   (or drop them); shrinks the parser and the =agg= help page.
-- =hdr= and =--no-header= overlap: a language command that must come first vs
-  a CLI flag. A single =--header a,b,c= flag (with =--no-header= as the
-  auto-naming case) removes the "must be the first command" special case from
-  the language.
 - The =join= item grammar has a documented ambiguity: a keyless file after an
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
@@ -86,6 +82,13 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE =--header= replaces =hdr= and =--no-header=
+Shipped 2026-09-05: one CLI flag names a headerless input's columns
+(=--header a,b,c=) or auto-names them (=--header -=). The =hdr= command is
+gone (a hint points at the flag), and with it the "must be the first
+command" rule and =Plan.input_header=; a =join= right file always carries
+its own header.
 
 ** DONE Spilled sort runs keep the full key
 Shipped 2026-09-05: a run spilled past =--sort-buffer= used to keep only the
@@ -395,8 +398,8 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 First cut of the pluggable-format roadmap. Feature-gated (=--features parquet=
 pulls =parquet=+=arrow=+codecs) to keep the default dep tree lean. =src/parquet.rs=
 wraps the arrow =ParquetRecordBatchReader=; selected by a =.parquet= extension or
-=--format parquet=; needs a seekable file (footer metadata), so stdin/=hdr=/
-=--no-header= are rejected. The schema gives header *and types* — numeric columns
+=--format parquet=; needs a seekable file (footer metadata), so stdin and
+=--header= are rejected. The schema gives header *and types* — numeric columns
 decode to =Field::Num= (no =to-num= needed), bool ⇒ =t=/=f=, null ⇒ empty; only
 flat primitives are supported (others error by name). =exec::run_parquet= streams
 a lone transform batch-by-batch, materializes for blocking stages. =gen_parquet=

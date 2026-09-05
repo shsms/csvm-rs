@@ -820,9 +820,6 @@ pub struct GraphSpec {
 pub struct Plan {
     pub stages: Vec<Stage>,
     pub output: OutputFormat,
-    /// Column names supplied by a `hdr` command, for input that has no header
-    /// line. When set, the whole input is data and this is the header.
-    pub input_header: Option<Vec<String>>,
     /// Colour rules, applied to the output rows at render time.
     pub colors: Vec<ColorRule>,
     /// A terminal chart to draw instead of emitting CSV (the `graph` sink).
@@ -1818,7 +1815,6 @@ mod tests {
                 })),
             ])],
             output: OutputFormat::Csv,
-            input_header: None,
             colors: Vec::new(),
             graph: None,
         };
@@ -1962,7 +1958,6 @@ mod tests {
                 positions: vec![],
             })])],
             output: OutputFormat::Csv,
-            input_header: None,
             colors: Vec::new(),
             graph: None,
         };

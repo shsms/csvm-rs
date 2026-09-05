@@ -35,7 +35,8 @@ const HEADER: &str = "  SCRIPT   pipe-syntax pipeline; quote it so the shell kee
 options (--flag VALUE or --flag=VALUE):
   -o, --output FILE    write to FILE (default: stdout)
   -f, --file FILE      read the pipeline from FILE instead of SCRIPT
-      --no-header      input has no header; name columns c1, c2, ...
+      --header NAMES   input has no header line; NAMES (a,b,c) name its columns,
+                       and `-` auto-names them c1, c2, ...
       --format FMT     input format: csv (default) | parquet (auto by extension;
                        parquet needs a build with --features parquet)
   -n, --threads N      worker threads, at most 1024 (default: the core count;
@@ -162,7 +163,7 @@ pub const COMMANDS: &[CmdHelp] = &[
         ],
         detail: "Reorders to the listed order. Names may be comma- or space-separated; \
 backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`. A bare \
-integer that is not a column name is a 1-based position (handy with --no-header's c1, c2, …), \
+integer that is not a column name is a 1-based position (handy with --header -'s c1, c2, …), \
 and that works wherever a column is named — sort, group, agg, stats, add's target — not just \
 here. Inside an \
 expression a bare integer is a number literal, so backtick it there: select `3` > 0. A range \
@@ -171,7 +172,7 @@ In `cols -v` an unknown name is ignored, but a bad position or range is an error
         examples: &[
             "csvm 'cols id,amount' data.csv",
             "csvm 'cols -v notes' data.csv",
-            "csvm --no-header 'cols 2-4 | sort 1=n' data.csv",
+            "csvm --header - 'cols 2-4 | sort 1=n' data.csv",
         ],
     },
     CmdHelp {
@@ -401,15 +402,6 @@ delta is 0.",
             "csvm 'delta amount' data.csv",
             "csvm 'delta -s _change amount qty | fmt' data.csv",
         ],
-    },
-    CmdHelp {
-        name: "hdr",
-        aliases: &[],
-        summary: "name columns of headerless input",
-        synopsis: &["hdr A,B,C       supply column names (must be the first command)"],
-        detail: "For input with no header line: the whole input is data and these names are \
-prepended on output. (The CLI's --no-header instead auto-names columns c1, c2, ….)",
-        examples: &["csvm 'hdr id,name,amount | select amount > 0' data.csv"],
     },
     CmdHelp {
         name: "color",

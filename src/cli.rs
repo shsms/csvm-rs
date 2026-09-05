@@ -5,7 +5,7 @@
 //! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
-//! `--no-header`, `--color`, `--format` (csv | parquet), and `--explain`.
+//! `--header`, `--color`, `--format` (csv | parquet), and `--explain`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -26,12 +26,39 @@ pub struct Args {
     pub sort_buffer: usize,
     pub explain: bool,
     pub color: ColorWhen,
-    /// `--no-header`: the input has no header line; columns are auto-named
-    /// `c1, c2, …`. Ignored if a `hdr` command supplies names instead.
-    pub no_header: bool,
+    /// `--header`: the input has no header line; this names its columns.
+    pub header: Option<Header>,
     /// `--format`: input format override. `None` auto-detects from the file
     /// extension (`.parquet` ⇒ Parquet, else CSV).
     pub format: Option<InputFormat>,
+}
+
+/// `--header`: how a headerless input's columns are named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Header {
+    /// These names, in order.
+    Named(Vec<String>),
+    /// `c1, c2, …`, one per column of the first line.
+    Auto,
+}
+
+impl Header {
+    /// Parse the flag's value: `-` or empty auto-names; else a comma list,
+    /// read like a header line (so a quoted name may contain a comma).
+    fn parse(value: &str) -> Result<Header, String> {
+        let value = value.trim();
+        if value.is_empty() || value == "-" {
+            return Ok(Header::Auto);
+        }
+        let names: Vec<String> = crate::csv::parse_header(value)
+            .into_iter()
+            .map(|n| n.trim().to_string())
+            .collect();
+        if names.iter().any(String::is_empty) {
+            return Err(format!("--header has an empty column name in '{value}'"));
+        }
+        Ok(Header::Named(names))
+    }
 }
 
 /// The input format, set by `--format` or auto-detected from the extension.
@@ -110,7 +137,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut explain = false;
     let mut color = ColorWhen::default();
     let mut script_file = None;
-    let mut no_header = false;
+    let mut header = None;
     let mut format = None;
 
     let mut it = args.into_iter();
@@ -163,7 +190,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--explain" => explain = true,
-            "--no-header" => no_header = true,
+            "--header" => header = Some(Header::parse(&value!())?),
             "--format" => {
                 let v = value!();
                 format = Some(match v.as_str() {
@@ -231,7 +258,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         sort_buffer,
         explain,
         color,
-        no_header,
+        header,
         format,
     })))
 }
@@ -350,9 +377,35 @@ mod tests {
     }
 
     #[test]
-    fn no_header_flag() {
-        assert!(!args(&["cols a"]).unwrap().no_header);
-        assert!(args(&["--no-header", "cols c1"]).unwrap().no_header);
+    fn header_flag() {
+        assert_eq!(args(&["cols a"]).unwrap().header, None);
+        assert_eq!(
+            args(&["--header", "a, b", "cols a"]).unwrap().header,
+            Some(Header::Named(vec!["a".into(), "b".into()]))
+        );
+        assert_eq!(
+            args(&["--header=a,b", "cols a"]).unwrap().header,
+            Some(Header::Named(vec!["a".into(), "b".into()]))
+        );
+        // `-` (or nothing) auto-names the columns c1, c2, …
+        assert_eq!(
+            args(&["--header", "-", "cols c1"]).unwrap().header,
+            Some(Header::Auto)
+        );
+        assert_eq!(
+            args(&["--header", "", "cols c1"]).unwrap().header,
+            Some(Header::Auto)
+        );
+        assert!(args(&["--header", "a,,b", "cols a"]).is_err());
+        // Quoted like a header line, so a name may hold a comma.
+        assert_eq!(
+            args(&["--header", "\"last, first\",n", "cols n"])
+                .unwrap()
+                .header,
+            Some(Header::Named(vec!["last, first".into(), "n".into()]))
+        );
+        // The old flag is gone.
+        assert!(args(&["--no-header", "cols c1"]).is_err());
     }
 
     #[test]

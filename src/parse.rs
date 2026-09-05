@@ -48,7 +48,6 @@ fn parse_stages(script: &str, fns: &FnTable, depth: usize) -> Result<Plan, Error
     }
     if builder.items.is_empty()
         && builder.output == OutputFormat::Csv
-        && builder.header.is_none()
         && builder.colors.is_empty()
         && builder.graph.is_none()
     {
@@ -64,13 +63,12 @@ fn err(msg: impl Into<String>) -> Error {
 /// Known command names, for the "did you mean …?" hint on an unknown verb and
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
-    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "hdr",
-    "join", "add", "delta", "group", "agg", "graph", "fn",
+    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "join",
+    "add", "delta", "group", "agg", "graph", "fn",
 ];
 
 /// Names a `fn` may not take: every command, every alias, `fn` itself, and
-/// the removed conversion commands (kept reserved so their hint stays
-/// reachable).
+/// the removed commands (kept reserved so their hint stays reachable).
 const RESERVED: &[&str] = &[
     "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "colour", "rename", "fmt",
     "hdr", "join", "add", "delta", "group", "agg", "graph", "fn", "to-num", "to_num", "to-str",
@@ -151,8 +149,6 @@ struct Builder<'a> {
     depth: usize,
     items: Vec<Item>,
     output: OutputFormat,
-    /// Column names from a `hdr` command, for headerless input.
-    header: Option<Vec<String>>,
     /// Colour rules from `color` commands (plan metadata, not stages).
     colors: Vec<ColorRule>,
     /// A `graph` sink (plan metadata; the last command, terminates the pipe).
@@ -166,7 +162,6 @@ impl<'a> Builder<'a> {
             depth,
             items: Vec::new(),
             output: OutputFormat::Csv,
-            header: None,
             colors: Vec::new(),
             graph: None,
         }
@@ -227,7 +222,6 @@ impl<'a> Builder<'a> {
         Plan {
             stages,
             output: self.output,
-            input_header: self.header.take(),
             colors: std::mem::take(&mut self.colors),
             graph: self.graph.take(),
         }
@@ -278,7 +272,10 @@ impl<'a> Builder<'a> {
             "add" => self.parse_add(rest),
             "delta" => self.parse_delta(rest),
             "fmt" => self.parse_fmt(rest),
-            "hdr" => self.parse_hdr(rest),
+            "hdr" => Err(err(
+                "hdr was removed: name a headerless input's columns with `--header a,b,c` on the \
+                 command line (`--header -` auto-names them c1, c2, …)",
+            )),
             "fn" => Err(err("fn definitions must come before the first stage")),
             other => Err(err(if self.fns.contains_key(other) {
                 format!(
@@ -357,24 +354,6 @@ impl<'a> Builder<'a> {
         })();
         self.depth -= 1;
         result
-    }
-
-    /// `hdr a,b,c` supplies column names for headerless input: the whole input
-    /// becomes data and these names are prepended as the header on output. It is
-    /// plan-level metadata, so it must come first and may appear only once.
-    fn parse_hdr(&mut self, rest: &str) -> Result<(), Error> {
-        if self.header.is_some() {
-            return Err(err("hdr may be given only once"));
-        }
-        if !self.items.is_empty() || self.output != OutputFormat::Csv {
-            return Err(err("hdr must be the first command in the pipeline"));
-        }
-        let names = split_list(rest);
-        if names.is_empty() {
-            return Err(err("hdr expects at least one column name"));
-        }
-        self.header = Some(names);
-        Ok(())
     }
 
     fn parse_head(&mut self, rest: &str) -> Result<(), Error> {
@@ -1103,7 +1082,6 @@ fn identity_plan() -> Plan {
     Plan {
         stages: Vec::new(),
         output: OutputFormat::Csv,
-        input_header: None,
         colors: Vec::new(),
         graph: None,
     }

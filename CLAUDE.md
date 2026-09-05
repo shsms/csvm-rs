@@ -230,10 +230,6 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
   stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
   default `_delta`), so it shares all of `add`'s machinery and guarantees.
-- **`hdr a,b,c`** supplies column names for headerless input: it sets
-  `Plan.input_header` (plan-level metadata, must be the first command), so the
-  whole input is data and `main`/the test harness skip reading a header line
-  (file shards start at byte 0). The names are prepended on output.
 - **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
@@ -366,7 +362,7 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
 (cfg-gated) wraps the arrow `ParquetRecordBatchReader`:
 - Selected by a `.parquet` extension or `--format parquet`; `--format csv`
   forces CSV. Parquet's metadata is in the file footer, so it needs a **seekable
-  file** — stdin is rejected, and `hdr`/`--no-header` error (the schema *is* the
+  file** — stdin is rejected, and `--header` errors (the schema *is* the
   header). Without the feature, a parquet input errors with a build hint.
 - The schema gives the header **and types**: numeric columns decode straight to
   `Field::Num`, so the implicit-typing engine works with **no cast**; bool ⇒
@@ -441,9 +437,11 @@ is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the
 single positional is the input. At most one input is accepted (a second
 positional is an error). Long options take `--flag VALUE` or `--flag=VALUE`.
 `--chunk-size`/`--sort-buffer` accept K/M/G (binary)
-suffixes. `--no-header` treats the input as headerless and auto-names columns
-`c1,c2,…` (main peeks the first line to count them — for stdin it reads the line
-and chains it back; `hdr` wins if both are given). `--color` honors
+suffixes. `--header a,b,c` treats the input as headerless with those column
+names, so the whole input is data (file shards start at byte 0); `--header -`
+auto-names the columns `c1,c2,…` (main peeks the first line to count them — for
+stdin it reads the line and chains it back). It applies to the main input only:
+a `join` right file always carries its own header. `--color` honors
 `NO_COLOR`/`CLICOLOR_FORCE` under `auto`. Help lives in one registry
 (`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
 or alias) a command's forms + example, `csvm help TOPIC` the `operators`/

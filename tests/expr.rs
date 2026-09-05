@@ -12,10 +12,7 @@ use common::temp_csv;
 fn run(script: &str, input: &str, threads: usize) -> Result<String, String> {
     let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;
     let mut reader = BufReader::new(input.as_bytes());
-    let header = match plan.input_header.as_deref() {
-        Some(h) => h.to_vec(),
-        None => exec::read_header(&mut reader).map_err(|e| e.to_string())?,
-    };
+    let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
     let opts = RunOpts {
         chunk_size: 64, // small, to exercise multi-chunk handling
