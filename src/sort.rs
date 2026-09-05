@@ -142,6 +142,50 @@ fn encode_str(field: Option<&Field>, descending: bool, out: &mut Vec<u8>) {
 
 // --- the parallel sorter ----------------------------------------------------
 
+/// Append `row` as typed cells: a tag byte, then for text its length (u32,
+/// little-endian) and bytes, for a number its `f64` bits (little-endian).
+/// Used in the following commit.
+pub fn encode_row(row: &[Field], out: &mut Vec<u8>) {
+    for f in row {
+        match f {
+            Field::Num(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            Field::Str(s) => encode_text(s, out),
+            Field::Owned(s) => encode_text(s, out),
+        }
+    }
+}
+
+fn encode_text(s: &str, out: &mut Vec<u8>) {
+    out.push(0);
+    out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// Decode a row written by [`encode_row`]; text cells borrow from `line`.
+pub fn decode_row(mut line: &[u8]) -> Result<Vec<Field<'_>>, Error> {
+    let corrupt = || Error::Other("corrupt sort record".to_string());
+    let mut row = Vec::new();
+    while let Some((&tag, rest)) = line.split_first() {
+        line = if tag == 1 {
+            let (bits, rest) = rest.split_at_checked(8).ok_or_else(corrupt)?;
+            row.push(Field::Num(f64::from_le_bytes(bits.try_into().unwrap())));
+            rest
+        } else {
+            let (len, rest) = rest.split_at_checked(4).ok_or_else(corrupt)?;
+            let len = u32::from_le_bytes(len.try_into().unwrap()) as usize;
+            let (text, rest) = rest.split_at_checked(len).ok_or_else(corrupt)?;
+            row.push(Field::Str(
+                std::str::from_utf8(text).map_err(|_| corrupt())?,
+            ));
+            rest
+        };
+    }
+    Ok(row)
+}
+
 /// Shared, immutable per-run context handed to every worker.
 struct WorkerCtx {
     sort: Arc<SortStmt>,
@@ -775,6 +819,28 @@ mod tests {
         let expected = ["1,b", "1,d", "1,c", "1,a"];
         assert_eq!(sort_lines_with(sort, pre, &lines, 4, 1 << 30), expected);
         assert_eq!(sort_lines_with(sort, pre, &lines, 4, 1), expected);
+    }
+
+    #[test]
+    fn typed_rows_round_trip() {
+        // Every cell kind survives, and a number keeps its exact value.
+        let row = [
+            Field::Num(1.00000021),
+            Field::Str("a,b \"c\""),
+            Field::Owned("é".to_string()),
+            Field::Str(""),
+            Field::Num(-0.0),
+        ];
+        let mut blob = Vec::new();
+        encode_row(&row, &mut blob);
+        let back = decode_row(&blob).unwrap();
+        assert_eq!(back.len(), row.len());
+        assert!(matches!(back[0], Field::Num(n) if n == 1.00000021));
+        assert_eq!(back[1].as_str(), "a,b \"c\"");
+        assert_eq!(back[2].as_str(), "é");
+        assert_eq!(back[3].as_str(), "");
+        assert!(matches!(back[4], Field::Num(n) if n == 0.0 && n.is_sign_negative()));
+        assert!(decode_row(&blob[..blob.len() - 1]).is_err());
     }
 
     #[test]
