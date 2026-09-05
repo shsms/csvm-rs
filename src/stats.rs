@@ -88,7 +88,7 @@ impl ColStats {
                 }
                 // NaN/inf parses as a number but would poison sum/mean/stddev, so
                 // it's skipped from the aggregates (still counted as non-empty).
-                // The column stays numeric. (select/sort/to-num still accept it.)
+                // The column stays numeric. (select/sort/num() still accept it.)
                 Some(_) => {}
                 None => self.numeric = false,
             }

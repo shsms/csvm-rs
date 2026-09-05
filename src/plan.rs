@@ -51,12 +51,12 @@ pub enum CmpOp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CmpMode {
     /// At least one operand is statically numeric (a number literal,
-    /// arithmetic, a numeric function, `rownum()`, or a `to-num`-typed
-    /// column): parse both to `f64` and order numerically (a non-number
+    /// arithmetic, a numeric function, `rownum()`, or a column typed numeric
+    /// by `add`): parse both to `f64` and order numerically (a non-number
     /// aborts the run).
     Numeric,
     /// A statically string operand (a string literal, `++` concat, a boolean
-    /// value, a string function, or a `to-str`-typed column), or an `==`/`!=`
+    /// value, a string function, or a column typed text by `add`), or an `==`/`!=`
     /// between two untyped operands: order lexically.
     String,
     /// An ordering (`< > <= >=`) between two untyped operands: decide per
@@ -79,8 +79,10 @@ pub struct Cmp {
     pub mode: CmpMode,
 }
 
-/// A column's known type: set by `to-num` / `to-str`, or by the static type
-/// of the `add` expression that produced it. An untyped column is `None`.
+/// A column's known type: the static type of the `add` expression that
+/// produced it (`add c num(c)` pins `c` numeric, `str()` text), or what a
+/// reducing stage knows about its output (see `Plan::resolve`). A column
+/// read from the input is untyped, `None`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
     Str,
@@ -284,8 +286,7 @@ impl Func {
 /// A value-producing expression for `add` (yields a number or a string). Like
 /// [`BoolExpr`], it is parsed once and evaluated per row with no interpreter —
 /// column refs are indices, operators monomorphic. Arithmetic coerces operands
-/// to numbers (csvm's implicit `to-num`); `++` and the string functions coerce
-/// to text.
+/// to numbers; `++` and the string functions coerce to text.
 #[derive(Clone, Debug)]
 pub enum ValExpr {
     /// A column's cell value.
@@ -332,17 +333,10 @@ pub struct ProjectStmt {
     pub positions: Vec<usize>,
 }
 
-/// `to-num(...)` or `to-str(...)`: convert the listed columns in place.
-#[derive(Clone, Debug)]
-pub struct ConvStmt {
-    pub names: Vec<String>,
-    pub positions: Vec<usize>,
-}
-
 /// How one `sort` key orders its cells. The sort-side counterpart of
-/// [`CmpMode`]: a bare column defaults to `Auto`; `=n` / a `to-num` column
-/// pins `Numeric`, `=s` / a `to-str` column pins `Lexical`. Both autos read
-/// a blank cell as 0.
+/// [`CmpMode`]: a bare column defaults to `Auto`; `=n` / a column typed
+/// numeric pins `Numeric`, `=s` / a column typed text pins `Lexical`. Both
+/// autos read a blank cell as 0.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SortMode {
     /// Decided per cell: a cell that parses as a number (a blank reads as 0)
@@ -693,8 +687,6 @@ fn disambiguate(name: &str, taken: &[String]) -> String {
 pub enum Stmt {
     Cols(ProjectStmt),
     Select(BoolExpr),
-    ToNum(ConvStmt),
-    ToStr(ConvStmt),
     Rename(RenameStmt),
     /// Append or replace a computed column (`add NAME EXPR`).
     Add(AddStmt),
@@ -1409,24 +1401,6 @@ impl Stmt {
                 }
                 Ok(true)
             }
-            Stmt::ToNum(c) => {
-                for &p in &c.positions {
-                    if let Some(f) = row.get_mut(p) {
-                        *f = Field::Num(f.coerce_num()?);
-                    }
-                }
-                Ok(true)
-            }
-            Stmt::ToStr(c) => {
-                for &p in &c.positions {
-                    if let Some(f) = row.get_mut(p)
-                        && let Field::Num(n) = *f
-                    {
-                        *f = Field::Owned(format_num(n));
-                    }
-                }
-                Ok(true)
-            }
             // Rename is a header-only change; row data is untouched.
             Stmt::Rename(_) => Ok(true),
         }
@@ -1440,23 +1414,12 @@ impl Stmt {
         header: &mut Vec<String>,
         types: &mut Vec<Option<ColType>>,
     ) -> Result<(), Error> {
-        let conv = match self {
-            Stmt::ToNum(_) => Some(ColType::Num),
-            Stmt::ToStr(_) => Some(ColType::Str),
-            _ => None,
-        };
         match self {
             Stmt::Cols(p) => {
                 p.resolve(header)?;
                 *types = p.positions.iter().map(|&i| types[i]).collect();
             }
             Stmt::Select(expr) => expr.resolve(header, types)?,
-            Stmt::ToNum(c) | Stmt::ToStr(c) => {
-                c.resolve(header)?;
-                for &i in &c.positions {
-                    types[i] = conv;
-                }
-            }
             Stmt::Rename(r) => {
                 for (from, to) in &r.pairs {
                     let pos = resolve_col(from, header)?;
@@ -1501,13 +1464,6 @@ impl ProjectStmt {
             named
         };
         *header = self.positions.iter().map(|&p| header[p].clone()).collect();
-        Ok(())
-    }
-}
-
-impl ConvStmt {
-    fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
-        self.positions = resolve_cols(&mut self.names, header)?;
         Ok(())
     }
 }
@@ -1569,7 +1525,7 @@ impl SortStmt {
     /// key order (`None` for a lexical key), parsed once so
     /// [`SortStmt::compare`] never re-reads a cell for them and the cell's
     /// text is never rewritten. A non-number under a numeric key is an error,
-    /// as for `to-num`.
+    /// as for `num()`.
     pub fn row_key(&self, row: &[Field]) -> Result<Box<[Option<f64>]>, Error> {
         self.keys
             .iter()
@@ -1644,12 +1600,12 @@ impl Plan {
     /// output header (the input header reshaped by any `cols`/`drop-cols`).
     pub fn resolve(&mut self, input_header: &[String]) -> Result<Vec<String>, Error> {
         let mut header = input_header.to_vec();
-        // The columns' known types, kept in step with `header`: `to-num` /
-        // `to-str` / `add` set them, `cols` reorders them, `group` keeps its
-        // keys' and types its aggregates, `stats` types its profile columns,
-        // a join keeps the left side's and leaves the right untyped. Sort
-        // keys and comparisons pin their mode from this, so a type follows
-        // the column however it is spelled.
+        // The columns' known types, kept in step with `header`: `add` sets
+        // them, `cols` reorders them, `group` keeps its keys' and types its
+        // aggregates, `stats` types its profile columns, a join keeps the left
+        // side's and leaves the right untyped. Sort keys and comparisons pin
+        // their mode from this, so a type follows the column however it is
+        // spelled.
         let mut types: Vec<Option<ColType>> = vec![None; header.len()];
         for stage in &mut self.stages {
             match stage {

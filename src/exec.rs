@@ -656,8 +656,8 @@ pub fn run_file<W: Write + Send>(
 }
 
 /// Run a plan over a `.parquet` file (feature `parquet`). Batches decode to
-/// owned, typed rows (numeric columns are already `Field::Num`, so no `to-num`
-/// is needed). A pure transform streams batch by batch (O(batch) memory), and
+/// owned, typed rows (numeric columns are already `Field::Num`, so no cast is
+/// needed). A pure transform streams batch by batch (O(batch) memory), and
 /// with `-n>1` shards across row groups; anything blocking (sort/group/tail/
 /// uniq/join, or a stateful `add`) materializes every batch and runs the staged
 /// in-memory path.
@@ -2212,8 +2212,6 @@ fn describe_stmt(stmt: &Stmt) -> String {
             format!("{verb} -> keep positions {:?}", p.positions)
         }
         Stmt::Select(e) => format!("select {}", fmt_expr(e)),
-        Stmt::ToNum(c) => format!("to-num {:?} (positions {:?})", c.names, c.positions),
-        Stmt::ToStr(c) => format!("to-str {:?} (positions {:?})", c.names, c.positions),
         Stmt::Rename(r) => format!("rename {:?}", r.pairs),
         Stmt::Add(a) => {
             let target = match a.pos {

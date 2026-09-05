@@ -21,9 +21,9 @@ use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
-    ColorRule, ColorScope, ConvStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
-    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage,
-    StatsStmt, Stmt, UniqStmt, ValExpr,
+    ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
+    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage, StatsStmt,
+    Stmt, UniqStmt, ValExpr,
 };
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -64,17 +64,58 @@ fn err(msg: impl Into<String>) -> Error {
 /// Known command names, for the "did you mean …?" hint on an unknown verb and
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
-    "cols", "cut", "select", "where", "filter", "sort", "to-num", "to-str", "head", "tail",
-    "stats", "uniq", "color", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg",
-    "graph", "fn",
+    "cols", "cut", "select", "where", "filter", "sort", "head", "tail", "stats", "uniq", "color",
+    "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg", "graph", "fn",
 ];
 
-/// Names a `fn` may not take: every command, every alias, and `fn` itself.
+/// Names a `fn` may not take: every command, every alias, `fn` itself, and
+/// the removed conversion commands (kept reserved so their hint stays
+/// reachable).
 const RESERVED: &[&str] = &[
-    "cols", "cut", "select", "where", "filter", "sort", "to-num", "to_num", "to-str", "to_str",
-    "head", "tail", "stats", "uniq", "dedup", "color", "colour", "rename", "fmt", "hdr", "join",
-    "add", "delta", "group", "agg", "graph", "plot", "fn",
+    "cols", "cut", "select", "where", "filter", "sort", "head", "tail", "stats", "uniq", "dedup",
+    "color", "colour", "rename", "fmt", "hdr", "join", "add", "delta", "group", "agg", "graph",
+    "plot", "fn", "to-num", "to_num", "to-str", "to_str",
 ];
+
+/// The cast that replaced a removed conversion command, if `cmd` is one.
+fn removed_cast(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "to-num" | "to_num" => Some("num"),
+        "to-str" | "to_str" => Some("str"),
+        _ => None,
+    }
+}
+
+/// The error for a removed conversion command, spelling out the `add` that
+/// does the same for each column it named. Inside the expression a name that
+/// is not a bare identifier (a position, a name with spaces) is
+/// backtick-quoted; as the `add` target only a name with spaces needs that.
+fn removed_hint(cmd: &str, cast: &str, args: &str) -> Error {
+    let cols = split_list(args);
+    let stages: Vec<String> = if cols.is_empty() {
+        vec![format!("add COL {cast}(COL)")]
+    } else {
+        cols.iter()
+            .map(|c| {
+                let arg = if is_ident(c) {
+                    c.clone()
+                } else {
+                    format!("`{c}`")
+                };
+                let target = if c.contains(char::is_whitespace) {
+                    format!("`{c}`")
+                } else {
+                    c.clone()
+                };
+                format!("add {target} {cast}({arg})")
+            })
+            .collect()
+    };
+    err(format!(
+        "{cmd} was removed: convert with add, e.g. `{}`",
+        stages.join(" | ")
+    ))
+}
 
 /// How deep fragment expansion may nest before it is treated as runaway
 /// recursion (a fragment that calls itself, directly or in a cycle).
@@ -199,6 +240,9 @@ impl<'a> Builder<'a> {
             return match fns.get(name) {
                 Some(def) => self.expand_fragment(name, def, args),
                 None => {
+                    if let Some(cast) = removed_cast(name) {
+                        return Err(removed_hint(name, cast, args));
+                    }
                     let mut cands: Vec<String> = fns.keys().cloned().collect();
                     cands.extend(COMMANDS.iter().map(|s| s.to_string()));
                     Err(err(match crate::error::did_you_mean(name, &cands) {
@@ -209,12 +253,13 @@ impl<'a> Builder<'a> {
             };
         }
         let (cmd, rest) = split_first_word(stage);
+        if let Some(cast) = removed_cast(cmd) {
+            return Err(removed_hint(cmd, cast, rest));
+        }
         let result = match cmd {
             "cols" | "cut" => self.parse_cols(rest),
             "select" | "where" | "filter" => self.parse_select(rest),
             "sort" => self.parse_sort(rest),
-            "to-num" | "to_num" => self.parse_conv(rest, true),
-            "to-str" | "to_str" => self.parse_conv(rest, false),
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
@@ -767,23 +812,6 @@ impl<'a> Builder<'a> {
             names,
             positions: Vec::new(),
         })));
-        Ok(())
-    }
-
-    fn parse_conv(&mut self, rest: &str, to_num: bool) -> Result<(), Error> {
-        let names = split_list(rest);
-        if names.is_empty() {
-            return Err(err("to-num/to-str expects at least one column"));
-        }
-        let conv = ConvStmt {
-            names,
-            positions: Vec::new(),
-        };
-        self.items.push(Item::Stmt(if to_num {
-            Stmt::ToNum(conv)
-        } else {
-            Stmt::ToStr(conv)
-        }));
         Ok(())
     }
 
@@ -2148,6 +2176,34 @@ mod tests {
         };
         assert_eq!(c.mode, CmpMode::Auto);
         assert!(matches!(&c.rhs, ValExpr::Str(s) if s == "5"));
+    }
+
+    #[test]
+    fn removed_conversion_commands_point_at_the_casts() {
+        // Every column named gets its own add; a position or an awkward name
+        // is backtick-quoted where the expression needs it; the call spelling
+        // of the old command gets the same hint.
+        for (cmd, cast) in [
+            ("to-num", "num"),
+            ("to_num", "num"),
+            ("to-str", "str"),
+            ("to_str", "str"),
+        ] {
+            let err = parse(&format!("{cmd} a,b")).unwrap_err().to_string();
+            assert!(err.contains("removed"), "{err}");
+            assert!(
+                err.contains(&format!("add a {cast}(a) | add b {cast}(b)")),
+                "{err}"
+            );
+        }
+        let err = parse("to-str 2").unwrap_err().to_string();
+        assert!(err.contains("add 2 str(`2`)"), "{err}");
+        let err = parse("to-num 'my col'").unwrap_err().to_string();
+        assert!(err.contains("add `my col` num(`my col`)"), "{err}");
+        let err = parse("to_num(qty)").unwrap_err().to_string();
+        assert!(err.contains("add qty num(qty)"), "{err}");
+        let err = parse("to-num").unwrap_err().to_string();
+        assert!(err.contains("add COL num(COL)"), "{err}");
     }
 
     #[test]

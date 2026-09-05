@@ -1,7 +1,7 @@
 //! Optional `.parquet` input reader (feature `parquet`).
 //!
 //! Parquet carries its own typed schema, so numeric columns decode straight to
-//! [`Field::Num`] — no `to-num` needed — and column names come from the schema
+//! [`Field::Num`] — no cast needed — and column names come from the schema
 //! (so `hdr`/`--no-header` don't apply). Reading is batch-streaming: each arrow
 //! `RecordBatch` (a row group, or a slice of one) is transposed from columnar
 //! arrays into rows of owned `Field`s for the row-oriented plan. Only flat
@@ -147,7 +147,7 @@ fn batch_to_rows(batch: &RecordBatch) -> Result<Vec<Vec<Field<'static>>>, Error>
 
 /// One cell as an owned `Field`. A null becomes the empty string (matching a CSV
 /// empty cell); booleans render as csvm's `t`/`f`. Numeric columns decode to
-/// `Field::Num` so the plan's implicit typing needs no `to-num`.
+/// `Field::Num` so the plan's implicit typing needs no cast.
 ///
 /// Numbers join the engine's `f64` model, so an `Int64`/`UInt64` magnitude above
 /// 2^53 loses integer precision on read (the same limit CSV numbers hit) — no
@@ -367,7 +367,7 @@ mod tests {
             crate::exec::run_parquet(&plan, &out_header, &opts, &path, &mut buf).unwrap();
             String::from_utf8(buf).unwrap()
         };
-        // Streaming transform: numeric compare needs no `to-num` (typed input).
+        // Streaming transform: numeric compare needs no cast (typed input).
         assert_eq!(
             run("select amount > 10"),
             "id,name,amount,flag\n2,,20,f\n3,c,15,t\n"

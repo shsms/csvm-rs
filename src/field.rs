@@ -13,7 +13,7 @@ use std::fmt;
 /// - `Str` borrows from the chunk buffer — the zero-copy fast path.
 /// - `Owned` is allocated: an unescaped quoted field, or a field that had to
 ///   cross a thread/stage boundary (see [`Field::into_owned`]).
-/// - `Num` is a value converted to a number, either explicitly via `to-num` or
+/// - `Num` is a value converted to a number, either explicitly via `num()` or
 ///   implicitly by a numeric comparison.
 #[derive(Clone, Debug)]
 pub enum Field<'a> {
@@ -35,7 +35,7 @@ impl fmt::Display for NumError {
 
 impl<'a> Field<'a> {
     /// View the field as text. Numbers are formatted with [`format_num`]; this
-    /// is what serialization and string comparisons see, so a `to-str` is never
+    /// is what serialization and string comparisons see, so a `str()` is never
     /// needed just to print a converted number.
     #[inline]
     pub fn as_str(&self) -> Cow<'_, str> {

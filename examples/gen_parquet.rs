@@ -7,7 +7,7 @@
 //! ```
 //!
 //! Same column shape as `gen_csv` (id, grp, region, amount, price, flag), but
-//! typed: ints and a float decode straight to numbers, so no `to-num` is needed.
+//! typed: ints and a float decode straight to numbers, so no cast is needed.
 
 use std::env;
 use std::fs::File;
