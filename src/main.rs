@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
     exec::prepare_joins(&mut plan).map_err(|e| e.to_string())?;
     let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
 
-    if args.print_engine {
+    if args.explain {
         print!("{}", exec::describe(&plan));
         return Ok(());
     }

@@ -5,7 +5,7 @@
 //! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
-//! `--no-header`, `--color`, `--format` (csv | parquet), and `--print-engine`.
+//! `--no-header`, `--color`, `--format` (csv | parquet), and `--explain`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -24,7 +24,7 @@ pub struct Args {
     pub temp_dir: Option<PathBuf>,
     pub chunk_size: usize,
     pub sort_buffer: usize,
-    pub print_engine: bool,
+    pub explain: bool,
     pub color: ColorWhen,
     /// `--no-header`: the input has no header line; columns are auto-named
     /// `c1, c2, …`. Ignored if a `hdr` command supplies names instead.
@@ -107,7 +107,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut temp_dir = None;
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
     let mut sort_buffer = DEFAULT_SORT_BUFFER;
-    let mut print_engine = false;
+    let mut explain = false;
     let mut color = ColorWhen::default();
     let mut script_file = None;
     let mut no_header = false;
@@ -162,7 +162,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                     n as usize
                 };
             }
-            "--print-engine" => print_engine = true,
+            "--explain" => explain = true,
             "--no-header" => no_header = true,
             "--format" => {
                 let v = value!();
@@ -229,7 +229,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         temp_dir,
         chunk_size,
         sort_buffer,
-        print_engine,
+        explain,
         color,
         no_header,
         format,
@@ -264,15 +264,17 @@ mod tests {
         assert_eq!(a.in_file, None);
         assert!(a.threads >= 1);
         assert_eq!(a.chunk_size, DEFAULT_CHUNK_SIZE);
-        assert!(!a.print_engine);
+        assert!(!a.explain);
     }
 
     #[test]
     fn flags_parse() {
-        let a = args(&["-o", "out.csv", "-n", "4", "--print-engine", "sort x"]).unwrap();
+        let a = args(&["-o", "out.csv", "-n", "4", "--explain", "sort x"]).unwrap();
+        // The old spelling is gone.
+        assert!(parse(["--print-engine".to_string(), "sort x".to_string()]).is_err());
         assert_eq!(a.out_file.as_deref(), Some("out.csv"));
         assert_eq!(a.threads, 4);
-        assert!(a.print_engine);
+        assert!(a.explain);
         assert_eq!(a.script, "sort x");
         assert_eq!(a.in_file, None); // no input positional -> stdin
     }

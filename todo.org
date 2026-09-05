@@ -70,7 +70,7 @@ Reproducible (a function of the two values, not a sampled type) and never aborts
 the successful =f64= parses are reused, so it tracks an explicit =to-num= within
 noise (benchmarked). =to-str= pins a column back to lexical. ===/!== between bare
 columns stay lexical (float equality is fragile). Visible as =:auto= under
-=--print-engine=. The =num()= coercion alternative was dropped — auto fixes the
+=--explain=. The =num()= coercion alternative was dropped — auto fixes the
 default without new syntax.
 
 ** DONE Sort auto-detects like select (per-cell =SortMode::Auto=)
@@ -85,7 +85,7 @@ text follows lexically. That is a total order, so it is reproducible at any =-n=
 mixed column never aborts. =encode_key= (=sort.rs=) prefixes an auto key with
 a one-byte tag and =SortStmt::compare= applies the same rule, so the external
 and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
-=--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
+=--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
 

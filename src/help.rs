@@ -45,7 +45,7 @@ options (--flag VALUE or --flag=VALUE):
       --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;
                        also caps sort workers at SZ / 2M)
       --color WHEN     auto (TTY only) | always | never
-      --print-engine   print the compiled plan and exit
+      --explain        print the compiled plan and exit
   -h, --help           show this help
   -V, --version        print version and exit";
 

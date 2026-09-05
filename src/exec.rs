@@ -2067,7 +2067,7 @@ fn write_csv_colored<W: Write>(
     Ok(())
 }
 
-/// Render a resolved plan for `--print-engine`: stages, their statements, and
+/// Render a resolved plan for `--explain`: stages, their statements, and
 /// the column positions each one resolved to.
 pub fn describe(plan: &Plan) -> String {
     let mut out = String::new();

@@ -49,7 +49,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   Resolvers that keep a column's name — group keys, agg names, the stats
   `field` column, sort keys, `uniq` lists, and `ColRef`
   (chart titles, expression refs) — rewrite it to the header name, so
-  output and `--print-engine` show `qty`, not `2`. Join keys and `rename`'s
+  output and `--explain` show `qty`, not `2`. Join keys and `rename`'s
   source name still echo the spec text.
   Backticks are stripped before resolution (`split_list`), so they do not
   force a name reading. Column types are tracked by position in
@@ -300,7 +300,7 @@ Each comparison resolves to one of three modes at compile time (`CmpMode` in
 `plan.rs`, decided by `CmpMode::decide` from the operands' **static types** —
 `ValExpr::static_type`, which takes a lookup for `Col`/`prev` leaves and
 types a `?:` only when both branches agree; visible per-compare as
-`:num`/`:str`/`:auto` under `--print-engine`). The parser knows no column
+`:num`/`:str`/`:auto` under `--explain`). The parser knows no column
 types and leaves every compare `Auto`; the mode is decided once, in
 `Plan::resolve`, from the operands' static types plus a **position-keyed**
 type map it threads through the statements (`add` sets a column's type from
@@ -434,7 +434,7 @@ lifetime, so there is one `apply` implementation.
 ## CLI
 
 `csvm [-o/--output OUT] [-n/--threads N] [-f/--file FILE] [-t/--temp-dir DIR]
-[--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--print-engine]
+[--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--explain]
 [-V/--version] [SCRIPT] [INPUT]`. The script is the first positional; the input
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
 is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the

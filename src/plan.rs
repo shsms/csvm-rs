@@ -29,7 +29,7 @@ impl ColRef {
     }
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         self.pos = resolve_col(&self.name, header)?;
-        // Carry the header name, so a chart title or `--print-engine` shows
+        // Carry the header name, so a chart title or `--explain` shows
         // `qty` for a column given by position.
         self.name = header[self.pos].clone();
         Ok(())
@@ -136,7 +136,7 @@ pub enum AffixKind {
 }
 
 impl AffixKind {
-    /// The operator spelling, for `--print-engine`.
+    /// The operator spelling, for `--explain`.
     pub fn symbol(self) -> &'static str {
         match self {
             AffixKind::StartsWith => "^=",
@@ -179,7 +179,7 @@ pub enum ArithOp {
 }
 
 impl ArithOp {
-    /// The operator spelling, for `--print-engine`.
+    /// The operator spelling, for `--explain`.
     pub fn symbol(self) -> &'static str {
         match self {
             ArithOp::Add => "+",
@@ -389,7 +389,7 @@ pub enum AggFunc {
 }
 
 impl AggFunc {
-    /// The verb as written, for the default output-column name and `--print-engine`.
+    /// The verb as written, for the default output-column name and `--explain`.
     pub fn name(self) -> &'static str {
         match self {
             AggFunc::Count => "count",
@@ -474,7 +474,7 @@ impl UniqStmt {
 
 /// Resolve `names` to positions and rewrite them to the header names, so a
 /// statement given a column by position shows the real name in
-/// `--print-engine` (and, for `group` / `stats`, in the output header).
+/// `--explain` (and, for `group` / `stats`, in the output header).
 fn resolve_cols(names: &mut Vec<String>, header: &[String]) -> Result<Vec<usize>, Error> {
     let positions = names
         .iter()
@@ -550,7 +550,7 @@ impl JoinType {
     pub fn keeps_right_unmatched(self) -> bool {
         matches!(self, JoinType::Right | JoinType::Full)
     }
-    /// The flag spelling, for `--print-engine`.
+    /// The flag spelling, for `--explain`.
     pub fn label(self) -> &'static str {
         match self {
             JoinType::Inner => "inner",

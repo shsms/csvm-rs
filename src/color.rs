@@ -30,7 +30,7 @@ fn named(name: &str) -> Option<Rgb> {
 
 /// The base-colour name for `c`, or a `#rrggbb` literal when it isn't one of the
 /// named colours (e.g. a value interpolated along a ramp). Inverse of [`named`];
-/// used for the terse `--print-engine` rendering.
+/// used for the terse `--explain` rendering.
 fn rgb_name(c: Rgb) -> String {
     match (c.0, c.1, c.2) {
         (0, 0, 0) => "black".into(),

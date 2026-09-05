@@ -26,7 +26,7 @@ builds the release binary and copies it to your XDG user-binaries directory
 
 ```
 csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
-     [--sort-buffer SIZE] [--color WHEN] [--print-engine] [SCRIPT] [INPUT]
+     [--sort-buffer SIZE] [--color WHEN] [--explain] [SCRIPT] [INPUT]
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
@@ -44,7 +44,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--sort-buffer SIZE`| in-memory budget before `sort` spills; `K`/`M`/`G` ok (default 256 MiB) |
 | `--no-header`      | input has no header row; columns are named `c1, c2, …`      |
 | `--color WHEN`     | `auto` (TTY only), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE` |
-| `--print-engine`   | print the compiled plan and exit                            |
+| `--explain`   | print the compiled plan and exit                            |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
 
@@ -194,10 +194,10 @@ csvm 'graph hist amount --svg' sales.csv -o amount.svg
 csvm 'color red amount < 0 | fmt' input.csv
 ```
 
-`--print-engine` shows the compiled, resolved plan:
+`--explain` shows the compiled, resolved plan:
 
 ```
-$ csvm --print-engine "add amount num(amount) | select amount > 0 | sort amount=r | cols -v flag" input.csv
+$ csvm --explain "add amount num(amount) | select amount > 0 | sort amount=r | cols -v flag" input.csv
 stage 1 (transform):
   1.1 add amount[3] = (num amount[3])
   1.2 select (> amount[3] 0 :num)
