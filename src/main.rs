@@ -122,23 +122,30 @@ fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     if input_format(args) == cli::InputFormat::Parquet {
         return open_parquet(args);
     }
+    // A named header needs no look at the input (so an empty input is a
+    // legal zero-row table, and `--explain` never waits on stdin); otherwise
+    // the first line is read and `Header::resolve` decides whether it was the
+    // header or the first data row.
+    let named = match &args.header {
+        Some(cli::Header::Named(h)) => Some(h.clone()),
+        _ => None,
+    };
     match args.in_file.as_deref().filter(|p| *p != "-") {
         Some(path) => {
-            let (header, data_start, file_len) = match &args.header {
-                Some(cli::Header::Named(h)) => {
+            let (header, data_start, file_len) = match named {
+                Some(h) => {
                     let len = std::fs::metadata(path)
                         .map_err(|e| format!("cannot stat '{path}': {e}"))?
                         .len();
-                    (h.clone(), 0, len)
+                    (h, 0, len)
                 }
-                Some(cli::Header::Auto) => {
-                    // Peek the first line only to count columns; it is data, so
-                    // the data region starts at byte 0.
-                    let (first, _data_start, file_len) =
+                None => {
+                    let (first, after_first, file_len) =
                         exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?;
-                    (auto_header(first.len()), 0, file_len)
+                    let (header, data_start) =
+                        cli::Header::resolve(args.header.as_ref(), first, after_first);
+                    (header, data_start, file_len)
                 }
-                None => exec::read_header_from_path(Path::new(path)).map_err(|e| e.to_string())?,
             };
             let source = Source::File {
                 path: PathBuf::from(path),
@@ -149,32 +156,31 @@ fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
         }
         None => {
             let mut reader: Box<dyn BufRead> = Box::new(BufReader::new(io::stdin()));
-            if let Some(cli::Header::Named(h)) = &args.header {
-                return Ok((Source::Stream(reader), h.clone()));
+            if let Some(h) = named {
+                return Ok((Source::Stream(reader), h));
             }
-            if args.header == Some(cli::Header::Auto) {
-                // Read the first line to count columns, then chain it back in
-                // front of the rest so the whole stream is processed as data.
-                let mut first = Vec::new();
-                reader
-                    .read_until(b'\n', &mut first)
-                    .map_err(|e| e.to_string())?;
-                let line = std::str::from_utf8(&first)
-                    .map_err(|e| format!("input is not valid UTF-8: {e}"))?;
-                let n = csvm::csv::parse_header(line.strip_suffix('\n').unwrap_or(line)).len();
+            // Read the first line: the header, or the row `--header -` counts
+            // and then chains back in front of the rest as data.
+            let mut first = Vec::new();
+            reader
+                .read_until(b'\n', &mut first)
+                .map_err(|e| e.to_string())?;
+            if first.is_empty() {
+                return Err("input is empty (no header line)".to_string());
+            }
+            let line = std::str::from_utf8(&first)
+                .map_err(|e| format!("input is not valid UTF-8: {e}"))?;
+            let columns = csvm::csv::parse_header(line.strip_suffix('\n').unwrap_or(line));
+            let (header, data_start) =
+                cli::Header::resolve(args.header.as_ref(), columns, first.len() as u64);
+            if data_start == 0 {
                 let chained: Box<dyn BufRead> =
                     Box::new(BufReader::new(Cursor::new(first).chain(reader)));
-                return Ok((Source::Stream(chained), auto_header(n)));
+                return Ok((Source::Stream(chained), header));
             }
-            let header = exec::read_header(&mut reader).map_err(|e| e.to_string())?;
             Ok((Source::Stream(reader), header))
         }
     }
-}
-
-/// Auto-generated column names for `--header -`: `c1, c2, …, cn`.
-fn auto_header(n: usize) -> Vec<String> {
-    (1..=n).map(|i| format!("c{i}")).collect()
 }
 
 /// The input format: an explicit `--format` wins, else auto-detect from the

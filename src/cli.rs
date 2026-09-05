@@ -43,6 +43,23 @@ pub enum Header {
 }
 
 impl Header {
+    /// The input's header and where its data starts, from the first line's
+    /// columns and the byte offset just past that line. Without a
+    /// `--header` the first line is the header; with one it is data, so the
+    /// data starts at byte 0 and the names come from the flag (auto-named
+    /// `c1, c2, …` to the first line's width for [`Header::Auto`]).
+    pub fn resolve(
+        spec: Option<&Header>,
+        first_line: Vec<String>,
+        after_first: u64,
+    ) -> (Vec<String>, u64) {
+        match spec {
+            None => (first_line, after_first),
+            Some(Header::Auto) => ((1..=first_line.len()).map(|i| format!("c{i}")).collect(), 0),
+            Some(Header::Named(names)) => (names.clone(), 0),
+        }
+    }
+
     /// Parse the flag's value: `-` or empty auto-names; else a comma list,
     /// read like a header line (so a quoted name may contain a comma).
     fn parse(value: &str) -> Result<Header, String> {
@@ -373,6 +390,24 @@ mod tests {
                 "cols a".to_string()
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn header_resolves_names_and_data_start() {
+        let first = || vec!["x".to_string(), "y".to_string()];
+        // No flag: the first line is the header and the data follows it.
+        assert_eq!(Header::resolve(None, first(), 4), (first(), 4));
+        // Auto: the first line is data, one `cN` per column.
+        assert_eq!(
+            Header::resolve(Some(&Header::Auto), first(), 4),
+            (vec!["c1".to_string(), "c2".to_string()], 0)
+        );
+        // Named: the first line is data and the names are the flag's.
+        let named = Header::Named(vec!["a".to_string()]);
+        assert_eq!(
+            Header::resolve(Some(&named), first(), 4),
+            (vec!["a".to_string()], 0)
         );
     }
 
