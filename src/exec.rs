@@ -26,7 +26,7 @@ use crate::plan::{
     GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
     apply_stmts,
 };
-use crate::sort::Sorter;
+use crate::sort::{LineFormat, Sorter};
 use crate::stats::ColStats;
 use unicode_width::UnicodeWidthStr;
 
@@ -1274,6 +1274,7 @@ fn run_staged<R: BufRead, W: Write>(
     let mut sorter = Sorter::new(
         sort,
         pre,
+        LineFormat::Csv,
         opts.threads,
         opts.temp_dir.clone(),
         opts.sort_buffer,

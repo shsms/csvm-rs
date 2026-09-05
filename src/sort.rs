@@ -5,16 +5,18 @@
 //! **order-preserving encoded key** (so comparison is a byte compare). It then
 //! sorts an index over those rows. The serial **k-way merge** picks the
 //! smallest key across runs and hands the caller the row's already-serialized
-//! line bytes — no per-field allocation, and no re-serialization on output.
+//! bytes — the output CSV line, or typed cells when statements follow the
+//! sort (see [`LineFormat`]) — no per-field allocation, and no
+//! re-serialization on output.
 //!
 //! Doing the serialization in the parallel workers (not the serial merge) is
 //! what makes the merge cheap: it only compares small encoded keys and copies
-//! line bytes. A block is a contiguous input range, so its sequence number
+//! row bytes. A block is a contiguous input range, so its sequence number
 //! keeps the merge stable (the role csvm's `orig_chunk_id` plays).
 //!
 //! Small inputs never touch disk; larger ones spill sorted runs to temp files
-//! as key + line records, so a spilled key is exactly the one computed from
-//! the live row (re-deriving it from the serialized line would round numbers
+//! as key + row records, so a spilled key is exactly the one computed from
+//! the live row (re-deriving it from the serialized row would round numbers
 //! to six decimals). With many runs the merge is multi-level.
 
 use std::cmp::{Ordering, Reverse};
@@ -142,9 +144,19 @@ fn encode_str(field: Option<&Field>, descending: bool, out: &mut Vec<u8>) {
 
 // --- the parallel sorter ----------------------------------------------------
 
+/// How a worker serializes each surviving row for the merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineFormat {
+    /// The output CSV line, written out as is.
+    Csv,
+    /// Typed cells ([`encode_row`] / [`decode_row`]): a number keeps its full
+    /// value for the statements after the sort instead of its six-decimal
+    /// output text.
+    Typed,
+}
+
 /// Append `row` as typed cells: a tag byte, then for text its length (u32,
 /// little-endian) and bytes, for a number its `f64` bits (little-endian).
-/// Used in the following commit.
 pub fn encode_row(row: &[Field], out: &mut Vec<u8>) {
     for f in row {
         match f {
@@ -190,6 +202,7 @@ pub fn decode_row(mut line: &[u8]) -> Result<Vec<Field<'_>>, Error> {
 struct WorkerCtx {
     sort: Arc<SortStmt>,
     pre: Arc<Vec<Stmt>>,
+    format: LineFormat,
     in_mem: AtomicUsize,
     budget: usize,
     temp_dir: PathBuf,
@@ -213,6 +226,7 @@ impl Sorter {
     pub fn new(
         sort: &SortStmt,
         pre: &[Stmt],
+        format: LineFormat,
         threads: usize,
         temp_dir: PathBuf,
         budget: usize,
@@ -223,7 +237,8 @@ impl Sorter {
         // at what the budget holds. The merge width is not bound by it.
         let workers = threads.clamp(1, (budget / (2 * MIN_BLOCK)).max(1));
         let block_size = (budget / (2 * workers)).clamp(MIN_BLOCK, 64 << 20);
-        let mut sorter = Self::with_params(sort, pre, workers, temp_dir, budget, block_size);
+        let mut sorter =
+            Self::with_params(sort, pre, format, workers, temp_dir, budget, block_size);
         sorter.threads = threads.max(1);
         sorter
     }
@@ -233,6 +248,7 @@ impl Sorter {
     pub fn with_params(
         sort: &SortStmt,
         pre: &[Stmt],
+        format: LineFormat,
         threads: usize,
         temp_dir: PathBuf,
         budget: usize,
@@ -243,6 +259,7 @@ impl Sorter {
         let ctx = Arc::new(WorkerCtx {
             sort: Arc::clone(&sort),
             pre: Arc::new(pre.to_vec()),
+            format,
             in_mem: AtomicUsize::new(0),
             budget,
             temp_dir: temp_dir.clone(),
@@ -435,9 +452,14 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
                     return;
                 }
                 let start = blob.len() as u32;
-                line.clear();
-                csv::write_row(&mut line, row);
-                blob.extend_from_slice(line.as_bytes());
+                match ctx.format {
+                    LineFormat::Csv => {
+                        line.clear();
+                        csv::write_row(&mut line, row);
+                        blob.extend_from_slice(line.as_bytes());
+                    }
+                    LineFormat::Typed => encode_row(row, &mut blob),
+                }
                 lines.push((start, blob.len() as u32));
                 keys.push(key_buf.as_slice().into());
             }
@@ -512,7 +534,8 @@ where
 }
 
 /// Append one spilled row: the two lengths (u32, little-endian), the encoded
-/// key, then the CSV line. Length-prefixed because a key can hold any byte.
+/// key, then the row's serialized bytes (per [`LineFormat`]). Length-prefixed
+/// because a key can hold any byte.
 fn write_record<W: Write>(writer: &mut W, key: &[u8], line: &[u8]) -> Result<(), Error> {
     writer.write_all(&(key.len() as u32).to_le_bytes())?;
     writer.write_all(&(line.len() as u32).to_le_bytes())?;
@@ -546,8 +569,9 @@ fn read_record(
 
 // --- the merge --------------------------------------------------------------
 
-/// k-way merge over sorted runs. Single-threaded; emits already-serialized line
-/// bytes via a callback so there is no per-row allocation on output.
+/// k-way merge over sorted runs. Single-threaded; emits each row's
+/// already-serialized bytes (per [`LineFormat`]) via a callback so there is no
+/// per-row allocation on output.
 pub struct Merge {
     sources: Vec<Source>,
     heap: BinaryHeap<Reverse<HeapKey>>,
@@ -572,8 +596,9 @@ impl Merge {
         Ok(Merge { sources, heap })
     }
 
-    /// Drive the merge, calling `emit` with each row's line bytes in order
-    /// until it returns `Break` (a full `head` stops reading the runs).
+    /// Drive the merge, calling `emit` with each row's serialized bytes (per
+    /// [`LineFormat`]) in order until it returns `Break` (a full `head` stops
+    /// reading the runs).
     pub fn for_each_line<F>(self, mut emit: F) -> Result<(), Error>
     where
         F: FnMut(&[u8]) -> Result<ControlFlow<()>, Error>,
@@ -581,8 +606,8 @@ impl Merge {
         self.for_each_record(|_, line| emit(line))
     }
 
-    /// Drive the merge, calling `emit` with each row's encoded key and line
-    /// bytes in order (an intermediate merge writes both back out).
+    /// Drive the merge, calling `emit` with each row's encoded key and
+    /// serialized bytes in order (an intermediate merge writes both back out).
     fn for_each_record<F>(mut self, mut emit: F) -> Result<(), Error>
     where
         F: FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, Error>,
@@ -727,7 +752,15 @@ mod tests {
         threads: usize,
         budget: usize,
     ) -> Vec<String> {
-        let mut s = Sorter::with_params(sort, pre, threads, std::env::temp_dir(), budget, 1 << 20);
+        let mut s = Sorter::with_params(
+            sort,
+            pre,
+            LineFormat::Csv,
+            threads,
+            std::env::temp_dir(),
+            budget,
+            1 << 20,
+        );
         for line in lines {
             s.push_block(format!("{line}\n"));
         }
@@ -776,7 +809,15 @@ mod tests {
             keys: vec![key(0, false, SortMode::Numeric)],
         };
         let block = |threads, budget| {
-            Sorter::new(&s, &[], threads, std::env::temp_dir(), budget).block_size()
+            Sorter::new(
+                &s,
+                &[],
+                LineFormat::Csv,
+                threads,
+                std::env::temp_dir(),
+                budget,
+            )
+            .block_size()
         };
         // Two blocks per worker in flight share the budget.
         assert_eq!(block(8, 256 << 20), 16 << 20);
@@ -787,11 +828,11 @@ mod tests {
         assert_eq!(block(1, 1 << 30), 64 << 20);
         // Workers are capped so their in-flight blocks fit the budget; the
         // merge width stays as requested.
-        let sorter = Sorter::new(&s, &[], 64, std::env::temp_dir(), 4 << 20);
+        let sorter = Sorter::new(&s, &[], LineFormat::Csv, 64, std::env::temp_dir(), 4 << 20);
         assert_eq!((sorter.workers(), sorter.threads), (2, 64));
-        let sorter = Sorter::new(&s, &[], 4, std::env::temp_dir(), 1 << 20);
+        let sorter = Sorter::new(&s, &[], LineFormat::Csv, 4, std::env::temp_dir(), 1 << 20);
         assert_eq!((sorter.workers(), sorter.threads), (1, 4));
-        let sorter = Sorter::new(&s, &[], 8, std::env::temp_dir(), 256 << 20);
+        let sorter = Sorter::new(&s, &[], LineFormat::Csv, 8, std::env::temp_dir(), 256 << 20);
         assert_eq!((sorter.workers(), sorter.threads), (8, 8));
     }
 
@@ -919,7 +960,15 @@ mod tests {
         let sort = SortStmt {
             keys: vec![key(0, false, SortMode::Numeric)],
         };
-        let mut s = Sorter::with_params(&sort, &[], threads, std::env::temp_dir(), budget, 1 << 20);
+        let mut s = Sorter::with_params(
+            &sort,
+            &[],
+            LineFormat::Csv,
+            threads,
+            std::env::temp_dir(),
+            budget,
+            1 << 20,
+        );
         s.set_fanout(fanout);
         for line in lines {
             s.push_block(format!("{line}\n"));
@@ -964,7 +1013,15 @@ mod tests {
         };
         let lines: Vec<String> = (0..30).map(|i| format!("{},{i}", i % 3)).collect();
         let refs: Vec<&str> = lines.iter().map(|s| s.as_str()).collect();
-        let mut s = Sorter::with_params(&sort, &[], 4, std::env::temp_dir(), 1, 1 << 20);
+        let mut s = Sorter::with_params(
+            &sort,
+            &[],
+            LineFormat::Csv,
+            4,
+            std::env::temp_dir(),
+            1,
+            1 << 20,
+        );
         s.set_fanout(2);
         for line in &refs {
             s.push_block(format!("{line}\n"));
