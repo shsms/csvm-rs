@@ -202,6 +202,33 @@ fn numeric_sort_keeps_cell_text_on_every_path() {
 }
 
 #[test]
+fn statements_after_a_sort_see_the_full_number() {
+    // A number computed before the sort must reach the statements after it
+    // with its full value, not the six-decimal output text: the output
+    // rounds, the pipeline does not.
+    let input = "v\n1.00000021\n1.00000019\n";
+    assert_eq!(
+        run_checked("add v = num(v) | sort v | select v > 1.0000002", input),
+        "v\n1\n"
+    );
+    assert_eq!(
+        run_checked(
+            "add v = num(v) | sort v | add d = round((v - 1) * 100000000) | cols d",
+            input
+        ),
+        "d\n19\n21\n"
+    );
+    // The same through a window after the sort.
+    assert_eq!(
+        run_checked(
+            "add v = num(v) | sort v=r | select v > 1.0000002 | head 1",
+            input
+        ),
+        "v\n1\n"
+    );
+}
+
+#[test]
 fn column_types_follow_the_column_not_its_spelling() {
     // A column typed by `add … num()/str()` is pinned by position at resolve
     // time, so the pin holds however the column is later named: by position,

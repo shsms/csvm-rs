@@ -26,7 +26,7 @@ use crate::plan::{
     GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
     apply_stmts,
 };
-use crate::sort::{LineFormat, Sorter};
+use crate::sort::{self, LineFormat, Sorter};
 use crate::stats::ColStats;
 use unicode_width::UnicodeWidthStr;
 
@@ -1270,11 +1270,19 @@ fn run_staged<R: BufRead, W: Write>(
     };
 
     // Feed raw input blocks to the sorter; its workers parse, apply the
-    // pre-sort statements, and sort each block in parallel.
+    // pre-sort statements, and sort each block in parallel. With nothing to
+    // run after the sort the workers serialize the output line itself;
+    // otherwise typed cells, so a number reaches the post-sort statements
+    // with its full value.
+    let format = if post.is_empty() && post2.is_empty() {
+        LineFormat::Csv
+    } else {
+        LineFormat::Typed
+    };
     let mut sorter = Sorter::new(
         sort,
         pre,
-        LineFormat::Csv,
+        format,
         opts.threads,
         opts.temp_dir.clone(),
         opts.sort_buffer,
@@ -1284,19 +1292,21 @@ fn run_staged<R: BufRead, W: Write>(
         sorter.push_block(block);
     }
 
-    // The merge hands us already-serialized line bytes (workers serialized them
-    // in parallel). With no post-sort statements we write them straight out;
-    // otherwise we re-parse each line, apply, and re-serialize. A full window
-    // stops the merge.
+    // The merge hands us the workers' serialized rows. With no post-sort
+    // statements they are output lines and go straight out; otherwise we
+    // decode each, apply, and serialize. A full window stops the merge.
     let mut out_buf: Vec<u8> = Vec::new();
     let mut row_buf = String::new();
     sorter.finish()?.for_each_line(|line| {
-        if post.is_empty() && post2.is_empty() {
-            if window.admit() {
-                out_buf.extend_from_slice(line);
+        match format {
+            LineFormat::Csv => {
+                if window.admit() {
+                    out_buf.extend_from_slice(line);
+                }
             }
-        } else {
-            apply_post_to_line(post, &mut window, post2, line, &mut row_buf, &mut out_buf)?;
+            LineFormat::Typed => {
+                apply_post_to_line(post, &mut window, post2, line, &mut row_buf, &mut out_buf)?;
+            }
         }
         if out_buf.len() >= 1 << 16 {
             output.write_all(&out_buf)?;
@@ -1312,8 +1322,8 @@ fn run_staged<R: BufRead, W: Write>(
     Ok(())
 }
 
-/// Re-parse one merged line, apply `[post | window | post2]`, and append the
-/// re-serialized survivor to `out` (`row_buf` is the reused serialization
+/// Decode one merged typed row, apply `[post | window | post2]`, and append
+/// the serialized survivor to `out` (`row_buf` is the reused serialization
 /// buffer). Only used when a `sort` has trailing transforms; the pure-sort
 /// and bare-window paths write line bytes directly.
 fn apply_post_to_line(
@@ -1324,30 +1334,18 @@ fn apply_post_to_line(
     row_buf: &mut String,
     out: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    let text = std::str::from_utf8(line)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-    let mut err: Option<Error> = None;
+    let mut row = sort::decode_row(line)?;
     let mut scratch: Vec<Field> = Vec::new();
-    csv::parse_chunk(text, |row| {
-        if err.is_some() {
-            return;
-        }
-        let kept = apply_stmts(post, row, &mut scratch, &EvalCtx::default())
-            .map(|kept| kept && window.admit())
-            .and_then(|kept| {
-                Ok(kept && apply_stmts(post2, row, &mut scratch, &EvalCtx::default())?)
-            });
-        match kept {
-            Ok(true) => {
-                row_buf.clear();
-                csv::write_row(row_buf, row);
-                out.extend_from_slice(row_buf.as_bytes());
-            }
-            Ok(false) => {}
-            Err(e) => err = Some(e),
-        }
-    });
-    err.map_or(Ok(()), Err)
+    let ctx = EvalCtx::default();
+    let kept = apply_stmts(post, &mut row, &mut scratch, &ctx)?
+        && window.admit()
+        && apply_stmts(post2, &mut row, &mut scratch, &ctx)?;
+    if kept {
+        row_buf.clear();
+        csv::write_row(row_buf, &row);
+        out.extend_from_slice(row_buf.as_bytes());
+    }
+    Ok(())
 }
 
 /// Whether any transform stage holds a stateful statement — an `add` or
