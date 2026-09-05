@@ -84,10 +84,9 @@ Each stage is a command with comma- or space-separated arguments:
 | `graph bar LABEL VALUE` | one horizontal bar per row (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
 | `graph scatter X Y` / `line X Y` | braille scatter/line plot, multi-series (sink) |
-| `to-num a,b` / `to-str a,b` | mark columns numeric / string (usually unnecessary) |
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
-`to_num`/`to_str` (underscore) are accepted too. `where`/`filter` are aliases for
+`where`/`filter` are aliases for
 `select`, `cut` for `cols`, and `dedup` for `uniq`. A `#` outside quotes starts a
 comment to end of line. A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age ``. A bare integer
@@ -110,10 +109,11 @@ A few things worth knowing up front:
   and `&& || !` with parens; a leading `-v` negates the whole expression.
 - **Conversions are implicit.** A comparison against a number is numeric, against
   a string lexical — `amount > 1000` just works, and numbers print correctly with
-  no `to-str`. A bare `sort col` auto-detects too: cells that are numbers sort
+  no cast. A bare `sort col` auto-detects too: cells that are numbers sort
   numerically and first, the rest lexically (`col=n` / `col=s` force one mode).
-  `to-num`/`to-str` remain as explicit overrides. Empty coerces to `0`; a
-  non-numeric value where a number is required aborts the run.
+  To pin a column explicitly, convert it in place: `add c num(c)` (a non-number
+  aborts) or `add c str(c)`. Empty coerces to `0`; a non-numeric value where a
+  number is required aborts the run.
 - **`add` / `delta`** compute columns: `add total amount * qty`, and
   `add rate amount - prev(amount)` — or the shorthand `delta amount` — for the
   step-to-step difference. An `add` using `prev()`/`rownum()` runs ordered and
@@ -152,7 +152,7 @@ csvm 'cols id,region,amount' input.csv
 # drop a column, write to a file
 csvm -o out.csv 'cols -v flag' input.csv
 
-# filter (numeric — no to-num needed), then drop the filter column
+# filter (numeric — no cast needed), then drop the filter column
 csvm 'select flag == "t" && (amount > 0 || qty > 0) | cols -v flag' input.csv
 
 # filter, then numeric reverse sort
@@ -196,9 +196,9 @@ csvm 'color red amount < 0 | fmt' input.csv
 `--print-engine` shows the compiled, resolved plan:
 
 ```
-$ csvm --print-engine "to-num amount | select amount > 0 | sort amount=r | cols -v flag" input.csv
+$ csvm --print-engine "add amount num(amount) | select amount > 0 | sort amount=r | cols -v flag" input.csv
 stage 1 (transform):
-  1.1 to-num ["amount"] (positions [3])
+  1.1 add amount[3] = (num amount[3])
   1.2 select (> amount[3] 0 :num)
 stage 2 (sort):
   2.1 sort amount[3] reverse numeric

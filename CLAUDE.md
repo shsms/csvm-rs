@@ -31,7 +31,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 | `!cols(a, b)`                    | `cols -v a,b`                                 |
 | `select(a == 't' && b != '0')`   | `select a == 't' && b != '0'`                 |
 | `sort(a, b:r)`                   | `sort a b=r`                                  |
-| `to_num(a, b)` / `to_str(a, b)`  | `to-num a,b` / `to-str a,b`                   |
+| `to_num(a)` / `to_str(a)`        | `add a num(a)` / `add a str(a)` (rarely needed) |
 
 - **`cols`** keeps/reorders the named columns; **`cols -v`** keeps everything
   *except* them (like `cut --complement`). Columns can also be referenced by
@@ -47,14 +47,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   range is an error (`resolve_col_spec` takes an `Unknown` policy that applies
   to a bare name only, so a range endpoint keeps its did-you-mean hint).
   Resolvers that keep a column's name — group keys, agg names, the stats
-  `field` column, sort keys, `uniq`/`to-num`/`to-str` lists, and `ColRef`
+  `field` column, sort keys, `uniq` lists, and `ColRef`
   (chart titles, expression refs) — rewrite it to the header name, so
   output and `--print-engine` show `qty`, not `2`. Join keys and `rename`'s
   source name still echo the spec text.
   Backticks are stripped before resolution (`split_list`), so they do not
-  force a name reading. A `to-num`/`to-str` given by position pins the same
-  column as one given by name: types are re-derived by position in
-  `Plan::resolve` (see *Implicit conversions*).
+  force a name reading. Column types are tracked by position in
+  `Plan::resolve` (see *Implicit conversions*), so a typed column keeps its
+  type however a later stage spells it.
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
   `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved
@@ -83,8 +83,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   before every non-number, a blank reading as 0 as in `select`'s auto; text
   follows lexically; NaN/inf are numbers — a total
   order, so it streams and shards without sampling types, and a mixed column
-  never aborts), `=n` or a `to-num` column is `Numeric` (a non-number aborts),
-  `=s` or a `to-str` column is `Lexical`. The external sort's encoded key
+  never aborts), `=n` or a column typed numeric (`add c num(c)`) is `Numeric`
+  (a non-number aborts), `=s` or a column typed text is `Lexical`. The
+  external sort's encoded key
   (`encode_key` in `sort.rs`) prefixes an auto key with a one-byte tag
   (number / text), and the in-memory path parses the same cell once through
   `SortStmt::row_key` (`plan::auto_num`) before `SortStmt::compare` orders
@@ -108,11 +109,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   column. A blocking, *reducing* stage: it streams the input through per-column
   accumulators (`ColStats` in `stats.rs`, O(columns) memory) and rewrites the
   header to the profile schema, so `sort`/`head`/`fmt` compose after it. Type
-  detection is lenient (a non-numeric cell ⇒ text column; unlike `to-num` it
+  detection is lenient (a non-numeric cell ⇒ text column; unlike `num()` it
   never aborts); min/max are numeric for numeric columns, lexical for text;
   sample stddev via Welford. Non-finite values (`NaN`/`inf`) parse as numbers
   but are skipped from the aggregates (still counted as non-empty) so they don't
-  poison sum/mean/stddev; `select`/`sort`/`to-num` still accept them. `ColStats`
+  poison sum/mean/stddev; `select`/`sort`/`num()` still accept them. `ColStats`
   is deliberately presentation-free so `fmt`'s value-colouring can reuse it.
   Over a **seekable file with `-n>1`**, `stats` shards: each worker builds a
   partial `ColStats` over its byte range and `ColStats::merge` (Welford parallel
@@ -212,9 +213,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `plan_has_stateful_expr` in `exec::run_body`/`run_file`, mirroring the
   `tail`/`uniq`/`join` fallback), so its output is `-n`-independent. The new
   column carries the expression's **static type** (numeric / text / untyped,
-  `ExprParser::static_type` — including a type inherited from a
-  `to-num`/`to-str` column or a `?:` whose branches agree), so later
-  comparisons against it are typed the same as against the expression itself.
+  `ValExpr::static_type` — including a type inherited from a typed column or
+  a `?:` whose branches agree; `num(x)` is numeric and `str(x)` text, so
+  `add c num(c)` is how a column is pinned), so later comparisons against it
+  are typed the same as against the expression itself.
 - **`delta [-s SUF] COLS`** is pure parser-level sugar: `parse_delta` emits one
   stateful `Stmt::Add` per column (`COL<suffix> = COL - prev(COL)`, suffix
   default `_delta`), so it shares all of `add`'s machinery and guarantees.
@@ -263,7 +265,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
   (needs a raster dep) and a scatter density colour ramp are the remaining
   follow-ups (`todo.org`).
-- `to-num`/`to_num` and `to-str`/`to_str` both spellings accepted.
+- There are no conversion commands: `to-num`/`to-str` (and the underscore
+  spellings) are rejected with a hint pointing at `add c num(c)` / `str()`.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
   **or a newline** (so a multi-line `-f` script is one stage per line, no
@@ -276,36 +279,40 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   backtracking, so parse time is linear in the script and errors point at the
   offending token.
 
-## Implicit conversions (`to_num`/`to_str` are implicit)
+## Implicit conversions (there are no conversion commands)
 
 csvm requires explicit `to_num` before numeric comparison/sort and `to_str`
-before output. csvm-rs makes these implicit:
+before output. csvm-rs makes these implicit, and has no conversion commands:
+the casts `num(x)` / `str(x)` in an `add` are the only explicit type signal
+(`add c num(c)` converts `c` in place and pins it numeric).
 
 Each comparison resolves to one of three modes at compile time (`CmpMode` in
 `plan.rs`, decided by `CmpMode::decide` from the operands' **static types** —
-`ValExpr::static_type`, which consults the tracked `to-num`/`to-str`/`add`
-column types for `Col`/`prev` leaves and types a `?:` only when both branches
-agree; visible per-compare as `:num`/`:str`/`:auto` under `--print-engine`).
-The decision runs twice: the parser decides by column *name*, then
-`Plan::resolve` re-decides from a **position-keyed** type map it threads
-through the statements (`to-num`/`to-str`/`add` set a column's type, `cols`
-reorders the map, `group` keeps its keys' types and types its aggregates,
-`stats` types its profile columns, a join keeps the left side's), so a type
-follows the column however it is spelled — `to-str 2 | sort qty`, a rename in
-between, a `cols` reorder, a `group` on the column. Resolve only pins further:
-an `Auto` becomes `Numeric`/`String` and a default `String` becomes
-`Numeric` (numericizing a literal), never the reverse. The three checks
-below run **in order**, so a numeric signal wins over a string one (`to-str c
-| select c > 5` is still `Numeric` — the numeric literal decides). `sort`
-mirrors this per key with its own `SortMode` (a bare `sort c` auto-detects
-per cell; `=n`/`=s` or a typed column pin it, the latter also at resolve time
-— see the `sort` bullet above):
+`ValExpr::static_type`, which takes a lookup for `Col`/`prev` leaves and
+types a `?:` only when both branches agree; visible per-compare as
+`:num`/`:str`/`:auto` under `--print-engine`). The parser knows no column
+types and leaves every compare `Auto`; the mode is decided once, in
+`Plan::resolve`, from the operands' static types plus a **position-keyed**
+type map it threads through the statements (`add` sets a column's type from
+its expression, `cols` reorders the map, `group` keeps its keys' types and
+types its aggregates, `stats` types its profile columns, a join keeps the
+left side's), so a type follows the column however it is spelled — `add qty
+str(qty) | sort 2`, a rename in between, a `cols` reorder, a `group` on the
+column. A non-numeric literal in a numeric compare is therefore reported at
+resolve time: still before any row is read, but after the input is opened.
+The three checks below run **in order**, so a numeric signal wins
+over a string one (`add c str(c) | select c > 5` is still `Numeric` — the
+numeric literal decides). `sort` mirrors this per key with its own `SortMode`
+(a bare `sort c` auto-detects per cell; `=n`/`=s` or a typed column pin it at
+resolve time — see the `sort` bullet above):
 
 - A comparison with a **statically numeric side** (a numeric literal,
-  arithmetic, a numeric function, `rownum()`, or a `to-num`-typed column) ⇒
-  `Numeric`: both sides parse to `f64` (a non-number aborts the run).
+  arithmetic, a numeric function such as `num()`, `rownum()`, or a column
+  typed numeric by `add`) ⇒ `Numeric`: both sides parse to `f64` (a
+  non-number aborts the run).
 - A comparison with a **statically string side** (a string literal, `++`
-  concat, a boolean value, a string function, or a `to-str`-typed column),
+  concat, a boolean value, a string function such as `str()`, or a column
+  typed text by `add`),
   **or an `==`/`!=` between two untyped sides** ⇒ `String`: lexical. (Equality
   stays lexical because numeric equality on floats is fragile.)
 - An **ordering (`< > <= >=`) between two untyped sides** ⇒ `Auto`: decided
@@ -313,11 +320,12 @@ per cell; `=n`/`=s` or a typed column pin it, the latter also at resolve time
   to lexical. This kills the old footgun where `select qty > stock` silently
   compared `"100" < "9"` as text. It's reproducible (a function of the two
   values, not a sampled type) and never aborts; the successful `f64` parses are
-  reused so the common all-numeric case costs the same as an explicit `to-num`.
-  Pin a genuinely-text column back to lexical with `to-str`.
-- Numbers always serialize correctly on output — no `to-str` needed to print.
-- `to-num c` / `to-str c` remain as explicit **type overrides** affecting later
-  column-vs-column comparisons and the default sort mode for that column.
+  reused so the common all-numeric case costs the same as an explicit cast.
+  Pin a genuinely-text column back to lexical with `add c str(c)`.
+- Numbers always serialize correctly on output — no `str()` needed to print.
+- `add c num(c)` / `add c str(c)` are the explicit **type overrides**,
+  affecting later column-vs-column comparisons and the default sort mode for
+  that column.
 
 Numeric coercion: trim, empty ⇒ `0.0`, else parse `f64`; non-numeric is an error
 that aborts the run with the offending value (matches csvm's `to_num`
@@ -351,7 +359,7 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   file** — stdin is rejected, and `hdr`/`--no-header` error (the schema *is* the
   header). Without the feature, a parquet input errors with a build hint.
 - The schema gives the header **and types**: numeric columns decode straight to
-  `Field::Num`, so the implicit-typing engine works with **no `to-num`**; bool ⇒
+  `Field::Num`, so the implicit-typing engine works with **no cast**; bool ⇒
   `t`/`f`; null ⇒ empty cell. Only flat primitives (int/uint/float/string/bool)
   are supported — any other column type (temporal/decimal/binary/nested, and a
   dictionary/categorical-encoded column whose arrow type is `Dictionary`) errors

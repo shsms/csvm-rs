@@ -19,7 +19,7 @@ git history; this file is the "what next / what was decided" scratchpad.
   =format_num= text. Two values that differ past the sixth decimal are ordered
   in memory but tie after a spill, so the order (and stability) changes with
   =--sort-buffer= / =-n= whenever an upstream stage produced =Field::Num=
-  (=to-num=, =add=, parquet). Fix: spill the already-computed key bytes with
+  (=num()=, =add=, parquet). Fix: spill the already-computed key bytes with
   each line (length-prefixed) and read them back in the merge — which also
   removes the per-line re-parse — or serialize spilled numbers round-trip.
 ** TODO Feature ideas
@@ -47,10 +47,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   a CLI flag. A single =--header a,b,c= flag (with =--no-header= as the
   auto-naming case) removes the "must be the first command" special case from
   the language.
-- =to-num= / =to-str= are nearly vestigial now that comparisons (and =sort=,
-  once auto-detect lands) auto-detect: their remaining job is pinning a
-  column's type. Demote them in the help to "rarely needed" rather than
-  top-level commands (keep them working).
 - The =join= item grammar has a documented ambiguity: a keyless file after an
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
@@ -59,14 +55,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   document; consider dropping =:=.
 
 ** TODO Correctness / edges
-- Two type maps decide sort and compare modes: the parser's name-keyed
-  =col_types= (=parse.rs=; never sees a rename or a position) and
-  =Plan::resolve='s position-keyed one; resolve re-decides every comparison
-  (the parser never knows a type resolve lacks, so this only pins further)
-  and pins =Auto= sort keys. Make resolve the single owner: the parser leaves comparisons undecided and sort keys =Auto=, and
-  =col_types= / =default_sort_mode= go. =numericize='s non-numeric-literal
-  error then moves from parse time to resolve time (still before any row is
-  read), and =describe= of an unresolved plan shows undecided modes.
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
   spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
   A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
@@ -99,6 +87,17 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE Conversion commands replaced by =num()= / =str()= casts
+Shipped 2026-09-05: =to-num= / =to-str= are gone. Conversions were already
+implicit; their one remaining job, pinning a column's type in place, is now
+=add c num(c)= / =add c str(c)= — the casts type their result, and =add=
+carries its expression's type. =num()= also fixes the case auto never
+covered, numeric equality between two untyped columns (=select num(a) ==
+b=). With the commands gone the parser stopped tracking column types by
+name; =Plan::resolve= is the single owner (position-keyed, so a pin follows
+the column through a rename, a =cols= reorder, or a =group= key). A script
+that still uses a command gets an error naming the replacement.
 
 ** DONE Column indices and ranges
 Shipped 2026-09-05: =resolve_col= (=plan.rs=) matches the header name first
