@@ -67,7 +67,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key; `col=nr` flags: `n` numeric, `s` string, `r` reverse) |
 | `head [N]`         | keep the first `N` rows (default 10; `head -n -N` keeps all *but* the last N) |
-| `tail [N]`         | keep the last `N` rows (default 10; blocking)              |
+| `tail [N]`         | keep the last `N` rows (default 10; blocking); `tail +N` starts at row `N` (streams) |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |

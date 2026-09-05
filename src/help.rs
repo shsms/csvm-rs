@@ -228,9 +228,13 @@ defaults to the matching mode. See `csvm help types`.",
         name: "tail",
         aliases: &[],
         summary: "keep the last N rows",
-        synopsis: &["tail [N]        last N rows (default 10; same count spellings as head)"],
-        detail: "Blocking: it buffers the tail, so a plan with tail reads all input.",
-        examples: &["csvm 'tail 20' data.csv"],
+        synopsis: &[
+            "tail [N]        last N rows (default 10; same count spellings as head)",
+            "tail +N         from row N on (skips the first N-1; also -n +N)",
+        ],
+        detail: "tail N is blocking: it buffers the tail, so the plan reads all input. \
+tail +N streams, and stops early with a head after it.",
+        examples: &["csvm 'tail 20' data.csv", "csvm 'tail +2' data.csv"],
     },
     CmdHelp {
         name: "uniq",

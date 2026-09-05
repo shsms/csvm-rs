@@ -92,14 +92,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   it, so both paths agree byte for byte.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
-  streams + stops early when there's no sort, else truncates in the materialized
-  path. A *negative* count (`head -n -N`) keeps all but the last N — a separate
+  streams + stops early when there's no sort (`window_shape` /
+  `stream_window` in `exec.rs`), else truncates in the materialized path. A
+  *negative* count (`head -n -N`) keeps all but the last N — a separate
   `Stage::DropLast` on the blocking in-memory path. (Byte mode `-c` isn't
   supported.)
 - **`tail [N]`** keeps the last N rows (default 10; same count spellings as
-  `head`, via the shared `parse_row_count`). Blocking — it can't stream/stop
-  early, so any plan with `tail` takes the in-memory path (`Stage::Tail`,
-  applied as a drain in `apply_stages_over_rows`).
+  `head`, via the shared `parse_count`). Blocking — it can't stream/stop
+  early, so any plan with `tail N` takes the in-memory path (`Stage::Tail`,
+  applied as a drain in `apply_stages_over_rows`). **`tail +N`** (`-n +N`) is
+  coreutils' "from row N on": a `Stage::Skip(N-1)` that streams through the
+  same window path as `head` (`[pre | skip | head | post]`), so `tail +N |
+  head M` stops early; elsewhere it drains in the materialized path.
 - **`uniq [cols]`** (alias `dedup`) drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
   pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is

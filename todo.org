@@ -7,11 +7,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 * Open items
 
 ** TODO Bugs
-- =tail -n +3= silently means =tail 3=: =parse_count= (=parse.rs=) parses the
-  count text with =i64::parse=, which accepts a leading =+=, so coreutils'
-  "from row N onward" spelling returns the last N rows instead. Either
-  implement =+N= (skip the first N-1 rows — a cheap streaming stage) or reject
-  it with a message. The same parser serves =head=, where =+N= is meaningless.
 - Spilled sort runs lose float precision (pre-existing, found in review
   2026-09-05): an in-memory run keeps keys encoded from the live =Field= values,
   but a run spilled past =--sort-buffer= keeps only the serialized line, and
@@ -37,6 +32,13 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
+- Fold adjacent =head= / =tail +N= stages into one window at parse time
+  (=skip a | head l | skip b= is =skip a+b, head l-b=), so =head 5 | tail +2=
+  streams too; today only the =[skip | head]= order does (=window_shape=).
+- =next_chunk_available= (=exec.rs=) allocates a fresh zeroed chunk buffer
+  per read; on a pipe a read returns ~64 KiB, so a whole-input stream
+  (=tail +N= with no head, any serial transform on stdin) pays a 1 MiB
+  alloc per 64 KiB. Hoist a caller-owned buffer through the serial loops.
 
 ** TODO Interface simplifications
 - Three spellings for one aggregation: =group X | agg …=, =agg … by X=, and a
@@ -55,6 +57,19 @@ git history; this file is the "what next / what was decided" scratchpad.
   document; consider dropping =:=.
 
 ** TODO Correctness / edges
+- Post-sort statements see output-rounded numbers: the streaming sort path
+  carries rows through the merge as their serialized line, so a =Field::Num=
+  produced upstream (=num()=, =add=, parquet) reaches a statement *after* the
+  sort as its six-decimal =format_num= text (=apply_post_to_line=, =exec.rs=),
+  while the materialized path keeps the full value. =add v num(v) | sort v |
+  select v > 1.0000002= can therefore differ between the two paths. The key
+  itself is exact since 2026-09-05 (spilled key + line records). Fix: a
+  round-trip number format for the sort blob, re-formatted at output.
+- Sharded =stats= / =group= reduce in =-n= ranges, so the documented ~1-ULP
+  float drift is now the default behaviour (threads default to the core
+  count since 2026-09-05) and can differ between machines. Decoupling the
+  shard count from the worker count (=shard_ranges= picking a count from
+  file size) would make the output thread-count independent.
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
   spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
   A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
@@ -87,6 +102,14 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--print-engine=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE =tail +N= starts at row N
+Shipped 2026-09-05: =tail -n +3= used to mean =tail 3= (the count parser
+accepted a leading =+=). =tail +N= is now coreutils' "from row N on": a
+=Stage::Skip(N-1)= that streams through the same window path as =head=
+(=window_shape= / =stream_window= in =exec.rs=), so =tail +N | head M=
+stops early; after a sort it drains the materialized rows. =head +N= is an
+error.
 
 ** DONE Conversion commands replaced by =num()= / =str()= casts
 Shipped 2026-09-05: =to-num= / =to-str= are gone. Conversions were already

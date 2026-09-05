@@ -398,6 +398,23 @@ fn head_keeps_first_rows() {
 }
 
 #[test]
+fn tail_plus_n_starts_at_row_n() {
+    // coreutils' `tail -n +N`: from row N on (a streaming skip, unlike `tail N`).
+    assert_eq!(run_checked("tail +3 | cols id", INPUT), "id\n3\n4\n5\n");
+    assert_eq!(run_checked("tail -n +3 | cols id", INPUT), "id\n3\n4\n5\n");
+    // A window: skip 1, then the next 2 — across the test chunk boundary too.
+    let long: String = std::iter::once("id\n".to_string())
+        .chain((1..=200).map(|i| format!("{i}\n")))
+        .collect();
+    assert_eq!(run_checked("tail +150 | head 2", &long), "id\n150\n151\n");
+    // After a sort it skips in sorted order (countZ desc: ids 4,1,5,2,3).
+    assert_eq!(
+        run_checked("sort countZ=nr | tail +4 | cols id", INPUT),
+        "id\n2\n3\n"
+    );
+}
+
+#[test]
 fn rename_changes_header_only() {
     assert_eq!(
         run_checked("rename fieldA=flag, countZ=z | cols id,flag,z", INPUT),
