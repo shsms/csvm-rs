@@ -802,6 +802,55 @@ fn parse_index(s: &str) -> Option<usize> {
     Some(s.parse().unwrap_or(usize::MAX))
 }
 
+/// What [`resolve_col_spec`] does with a bare name that is not in the header.
+#[derive(Clone, Copy)]
+enum Unknown {
+    Error,
+    /// Resolve to no columns: csvm's `cols -v` rule for an unknown name.
+    Ignore,
+}
+
+/// Resolve one `cols` spec to the positions it covers: a single column
+/// reference (see [`resolve_col`]), an index range `LO-HI`, or a range
+/// `LO:HI` between any two references (names or indices) in header order.
+/// An exact header name always wins, so a column called `1-2` stays a name.
+/// `unknown` applies to a bare name only; a bad index or a range with an
+/// unknown end is always an error.
+fn resolve_col_spec(spec: &str, header: &[String], unknown: Unknown) -> Result<Vec<usize>, Error> {
+    // An exact header name always wins over a range or index reading.
+    if let Some(p) = header.iter().position(|h| h == spec) {
+        return Ok(vec![p]);
+    }
+    let Some((lo, hi)) = range_bounds(spec) else {
+        return match (resolve_col(spec, header), unknown) {
+            (Err(Error::Column { .. }), Unknown::Ignore) => Ok(Vec::new()),
+            (r, _) => r.map(|p| vec![p]),
+        };
+    };
+    // An endpoint error names the whole spec: the user typed `us:east`, not `us`.
+    let endpoint = |name: &str| {
+        resolve_col(name, header).map_err(|e| Error::Other(format!("cols: range {spec}: {e}")))
+    };
+    let (lo_pos, hi_pos) = (endpoint(lo)?, endpoint(hi)?);
+    if lo_pos > hi_pos {
+        return Err(Error::Other(format!(
+            "cols: range {spec} runs backwards (`{lo}` is column {}, `{hi}` is column {})",
+            lo_pos + 1,
+            hi_pos + 1
+        )));
+    }
+    Ok((lo_pos..=hi_pos).collect())
+}
+
+/// The two ends of a range spec: `LO-HI` when both sides are bare integers,
+/// else `LO:HI`. `None` for a single column reference.
+fn range_bounds(spec: &str) -> Option<(&str, &str)> {
+    match spec.split_once('-') {
+        Some((lo, hi)) if parse_index(lo).is_some() && parse_index(hi).is_some() => Some((lo, hi)),
+        _ => spec.split_once(':'),
+    }
+}
+
 /// View a row cell as text, treating an out-of-range index as empty (rows can
 /// be ragged; csvm would index out of bounds here).
 #[inline]
@@ -1270,21 +1319,24 @@ impl Stmt {
 
 impl ProjectStmt {
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
-        if self.exclude {
-            // Keep, in order, the columns not named. Unknown names are ignored
-            // (csvm's exclude path does the same).
-            self.positions = (0..header.len())
-                .filter(|&i| !self.names.iter().any(|n| n == &header[i]))
-                .collect();
+        // `cols -v` ignores an unknown name (csvm's exclude path does the
+        // same); `cols` errors on it. A range expands in header order.
+        let unknown = if self.exclude {
+            Unknown::Ignore
         } else {
-            // Keep the named columns, in the given order. A missing name is an
-            // error.
-            self.positions = self
-                .names
-                .iter()
-                .map(|n| resolve_col(n, header))
-                .collect::<Result<_, _>>()?;
+            Unknown::Error
+        };
+        let mut named = Vec::with_capacity(self.names.len());
+        for n in &self.names {
+            named.extend(resolve_col_spec(n, header, unknown)?);
         }
+        self.positions = if self.exclude {
+            // Keep, in order, the columns not named.
+            (0..header.len()).filter(|i| !named.contains(i)).collect()
+        } else {
+            // Keep the named columns, in the given order.
+            named
+        };
         *header = self.positions.iter().map(|&p| header[p].clone()).collect();
         Ok(())
     }

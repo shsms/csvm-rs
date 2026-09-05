@@ -339,11 +339,27 @@ fn columns_by_position_and_range() {
     let input = POSITIONAL;
     assert_eq!(run_checked("cols 4,1", input), "name,id\nalice,1\nbob,2\n");
     assert_eq!(
-        run_checked("cols 2,3 | sort 1", input),
+        run_checked("cols 2-3 | sort 1", input),
         "qty,stock\n9,20\n100,50\n"
+    );
+    assert_eq!(run_checked("cols -v 2:name", input), "id\n1\n2\n");
+    assert_eq!(
+        run_checked("hdr a,b,c,d | cols 1,b:3", input),
+        "a,b,c\nid,qty,stock\n1,100,50\n2,9,20\n"
     );
     let err = run("cols 5", input, 1).unwrap_err();
     assert!(err.contains("column index 5 is out of range"), "{err}");
+    // A bad position or a range with an unknown endpoint in `cols -v` is an
+    // error too, not a silent no-op (only an unknown bare name is ignored).
+    let err = run("cols -v 2-9", input, 1).unwrap_err();
+    assert!(err.contains("out of range"), "{err}");
+    let err = run("cols -v qty:nope", input, 1).unwrap_err();
+    assert!(err.contains("range qty:nope"), "{err}");
+    assert!(err.contains("column not found: nope"), "{err}");
+    assert_eq!(
+        run_checked("cols -v nope", input),
+        "id,qty,stock,name\n1,100,50,alice\n2,9,20,bob\n"
+    );
     // In an expression a bare integer is a literal; a backticked one is a
     // column position.
     assert_eq!(run_checked("select `2` > 20 | cols id", input), "id\n1\n");
