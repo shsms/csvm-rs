@@ -6,6 +6,66 @@ git history; this file is the "what next / what was decided" scratchpad.
 
 * Open items
 
+** TODO Bugs
+- =tail -n +3= silently means =tail 3=: =parse_count= (=parse.rs=) parses the
+  count text with =i64::parse=, which accepts a leading =+=, so coreutils'
+  "from row N onward" spelling returns the last N rows instead. Either
+  implement =+N= (skip the first N-1 rows — a cheap streaming stage) or reject
+  it with a message. The same parser serves =head=, where =+N= is meaningless.
+- Spilled sort runs lose float precision (pre-existing, found in review
+  2026-09-05): an in-memory run keeps keys encoded from the live =Field= values,
+  but a run spilled past =--sort-buffer= keeps only the serialized line, and
+  =encode_file_line= (=sort.rs=) re-derives the key from that 6-decimal
+  =format_num= text. Two values that differ past the sixth decimal are ordered
+  in memory but tie after a spill, so the order (and stability) changes with
+  =--sort-buffer= / =-n= whenever an upstream stage produced =Field::Num=
+  (=to-num=, =add=, parquet). Fix: spill the already-computed key bytes with
+  each line (length-prefixed) and read them back in the merge — which also
+  removes the per-line re-parse — or serialize spilled numbers round-trip.
+- =to-num= / =to-str= type tracking is keyed by the spec text at parse time
+  (=col_types= in =parse.rs=), so a positional spelling misses it: =to-str 1 |
+  sort qty= and =to-str qty | sort 1= both sort =auto=, and =to-num qty | sort
+  1= quietly drops =to-num='s strictness. Fix: decide =SortMode= / =CmpMode=
+  upgrades at resolve time from a position-keyed type map that =Plan::resolve=
+  threads through the statements (=ConvStmt= sets, =cols= reorders, reducing
+  stages reset), or reject mixed spellings.
+
+** TODO Feature ideas
+- Default =-n= to the core count (=std::thread::available_parallelism=). Today
+  threads default to 1, so the headline benefit needs =-n 8= every time. Output
+  is =-n=-independent except the documented ~1-ULP float drift in sharded
+  =stats=/=group=, so the change is low risk; =-n 1= stays as the explicit
+  escape hatch.
+- String and date functions in =add= (deferred from the original =add= design,
+  below): =split(s, sep, i)=, regex =match(s, re)= (first capture) and =sub=,
+  and =epoch(ts)= exposing =src/datetime.rs= so a timestamp column becomes a
+  numeric x for charts or plain arithmetic.
+- =count_distinct(col)= in =agg=: one =HashSet= per group, merged by union —
+  unlike median it is cheaply mergeable, so it fits the sharded path as-is.
+- JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
+  write is listed under the parquet follow-ups.
+- A first tagged release: the tool is well past =0.1.0= in practice.
+
+** TODO Interface simplifications
+- Three spellings for one aggregation: =group X | agg …=, =agg … by X=, and a
+  bare =group X= as a count — and the fusion rule carries its own non-fusable
+  error cases. Pick one primary form and demote the rest to documented aliases
+  (or drop them); shrinks the parser and the =agg= help page.
+- =hdr= and =--no-header= overlap: a language command that must come first vs
+  a CLI flag. A single =--header a,b,c= flag (with =--no-header= as the
+  auto-naming case) removes the "must be the first command" special case from
+  the language.
+- =to-num= / =to-str= are nearly vestigial now that comparisons (and =sort=,
+  once auto-detect lands) auto-detect: their remaining job is pinning a
+  column's type. Demote them in the help to "rarely needed" rather than
+  top-level commands (keep them working).
+- The =join= item grammar has a documented ambiguity: a keyless file after an
+  =on= clause is lexically identical to more key columns, so a forgotten
+  per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
+  distinct item separator, removes the trap.
+- =sort= accepts both =col=nr= and =col:nr=. Harmless, but one fewer thing to
+  document; consider dropping =:=.
+
 ** TODO Correctness / edges
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
   spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
@@ -37,20 +97,7 @@ default without new syntax.
   can't cheaply sample types. Leaning: document-only for now; revisit if it bites.
 
 ** TODO Smaller features
-- Delimiter support =-d= / =--delim= (TSV) — a narrow near-term step toward the
-  Source/Sink roadmap; touches the scanner + writer.
 - Column ranges / indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
-- Join naming sugar: kill the per-file =(rename value=X | cols -v metric)=
-  boilerplate in multi-file joins — per-item =as NAME= (prefix all non-key
-  right columns: =join pv.csv as pv on ts= → =pv_value=, =pv_metric=) and/or a
-  =--auto= flag deriving the prefix from the file stem (=pv.active.csv= →
-  =pv_active_…=). Sugar over the sub-pipeline, never a replacement. Decided
-  with the multi-file join (2026-08-26); naming mechanism still open. The
-  =fn= fragments feature (shipped) reduces this item's urgency but does not
-  replace it.
-- Multiple input files: =csvm SCRIPT a.csv b.csv= — concatenate inputs sharing a
-  header (currently only one input is accepted; =join= already covers keyed
-  merges).
 - =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
   — not cheaply mergeable, so they need buffering or t-digest/HLL.
 
@@ -282,8 +329,8 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 - =graph scatter= density colour ramp: colour a single-series scatter by point
   density / a third value column (reuse =color.rs= =Ramp=); multi-series already
   gets distinct per-series colours.
-- =add= =epoch()= / date function: expose =src/datetime.rs= parsing in the value
-  expression (also lets a chart take a numeric time x directly).
+- =add= =epoch()= / date function — folded into the "string and date functions"
+  feature idea under Open items.
 - Time-axis labels honour the source offset (currently formatted as UTC).
 - Chart data fidelity is capped at =format_num='s 6 decimals because charts
   re-parse the serialized output (the buffer reuse =fmt=/=color= share), so a
@@ -328,6 +375,7 @@ group file can't shard. Blocking stages (group/sort/…) still take the
 single-threaded materialize path. =gen_parquet= now writes multiple row groups.
 
 ** TODO Projection push-down (parquet) — only decode the columns the plan needs
+Wanted, but postponed for now (2026-09-05); the scoping below stands.
 Parquet is columnar, so an unused column's chunk can be skipped on disk
 entirely. Today =batch_to_rows= decodes *every* column of every batch into
 =Field=s even when the plan never reads them — pure waste on a wide file (a
@@ -384,12 +432,14 @@ keys — because a missed ref ⇒ wrong column or panic.
 - Exact-integer columns: int64/uint64 above 2^53 lose precision under the =f64=
   numeric model. A dedicated integer =Field= variant would fix it (big change).
 - Parquet *write* (the =Sink= half) and the general =Source=/=Sink= trait that
-  also subsumes TSV / JSON-lines.
+  also subsumes JSON-lines.
 
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
-- Remaining pluggable formats via a =Source=/=Sink= trait: TSV, JSON-lines
-  (parquet read shipped; see above).
+- Remaining pluggable formats via a =Source=/=Sink= trait: JSON-lines (parquet
+  read shipped; see above). Not TSV / a delimiter flag, not multiple input
+  files, not join naming sugar — all three were considered and rejected for
+  good (2026-09-05).
 - =join= follow-ups (core implemented — =Stage::Join=, sub-pipeline right side):
   stream / shard-probe the left side with a shared =Arc= build table instead of
   forcing the in-memory path; numeric-key normalization; auto-pick the smaller

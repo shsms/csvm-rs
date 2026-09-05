@@ -410,9 +410,10 @@ in-memory path). Group-by aggregation is implemented (`Stage::Group`,
 hist/bar/spark/scatter/line` in `src/graph.rs`, `--svg` export in
 `src/svg.rs`). Pluggable input formats have begun: **parquet read** ships behind
 the optional `parquet` feature (`src/parquet.rs`, see above). Planned (see
-`todo.org` for design notes): conditional colouring for `fmt`, the rest of the
-`Source`/`Sink` trait (TSV, parquet *write*, row-group-parallel parquet), and a
-scatter density colour ramp.
+`todo.org` for design notes): parquet projection push-down and *write*,
+JSON-lines output, and a scatter density colour ramp. TSV / a delimiter flag,
+multiple input files, and join naming sugar were considered and rejected for
+good.
 
 ## Conventions
 

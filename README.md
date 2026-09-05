@@ -251,9 +251,10 @@ and alignment — reporting per-operation throughput.
 ## Roadmap
 
 The pipe language is built to grow. Terminal-native charts ship today
-(`graph hist/bar/spark/scatter/line`, with `--svg` export). Planned: conditional
-colouring for `fmt`, pluggable formats via a `Source`/`Sink` trait (Parquet,
-TSV), and a scatter density colour ramp. See `todo.org` for design notes.
+(`graph hist/bar/spark/scatter/line`, with `--svg` export), as do conditional
+colouring (`color`) and Parquet input. Planned: Parquet projection push-down and
+write, JSON-lines output, and a scatter density colour ramp. See `todo.org` for
+design notes.
 
 ## License
 
