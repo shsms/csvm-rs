@@ -21,6 +21,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
@@ -351,7 +352,10 @@ fn merge_groups(groups: Vec<Vec<Run>>, threads: usize, temp_dir: &Path) -> Resul
 fn merge_group(group: Vec<Run>, temp_dir: &Path) -> Result<Run, Error> {
     let seq = group.iter().map(|r| r.seq).min().unwrap_or(0);
     let file = write_run(temp_dir, |w| {
-        Merge::new(group)?.for_each_record(|key, line| write_record(w, key, line))
+        Merge::new(group)?.for_each_record(|key, line| {
+            write_record(w, key, line)?;
+            Ok(ControlFlow::Continue(()))
+        })
     })?;
     Ok(Run {
         seq,
@@ -524,10 +528,11 @@ impl Merge {
         Ok(Merge { sources, heap })
     }
 
-    /// Drive the merge, calling `emit` with each row's line bytes in order.
+    /// Drive the merge, calling `emit` with each row's line bytes in order
+    /// until it returns `Break` (a full `head` stops reading the runs).
     pub fn for_each_line<F>(self, mut emit: F) -> Result<(), Error>
     where
-        F: FnMut(&[u8]) -> Result<(), Error>,
+        F: FnMut(&[u8]) -> Result<ControlFlow<()>, Error>,
     {
         self.for_each_record(|_, line| emit(line))
     }
@@ -536,10 +541,12 @@ impl Merge {
     /// bytes in order (an intermediate merge writes both back out).
     fn for_each_record<F>(mut self, mut emit: F) -> Result<(), Error>
     where
-        F: FnMut(&[u8], &[u8]) -> Result<(), Error>,
+        F: FnMut(&[u8], &[u8]) -> Result<ControlFlow<()>, Error>,
     {
         while let Some(Reverse(item)) = self.heap.pop() {
-            emit(&item.key, self.sources[item.idx].current_line())?;
+            if emit(&item.key, self.sources[item.idx].current_line())?.is_break() {
+                break;
+            }
             if let Some(key) = self.sources[item.idx].next_key(item.key)? {
                 self.heap.push(Reverse(HeapKey {
                     key,
@@ -690,7 +697,7 @@ mod tests {
                         .trim_end()
                         .to_string(),
                 );
-                Ok(())
+                Ok(ControlFlow::Continue(()))
             })
             .unwrap();
         out
@@ -861,7 +868,7 @@ mod tests {
                     .parse()
                     .unwrap();
                 out.push(n);
-                Ok(())
+                Ok(ControlFlow::Continue(()))
             })
             .unwrap();
         out
@@ -901,7 +908,7 @@ mod tests {
             .unwrap()
             .for_each_line(|line| {
                 out.push(std::str::from_utf8(line).unwrap().trim_end().to_string());
-                Ok(())
+                Ok(ControlFlow::Continue(()))
             })
             .unwrap();
         // Within each key group, tags ascend (input order preserved).

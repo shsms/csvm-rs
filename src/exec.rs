@@ -9,6 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -151,8 +152,8 @@ fn run_body<R: BufRead, W: Write + Send>(
     }
     // A `tail +N` / `head` window with no sort streams single-threaded and
     // stops early.
-    if let Some((pre, skip, limit, post)) = window_shape(plan) {
-        return stream_window(pre, skip, limit, post, opts.chunk_size, input, output);
+    if let Some((pre, window, post)) = window_shape(&plan.stages) {
+        return stream_window(pre, window, post, opts.chunk_size, input, output);
     }
     // `stats` reduces the stream to a tiny profile; stream the input through it
     // (O(columns) memory) and run any following stages over that profile.
@@ -170,17 +171,51 @@ fn run_body<R: BufRead, W: Write + Send>(
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
         }
         [Stage::Transform(stmts)] => {
-            stream_window(stmts, 0, usize::MAX, &[], opts.chunk_size, input, output)
+            stream_window(stmts, Window::ALL, &[], opts.chunk_size, input, output)
         }
         _ => run_staged(plan, opts, input, output),
     }
 }
 
-/// If the plan is `[Transform?, Skip?, Head?, Transform?]` with at least one
-/// of the window stages, return the pre-window statements, the rows to skip,
-/// the limit (`usize::MAX` for none), and the post-window statements.
-fn window_shape(plan: &Plan) -> Option<(&[Stmt], usize, usize, &[Stmt])> {
-    let (pre, rest) = match plan.stages.as_slice() {
+/// A row window: drop the first `skip` rows, then pass the next `limit`.
+#[derive(Clone, Copy)]
+struct Window {
+    skip: usize,
+    limit: usize,
+    /// Rows offered so far.
+    seen: usize,
+}
+
+impl Window {
+    /// Every row.
+    const ALL: Window = Window::new(0, usize::MAX);
+
+    const fn new(skip: usize, limit: usize) -> Self {
+        Window {
+            skip,
+            limit,
+            seen: 0,
+        }
+    }
+
+    /// Offer the next row: `true` if it is inside the window.
+    fn admit(&mut self) -> bool {
+        let inside = self.seen >= self.skip && !self.done();
+        self.seen += 1;
+        inside
+    }
+
+    /// Whether the window is full, so no later row can be admitted.
+    fn done(&self) -> bool {
+        self.seen >= self.skip.saturating_add(self.limit)
+    }
+}
+
+/// If `stages` is `[Transform?, Skip?, Head?, Transform?]` with at least one
+/// of the window stages, return the pre-window statements, the window, and
+/// the post-window statements.
+fn window_shape(stages: &[Stage]) -> Option<(&[Stmt], Window, &[Stmt])> {
+    let (pre, rest) = match stages {
         [Stage::Transform(p), rest @ ..] => (p.as_slice(), rest),
         rest => (&[][..], rest),
     };
@@ -200,27 +235,24 @@ fn window_shape(plan: &Plan) -> Option<(&[Stmt], usize, usize, &[Stmt])> {
     if skip.is_none() && limit.is_none() {
         return None; // no window stage: a lone transform has its own paths
     }
-    Some((pre, skip.unwrap_or(0), limit.unwrap_or(usize::MAX), post))
+    let window = Window::new(skip.unwrap_or(0), limit.unwrap_or(usize::MAX));
+    Some((pre, window, post))
 }
 
-/// Stream `[pre | skip | head limit | post]` single-threaded, dropping the
-/// first `skip` rows that survive `pre` and stopping once `limit` more have
-/// passed. Reads only as much input as it needs (via
-/// [`next_chunk_available`]) so it emits and stops promptly on a stream rather
-/// than blocking for a full chunk.
+/// Stream `[pre | window | post]` single-threaded, offering the rows that
+/// survive `pre` to the window and stopping once it is full. Reads only as
+/// much input as it needs (via [`next_chunk_available`]) so it emits and
+/// stops promptly on a stream rather than blocking for a full chunk.
 fn stream_window<R: BufRead, W: Write>(
     pre: &[Stmt],
-    skip: usize,
-    limit: usize,
+    mut window: Window,
     post: &[Stmt],
     chunk_size: usize,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let end = skip.saturating_add(limit);
-    let mut seen = 0usize; // rows that survived `pre`
     let mut out_buf = String::new();
-    while seen < end {
+    while !window.done() {
         let Some(chunk) = next_chunk_available(input, chunk_size)? else {
             break;
         };
@@ -228,13 +260,12 @@ fn stream_window<R: BufRead, W: Write>(
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
         csv::parse_chunk(&chunk, |row| {
-            if err.is_some() || seen >= end {
+            if err.is_some() || window.done() {
                 return;
             }
             match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
                 Ok(true) => {
-                    seen += 1;
-                    if seen <= skip {
+                    if !window.admit() {
                         return;
                     }
                     match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
@@ -1164,41 +1195,25 @@ fn run_staged<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let sort_count = plan
-        .stages
-        .iter()
-        .filter(|s| matches!(s, Stage::Sort(_)))
-        .count();
-    let has_head = plan.stages.iter().any(|s| matches!(s, Stage::Head(_)));
-    let has_stats = plan.stages.iter().any(|s| matches!(s, Stage::Stats(_)));
-    let has_buffered = plan.stages.iter().any(|s| {
-        matches!(
-            s,
-            Stage::Tail(_)
-                | Stage::DropLast(_)
-                | Stage::Skip(_)
-                | Stage::Uniq(_)
-                | Stage::Group(_)
-                | Stage::Join(_)
-        )
-    });
-    // The streaming sort path handles exactly one sort and no head/stats/
-    // tail/drop-last/skip/uniq/join; anything else materializes and runs stage
-    // by stage.
-    if sort_count != 1 || has_head || has_stats || has_buffered {
-        return run_staged_in_memory(plan, opts, input, output);
-    }
-
-    let sort_idx = plan
-        .stages
-        .iter()
-        .position(|s| matches!(s, Stage::Sort(_)))
-        .unwrap();
-    let pre = transform_stmts(&plan.stages[..sort_idx]);
-    let Stage::Sort(sort) = &plan.stages[sort_idx] else {
-        unreachable!()
+    // The streaming sort path handles `[Transform?, Sort, Transform?]`, or a
+    // window (`Skip`/`Head` with transforms around it) after the sort, which
+    // is a counter over the merge output; anything else materializes and
+    // runs stage by stage.
+    let (pre, rest) = match plan.stages.as_slice() {
+        [Stage::Transform(p), rest @ ..] => (p.as_slice(), rest),
+        rest => (&[][..], rest),
     };
-    let post = transform_stmts(&plan.stages[sort_idx + 1..]);
+    let [Stage::Sort(sort), tail @ ..] = rest else {
+        return run_staged_in_memory(plan, opts, input, output);
+    };
+    let (post, mut window, post2) = match tail {
+        [] => (&[][..], Window::ALL, &[][..]),
+        [Stage::Transform(p)] => (p.as_slice(), Window::ALL, &[][..]),
+        tail => match window_shape(tail) {
+            Some(shape) => shape,
+            None => return run_staged_in_memory(plan, opts, input, output),
+        },
+    };
 
     // Feed raw input blocks to the sorter; its workers parse, apply the
     // pre-sort statements, and sort each block in parallel.
@@ -1216,42 +1231,62 @@ fn run_staged<R: BufRead, W: Write>(
 
     // The merge hands us already-serialized line bytes (workers serialized them
     // in parallel). With no post-sort statements we write them straight out;
-    // otherwise we re-parse each line, apply, and re-serialize.
+    // otherwise we re-parse each line, apply, and re-serialize. A full window
+    // stops the merge.
     let mut out_buf: Vec<u8> = Vec::new();
+    let mut row_buf = String::new();
     sorter.finish()?.for_each_line(|line| {
-        if post.is_empty() {
-            out_buf.extend_from_slice(line);
+        if post.is_empty() && post2.is_empty() {
+            if window.admit() {
+                out_buf.extend_from_slice(line);
+            }
         } else {
-            apply_post_to_line(post, line, &mut out_buf)?;
+            apply_post_to_line(post, &mut window, post2, line, &mut row_buf, &mut out_buf)?;
         }
         if out_buf.len() >= 1 << 16 {
             output.write_all(&out_buf)?;
             out_buf.clear();
         }
-        Ok(())
+        Ok(if window.done() {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        })
     })?;
     output.write_all(&out_buf)?;
     Ok(())
 }
 
-/// Re-parse one merged line, apply the post-sort statements, and append the
-/// re-serialized survivors to `out`. Only used when a `sort` has trailing
-/// transforms; the common pure-sort path writes line bytes directly.
-fn apply_post_to_line(post: &[Stmt], line: &[u8], out: &mut Vec<u8>) -> Result<(), Error> {
+/// Re-parse one merged line, apply `[post | window | post2]`, and append the
+/// re-serialized survivor to `out` (`row_buf` is the reused serialization
+/// buffer). Only used when a `sort` has trailing transforms; the pure-sort
+/// and bare-window paths write line bytes directly.
+fn apply_post_to_line(
+    post: &[Stmt],
+    window: &mut Window,
+    post2: &[Stmt],
+    line: &[u8],
+    row_buf: &mut String,
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
     let text = std::str::from_utf8(line)
         .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
     let mut err: Option<Error> = None;
-    let mut buf = String::new();
     let mut scratch: Vec<Field> = Vec::new();
     csv::parse_chunk(text, |row| {
         if err.is_some() {
             return;
         }
-        match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
+        let kept = apply_stmts(post, row, &mut scratch, &EvalCtx::default())
+            .map(|kept| kept && window.admit())
+            .and_then(|kept| {
+                Ok(kept && apply_stmts(post2, row, &mut scratch, &EvalCtx::default())?)
+            });
+        match kept {
             Ok(true) => {
-                buf.clear();
-                csv::write_row(&mut buf, row);
-                out.extend_from_slice(buf.as_bytes());
+                row_buf.clear();
+                csv::write_row(row_buf, row);
+                out.extend_from_slice(row_buf.as_bytes());
             }
             Ok(false) => {}
             Err(e) => err = Some(e),
@@ -1268,14 +1303,6 @@ fn plan_has_stateful_expr(plan: &Plan) -> bool {
         Stage::Transform(stmts) => stmts.iter().any(Stmt::is_stateful),
         _ => false,
     })
-}
-
-/// The statements of an optional single transform stage (empty otherwise).
-fn transform_stmts(stages: &[Stage]) -> &[Stmt] {
-    match stages {
-        [Stage::Transform(stmts)] => stmts,
-        _ => &[],
-    }
 }
 
 /// Materialize all rows, run each stage in turn, then serialize. The fallback
@@ -2521,7 +2548,8 @@ mod tests {
         let shape = |script: &str| {
             let mut plan = crate::parse::parse(script).unwrap();
             plan.resolve(&["id".to_string()]).unwrap();
-            window_shape(&plan).map(|(pre, skip, limit, post)| (pre.len(), skip, limit, post.len()))
+            window_shape(&plan.stages)
+                .map(|(pre, w, post)| (pre.len(), w.skip, w.limit, post.len()))
         };
         assert_eq!(shape("tail +3 | head 2"), Some((0, 2, 2, 0)));
         assert_eq!(
@@ -2533,6 +2561,44 @@ mod tests {
         // A lone transform has its own paths; a window after a sort does not stream.
         assert_eq!(shape("cols id"), None);
         assert_eq!(shape("sort id | head 2"), None);
+    }
+
+    #[test]
+    fn sort_streams_a_trailing_window() {
+        // A skip/head after the sort is a counter over the merge output, so the
+        // external sort still applies; with a 1-byte budget every run spills.
+        let run = |script: &str| {
+            let mut plan = parse(script).unwrap();
+            let mut reader = io::BufReader::new(INPUT.as_bytes());
+            let header = read_header(&mut reader).unwrap();
+            let out_header = plan.resolve(&header).unwrap();
+            let opts = RunOpts {
+                chunk_size: 16,
+                threads: 4,
+                temp_dir: std::env::temp_dir(),
+                sort_buffer: 1,
+            };
+            let mut out = Vec::new();
+            run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        // countZ desc: ids 4,1,2,3 (2 and 3 tie at 0, input order).
+        assert_eq!(
+            run("sort countZ=nr | tail +2 | head 2 | cols id"),
+            "id\n1\n2\n"
+        );
+        assert_eq!(run("sort countZ=nr | head 1"), "id,fieldA,countZ\n4,t,9\n");
+        assert_eq!(
+            run("sort countZ=nr | select fieldA == 't' | tail +2 | cols id"),
+            "id\n1\n3\n"
+        );
+        assert_eq!(run("sort countZ=nr | tail +9"), "id,fieldA,countZ\n");
+        // A zero limit admits nothing.
+        assert_eq!(run("sort countZ=nr | head 0"), "id,fieldA,countZ\n");
+        assert_eq!(
+            run("sort countZ=nr | tail +2 | head 0"),
+            "id,fieldA,countZ\n"
+        );
     }
 
     #[test]

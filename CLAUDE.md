@@ -93,7 +93,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
   streams + stops early when there's no sort (`window_shape` /
-  `stream_window` in `exec.rs`), else truncates in the materialized path. A
+  `stream_window` in `exec.rs`); after a single `sort` it is a counter over
+  the merge output (`Window`), so the external sort still applies; else it
+  truncates in the materialized path. A
   *negative* count (`head -n -N`) keeps all but the last N — a separate
   `Stage::DropLast` on the blocking in-memory path. (Byte mode `-c` isn't
   supported.)
@@ -103,7 +105,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   applied as a drain in `apply_stages_over_rows`). **`tail +N`** (`-n +N`) is
   coreutils' "from row N on": a `Stage::Skip(N-1)` that streams through the
   same window path as `head` (`[pre | skip | head | post]`), so `tail +N |
-  head M` stops early; elsewhere it drains in the materialized path.
+  head M` stops early, and counts over the merge output after a `sort` like
+  `head`; elsewhere it drains in the materialized path.
 - **`uniq [cols]`** (alias `dedup`) drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
   pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is
@@ -418,7 +421,10 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   A single-threaded binary-heap k-way merge then picks the smallest key and
   emits the row's already-serialized line bytes via a callback — no per-field
   allocation, no re-serialization on output. A block is a contiguous input
-  range, so its sequence number keeps the merge stable.
+  range, so its sequence number keeps the merge stable. Trailing transforms
+  and a trailing `head`/`tail +N` window run on the merge output line by line
+  (the `Window` counter in `run_staged`; `apply_post_to_line` when transforms
+  wrap the window); anything else after the sort materializes.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls
