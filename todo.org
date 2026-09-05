@@ -100,8 +100,21 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
 
+** DONE Column indices and ranges
+Shipped 2026-09-05: =resolve_col= (=plan.rs=) matches the header name first
+and then reads a bare integer as a 1-based position, so positional refs work
+in every command that names a column (=cols 1,3=, =sort 2=nr=, =group 1=,
+=select `3` > 0=); out of range is its own error. =cols= alone takes ranges via
+=resolve_col_spec=: =2-4= between two positions, =a:d= between any two
+references, expanded in header order. An exact name always wins over the
+positional or range reading, so a column literally named =2= or =1-2= is
+unaffected. The =$3= spelling was dropped: the bare integer covers it and =$=
+would clash with the =$== ends-with operator. Backticks are stripped by
+=split_list= before resolution, so they do not force a name reading — a
+missing name that happens to be a number resolves as a position (name-first
+makes that harmless in practice).
+
 ** TODO Smaller features
-- Column ranges / indices: =cols 1-5=, =cols a:e=, =$3= positionals (wide data).
 - =stats --full=: the deferred =median=/quantiles, =distinct=/cardinality, =mode=
   — not cheaply mergeable, so they need buffering or t-digest/HLL.
 

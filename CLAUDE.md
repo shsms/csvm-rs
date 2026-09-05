@@ -34,7 +34,27 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 | `to_num(a, b)` / `to_str(a, b)`  | `to-num a,b` / `to-str a,b`                   |
 
 - **`cols`** keeps/reorders the named columns; **`cols -v`** keeps everything
-  *except* them (like `cut --complement`).
+  *except* them (like `cut --complement`). Columns can also be referenced by
+  **1-based position**: `resolve_col` (`plan.rs`) matches the header name
+  first and only then reads a bare integer as a position (so a column
+  literally named `2` is never shadowed; out of range is its own error). That
+  fallback lives in the one shared resolver, so it works for every column
+  reference — `sort 1=n`, `group 2`, `` select `3` > 0 `` — not just `cols`.
+  `cols` alone also takes **ranges** (`resolve_col_spec`): `2-4` between two
+  positions, or `a:d` between any two references, expanding in header order;
+  an exact header name (even one like `1-2`) always wins over the range
+  reading. `cols -v` still ignores an unknown name, but a bad position or
+  range is an error (`resolve_col_spec` takes an `Unknown` policy that applies
+  to a bare name only, so a range endpoint keeps its did-you-mean hint).
+  Resolvers that keep a column's name — group keys, agg names, the stats
+  `field` column, sort keys, `uniq`/`to-num`/`to-str` lists, and `ColRef`
+  (chart titles, expression refs) — rewrite it to the header name, so
+  output and `--print-engine` show `qty`, not `2`. Join keys and `rename`'s
+  source name still echo the spec text.
+  Backticks are stripped before resolution (`split_list`), so they do not
+  force a name reading. Known gap: the parser's `to-num`/`to-str` type map is
+  keyed by the spec text, so `to-str 1 | sort qty` does not see the `to-str`
+  (`todo.org`).
 - **`select`** operators: `==` (or `=`), `!=`, `< > <= >=`, `=~` / `!~` (regex),
   `^=` / `*=` / `$=` (begins/contains/ends, literal substring — negate with
   `!(…)`), `&&`, `||`, `!`, parens. No word operators (so columns are never reserved

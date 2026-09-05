@@ -155,12 +155,20 @@ pub const COMMANDS: &[CmdHelp] = &[
         synopsis: &[
             "cols A,B,C      keep these columns, in this order",
             "cols -v A,B     keep everything except these",
+            "cols 1,3 2-4    columns by 1-based position; N-M is a range",
+            "cols A:D        a range between any two columns (names or positions)",
         ],
         detail: "Reorders to the listed order. Names may be comma- or space-separated; \
-backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`.",
+backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`. A bare \
+integer that is not a column name is a 1-based position (handy with --no-header's c1, c2, …), \
+and that works wherever a column is named — sort, group, agg, stats — not just here. Inside an \
+expression a bare integer is a number literal, so backtick it there: select `3` > 0. A range \
+expands in header order; an exact column name always wins over a position or range reading. \
+In `cols -v` an unknown name is ignored, but a bad position or range is an error.",
         examples: &[
             "csvm 'cols id,amount' data.csv",
             "csvm 'cols -v notes' data.csv",
+            "csvm --no-header 'cols 2-4 | sort 1=n' data.csv",
         ],
     },
     CmdHelp {

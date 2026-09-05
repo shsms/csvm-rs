@@ -63,6 +63,7 @@ Each stage is a command with comma- or space-separated arguments:
 |--------------------|------------------------------------------------------------|
 | `cols a,b,c`       | keep these columns, in this order                          |
 | `cols -v a,b`      | keep everything *except* these columns                     |
+| `cols 1,3 2-4 a:d` | columns by 1-based position, position range, or name range |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
 | `sort SPEC...`     | sort rows (stable, multi-key; `col=nr` flags: `n` numeric, `s` string, `r` reverse) |
 | `head [N]`         | keep the first `N` rows (default 10; `head -n -N` keeps all *but* the last N) |
@@ -89,7 +90,9 @@ Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 `to_num`/`to_str` (underscore) are accepted too. `where`/`filter` are aliases for
 `select`, `cut` for `cols`, and `dedup` for `uniq`. A `#` outside quotes starts a
 comment to end of line. A column name with a comma or space can be
-backtick-quoted in any command — `` cols `first, last`,age ``.
+backtick-quoted in any command — `` cols `first, last`,age ``. A bare integer
+that is not a column name is a 1-based position, in any command that names a
+column (`sort 2=nr`, `group 1`); with `--no-header` that is the natural way in.
 
 ### Per-command detail
 
