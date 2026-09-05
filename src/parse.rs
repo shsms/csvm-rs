@@ -586,8 +586,15 @@ impl<'a> Builder<'a> {
     /// `agg [NAME=]FN(col),… [by COLS]` reduces to one row per key; `by COLS`
     /// gives the keys, and without it the whole input is one group.
     fn parse_agg(&mut self, rest: &str) -> Result<(), Error> {
-        let (specs, by) = split_off_by(rest);
-        let aggs = split_specs(specs)
+        // One item list: the aggregates, then an unquoted `by` item, then
+        // the keys (`by COLS`; without it, one global aggregate row).
+        let items = split_specs(rest)?;
+        let by_at = items.iter().position(|t| t == "by");
+        let (specs, keys) = match by_at {
+            Some(at) => (&items[..at], &items[at + 1..]),
+            None => (&items[..], &[][..]),
+        };
+        let aggs = specs
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
@@ -596,17 +603,10 @@ impl<'a> Builder<'a> {
                 "agg expects at least one aggregate, e.g. agg sum(amount)",
             ));
         }
-        // `by COLS` gives the keys; without it, one global aggregate row.
-        let keys = match by {
-            Some(k) => {
-                let keys = split_list(k);
-                if keys.is_empty() {
-                    return Err(err("agg: `by` expects at least one key column"));
-                }
-                keys
-            }
-            None => Vec::new(),
-        };
+        if by_at.is_some() && keys.is_empty() {
+            return Err(err("agg: `by` expects at least one key column"));
+        }
+        let keys: Vec<String> = keys.iter().map(|k| unquote(k).to_string()).collect();
         self.items.push(Item::Stage(Stage::Group(GroupStmt {
             keys,
             key_positions: Vec::new(),
@@ -807,8 +807,8 @@ impl<'a> Builder<'a> {
 
     /// `add NAME = EXPR` — append (or replace, if `NAME` exists) a computed
     /// column. The expression is the value-expression grammar (arithmetic,
-    /// `++` concat, functions, `?:`, `prev()`/`rownum()`). A backtick-quoted
-    /// `NAME` may contain spaces.
+    /// `++` concat, functions, `?:`, `prev()`/`rownum()`). A quoted `NAME`
+    /// (`'`, `"` or backticks) may contain spaces.
     fn parse_add(&mut self, rest: &str) -> Result<(), Error> {
         let (name, after, assigned) = split_name_eq(rest)?;
         if name.is_empty() {
@@ -1264,17 +1264,15 @@ fn split_first_word(stage: &str) -> (&str, &str) {
 
 /// Split a `NAME = …` assignment: the name, everything after it, and what
 /// follows a single `=` (`None` when there is no `=`, or a `==`, which is a
-/// comparison). A backtick-quoted name may contain spaces; otherwise the
-/// name ends at whitespace or at the `=`.
+/// comparison). A quoted name (`'`, `"` or backticks) may contain spaces;
+/// otherwise the name ends at whitespace or at the `=`.
 fn split_name_eq(rest: &str) -> Result<(String, &str, Option<&str>), Error> {
     let rest = rest.trim_start();
-    let (name, after) = if let Some(after_tick) = rest.strip_prefix('`') {
-        match after_tick.find('`') {
-            Some(end) => (
-                after_tick[..end].to_string(),
-                after_tick[end + 1..].trim_start(),
-            ),
-            None => return Err(err("unterminated backtick column name")),
+    let (name, after) = if let Some(q) = rest.chars().next().filter(|c| "'\"`".contains(*c)) {
+        let body = &rest[1..];
+        match body.find(q) {
+            Some(end) => (body[..end].to_string(), body[end + 1..].trim_start()),
+            None => return Err(err("unterminated quoted column name")),
         }
     } else {
         let end = rest
@@ -1359,8 +1357,9 @@ fn joins_at_eq(c: char, after_eq: bool, rest: &str) -> bool {
 /// comma/space can be written `` `odd, name` ``). With `keep_quotes` the
 /// quote characters stay in the item, else they are stripped; with
 /// `nest_parens` a `func(a, b)` group is one item. An unquoted `=` binds
-/// tighter than whitespace: `a = b` is one item.
-fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> Vec<String> {
+/// tighter than whitespace: `a = b` is one item. The second value is a
+/// quote left open at the end (its text is in the last item).
+fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> (Vec<String>, Option<char>) {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -1406,19 +1405,26 @@ fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> Vec<String> {
     if in_item {
         out.push(cur);
     }
-    out
+    (out, quote)
 }
 
-/// A column/argument list: [`split_items`] with the quotes stripped.
+/// A column/argument list: [`split_items`] with the quotes stripped (an
+/// open quote runs to the end).
 fn split_list(s: &str) -> Vec<String> {
-    split_items(s, false, false)
+    split_items(s, false, false).0
 }
 
 /// An `agg` argument: [`split_items`] keeping `func(col)` groups and quoted
 /// names intact, quotes included, so `by` can be told from `'by'` and a
-/// trailing `=` is known to be unquoted.
-fn split_specs(s: &str) -> Vec<String> {
-    split_items(s, true, true)
+/// trailing `=` is known to be unquoted. An open quote is an error.
+fn split_specs(s: &str) -> Result<Vec<String>, Error> {
+    match split_items(s, true, true) {
+        (items, None) => Ok(items),
+        (_, Some('`')) => Err(err("agg: unterminated backtick")),
+        (_, Some(q)) => Err(err(format!(
+            "agg: unterminated {q} quote; backtick a column name containing a quote"
+        ))),
+    }
 }
 
 /// Replace each parameter, wherever it appears in `body` as a whole
@@ -1500,30 +1506,15 @@ fn parse_scale(s: &str) -> Result<f64, Error> {
         .ok_or_else(|| err(format!("-s/--scale expects a positive number, got `{s}`")))
 }
 
-/// Split an `agg` argument at a top-level `by` keyword — outside `func(col)`
-/// parens and backticks, with a separator (blank or comma) or the end on both
-/// sides — into the aggregate specs and the optional grouping-key list.
-fn split_off_by(s: &str) -> (&str, Option<&str>) {
-    let separates = |c: char| c == ',' || c.is_whitespace();
-    let mut depth = 0i32;
-    let mut in_tick = false;
-    for (i, c) in s.char_indices() {
-        match c {
-            '`' => in_tick = !in_tick,
-            '(' if !in_tick => depth += 1,
-            ')' if !in_tick => depth -= 1,
-            'b' if depth == 0
-                && !in_tick
-                && s[..i].chars().next_back().is_none_or(separates)
-                && s[i..].starts_with("by")
-                && s[i + 2..].chars().next().is_none_or(separates) =>
-            {
-                return (s[..i].trim(), Some(s[i + 2..].trim()));
-            }
-            _ => {}
-        }
+/// `s` without one pair of surrounding quotes (`'`, `"` or backticks), if it
+/// has one; the items of [`split_specs`] keep theirs. Stricter than
+/// [`take_token`]: text after the closing quote, or an unterminated quote,
+/// is left as it is.
+fn unquote(s: &str) -> &str {
+    match s.as_bytes() {
+        [q @ (b'\'' | b'"' | b'`'), .., last] if last == q => &s[1..s.len() - 1],
+        _ => s,
     }
-    (s.trim(), None)
 }
 
 /// Parse one aggregate spec: `func` (only `count` may omit a column),
@@ -1551,7 +1542,7 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
             let inner = tok[open + 1..]
                 .strip_suffix(')')
                 .ok_or_else(|| err(format!("agg: malformed aggregate `{tok}`")))?;
-            let col = inner.trim();
+            let col = unquote(inner.trim());
             if col.is_empty() {
                 return Err(err(format!("agg: `{}` needs a column name", &tok[..open])));
             }
@@ -2450,6 +2441,46 @@ mod tests {
             let err = parse(bad).unwrap_err().to_string();
             assert!(err.contains("invalid number"), "{bad}: {err}");
         }
+    }
+
+    #[test]
+    fn agg_unquotes_columns_and_keys_alike() {
+        // One tokenizer for the whole argument: a quoted column inside a
+        // call, a quoted key, and a key literally named `by`.
+        let plan = parse("agg sum(`a b`), n = count('c d') by `by`, \"e f\"").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        assert_eq!(g.keys, ["by", "e f"]);
+        assert_eq!(g.aggs[0].col.as_deref(), Some("a b"));
+        assert_eq!(g.aggs[1].col.as_deref(), Some("c d"));
+        assert_eq!(g.aggs[1].name.as_deref(), Some("n"));
+        // An apostrophe opens a quote here, as in any list; unclosed, it
+        // is an error that names the quote, not a swallowed `by`.
+        let err = parse("agg sum(driver's_id) by g").unwrap_err().to_string();
+        assert!(err.contains("unterminated ' quote"), "{err}");
+        let err = parse("agg sum(`a)").unwrap_err().to_string();
+        assert!(err.contains("unterminated backtick"), "{err}");
+    }
+
+    #[test]
+    fn assigned_names_take_any_quote() {
+        // The NAME half of `NAME = …` takes `'`, `"` or backticks, in `add`
+        // and `agg` alike; the quotes come off.
+        let plan = parse("agg 'my n' = sum(x), \"m\"=count").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
+            panic!()
+        };
+        let names: Vec<_> = g.aggs.iter().map(|a| a.name.as_deref()).collect();
+        assert_eq!(names, [Some("my n"), Some("m")]);
+        let plan = parse("add \"n n\" = x").unwrap();
+        let Stage::Transform(stmts) = &plan.stages[0] else {
+            panic!()
+        };
+        let Stmt::Add(a) = &stmts[0] else { panic!() };
+        assert_eq!(a.name, "n n");
+        let err = parse("add 'x = 1").unwrap_err().to_string();
+        assert!(err.contains("unterminated quoted column name"), "{err}");
     }
 
     #[test]

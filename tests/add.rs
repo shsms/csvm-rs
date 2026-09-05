@@ -93,6 +93,14 @@ fn exponent_literals() {
 }
 
 #[test]
+fn a_quoted_name_loses_its_quotes() {
+    assert_eq!(
+        run_checked("add 'total price' = price * qty | cols 'total price'", NUM),
+        "total price\n30\n40\n20\n"
+    );
+}
+
+#[test]
 fn precedence_and_parens() {
     // (price - qty) * 2, not price - qty*2
     assert_eq!(
