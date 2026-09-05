@@ -14,9 +14,19 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
-- The expression lexer has no exponent literals: =add d = v * 1e8= fails
-  with "expected ',' or ')' in function arguments" (the =e8= reads as an
-  identifier); =100000000= works.
+- Number literals in expressions are a hand-rolled grammar (=lex_number=),
+  narrower than a cell's (=f64::from_str=): =.5=, =inf= and =NaN= are
+  numbers in a cell and in a quoted literal, but a bare =.5= is a lex error
+  and bare =inf= reads as a column. Let the lexer find a candidate span and
+  the float parse decide; =inf=/=NaN= need a keyword case or a doc note.
+  Related: numbers print rounded to six decimals, so =add v = 1e-7=
+  prints =0= while =--explain= shows =0.0000001=. That is the output
+  formatter, not the lexer, but exponent literals make it easy to hit.
+- =parse_agg= runs three tokenizers with three quoting rules over one
+  argument (=split_off_by=, =split_specs=, =split_list=); only the keys are
+  unquoted, so =agg sum(`a b`)= fails with "column not found". Tokenize
+  once with per-item quotedness and find =by= as a bare item, the way
+  =join= finds =on= (=has_bare_word=).
 - Fold adjacent =head= / =tail +N= stages into one window at parse time
   (=skip a | head l | skip b= is =skip a+b, head l-b=), so =head 5 | tail +2=
   streams too; today only the =[skip | head]= order does (=window_shape=).
@@ -71,6 +81,11 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE Exponent literals and Unicode blanks around =by=
+Shipped 2026-09-05: =1e8= / =2.5E-3= lex as numbers in =add= / =select=
+(=lex_number=), and =split_off_by= scans chars so any Unicode blank finds
+the =by= keyword, as the item splitters already did.
 
 ** DONE Post-sort statements see the full number
 Shipped 2026-09-05: with statements after a streaming =sort= the workers
