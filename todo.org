@@ -14,6 +14,9 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
+- The expression lexer has no exponent literals: =add d = v * 1e8= fails
+  with "expected ',' or ')' in function arguments" (the =e8= reads as an
+  identifier); =100000000= works.
 - Fold adjacent =head= / =tail +N= stages into one window at parse time
   (=skip a | head l | skip b= is =skip a+b, head l-b=), so =head 5 | tail +2=
   streams too; today only the =[skip | head]= order does (=window_shape=).
@@ -29,14 +32,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   distinct item separator, removes the trap.
 
 ** TODO Correctness / edges
-- Post-sort statements see output-rounded numbers: the streaming sort path
-  carries rows through the merge as their serialized line, so a =Field::Num=
-  produced upstream (=num()=, =add=, parquet) reaches a statement *after* the
-  sort as its six-decimal =format_num= text (=apply_post_to_line=, =exec.rs=),
-  while the materialized path keeps the full value. =add v = num(v) | sort v |
-  select v > 1.0000002= can therefore differ between the two paths. The key
-  itself is exact since 2026-09-05 (spilled key + line records). Fix: a
-  round-trip number format for the sort blob, re-formatted at output.
 - Sharded =stats= / =group= reduce in =-n= ranges, so the documented
   low-order-digit float drift of =sum=/=mean=/=stddev= (hundreds of ULP on a
   few hundred thousand rows) is now the default behaviour (threads default
@@ -76,6 +71,14 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE Post-sort statements see the full number
+Shipped 2026-09-05: with statements after a streaming =sort= the workers
+serialize rows with a typed cell codec (=encode_row= / =decode_row= in
+=sort.rs=, chosen by =LineFormat=) instead of the six-decimal output line,
+so =add v = num(v) | sort v | select v > 1.0000002= matches the in-memory
+path. A bare sort (or one followed only by a window) still writes output
+lines the merge copies out as they are.
 
 ** DONE Spaces around === in every argument list
 Shipped 2026-09-05: an unquoted === binds tighter than whitespace in

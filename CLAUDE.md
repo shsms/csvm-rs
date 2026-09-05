@@ -420,12 +420,16 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   as length-prefixed key + line records, so the merge never re-derives a key
   from the six-decimal serialized line).
   A single-threaded binary-heap k-way merge then picks the smallest key and
-  emits the row's already-serialized line bytes via a callback — no per-field
+  emits the row's already-serialized bytes via a callback — no per-field
   allocation, no re-serialization on output. A block is a contiguous input
   range, so its sequence number keeps the merge stable. Trailing transforms
-  and a trailing `head`/`tail +N` window run on the merge output line by line
+  and a trailing `head`/`tail +N` window run on the merge output row by row
   (the `Window` counter in `run_staged`; `apply_post_to_line` when transforms
-  wrap the window); anything else after the sort materializes.
+  wrap the window); anything else after the sort materializes. The row's
+  serialized form is the `LineFormat`: the output CSV line when nothing runs
+  after the sort, else the typed cell codec (`encode_row` / `decode_row`),
+  which keeps a `Field::Num` exact for the statements after the sort instead
+  of handing them its six-decimal output text.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls
