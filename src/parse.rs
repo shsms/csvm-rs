@@ -64,7 +64,7 @@ fn err(msg: impl Into<String>) -> Error {
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
     "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "join",
-    "add", "group", "agg", "graph", "fn",
+    "add", "agg", "graph", "fn",
 ];
 
 /// Names a `fn` may not take: every command, every alias, `fn` itself, and
@@ -281,7 +281,14 @@ impl<'a> Builder<'a> {
             "head" => self.parse_head(rest),
             "tail" => self.parse_tail(rest),
             "stats" => self.parse_stats(rest),
-            "group" => self.parse_group(rest),
+            "group" => Err(err(format!(
+                "group was removed: give the keys to agg, e.g. `agg count by {}`",
+                if rest.trim().is_empty() {
+                    "COLS"
+                } else {
+                    rest.trim()
+                }
+            ))),
             "agg" => self.parse_agg(rest),
             "graph" => self.parse_graph(rest),
             "uniq" => self.parse_uniq(rest),
@@ -564,26 +571,8 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `group COLS` sets the group keys for a following `agg`. On its own it
-    /// reduces to one row per key with a `count` of the rows in each group.
-    fn parse_group(&mut self, rest: &str) -> Result<(), Error> {
-        let keys = split_list(rest);
-        if keys.is_empty() {
-            return Err(err(
-                "group expects at least one column (use `agg …` alone for a global aggregate)",
-            ));
-        }
-        self.items.push(Item::Group(GroupStmt {
-            keys,
-            key_positions: Vec::new(),
-            aggs: vec![count_rows_agg()],
-        }));
-        Ok(())
-    }
-
-    /// `agg FN(col),… [by COLS]` reduces to one row per key. Keys come from a
-    /// trailing `by`, or an immediately preceding `group` (fused, replacing its
-    /// default count); with neither it's a single-row global aggregate.
+    /// `agg [NAME=]FN(col),… [by COLS]` reduces to one row per key; `by COLS`
+    /// gives the keys, and without it the whole input is one group.
     fn parse_agg(&mut self, rest: &str) -> Result<(), Error> {
         let (specs, by) = split_off_by(rest);
         if specs.is_empty() {
@@ -599,31 +588,15 @@ impl<'a> Builder<'a> {
             .iter()
             .map(|t| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
-        let preceding_group = self.items.iter().any(|it| matches!(it, Item::Group(_)));
+        // `by COLS` gives the keys; without it, one global aggregate row.
         let keys = match by {
             Some(k) => {
-                if matches!(self.items.last(), Some(Item::Group(_))) {
-                    return Err(err(
-                        "`agg … by COLS` can't follow a `group` — the group already sets the keys",
-                    ));
+                let keys = split_list(k);
+                if keys.is_empty() {
+                    return Err(err("agg: `by` expects at least one key column"));
                 }
-                split_list(k)
+                keys
             }
-            // Fuse with a directly preceding `group`: adopt its keys and drop its
-            // placeholder count.
-            None if matches!(self.items.last(), Some(Item::Group(_))) => match self.items.pop() {
-                Some(Item::Group(g)) => g.keys,
-                _ => unreachable!(),
-            },
-            // A `group` is present but a stage sits between it and this `agg`, so
-            // they can't fuse (the group already reduced the rows). Flag it
-            // rather than silently making a global aggregate / a cryptic error.
-            None if preceding_group => {
-                return Err(err(
-                    "`agg` must directly follow its `group` (no stage in between), or use `agg … by COLS`",
-                ));
-            }
-            // No group anywhere ⇒ a single global aggregate row.
             None => Vec::new(),
         };
         self.items.push(Item::Group(GroupStmt {
@@ -1471,16 +1444,6 @@ fn parse_scale(s: &str) -> Result<f64, Error> {
         .ok()
         .filter(|v| v.is_finite() && *v > 0.0)
         .ok_or_else(|| err(format!("--scale expects a positive number, got `{s}`")))
-}
-
-/// The default `count` aggregate (counts rows) `group` uses when no `agg` follows.
-fn count_rows_agg() -> AggSpec {
-    AggSpec {
-        func: AggFunc::Count,
-        col: None,
-        pos: None,
-        name: None,
-    }
 }
 
 /// Split an `agg` argument at a top-level (paren-depth-0) `by` keyword into the
@@ -2400,10 +2363,8 @@ mod tests {
     }
 
     #[test]
-    fn group_and_agg_parse_into_one_group_stage() {
-        // `group` + a following `agg` fuse into a single Group stage; the agg's
-        // functions replace group's placeholder count.
-        let plan = parse("group region | agg sum(amount),mean(amount)").unwrap();
+    fn agg_by_parses_into_a_group_stage() {
+        let plan = parse("agg sum(amount),mean(amount) by region").unwrap();
         assert_eq!(plan.stages.len(), 1);
         let Stage::Group(g) = &plan.stages[0] else {
             panic!("expected a group stage");
@@ -2413,17 +2374,17 @@ mod tests {
         let mut plan = plan;
         let out = plan.resolve(&["amount".into(), "region".into()]).unwrap();
         assert_eq!(out, ["region", "amount_sum", "amount_mean"]);
-        // `by` supplies keys directly; a bare `group` keeps its default count.
-        assert!(matches!(
-            parse("agg count by a,b").unwrap().stages[0],
-            Stage::Group(_)
-        ));
-        let solo = parse("group region").unwrap();
-        let Stage::Group(g) = &solo.stages[0] else {
+        // A bare count per key.
+        let plan = parse("agg count by a,b").unwrap();
+        let Stage::Group(g) = &plan.stages[0] else {
             panic!()
         };
-        assert_eq!(g.aggs.len(), 1);
+        assert_eq!(g.keys, ["a", "b"]);
         assert_eq!(g.aggs[0].func, AggFunc::Count);
+        // `group` is gone; the hint carries the keys over.
+        let err = parse("group region").unwrap_err().to_string();
+        assert!(err.contains("agg count by region"), "{err}");
+        assert!(parse("group r | agg sum(a)").is_err());
     }
 
     #[test]
@@ -2432,26 +2393,12 @@ mod tests {
         assert!(parse("agg sum").is_err()); // sum needs a column
         assert!(parse("agg sum()").is_err()); // empty column
         assert!(parse("agg").is_err()); // no aggregates
-        assert!(parse("group").is_err()); // no keys
+        assert!(parse("agg count by").is_err()); // no keys
         assert!(parse("agg =sum(x)").is_err()); // empty name
         assert!(parse("agg total=").is_err()); // name without an aggregate
         let err = parse("agg total = sum(x)").unwrap_err().to_string();
         assert!(err.contains("without spaces"), "{err}");
         assert!(parse("agg `odd name`=sum(x)").is_ok());
-    }
-
-    #[test]
-    fn agg_must_directly_follow_group() {
-        // Adjacent fuses; a global agg with no group is fine.
-        assert!(parse("group r | agg sum(a)").is_ok());
-        assert!(parse("agg sum(a)").is_ok());
-        assert!(parse("agg sum(a) by r").is_ok());
-        // A stage between group and agg can't fuse — clear error, not a silent
-        // global aggregate or a cryptic column error.
-        assert!(parse("group r | head 5 | agg count").is_err());
-        assert!(parse("group r | select a > 0 | agg sum(a)").is_err());
-        // `by` contradicts a preceding group's keys.
-        assert!(parse("group r | agg sum(a) by b").is_err());
     }
 
     #[test]

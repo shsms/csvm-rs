@@ -237,7 +237,7 @@ fn column_types_follow_the_column_not_its_spelling() {
     // A group key keeps its column's type, so the pin survives the reduce.
     assert_eq!(
         run_checked(
-            "add qty = str(qty) | group qty | agg count | sort qty | cols qty",
+            "add qty = str(qty) | agg count by qty | sort qty | cols qty",
             input
         ),
         "qty\n10\n100\n9\n"
@@ -247,7 +247,7 @@ fn column_types_follow_the_column_not_its_spelling() {
     // position 1 was typed numeric, and the stats `field` column is text.
     assert_eq!(
         run_checked(
-            "add amount = num(amount) | group region | agg count | sort region",
+            "add amount = num(amount) | agg count by region | sort region",
             "amount,region\n10,west\n9,east\n100,north\n"
         ),
         "region,count\neast,1\nnorth,1\nwest,1\n"
@@ -532,7 +532,7 @@ fn positional_refs_emit_the_real_column_names() {
     // the stats `field` column) must use the header name, not the spec text.
     let input = POSITIONAL;
     assert_eq!(
-        run_checked("group 4", input),
+        run_checked("agg count by 4", input),
         "name,count\nalice,1\nbob,1\n"
     );
     assert_eq!(

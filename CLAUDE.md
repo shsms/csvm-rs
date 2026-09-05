@@ -39,7 +39,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   first and only then reads a bare integer as a position (so a column
   literally named `2` is never shadowed; out of range is its own error). That
   fallback lives in the one shared resolver, so it works for every column
-  reference — `sort 1=n`, `group 2`, `` select `3` > 0 `` — not just `cols`.
+  reference — `sort 1=n`, `agg count by 2`, `` select `3` > 0 `` — not just `cols`.
   `cols` alone also takes **ranges** (`resolve_col_spec`): `2-4` between two
   positions, or `a:d` between any two references, expanding in header order;
   an exact header name (even one like `1-2`) always wins over the range
@@ -130,11 +130,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   a different order, and the gap grows with the row count), so pass `-n 1`
   for bit-reproducible float aggregates. stdin / `-n1` use the single-pass
   streaming path.
-- **`group COLS`** + **`agg FN(col),… [by COLS]`** reduce to one row per distinct
-  key — the per-key sibling of `stats` (which reduces globally). `group` sets the
-  keys; a following `agg` fuses with it (replacing `group`'s placeholder `count`),
-  or `agg … by COLS` carries its own keys, or `agg` with neither emits a single
-  global row. Functions are `count/sum/min/max/mean/stddev` (a bare `count`
+- **`agg [NAME=]FN(col),… [by COLS]`** reduces to one row per distinct key —
+  the per-key sibling of `stats` (which reduces globally). `by COLS` gives the
+  keys; without it `agg` emits a single global row. Functions are `count/sum/min/max/mean/stddev` (a bare `count`
   counts rows; `count(col)` counts non-empty cells); output cols are named
   `col_func` (`amount_sum`) or `count`, or whatever a `NAME=FN(col)` spec
   gives (`AggSpec.name`). `sum/mean/stddev` are blank for a
@@ -149,7 +147,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   and `Grouper::merge` folds them in file order (so first-seen group order is
   preserved). Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may
   differ from `-n1` in their low-order digits (parallel reduction order), the
-  same caveat as sharded `stats`. A `group` combined with a `sort` (or another blocking stage)
+  same caveat as sharded `stats`. An `agg` combined with a `sort` (or another blocking stage)
   still takes the in-memory path.
 - **`join [FLAGS] ITEM[, ITEM…]`** (`ITEM := [(SUBPIPELINE)] FILE [on KEYS]`)
   merges one or more right-side CSVs in by key. Items are separated by
@@ -298,10 +296,10 @@ types a `?:` only when both branches agree; visible per-compare as
 types and leaves every compare `Auto`; the mode is decided once, in
 `Plan::resolve`, from the operands' static types plus a **position-keyed**
 type map it threads through the statements (`add` sets a column's type from
-its expression, `cols` reorders the map, `group` keeps its keys' types and
+its expression, `cols` reorders the map, `agg` keeps its keys' types and
 types its aggregates, `stats` types its profile columns, a join keeps the
 left side's), so a type follows the column however it is spelled — `add qty
-str(qty) | sort 2`, a rename in between, a `cols` reorder, a `group` on the
+str(qty) | sort 2`, a rename in between, a `cols` reorder, an `agg` on the
 column. A non-numeric literal in a numeric compare is therefore reported at
 resolve time: still before any row is read, but after the input is opened.
 The three checks below run **in order**, so a numeric signal wins

@@ -164,7 +164,7 @@ pub const COMMANDS: &[CmdHelp] = &[
         detail: "Reorders to the listed order. Names may be comma- or space-separated; \
 backtick-quote a name containing a comma or space, e.g. `cols `first, last`,age`. A bare \
 integer that is not a column name is a 1-based position (handy with --header -'s c1, c2, …), \
-and that works wherever a column is named — sort, group, agg, stats, add's target — not just \
+and that works wherever a column is named — sort, agg, stats, add's target — not just \
 here. Inside an \
 expression a bare integer is a number literal, so backtick it there: select `3` > 0. A range \
 expands in header order; an exact column name always wins over a position or range reading. \
@@ -264,18 +264,6 @@ numeric-only. Composes with sort/head/fmt after it.",
         examples: &["csvm 'stats | sort mean=nr | fmt' data.csv"],
     },
     CmdHelp {
-        name: "group",
-        aliases: &[],
-        summary: "set group-by keys for agg",
-        synopsis: &[
-            "group COLS              one row per distinct key",
-            "group COLS | agg FNS    aggregate within each group",
-        ],
-        detail: "On its own, reduces to one row per key with a count of the group's rows. \
-Followed by agg, the aggregates replace that count. The per-key sibling of stats.",
-        examples: &["csvm 'group region | agg sum(amount) | fmt' sales.csv"],
-    },
-    CmdHelp {
         name: "agg",
         aliases: &[],
         summary: "aggregate rows per group",
@@ -283,12 +271,12 @@ Followed by agg, the aggregates replace that count. The per-key sibling of stats
             "agg [NAME=]FN(col),... [by COLS]",
             "  FN: count sum min max mean stddev   (count alone counts rows)",
             "  NAME=: name the output column (default col_func, e.g. amount_sum)",
-            "  by COLS: keys, or fuse with a preceding group; neither ⇒ one global row",
+            "  by COLS: the group keys; without it, one global row",
         ],
         detail: "Reduces to one row per key: the key columns then one column per aggregate. \
 sum/mean/stddev are blank for a non-numeric column.",
         examples: &[
-            "csvm 'group region | agg count, mean(amount) | fmt' sales.csv",
+            "csvm 'agg count, mean(amount) by region | fmt' sales.csv",
             "csvm 'agg total=sum(amount) by region,product' sales.csv",
         ],
     },
@@ -312,7 +300,7 @@ time axis; any other non-numeric x plots by row order. --svg emits an SVG docume
 instead of a terminal chart.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
-            "csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv",
+            "csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv",
             "csvm 'graph line ts open,close --scale 1.5' prices.csv",
             "csvm 'graph hist amount --svg' data.csv -o chart.svg",
         ],
@@ -490,7 +478,7 @@ place: `add c = num(c)` makes c numeric (a non-number aborts) and `add c = str(c
 text; a column added by `add` carries its expression's static type — including one inherited \
 from a typed column or from a ternary whose branches agree — so later comparisons against it \
 behave the same as against the expression itself, and the pin follows the column by position \
-through a rename, a cols reorder, or a group key. Sort follows the same idea per key: a bare \
+through a rename, a cols reorder, or an agg key. Sort follows the same idea per key: a bare \
 `sort col` \
 auto-detects per cell (numbers numerically and first, then text lexically; a blank reads as 0, \
 as in select), =n or a numeric column forces numeric, =s or a text column forces lexical. Empty \

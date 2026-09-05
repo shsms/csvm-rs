@@ -2644,7 +2644,8 @@ mod tests {
     #[test]
     fn describe_shows_header_names_for_positional_refs() {
         let mut plan =
-            parse("add countZ = num(`3`) | select `2` > 0 | sort 2 | uniq 3 | group 1").unwrap();
+            parse("add countZ = num(`3`) | select `2` > 0 | sort 2 | uniq 3 | agg count by 1")
+                .unwrap();
         let _ = plan.resolve(&["id".into(), "fieldA".into(), "countZ".into()]);
         let d = describe(&plan);
         assert!(d.contains("add countZ[2] = (num countZ[2])"), "{d}");
@@ -2798,9 +2799,9 @@ mod tests {
     }
 
     #[test]
-    fn group_default_count_in_first_seen_order() {
+    fn agg_count_by_key_in_first_seen_order() {
         // fieldA: 't' first (row 1), then 'f' (row 2). count = rows per group.
-        let out = run_str("group fieldA", INPUT).unwrap();
+        let out = run_str("agg count by fieldA", INPUT).unwrap();
         assert_eq!(out, "fieldA,count\nt,3\nf,1\n");
     }
 
@@ -2808,7 +2809,7 @@ mod tests {
     fn group_agg_numeric_reductions() {
         // 't' rows have countZ 5,0,9; 'f' has 0.
         let out = run_str(
-            "group fieldA | agg sum(countZ),mean(countZ),min(countZ),max(countZ)",
+            "agg sum(countZ),mean(countZ),min(countZ),max(countZ) by fieldA",
             INPUT,
         )
         .unwrap();
@@ -2871,7 +2872,7 @@ mod tests {
     #[test]
     fn agg_sum_of_text_column_is_blank() {
         // fieldA is text, so sum/mean are blank, but min/max stay lexical.
-        let out = run_str("group id | agg sum(fieldA),min(fieldA)", INPUT).unwrap();
+        let out = run_str("agg sum(fieldA),min(fieldA) by id", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "id,fieldA_sum,fieldA_min");
         assert_eq!(lines[1], "1,,t");
@@ -2881,13 +2882,13 @@ mod tests {
     fn count_rows_differs_from_count_of_column() {
         // A bare count counts rows; count(col) counts non-empty cells.
         let input = "g,v\nx,1\nx,\nx,3\n";
-        let out = run_str("group g | agg count, count(v)", input).unwrap();
+        let out = run_str("agg count, count(v) by g", input).unwrap();
         assert_eq!(out, "g,count,v_count\nx,3,2\n");
     }
 
     #[test]
     fn group_composes_with_sort_and_fmt() {
-        let out = run_str("group fieldA | agg sum(countZ) | sort countZ_sum=nr", INPUT).unwrap();
+        let out = run_str("agg sum(countZ) by fieldA | sort countZ_sum=nr", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         // f,0 sorts after t,14 when descending by the aggregate.
         assert_eq!(lines[1], "t,14");
@@ -2919,7 +2920,7 @@ mod tests {
 
         let run_threads = |threads: usize| -> String {
             let mut plan =
-                parse("group region | agg count, sum(price), mean(price), min(price), max(price), stddev(price)")
+                parse("agg count, sum(price), mean(price), min(price), max(price), stddev(price) by region")
                     .unwrap();
             let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
             let out_header = plan.resolve(&header).unwrap();
@@ -3008,7 +3009,7 @@ mod tests {
     #[test]
     fn graph_bar_draws_one_bar_per_row_after_group() {
         // group fieldA: t (3 rows), f (1 row); bar the counts.
-        let out = render_str("group fieldA | graph bar fieldA count", INPUT, false);
+        let out = render_str("agg count by fieldA | graph bar fieldA count", INPUT, false);
         // Title defaults to the value column.
         assert!(out.starts_with("count\n"), "{out}");
         assert!(out.contains("t │"), "{out}");

@@ -71,7 +71,6 @@ Each stage is a command with comma- or space-separated arguments:
 | `tail [N]`         | keep the last `N` rows (default 10; blocking); `tail +N` starts at row `N` (streams) |
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
-| `group cols`       | group-by keys for a following `agg` (alone: count rows per key) |
 | `agg [NAME=]FN(col)… [by cols]` | aggregate per group (count/sum/min/max/mean/stddev); `NAME=` names the output |
 | `join [(SUB)] FILE on KEYS, …` | merge right-side files in by key (inner/left/right/full) |
 | `fn name(a,b) { … }` | define a reusable pipeline fragment; call as `name(x,y)` |
@@ -88,7 +87,7 @@ Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`).
 A `#` outside quotes starts a comment to end of line. A column name with a comma or space can be
 backtick-quoted in any command — `` cols `first, last`,age ``. A bare integer
 that is not a column name is a 1-based position, in any command that names a
-column (`sort 2=nr`, `group 1`); with `--header -` that is the natural way in.
+column (`sort 2=nr`, `agg count by 1`); with `--header -` that is the natural way in.
 
 ### Per-command detail
 
@@ -173,13 +172,13 @@ prep(pv) | join (prep(grid)) grid.csv on timestamp' pv.csv
 csvm 'stats | fmt' input.csv
 
 # group-by: total and mean amount per region, biggest first
-csvm 'group region | agg sum(amount),mean(amount) | sort amount_sum=nr | fmt' sales.csv
+csvm 'agg sum(amount),mean(amount) by region | sort amount_sum=nr | fmt' sales.csv
 
 # terminal histogram of a column's distribution (after a filter)
 csvm 'select region == "EU" | graph hist amount --bins 12' sales.csv
 
 # horizontal bar chart of a total per group
-csvm 'group region | agg sum(amount) | graph bar region amount_sum' sales.csv
+csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv
 
 # braille line chart of two series over time
 csvm 'graph line ts open,close --scale 1.5' prices.csv

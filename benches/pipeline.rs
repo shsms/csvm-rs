@@ -111,9 +111,9 @@ fn pipeline(c: &mut Criterion) {
         // per-group accumulator growth respectively.
         (
             "group_low_card",
-            "group region | agg count, sum(amount), mean(amount)",
+            "agg count, sum(amount), mean(amount) by region",
         ),
-        ("group_high_card", "group name | agg sum(amount)"),
+        ("group_high_card", "agg sum(amount) by name"),
     ];
 
     let mut group = c.benchmark_group("pipeline");

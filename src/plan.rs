@@ -415,7 +415,7 @@ pub struct AggSpec {
     pub name: Option<String>,
 }
 
-/// `group COLS` + `agg FNS`: reduce the input to one row per distinct key,
+/// `agg FNS by COLS`: reduce the input to one row per distinct key,
 /// emitting the key columns followed by one column per aggregate. The per-key
 /// sibling of `stats` (which reduces globally); a blocking, reducing stage that
 /// holds O(groups × aggregated-cols) accumulators, not O(rows). With no keys it

@@ -30,10 +30,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   alloc per 64 KiB. Hoist a caller-owned buffer through the serial loops.
 
 ** TODO Interface simplifications
-- Three spellings for one aggregation: =group X | agg …=, =agg … by X=, and a
-  bare =group X= as a count — and the fusion rule carries its own non-fusable
-  error cases. Pick one primary form and demote the rest to documented aliases
-  (or drop them); shrinks the parser and the =agg= help page.
 - The =join= item grammar has a documented ambiguity: a keyless file after an
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
@@ -87,6 +83,12 @@ and in-memory paths agree. Visible as =auto= / =numeric= / =lexical= under
 =--explain=. Cost (criterion, =benches/pipeline.rs=, 3 s runs): auto on
 a text key 13.5 ms vs 12.6 ms lexical (+7%, the failed number parse per cell);
 auto on a numeric key 18.6 ms vs 18.0 ms =n (+3.5%, the tag byte).
+
+** DONE One aggregation spelling: =agg [NAME=]FN(col)… by KEYS=
+Shipped 2026-09-05: =group= is gone (a hint rewrites =group k= to =agg count
+by k=), and with it the =group | agg= fusion rule and its non-fusable error
+cases. =NAME=FN(col)= names an output column; =add= now requires =NAME =
+EXPR=, so the three assignment sites (=rename=, =add=, =agg=) all use ===.
 
 ** DONE =--header= replaces =hdr= and =--no-header=
 Shipped 2026-09-05: one CLI flag names a headerless input's columns
