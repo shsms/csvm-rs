@@ -122,23 +122,29 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
         .map(|(l, _)| l.chars().count())
         .max()
         .unwrap_or(0);
-    // The baseline is always 0, so a column of positive values bars from the left.
-    let mut lo = 0.0f64;
-    let mut hi = 0.0f64;
-    for (_, v) in &rows {
-        lo = lo.min(*v);
-        hi = hi.max(*v);
-    }
+    // The baseline is always 0, so a column of positive values bars from the
+    // left. An explicit axis (`-y`) replaces the data's own range: a bar past it
+    // draws to the edge, and the baseline moves onto the axis.
+    let (lo, hi) = b.axis.unwrap_or_else(|| {
+        let mut lo = 0.0f64;
+        let mut hi = 0.0f64;
+        for (_, v) in &rows {
+            lo = lo.min(*v);
+            hi = hi.max(*v);
+        }
+        (lo, hi)
+    });
     let span = hi - lo;
     let w = frame.width.saturating_sub(label_w + 14).max(10);
-    let zero = pos_in(0.0, lo, span, w);
+    let zero = pos_in(0.0f64.clamp(lo, hi), lo, span, w);
     let axis_v = frame.glyphs.axis_v;
 
     let mut out = String::new();
     out.push_str(&frame.title);
     out.push('\n');
     for (label, v) in &rows {
-        let p = pos_in(*v, lo, span, w);
+        // The drawn length is clamped to the axis; the printed value is real.
+        let p = pos_in(v.clamp(lo, hi), lo, span, w);
         let (from, to) = (zero.min(p), zero.max(p));
         let mut field = vec![' '; w];
         for cell in field.iter_mut().take(to).skip(from) {
@@ -170,7 +176,10 @@ fn pos_in(v: f64, lo: f64, span: f64, width: usize) -> usize {
 /// width by the collector), with a title and a min/max summary. Each cell is an
 /// eighth-height block scaled to the value range.
 fn render_spark(frame: &Frame, s: &SparkData) -> String {
-    let (lo, hi) = minmax(&s.values).unwrap_or((0.0, 0.0));
+    let (dlo, dhi) = minmax(&s.values).unwrap_or((0.0, 0.0));
+    // An explicit range (`-y`) is the axis the levels scale to; the summary
+    // still reports the data's own min and max.
+    let (lo, hi) = s.range.unwrap_or((dlo, dhi));
     let span = hi - lo;
     let levels = frame.glyphs.levels;
     let line: String = s
@@ -189,8 +198,8 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
     let mut out = format!(
         "{}\n{line}\nmin={}  max={}",
         frame.title,
-        format_num(lo),
-        format_num(hi)
+        format_num(dlo),
+        format_num(dhi)
     );
     out.push_str(&frame.notes_tail());
     out.push('\n');
@@ -469,6 +478,10 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
             yhi = yhi.max(y);
         }
     }
+    // An explicit range (`-x`/`-y`) is the axis: the canvas spans it instead of
+    // the points' own extent (the points outside it are already clipped away).
+    let (xlo, xhi) = xy.xrange.unwrap_or((xlo, xhi));
+    let (ylo, yhi) = xy.yrange.unwrap_or((ylo, yhi));
     let (xspan, yspan) = (xhi - xlo, yhi - ylo);
 
     // Left gutter holds the y-axis labels (top = yhi, bottom = ylo).
@@ -612,6 +625,7 @@ mod tests {
                 .iter()
                 .map(|(l, v)| (l.clone(), vec![Some(*v)]))
                 .collect(),
+            axis: None,
         }
     }
 
@@ -651,13 +665,15 @@ mod tests {
             rows,
             xaxis,
             connect,
+            xrange: None,
+            yrange: None,
         }
     }
 
     #[test]
     fn bins_span_min_to_max_inclusive() {
         // 0..=9 into 3 bins: edges 0,3,6; the max (9) lands in the last bin.
-        let h = HistData::build(&[0.0, 1.0, 3.0, 4.0, 9.0], Some(3)).unwrap();
+        let h = HistData::build(&[0.0, 1.0, 3.0, 4.0, 9.0], Some(3), None).unwrap();
         assert_eq!(h.lo, 0.0);
         assert_eq!(h.hi, 9.0);
         assert_eq!(h.counts, vec![2, 2, 1]);
@@ -666,28 +682,28 @@ mod tests {
 
     #[test]
     fn equal_values_collapse_to_one_populated_bin() {
-        let h = HistData::build(&[5.0, 5.0, 5.0], Some(4)).unwrap();
+        let h = HistData::build(&[5.0, 5.0, 5.0], Some(4), None).unwrap();
         assert_eq!(h.counts.iter().sum::<u64>(), 3);
         assert_eq!(h.counts[0], 3);
     }
 
     #[test]
     fn empty_values_render_nothing() {
-        assert!(HistData::build(&[], Some(4)).is_none());
+        assert!(HistData::build(&[], Some(4), None).is_none());
     }
 
     #[test]
     fn hist_edges_stay_real_on_an_axis_too_wide_to_subtract() {
         // The span of -1e308..1e308 overflows an f64, so edges worked out
         // from `hi - lo` printed as NaN and inf down the left of the chart.
-        let h = HistData::build(&[-1e308, 0.0, 1e308], Some(4)).unwrap();
+        let h = HistData::build(&[-1e308, 0.0, 1e308], Some(4), None).unwrap();
         let s = render_hist(&Frame::new("v".to_string(), 80, 15, false), &h);
         assert!(!s.contains("NaN") && !s.contains("inf"), "{s}");
     }
 
     #[test]
     fn render_reports_skipped_and_summary() {
-        let h = HistData::build(&[1.0, 2.0, 3.0], Some(2)).unwrap();
+        let h = HistData::build(&[1.0, 2.0, 3.0], Some(2), None).unwrap();
         let mut f = Frame::new("amount".to_string(), 40, 15, false);
         f.notes.push("skipped 2 non-numeric".to_string());
         let s = render_hist(&f, &h);
@@ -727,6 +743,30 @@ mod tests {
     }
 
     #[test]
+    fn bars_clamp_to_an_explicit_axis_but_print_the_real_value() {
+        let rows = [("a".to_string(), 1.0), ("b".to_string(), 9.0)];
+        let mut b = bar_data(&rows);
+        b.axis = Some((0.0, 2.0));
+        let s = render_bars(&Frame::new("v".to_string(), 40, 15, false), &b);
+        // The drawn field of a row: between the axis rule and the printed value.
+        let field = |name: &str| {
+            let line = s.lines().find(|l| l.contains(name)).unwrap();
+            line.split_once('│')
+                .unwrap()
+                .1
+                .rsplit_once(' ')
+                .unwrap()
+                .0
+                .to_string()
+        };
+        // `b` is past the axis top, so its bar fills the field; `a` does not.
+        assert!(field("b").chars().all(|c| c == '█'), "{s}");
+        assert!(field("a").contains(' '), "{s}");
+        // The clamp is only in the drawing: the printed value is still 9.
+        assert!(s.lines().any(|l| l.ends_with(" 9")), "{s}");
+    }
+
+    #[test]
     fn bars_report_skipped_and_truncated() {
         let rows = [("a".to_string(), 1.0)];
         let mut f = Frame::new("v".to_string(), 30, 15, false);
@@ -743,6 +783,7 @@ mod tests {
             &Frame::new("v".to_string(), 4, 15, false),
             &SparkData {
                 values: vec![1.0, 2.0, 3.0, 4.0],
+                range: None,
             },
         );
         let line = s.lines().nth(1).unwrap();
@@ -760,6 +801,7 @@ mod tests {
             &Frame::new("v".to_string(), 10, 15, false),
             &SparkData {
                 values: crate::chart::bucket(&vals, 10),
+                range: None,
             },
         );
         assert_eq!(s.lines().nth(1).unwrap().chars().count(), 10);

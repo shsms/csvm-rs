@@ -673,6 +673,14 @@ impl<'a> Builder<'a> {
                 let (val, tail) = v?;
                 opts.height = Some(parse_positive(&val, "-H/--height")?);
                 s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["-x", "--xrange"]) {
+                let (val, tail) = v?;
+                opts.xrange = Some(parse_range(&val, "-x/--xrange")?);
+                s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["-y", "--yrange"]) {
+                let (val, tail) = v?;
+                opts.yrange = Some(parse_range(&val, "-y/--yrange")?);
+                s = tail.trim_start();
             } else if word.starts_with('-') && word != "-" {
                 return Err(err(format!("graph: unknown flag `{word}`")));
             } else {
@@ -685,6 +693,7 @@ impl<'a> Builder<'a> {
         }
         let cols = split_list(&positional);
         check_graph_arity(kind, kind_word, cols.len())?;
+        check_graph_flags(kind, kind_word, &opts)?;
         self.graph = Some(GraphSpec {
             kind,
             cols: cols.into_iter().map(ColRef::new).collect(),
@@ -1507,6 +1516,35 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
         GraphKind::Scatter | GraphKind::Line => "an x column and one or more y columns",
     };
     Err(err(format!("graph {word} expects {want}, got {n}")))
+}
+
+/// Reject a flag the chart kind has no use for: a `hist` bins along x only, and
+/// `bar`/`spark` have no x axis to range.
+fn check_graph_flags(kind: GraphKind, word: &str, opts: &GraphOpts) -> Result<(), Error> {
+    let no = |flag: &str| Err(err(format!("graph {word} does not take {flag}")));
+    if opts.xrange.is_some()
+        && !matches!(kind, GraphKind::Hist | GraphKind::Scatter | GraphKind::Line)
+    {
+        return no("-x/--xrange");
+    }
+    if opts.yrange.is_some() && matches!(kind, GraphKind::Hist) {
+        return no("-y/--yrange");
+    }
+    Ok(())
+}
+
+/// Parse `lo:hi` for an axis range flag; `lo` must be below `hi`.
+fn parse_range(s: &str, flag: &str) -> Result<(f64, f64), Error> {
+    let bad = || err(format!("{flag} expects lo:hi with lo < hi, got `{s}`"));
+    let (lo, hi) = s.split_once(':').ok_or_else(bad)?;
+    let (lo, hi): (f64, f64) = (
+        lo.parse().map_err(|_| bad())?,
+        hi.parse().map_err(|_| bad())?,
+    );
+    if !(lo.is_finite() && hi.is_finite() && lo < hi) {
+        return Err(bad());
+    }
+    Ok((lo, hi))
 }
 
 /// Parse a positive-integer flag value (`--bins`).
@@ -2806,6 +2844,34 @@ mod tests {
         assert!(parse("graph hist x --scale 0").is_err()); // must be positive
         assert!(parse("graph hist x --scale -1").is_err());
         assert!(parse("graph hist x --scale big").is_err());
+    }
+
+    #[test]
+    fn graph_ranges_parse_and_are_checked_per_kind() {
+        let g = parse("graph scatter x y -x 0:10 --yrange -1:1")
+            .unwrap()
+            .graph
+            .unwrap();
+        assert_eq!(g.opts.xrange, Some((0.0, 10.0)));
+        assert_eq!(g.opts.yrange, Some((-1.0, 1.0)));
+        for bad in [
+            "graph hist a -x 5:5",
+            "graph hist a -x a:b",
+            "graph hist a -x 5",
+        ] {
+            let err = parse(bad).unwrap_err().to_string();
+            assert!(err.contains("-x/--xrange"), "{bad}: {err}");
+        }
+        // A range a kind has no axis for.
+        let err = parse("graph hist a -y 0:1").unwrap_err().to_string();
+        assert!(
+            err.contains("graph hist") && err.contains("-y/--yrange"),
+            "{err}"
+        );
+        assert!(parse("graph bar a b -x 0:1").is_err());
+        assert!(parse("graph spark a -x 0:1").is_err());
+        assert!(parse("graph bar a b -y 0:1").is_ok());
+        assert!(parse("graph spark a -y 0:1").is_ok());
     }
 
     #[test]

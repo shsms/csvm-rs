@@ -818,6 +818,12 @@ pub struct GraphOpts {
     /// Draw with the plain-ASCII glyph set (`-A`/`--ascii`), for terminals
     /// without block/braille glyphs.
     pub ascii: bool,
+    /// An explicit x-axis range (`-x`/`--xrange`), `lo:hi`. Values outside it
+    /// are clipped (and counted), not squeezed in.
+    pub xrange: Option<(f64, f64)>,
+    /// An explicit y-axis range (`-y`/`--yrange`), `lo:hi`. Values outside it
+    /// are clipped for hist/spark/scatter/line; bars clamp to the edge.
+    pub yrange: Option<(f64, f64)>,
 }
 
 impl Default for GraphOpts {
@@ -830,6 +836,8 @@ impl Default for GraphOpts {
             width: None,
             height: None,
             ascii: false,
+            xrange: None,
+            yrange: None,
         }
     }
 }

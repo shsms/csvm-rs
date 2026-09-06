@@ -2933,6 +2933,59 @@ mod tests {
     }
 
     #[test]
+    fn graph_ranges_clip_and_report() {
+        // countZ is 5,0,0,9: an x range of 0:6 on hist drops the 9.
+        let out = render_str("graph hist countZ -b 2 -x 0:6", INPUT, false);
+        assert!(
+            out.contains("n=3") && out.contains("clipped 1 out of range"),
+            "{out}"
+        );
+        // A y range on scatter drops the point at 9.
+        let out = render_str("graph scatter id countZ -y 0:6", INPUT, false);
+        assert!(
+            out.contains("points=3") && out.contains("clipped 1 out of range"),
+            "{out}"
+        );
+        // A bar past the axis range clamps to the edge but still prints its value.
+        let out = render_str(
+            "agg count by fieldA | graph bar fieldA count -y 0:2",
+            INPUT,
+            false,
+        );
+        assert!(out.contains(" 3\n"), "{out}");
+        assert!(!out.contains("clipped"), "{out}");
+    }
+
+    #[test]
+    fn graph_ranges_set_the_axis_not_just_a_filter() {
+        // A range wider than the data widens the axis: the bins span 0..100.
+        let out = render_str("graph hist countZ -b 4 -x 0:100", INPUT, false);
+        assert!(out.contains("min=0") && out.contains("max=100"), "{out}");
+        // The scatter canvas spans the range, so the gutter reads 100.
+        let out = render_str("graph scatter id countZ -y 0:100", INPUT, false);
+        assert!(out.contains("100"), "{out}");
+        // The spark levels scale to the range, so every cell drops low; the
+        // summary still reports the data's own min and max.
+        let plain = render_str("graph spark countZ", INPUT, false);
+        let ranged = render_str("graph spark countZ -y 0:100", INPUT, false);
+        assert!(plain.contains('█'), "{plain}");
+        assert!(!ranged.contains('█'), "{ranged}");
+        assert!(
+            ranged.contains("min=0") && ranged.contains("max=9"),
+            "{ranged}"
+        );
+        // A category axis labels its ends from the rows that survived the clip.
+        let cats = "k,v\na,1\nb,2\nc,3\n";
+        let out = render_str("graph scatter k v -x 0:2", cats, false);
+        assert!(out.contains("points=2"), "{out}");
+        let lines: Vec<&str> = out.lines().collect();
+        let summary = lines.iter().position(|l| l.starts_with("points=")).unwrap();
+        let labels = lines[summary - 1];
+        assert!(labels.trim_end().ends_with('b'), "{out}");
+        assert!(!labels.contains('c'), "{out}");
+    }
+
+    #[test]
     fn graph_spark_is_a_single_line() {
         let out = render_str("graph spark countZ", INPUT, false);
         assert!(out.starts_with("countZ\n"), "{out}");

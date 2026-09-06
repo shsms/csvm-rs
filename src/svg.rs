@@ -4,7 +4,7 @@
 //! [`crate::chart`] model the terminal renderers do, as a standalone `<svg>`
 //! document.
 
-use crate::chart::{BarData, ChartData, Frame};
+use crate::chart::{AxisRange, BarData, ChartData, Frame};
 use crate::color::Rgb;
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
@@ -138,19 +138,26 @@ fill=\"#4fc3f7\" stroke=\"white\"/>\n",
 }
 
 /// Horizontal bar chart: one labelled bar per row, anchored at a zero baseline.
-pub fn bars(title: &str, rows: &[(String, f64)], note: &str) -> String {
+pub fn bars(title: &str, rows: &[(String, f64)], axis: AxisRange, note: &str) -> String {
     if rows.is_empty() {
         return header(title, "", note);
     }
-    let lo = rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::min);
-    let hi = rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
+    // An explicit axis (`-y`) replaces the data's own range, as in the terminal
+    // chart: a bar past it draws to the edge and the baseline moves onto it.
+    let (lo, hi) = axis.unwrap_or_else(|| {
+        (
+            rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::min),
+            rows.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max),
+        )
+    });
     let span = (hi - lo).max(f64::MIN_POSITIVE);
     let n = rows.len();
     let rh = ph() / n as f64;
-    let zero = L + (0.0 - lo) / span * pw();
+    let zero = L + (0.0_f64.clamp(lo, hi) - lo) / span * pw();
     let mut body = axes();
     for (i, (label, v)) in rows.iter().enumerate() {
-        let vx = L + (*v - lo) / span * pw();
+        // The drawn length is clamped to the axis; the printed value is real.
+        let vx = L + (v.clamp(lo, hi) - lo) / span * pw();
         let (x, w) = (zero.min(vx), (vx - zero).abs());
         let y = T + i as f64 * rh;
         body.push_str(&format!(
@@ -167,11 +174,14 @@ pub fn bars(title: &str, rows: &[(String, f64)], note: &str) -> String {
 }
 
 /// Sparkline as a single polyline across the plot width.
-pub fn spark(title: &str, values: &[f64], note: &str) -> String {
+pub fn spark(title: &str, values: &[f64], range: AxisRange, note: &str) -> String {
     if values.is_empty() {
         return header(title, "", note);
     }
-    let (lo, hi) = crate::graph::minmax(values).unwrap_or((0.0, 0.0));
+    // An explicit range (`-y`) is the axis, as in the terminal chart.
+    let (lo, hi) = range
+        .or_else(|| crate::graph::minmax(values))
+        .unwrap_or((0.0, 0.0));
     let span = (hi - lo).max(f64::MIN_POSITIVE);
     let n = values.len().max(2);
     let pts: Vec<String> = values
@@ -200,6 +210,7 @@ pub fn xy_chart(
     connect: bool,
     note: &str,
     xaxis: XAxis,
+    ranges: (AxisRange, AxisRange),
 ) -> String {
     let mut xlo = f64::INFINITY;
     let mut xhi = f64::NEG_INFINITY;
@@ -216,6 +227,10 @@ pub fn xy_chart(
     if !xlo.is_finite() {
         return header(title, "", note);
     }
+    // An explicit range (`-x`/`-y`) is the axis: the plot spans it instead of
+    // the points' own extent (the points outside it are already clipped away).
+    let (xlo, xhi) = ranges.0.unwrap_or((xlo, xhi));
+    let (ylo, yhi) = ranges.1.unwrap_or((ylo, yhi));
     let xspan = (xhi - xlo).max(f64::MIN_POSITIVE);
     let yspan = (yhi - ylo).max(f64::MIN_POSITIVE);
     let map = |x: f64, y: f64| {
@@ -276,8 +291,8 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         // Keep the --svg contract even with nothing to plot: an empty chart.
         ChartData::Hist(None) => hist(&frame.title, 0.0, 0.0, &[], &note),
         ChartData::Hist(Some(h)) => hist(&frame.title, h.lo, h.hi, &h.counts, &note),
-        ChartData::Bar(b) => bars(&frame.title, &single_series(b), &note),
-        ChartData::Spark(s) => spark(&frame.title, &s.values, &note),
+        ChartData::Bar(b) => bars(&frame.title, &single_series(b), b.axis, &note),
+        ChartData::Spark(s) => spark(&frame.title, &s.values, s.range, &note),
         ChartData::Xy(xy) => xy_chart(
             &frame.title,
             &xy.names,
@@ -285,6 +300,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             xy.connect,
             &note,
             xy.xaxis.clone(),
+            (xy.xrange, xy.yrange),
         ),
     }
 }
@@ -314,15 +330,37 @@ mod tests {
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
         let series = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
         let names = ["y".to_string()];
-        assert!(xy_chart("s", &names, &series, false, "", XAxis::Numeric).contains("<circle"));
-        assert!(xy_chart("s", &names, &series, true, "", XAxis::Numeric).contains("<polyline"));
+        assert!(
+            xy_chart(
+                "s",
+                &names,
+                &series,
+                false,
+                "",
+                XAxis::Numeric,
+                (None, None)
+            )
+            .contains("<circle")
+        );
+        assert!(
+            xy_chart("s", &names, &series, true, "", XAxis::Numeric, (None, None))
+                .contains("<polyline")
+        );
     }
 
     #[test]
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
         let series = vec![vec![(0.0, 0.0)], vec![(1.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = xy_chart("m", &names, &series, false, "", XAxis::Numeric);
+        let s = xy_chart(
+            "m",
+            &names,
+            &series,
+            false,
+            "",
+            XAxis::Numeric,
+            (None, None),
+        );
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
     }
@@ -332,13 +370,32 @@ mod tests {
         let series = vec![vec![(1.0, 0.0), (2.0, 1.0)]];
         let names = ["y".to_string()];
         let ends = XAxis::Ends("t0".to_string(), "t9".to_string());
-        let s = xy_chart("y vs t", &names, &series, true, "", ends);
+        let s = xy_chart("y vs t", &names, &series, true, "", ends, (None, None));
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
 
     #[test]
+    fn explicit_ranges_set_the_svg_axes() {
+        // The y labels come from the range, not the values' own min/max.
+        let s = spark("v", &[1.0, 2.0], Some((0.0, 100.0)), "");
+        assert!(s.contains(">100</text>"), "{s}");
+        let series = vec![vec![(1.0, 1.0)]];
+        let names = ["y".to_string()];
+        let s = xy_chart(
+            "y",
+            &names,
+            &series,
+            false,
+            "",
+            XAxis::Numeric,
+            (None, Some((0.0, 100.0))),
+        );
+        assert!(s.contains(">100</text>"), "{s}");
+    }
+
+    #[test]
     fn titles_are_xml_escaped() {
-        let s = spark("a & b <x>", &[1.0, 2.0], "");
+        let s = spark("a & b <x>", &[1.0, 2.0], None, "");
         assert!(s.contains("a &amp; b &lt;x&gt;"));
     }
 
@@ -347,7 +404,7 @@ mod tests {
         let s = hist("h", 0.0, 1.0, &[1], "skipped 2 non-numeric");
         assert!(s.contains("skipped 2 non-numeric"));
         // An empty note adds no footer text element beyond title/labels.
-        let bare = spark("v", &[1.0, 2.0], "");
+        let bare = spark("v", &[1.0, 2.0], None, "");
         assert!(!bare.contains("skipped"));
     }
 }

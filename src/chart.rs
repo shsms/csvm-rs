@@ -82,6 +82,11 @@ impl Glyphs {
     }
 }
 
+/// An explicit axis range, `Some((lo, hi))` from `-x`/`-y`, or `None` for the
+/// data's own extent. A range *is* the axis: the chart spans it, and the values
+/// outside it are dropped (and counted) rather than squeezed in.
+pub type AxisRange = Option<(f64, f64)>;
+
 /// Base chart dimensions at scale 1: width in cells, canvas rows.
 const BASE_W: usize = 80;
 const BASE_H: usize = 15;
@@ -196,8 +201,13 @@ pub struct HistData {
 impl HistData {
     /// Bin finite `values`; `None` when there are none. The default bin count
     /// is Sturges' rule (⌈log2 n⌉ + 1), capped at 50; `bins` wins when given.
-    pub fn build(values: &[f64], bins: Option<usize>) -> Option<HistData> {
-        let (lo, hi) = crate::graph::minmax(values)?;
+    /// `span` is an explicit axis range (`-x`/`--xrange`): the bins then cover
+    /// exactly it, so a range widens or narrows the axis rather than only
+    /// filtering — the values are already clipped to it.
+    pub fn build(values: &[f64], bins: Option<usize>, span: AxisRange) -> Option<HistData> {
+        // No values is still an empty chart, range or not.
+        let (dlo, dhi) = crate::graph::minmax(values)?;
+        let (lo, hi) = span.unwrap_or((dlo, dhi));
         let n = values.len();
         let nbins = bins
             .unwrap_or_else(|| ((n as f64).log2().ceil() as usize + 1).clamp(1, 50))
@@ -228,11 +238,17 @@ pub type BarRow = (String, Vec<Option<f64>>);
 pub struct BarData {
     pub value_names: Vec<String>,
     pub rows: Vec<BarRow>,
+    /// An explicit value axis (`-y`/`--yrange`) instead of the data's own
+    /// range: a bar past it draws to the edge, still printing its real value.
+    pub axis: AxisRange,
 }
 
 /// A sparkline's values, already bucketed to the chart width.
 pub struct SparkData {
     pub values: Vec<f64>,
+    /// An explicit value range (`-y`/`--yrange`): the levels scale to it
+    /// instead of to the values' own min/max.
+    pub range: AxisRange,
 }
 
 /// One input row of an xy chart: the raw x cell, its plotted x, one y per
@@ -252,6 +268,10 @@ pub struct XyData {
     pub xaxis: XAxis,
     /// Join the points of each series (a `line` chart, not a `scatter`).
     pub connect: bool,
+    /// Explicit axis ranges (`-x`/`-y`): the canvas spans these instead of the
+    /// points' own extent. The points are already clipped to them.
+    pub xrange: AxisRange,
+    pub yrange: AxisRange,
 }
 
 impl XyData {
@@ -307,6 +327,62 @@ fn for_each_data_row(text: &str, mut f: impl FnMut(&[Field])) {
 /// The note for `n` dropped non-numeric cells, or none.
 fn skipped_note(n: u64) -> Option<String> {
     (n > 0).then(|| format!("skipped {n} non-numeric"))
+}
+
+/// Keep the values inside `range` (when given); the count dropped goes to the
+/// note.
+fn clip(values: Vec<f64>, range: AxisRange) -> (Vec<f64>, u64) {
+    let Some((lo, hi)) = range else {
+        return (values, 0);
+    };
+    let before = values.len();
+    let kept: Vec<f64> = values
+        .into_iter()
+        .filter(|v| (lo..=hi).contains(v))
+        .collect();
+    let dropped = (before - kept.len()) as u64;
+    (kept, dropped)
+}
+
+/// The note for `n` values dropped for falling outside an axis range, or none.
+fn clipped_note(n: u64) -> Option<String> {
+    (n > 0).then(|| format!("clipped {n} out of range"))
+}
+
+/// Apply the axis ranges to already-collected xy rows: a row whose x falls
+/// outside `xrange` goes entirely, and a y outside `yrange` is blanked. Every
+/// plotted point lost is counted, so the chart still says what it dropped.
+fn clip_xy(xy: &mut XyData, xrange: AxisRange, yrange: AxisRange) -> u64 {
+    let mut clipped = 0u64;
+    if xrange.is_none() && yrange.is_none() {
+        return clipped;
+    }
+    xy.rows.retain_mut(|r| {
+        if let Some((lo, hi)) = xrange
+            && !(lo..=hi).contains(&r.x)
+        {
+            clipped += r.ys.iter().filter(|y| y.is_some()).count() as u64;
+            return false;
+        }
+        if let Some((lo, hi)) = yrange {
+            for y in &mut r.ys {
+                if y.is_some_and(|v| !(lo..=hi).contains(&v)) {
+                    *y = None;
+                    clipped += 1;
+                }
+            }
+        }
+        r.ys.iter().any(Option::is_some)
+    });
+    // A category axis labels its ends with the raw cells, so they have to come
+    // from the rows that survived the clip, not the original first and last.
+    let XyData { rows, xaxis, .. } = xy;
+    if let XAxis::Ends(first, last) = xaxis {
+        let cell = |r: Option<&XyRow>| r.map(|r| r.xcell.clone()).unwrap_or_default();
+        *first = cell(rows.first());
+        *last = cell(rows.last());
+    }
+    clipped
 }
 
 /// One column's finite values, plus the non-numeric count.
@@ -453,6 +529,8 @@ fn collect_xy(
             rows,
             xaxis,
             connect: false,
+            xrange: None,
+            yrange: None,
         },
         skipped,
     )
@@ -479,14 +557,19 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
     let data = match g.kind {
         GraphKind::Hist => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            let (values, clipped) = clip(values, g.opts.xrange);
             notes.extend(skipped_note(skipped));
-            ChartData::Hist(HistData::build(&values, g.opts.bins))
+            notes.extend(clipped_note(clipped));
+            ChartData::Hist(HistData::build(&values, g.opts.bins, g.opts.xrange))
         }
         GraphKind::Spark => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            let (values, clipped) = clip(values, g.opts.yrange);
             notes.extend(skipped_note(skipped));
+            notes.extend(clipped_note(clipped));
             ChartData::Spark(SparkData {
                 values: bucket(&values, width),
+                range: g.opts.yrange,
             })
         }
         GraphKind::Bar => {
@@ -500,6 +583,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             ChartData::Bar(BarData {
                 value_names: g.cols[1..].iter().map(|c| c.name.clone()).collect(),
                 rows,
+                axis: g.opts.yrange,
             })
         }
         GraphKind::Scatter | GraphKind::Line => {
@@ -507,12 +591,15 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             let names: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
             let (mut xy, skipped) = collect_xy(text, &g.cols[0].name, g.cols[0].pos, &names, &ypos);
             xy.connect = g.kind == GraphKind::Line;
+            (xy.xrange, xy.yrange) = (g.opts.xrange, g.opts.yrange);
+            let clipped = clip_xy(&mut xy, g.opts.xrange, g.opts.yrange);
             // Only the category/row-index axis distorts spacing; numeric and
             // time axes are true.
             if matches!(xy.xaxis, XAxis::Ends(..)) {
                 notes.push("even row spacing".to_string());
             }
             notes.extend(skipped_note(skipped));
+            notes.extend(clipped_note(clipped));
             ChartData::Xy(xy)
         }
     };
@@ -566,7 +653,7 @@ mod tests {
         // -1e308 to 1e308: `hi - lo` is infinity, so a fraction worked out
         // from it is NaN and every value would fall in bin 0. The bins have to
         // divide the axis all the same, and their edges stay real numbers.
-        let h = HistData::build(&[-1e308, 0.0, 1e308], Some(4)).unwrap();
+        let h = HistData::build(&[-1e308, 0.0, 1e308], Some(4), None).unwrap();
         assert_eq!(h.counts, [1, 0, 1, 1]);
         let edges: Vec<f64> = (0..=4).map(|i| lerp(h.lo, h.hi, i, 4)).collect();
         assert!(edges.iter().all(|e| e.is_finite()), "{edges:?}");
@@ -577,13 +664,13 @@ mod tests {
 
     #[test]
     fn hist_data_bins_with_sturges_by_default() {
-        let h = HistData::build(&[1.0, 2.0, 3.0, 4.0], None).unwrap();
+        let h = HistData::build(&[1.0, 2.0, 3.0, 4.0], None, None).unwrap();
         assert_eq!((h.lo, h.hi, h.total), (1.0, 4.0, 4));
         assert_eq!(h.counts.len(), 3); // ceil(log2 4) + 1
         assert_eq!(h.counts.iter().sum::<u64>(), 4);
-        assert!(HistData::build(&[], None).is_none());
+        assert!(HistData::build(&[], None, None).is_none());
         assert_eq!(
-            HistData::build(&[5.0, 5.0], Some(2)).unwrap().counts,
+            HistData::build(&[5.0, 5.0], Some(2), None).unwrap().counts,
             [2, 0]
         );
     }
@@ -631,6 +718,8 @@ mod tests {
             ],
             xaxis: XAxis::Numeric,
             connect: false,
+            xrange: None,
+            yrange: None,
         };
         assert_eq!(
             d.series(),
