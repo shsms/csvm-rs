@@ -14,6 +14,9 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
+- =graph= without a kind: make =graph X Y= draw a line chart, since
+  choosing a kind is the hard part of using =graph=. Needs a rule for
+  =graph COL= (hist?) and for a bare =graph= (error with the kinds).
 - Numbers print rounded to six decimals, so =add v = 1e-7= prints =0=
   while =--explain= shows =0.0000001=. That is the output formatter, not
   the lexer, but exponent literals make it easy to hit.
@@ -384,15 +387,12 @@ below the chart rather than coercing to 0. Settle this before the binning code.
    spark= (eighth-height blocks, bucket-averaged to width).
 4. [X] =graph scatter= / =line= on a 2x4 braille canvas (=Braille=, Bresenham
    for line), multi-series via =X Y1,Y2= with distinct per-series colours +
-   legend. (Density colour *ramps* for a single scatter still open — see below.)
+   legend. (Colour ramps for a single-series scatter landed later — see the
+   follow-ups-done list.)
 5. [~] SVG export shipped (=--svg=, =src/svg.rs=, hand-written XML, no dep, so
    not feature-gated). PNG (needs a raster dep) is still the feature-gated part.
 
 ** Follow-ups — open (deferred)
-- =graph hist= colour: a density ramp over the bars (reuse =color.rs= =Ramp=).
-- =graph scatter= density colour ramp: colour a single-series scatter by point
-  density / a third value column (reuse =color.rs= =Ramp=); multi-series already
-  gets distinct per-series colours.
 - =add= =epoch()= / date function — folded into the "string and date functions"
   feature idea under Open items.
 - Time-axis labels honour the source offset (currently formatted as UTC).
@@ -402,6 +402,13 @@ below the chart rather than coercing to 0. Settle this before the binning code.
   =Field::Num= values instead of re-parsing — a deep change to the sink design.
 
 ** Follow-ups — done (see git history)
+- [X] 2026-09-06 =graph hist= colour: =-r/--ramp lo:hi= paints each bar along
+  the ramp by its bin count (=color.rs= =Ramp=; the same flag paints a
+  single-series =bar= by value and a =spark= cell by its level).
+- [X] 2026-09-06 =graph scatter=/=line= density colour ramp: with one y series,
+  =-r= paints each braille cell by how many points landed in it, and
+  =-c/--color-by COL= paints the points by a third column's value (the SVG
+  colours its points by =-c= too).
 - [X] Streaming + sharded group-by (the =stats= mirror): =group_shape= gates a
   streaming fast path (stdin/=-n1=, one =Grouper=) and an =-n>1= sharded path
   (per-shard partial =Grouper=, =Grouper::merge= folds them in file order so

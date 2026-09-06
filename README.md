@@ -79,9 +79,19 @@ Each stage is a command with comma- or space-separated arguments:
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
 | `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
-| `graph bar LABEL VALUE` | one horizontal bar per row (sink; use after group-by) |
+| `graph bar LABEL V[,V2…]` | one horizontal bar per row and value column (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
 | `graph scatter X Y` / `line X Y` | braille scatter/line plot, multi-series (sink) |
+| `graph heatmap X Y` | 2-D histogram on a grid, each cell shaded by its point count (sink) |
+
+`graph` flags: size — `-W/--width N`, `-H/--height N`, `-s/--scale F`,
+`-A/--ascii`; axes — `-x/--xrange lo:hi`, `-y/--yrange lo:hi`, `-l/--log`,
+`--xlabel T`, `--ylabel T`; other — `-b/--bins N` (the hist bins, or an N×N
+heatmap grid), `-t/--title T`, `-r/--ramp lo:hi`, `-c/--color-by COL`,
+`-D/--data`, `-S/--svg`. A range is the axis: a value outside it is dropped
+and counted, and only a bar draws to the edge instead (still printing its real
+value). `-D` writes the chart's own data as CSV instead of drawing it. Run
+`csvm help graph` for the rest.
 
 Arguments may be separated by commas or spaces (`cols a,b,c` ≡ `cols a b c`),
 and an `=` may have spaces around it (`rename a = b`, `agg total = sum(x)`).
@@ -184,6 +194,12 @@ csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv
 # braille line chart of two series over time
 csvm 'graph line ts open,close -s 1.5' prices.csv
 
+# where the points crowd: a 2-D histogram, each cell coloured by its count
+csvm 'graph heatmap x y -r blue:red' points.csv
+
+# the chart's own data as CSV, fed straight back into csvm
+csvm 'graph hist amount -D' sales.csv | csvm 'select count > 100'
+
 # write the chart as an SVG instead of drawing in the terminal
 csvm 'graph hist amount -S' sales.csv -o amount.svg
 
@@ -254,9 +270,9 @@ and alignment — reporting per-operation throughput.
 ## Roadmap
 
 The pipe language is built to grow. Terminal-native charts ship today
-(`graph hist/bar/spark/scatter/line`, with `-S` SVG export), as do conditional
-colouring (`color`) and Parquet input. Planned: Parquet projection push-down and
-write, JSON-lines output, and a scatter density colour ramp. See `todo.org` for
+(`graph hist/bar/spark/scatter/line/heatmap`, with `-S` SVG export), as do
+conditional colouring (`color`) and Parquet input. Planned: Parquet projection
+push-down and write, JSON-lines output, and PNG chart export. See `todo.org` for
 design notes.
 
 ## License

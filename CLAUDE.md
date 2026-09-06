@@ -249,45 +249,106 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
-- **`graph KIND COL [flags]`** is a terminal-chart **sink**: it
-  draws from the columns reaching it instead of emitting CSV, so it must be the
-  *last* command (the parser rejects anything after it). Plan metadata
-  (`Plan.graph`, `GraphSpec` in `plan.rs`), not a stage — like `fmt`/`color` it
-  renders in `exec::render` from the buffered output, reusing the whole executor
-  upstream. `exec::render_graph` pulls the charted columns and drops
-  non-numeric/empty cells *loudly* (counted and reported below the chart — the
-  "strict and loud" policy); the drawing lives in `src/graph.rs`. Charts:
-  - `graph hist COL` — `Histogram` bins values (Sturges' default, capped at 50)
-    into horizontal block bars with an eighth-block fractional tail.
-  - `graph bar LABEL VALUE` — one diverging bar per row anchored at a zero
-    baseline (negatives extend left); capped at `MAX_BARS=50` rows, overflow
-    reported. Use after group-by.
+- **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
+  reaching it instead of emitting CSV, so it must be the *last* command (the
+  parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`
+  in `plan.rs`), not a stage — like `fmt`/`color` it renders in `exec::render`
+  from the buffered output, reusing the whole executor upstream. The **data
+  model is `src/chart.rs`**: `exec::render_graph` builds the `Frame` (title,
+  labels, size, `Glyphs`, ramp, colour/log flags, notes) and `chart::collect`
+  reads the charted columns out of that buffer into one `ChartData` per kind
+  (`HistData` / `BarData` / `SparkData` / `XyData` / `HeatData`). Cells it
+  cannot use are dropped *loudly* — non-numeric or empty (`skipped N
+  non-numeric`), outside an axis range (`clipped N out of range`), not positive
+  under `-l` (`dropped N non-positive`), a non-numeric `-c` cell (`N
+  non-numeric colour cells`) — each counted into `Frame.notes` and printed
+  under the chart, the "strict and loud" policy. **Three consumers** read that
+  one model: `graph::render` (the terminal chart, `src/graph.rs`),
+  `svg::render` (`-S`, `src/svg.rs`, hand-written XML, no dep) and
+  `chart::to_csv` (`-D`, the chart's own data as CSV). The model keeps *real*
+  values throughout: a log axis is applied at draw time (`chart::value_pos` /
+  `bar_value` / `hist_len`), so the labels, the summaries and `--data` all read
+  the numbers that came out of the pipeline. Charts:
+  - `graph hist COL` — `HistData::build` bins values (Sturges' default, capped
+    at 50; `-b` overrides, `-x` sets the binned span) into horizontal block bars
+    with an eighth-block fractional tail.
+  - `graph bar LABEL V[,V2…]` — one diverging bar per row anchored at a zero
+    baseline (negatives extend left). Several value columns make a row a
+    *group*: one line per series, the label on the first line, a legend below,
+    and the series palette in place of `-r` (which a group rejects). The
+    *drawn* labels are capped at `MAX_BARS=50` (a group counts once), overflow
+    reported; `-D` writes them all. Under `-l` the baseline is a value
+    of 1 and a value that is not positive gets no bar at all (its number still
+    prints). Use after group-by.
   - `graph spark COL` — a one-line sparkline (eighth-height blocks), a long
-    series bucket-averaged down to the width.
-  - `graph scatter X Y[,Y2…]` / `graph line X Y[,Y2…]` — points (line: Bresenham
-    segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple y-series
-    get distinct colours (`render_xy`, when `--color`) with a legend; one braille
-    canvas per series, first-series-wins per shared cell. `collect_xy` picks the
-    X mode (a `graph::XAxis`): **numeric** (plotted as-is); else **temporal** — if
-    every X cell parses as a timestamp (`crate::datetime::parse_epoch`, no dep),
-    plot at true epoch positions; else the **row-index fallback** (categories) —
-    plot against the 1-based ordinal and flag `even row spacing`. A
-    partially-numeric X keeps the strict drop-bad-rows behaviour. The bottom axis
-    is *graduated* with intermediate ticks (`x_label_row`/`place_ticks`): numeric
-    uses round 1/2/5×10ⁿ values (`nice_ticks`), time interpolates and drops the
-    date to `HH:MM:SS` when every tick is the same day, categories show only the
-    end cells; tick count adapts to width (so `-s` adds more), labels that
-    collide are dropped.
-  Flags: `-b N` (hist), `-s F`, `-t T`, `-S`, with long forms `--bins`,
-  `--scale`, `--title`, `--svg` (`flag_value` in `parse.rs` takes every
-  spelling of a flag). A single `-s`
-  multiplies both base dimensions (`graph::chart_size`: `BASE_W`=80 cols,
-  `BASE_H`=15 rows; default 1.0) — there is no separate width/height knob and no
-  terminal probing. `-S` emits a
-  standalone SVG document to the normal output instead of the terminal chart
-  (`src/svg.rs`, hand-written XML, no dep; reuses the same collected data). PNG
-  (needs a raster dep) and a scatter density colour ramp are the remaining
-  follow-ups (`todo.org`).
+    series bucket-averaged down to the chart width.
+  - `graph scatter X Y[,Y2…]` / `graph line X Y[,Y2…]` — points (line:
+    Bresenham segments) on a 2×4 `Braille` canvas in a labelled frame. Multiple
+    y-series get distinct colours (`render_xy`, when `--color`) with a legend;
+    one braille canvas per series, first-series-wins per shared cell.
+    `chart::collect_xy` picks the X mode (a `graph::XAxis`): **numeric**
+    (plotted as-is); else **temporal** — if every X cell parses as a timestamp
+    (`crate::datetime::parse_epoch`, no dep), plot at true epoch positions;
+    else the **row-index fallback** (categories) — plot against the 1-based
+    ordinal and flag `even row spacing` (so an `-x` range there ranges over row
+    ordinals). A partially-numeric X keeps the strict drop-bad-rows behaviour.
+    The bottom axis is *graduated* with intermediate ticks
+    (`x_label_row`/`place_ticks`): numeric uses round 1/2/5×10ⁿ values
+    (`nice_ticks`), time interpolates and drops the date to `HH:MM:SS` when
+    every tick is the same day, categories show only the end cells; tick count
+    adapts to width (so `-s` adds more), labels that collide are dropped. A
+    single y-series is painted per braille cell when terminal colour is on: by
+    `-c/--color-by`'s value where the script named such a column, else — with
+    `-r` — by point *density*, how many points landed in the cell (a cell lit
+    only by a connecting segment has no count and stays plain). Density is a
+    per-cell count, so it is terminal-only; `-c` colours the SVG's points too,
+    though an SVG `line` is one polyline and shows no per-point colour.
+  - `graph heatmap X Y` — a 2-D histogram: `HeatData::build` counts the points
+    in each cell of a grid (the canvas by default, an N×N grid with `-b N`) and
+    shades them by that count — the full block painted along the ramp when
+    terminal colour is on (`-r`, else the default `Ramp`), else one of five
+    block shades. `-l` is the *count* axis here, not y: both of a heatmap's
+    own axes are binned. The X column goes through the same three modes a
+    scatter's does.
+
+  Flags (`flag_value` in `parse.rs` takes every spelling):
+  size — `-W/--width N`, `-H/--height N`, `-s/--scale F`, `-A/--ascii` (the
+  ASCII `Glyphs` set, for terminals without block/braille glyphs);
+  axes — `-x/--xrange lo:hi`,
+  `-y/--yrange lo:hi`, `-l/--log`, `--xlabel T`, `--ylabel T`; other —
+  `-b/--bins N` (the hist bins, or an N×N heatmap grid; the other kinds accept
+  it and ignore it), `-t/--title T`, `-r/--ramp lo:hi`, `-c/--color-by COL`,
+  `-D/--data`, `-S/--svg`. `chart::chart_size` sizes the chart: `-W`/`-H` win,
+  else the terminal's width (`src/term.rs`: `$COLUMNS`, else a `TIOCGWINSZ`
+  ioctl through `libc` — read only when stdout is a terminal and there is no
+  `-o`) or `BASE_W`=80, and `BASE_H`=15 rows, both × `-s`. A range *is* the
+  axis: the chart spans exactly it and the values outside are dropped and
+  counted — except a bar, which clamps to the axis edge and still prints its
+  real value. `-l` log10-scales the *value* axis: y for scatter/line/spark,
+  the bar length for bar, the count for hist/heatmap (there it draws
+  `log10(count + 1)`, so an empty bin stays at zero and a count of 1 is still
+  visible). `-y` ranges that same axis, except on a heatmap, where it ranges
+  the y bins, not the count (hist takes no `-y` at all; its `-x` sets the span
+  the bins cover). `check_graph_arity`/`check_graph_flags` (`parse.rs`) reject
+  a wrong column count, a flag a kind has no use for (`-c` off scatter/line,
+  `-r`/`-c` on several y-series, `-r` on a grouped bar, `-x` on bar/spark,
+  `-y` on hist) and a
+  non-positive `-y` bound under `-l` (heatmap excepted, its `-l` is the count
+  axis); `-D` and `-S` are exclusive, since both own the normal output. `-D`'s
+  shapes: `bin_lo,bin_hi,count` per hist bin, every label and its values for
+  bar (`--data` is never capped), `bucket,VALUE` per spark cell (so the row count is at most the chart
+  width — a shorter series passes through as it is; pin the width with `-W`),
+  the raw x cell plus the numeric ys for scatter/line, and `X,Y,count` lower
+  corners of the non-empty cells for heatmap. `-r/--ramp` means "colour by
+  value", and which value depends on the kind: the bin count for hist, the bar
+  value for a single series (a grouped bar takes no `-r`), the level for a
+  spark cell, point density for a single-series scatter/line, the cell count
+  for a heatmap. The SVG takes the ramp for hist, a single-series bar and
+  heatmap (and for `-c`'s points); a spark's polyline and the terminal-only
+  density do not reach it. `-c/--color-by COL` colours by a third column's
+  value, falls back to the default `Ramp` when there is no `-r`, and wins over
+  the density when both are given. PNG (needs a raster dep) is the remaining
+  export follow-up (`todo.org`).
 - There are no conversion commands: `to-num`/`to-str` (and the underscore
   spellings) are rejected with a hint pointing at `add c = num(c)` / `str()`.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
@@ -505,11 +566,12 @@ the `Plan` is now a small DAG). The computed `add` column is implemented
 (`Stmt::Add`, the `ValExpr` value engine; `prev`/`rownum` take the ordered
 in-memory path). Group-by aggregation is implemented (`Stage::Group`,
 `group … | agg …`), as is terminal-native graphing (`graph
-hist/bar/spark/scatter/line` in `src/graph.rs`, `--svg` export in
-`src/svg.rs`). Pluggable input formats have begun: **parquet read** ships behind
+hist/bar/spark/scatter/line/heatmap`, the `src/chart.rs` model drawn by
+`src/graph.rs`, `src/svg.rs` and `chart::to_csv`). Pluggable input formats have
+begun: **parquet read** ships behind
 the optional `parquet` feature (`src/parquet.rs`, see above). Planned (see
 `todo.org` for design notes): parquet projection push-down and *write*,
-JSON-lines output, and a scatter density colour ramp. TSV / a delimiter flag,
+JSON-lines output, and PNG chart export. TSV / a delimiter flag,
 multiple input files, and join naming sugar were considered and rejected for
 good.
 

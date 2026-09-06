@@ -291,22 +291,50 @@ by their output text (like a `by` key); sum/mean/stddev are blank for a non-nume
         summary: "draw a terminal chart (sink)",
         synopsis: &[
             "graph hist COL              distribution of a numeric column",
-            "graph bar LABEL VALUE       one bar per row (use after group-by)",
+            "graph bar LABEL V[,V2…]     one bar per row and value column (use after group-by)",
             "graph spark COL             one-line sparkline of a column",
             "graph scatter X Y[,Y2…]     points on a braille canvas",
             "graph line X Y[,Y2…]        connected points (multi-series)",
-            "  flags: -b/--bins N (hist)  -s/--scale F (size ×F)  -t/--title T  -S/--svg",
+            "graph heatmap X Y           2-D histogram, shaded by count",
+            "  size:   -W/--width N  -H/--height N  -s/--scale F  -A/--ascii",
+            "  axes:   -x/--xrange lo:hi  -y/--yrange lo:hi  -l/--log  --xlabel T  --ylabel T",
+            "  other:  -b/--bins N  -t/--title T  -r/--ramp lo:hi  -c/--color-by COL",
+            "  output: -D/--data  -S/--svg",
         ],
         detail: "A sink: draws a chart from the columns reaching it instead of emitting CSV, so \
-it must be the last command. Non-numeric/empty cells are dropped from the plot and reported. \
--s F multiplies the default size; hist bins to Sturges' rule; bar is capped at 50 rows; \
-scatter/line take multiple y-series, coloured with --color. A timestamp x is plotted on a true \
-time axis; any other non-numeric x plots by row order. -S emits an SVG document to the output \
-instead of a terminal chart.",
+it must be the last command. Cells that are not numbers are dropped from the plot and counted \
+in a note under it. The chart is as wide as the terminal (80 columns when the output is not a \
+terminal) and 15 rows tall; -s multiplies that default, and -W and -H set an exact size (never \
+smaller than 16 wide and 2 high). -A draws with plain ASCII, for a terminal without block \
+glyphs.\n\n\
+-l puts the value axis on a log10 scale: that axis is y for scatter, line and spark, the bar \
+length for bar, and the count for hist and heatmap. -y ranges that same axis, except on a \
+heatmap, where it ranges the y bins rather than the count; hist takes no -y, and its -x sets \
+the span the bins cover. A range is the axis, so a value outside -x or -y is dropped and \
+counted (`clipped N out of range`) — except a bar, which draws to the edge and still prints \
+its real value. On spark, scatter and line, -l drops the values that are not positive (counted \
+too); on hist and heatmap it draws a count as log10(count+1). -b sets the bin count: the bins \
+of a hist (Sturges' rule when -b is absent) and an N×N grid for a heatmap; the other kinds \
+ignore it.\n\n\
+-D writes the chart's own data as CSV instead of drawing it: hist bin edges, the bar labels \
+and values, the spark's width buckets, the plotted points, or the heatmap's cell corners and \
+counts. -S emits an SVG document to the output instead of a terminal chart, so -D and -S are \
+exclusive. -r colours by value: in the terminal (with --color) it paints hist bars by count, \
+spark cells and single-series bars by value, and a one-y-series scatter or line by how many \
+points share a cell; an SVG always has colour, and takes the ramp for hist, a single-series \
+bar, and heatmap. -c COL colours a scatter's or line's points by a third column's value — an \
+SVG scatter too — and wins over -r's density when both are given. A heatmap counts the points \
+in each cell of a grid and shades them by that count: along the ramp with colour on, over five \
+block shades without. bar draws at most 50 labels (-D writes them all), and takes -r only \
+with one value column; scatter and line take several y-series, drawn in distinct colours with \
+a legend when --color is on. A timestamp x is plotted on a true \
+time axis; any other non-numeric x plots by row order.",
         examples: &[
             "csvm 'select region == \"EU\" | graph hist amount' sales.csv",
             "csvm 'agg sum(amount) by region | graph bar region amount_sum' sales.csv",
             "csvm 'graph line ts open,close -s 1.5' prices.csv",
+            "csvm 'graph heatmap x y -r blue:red' points.csv",
+            "csvm 'graph hist amount -D' sales.csv | csvm 'select count > 100'",
             "csvm 'graph hist amount -S' data.csv -o chart.svg",
         ],
     },
