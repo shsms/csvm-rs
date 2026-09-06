@@ -539,6 +539,56 @@ pub(crate) fn axis_ticks(xaxis: &XAxis, xlo: f64, xhi: f64, target: usize) -> Ve
     }
 }
 
+/// The head of a framed canvas chart (scatter, line, heatmap): the title —
+/// carrying the caveat a category x axis comes with, since it belongs to the
+/// chart and not to what was dropped — and the `--ylabel` caption under it.
+fn canvas_head(frame: &Frame, xaxis: &XAxis) -> String {
+    let mut out = frame.title.clone();
+    if let Some(note) = spacing_note(xaxis) {
+        out.push_str(&format!("  ({note})"));
+    }
+    out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
+    out
+}
+
+/// The foot of a framed canvas chart: the corner and its axis rule, the
+/// graduated x tick row, the centred `--xlabel` caption, and the point count
+/// with the dropped-row notes. `gutter` is how wide the y-label column is and
+/// `cells` how many columns of canvas the rule spans.
+fn canvas_foot(
+    frame: &Frame,
+    xaxis: &XAxis,
+    (xlo, xhi): (f64, f64),
+    gutter: usize,
+    cells: usize,
+    points: u64,
+) -> String {
+    let mut out = format!(
+        "{:>gutter$} {}{}\n",
+        "",
+        frame.glyphs.axis_corner,
+        frame.glyphs.axis_h.to_string().repeat(cells)
+    );
+    out.push_str(&format!(
+        "{:>gutter$}  {}\n",
+        "",
+        x_label_row(xaxis, xlo, xhi, cells)
+    ));
+    if let Some(x) = &frame.xlabel {
+        let line = format!("{:>gutter$}  {:^cells$}", "", x);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push_str(&format!("points={points}"));
+    out.push_str(&frame.notes_tail());
+    out.push('\n');
+    out
+}
+
 /// The caveat a category (row-index) x axis carries: the points are spaced by
 /// row order, not by their real x. Both renderers read it off the axis — the
 /// terminal chart puts it in the title, the SVG in its footer note — so nothing
@@ -704,17 +754,7 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
                 false => (vals, 1.0, maxcount),
             }
         });
-    let mut out = String::new();
-    // An evenly-spaced (category) x axis is flagged in the title, not the tail.
-    out.push_str(&frame.title);
-    if let Some(note) = spacing_note(&xy.xaxis) {
-        out.push_str(&format!("  ({note})"));
-    }
-    out.push('\n');
-    if let Some(y) = &frame.ylabel {
-        out.push_str(y);
-        out.push('\n');
-    }
+    let mut out = canvas_head(frame, &xy.xaxis);
     for cy in 0..hcells {
         // Gutter label: yhi on the first row, ylo on the last.
         let label = if cy == 0 {
@@ -756,26 +796,14 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     }
     // Bottom axis with graduated x labels (interpolated ticks for a numeric or
     // time axis; first/last cells for a category axis).
-    out.push_str(&format!(
-        "{:>gutter$} {}{}\n",
-        "",
-        frame.glyphs.axis_corner,
-        frame.glyphs.axis_h.to_string().repeat(wcells)
+    out.push_str(&canvas_foot(
+        frame,
+        &xy.xaxis,
+        (xlo, xhi),
+        gutter,
+        wcells,
+        total as u64,
     ));
-    out.push_str(&format!(
-        "{:>gutter$}  {}\n",
-        "",
-        x_label_row(&xy.xaxis, xlo, xhi, wcells)
-    ));
-    if let Some(x) = &frame.xlabel {
-        let line = format!("{:>gutter$}  {:^wcells$}", "", x);
-        out.push_str(line.trim_end());
-        out.push('\n');
-    }
-
-    out.push_str(&format!("points={total}"));
-    out.push_str(&frame.notes_tail());
-    out.push('\n');
     if multi {
         out.push_str(&legend_line(&xy.names, &frame.glyphs, colors));
     }
@@ -822,18 +850,7 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
     let ramp = frame.ramp.unwrap_or_default();
     let (clo, chi) = h.count_bounds(frame.log);
 
-    let mut out = String::new();
-    // An evenly-spaced (category) x axis is flagged in the title, as in an xy
-    // chart, since it distorts spacing the same way.
-    out.push_str(&frame.title);
-    if let Some(note) = spacing_note(&h.xaxis) {
-        out.push_str(&format!("  ({note})"));
-    }
-    out.push('\n');
-    if let Some(y) = &frame.ylabel {
-        out.push_str(y);
-        out.push('\n');
-    }
+    let mut out = canvas_head(frame, &h.xaxis);
     // Row 0 of the grid is the lowest y band, so the rows print in reverse.
     for row in (0..h.rows).rev() {
         let label = if row == h.rows - 1 {
@@ -856,25 +873,14 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
         }
         out.push('\n');
     }
-    out.push_str(&format!(
-        "{:>gutter$} {}{}\n",
-        "",
-        frame.glyphs.axis_corner,
-        frame.glyphs.axis_h.to_string().repeat(h.cols)
+    out.push_str(&canvas_foot(
+        frame,
+        &h.xaxis,
+        (h.xlo, h.xhi),
+        gutter,
+        h.cols,
+        h.total,
     ));
-    out.push_str(&format!(
-        "{:>gutter$}  {}\n",
-        "",
-        x_label_row(&h.xaxis, h.xlo, h.xhi, h.cols)
-    ));
-    if let Some(x) = &frame.xlabel {
-        let line = format!("{:>gutter$}  {:^wcells$}", "", x, wcells = h.cols);
-        out.push_str(line.trim_end());
-        out.push('\n');
-    }
-    out.push_str(&format!("points={}", h.total));
-    out.push_str(&frame.notes_tail());
-    out.push('\n');
     out
 }
 
