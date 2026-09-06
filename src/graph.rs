@@ -69,6 +69,17 @@ fn tail_notes(frame: &Frame) -> String {
         .collect()
 }
 
+/// Paint `text` with the frame's ramp at `v` in `[lo, hi]` — the `-r/--ramp`
+/// gradient. Terminal colour is opt-in, so this is a no-op unless both a ramp
+/// and `frame.color` are on; empty text is left alone so no chart grows a pair
+/// of escapes around nothing.
+fn paint(frame: &Frame, v: f64, lo: f64, hi: f64, text: &str) -> String {
+    match (&frame.ramp, frame.color) {
+        (Some(r), true) if !text.is_empty() => r.at(v, lo, hi).paint(text),
+        _ => text.to_string(),
+    }
+}
+
 /// Draw a histogram: a right-aligned bin-edge axis, a block bar per bin, and the
 /// count, followed by a summary line. The bars fill what the axis leaves of
 /// `frame.width`.
@@ -96,15 +107,16 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
         out.push('\n');
     }
     for (edge, &count) in edges.iter().zip(&h.counts) {
-        out.push_str(&format!(
-            "{edge:>axis_w$} {axis_v}{} {count}\n",
-            bar_len(
-                hist_len(count, frame.log),
-                hist_len(max_count, frame.log),
-                bars,
-                &frame.glyphs
-            )
-        ));
+        let bar = bar_len(
+            hist_len(count, frame.log),
+            hist_len(max_count, frame.log),
+            bars,
+            &frame.glyphs,
+        );
+        // The ramp runs over the raw counts — the numbers printed beside the
+        // bars — whatever the axis does with their lengths.
+        let bar = paint(frame, count as f64, 0.0, max_count as f64, &bar);
+        out.push_str(&format!("{edge:>axis_w$} {axis_v}{bar} {count}\n"));
     }
     if let Some(x) = &frame.xlabel {
         out.push_str(&format!("{:>axis_w$}  {x}\n", ""));
@@ -184,6 +196,13 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
             }
         }
         let drawn: String = field.into_iter().collect();
+        // The ramp runs over the same bounds the bars are drawn against, so a
+        // colour is a position on the axis; a row a log axis cannot place has
+        // no bar to paint.
+        let drawn = match at {
+            Some(at) => paint(frame, *at, lo, hi, &drawn),
+            None => drawn,
+        };
         out.push_str(&format!(
             "{label:>label_w$} {axis_v}{drawn} {}\n",
             format_num(*v)
@@ -232,7 +251,10 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
             } else {
                 3
             };
-            levels[level.min(7)]
+            let cell = levels[level.min(7)];
+            // Each cell is painted on its own, over the same axis positions the
+            // levels scale to, so colour and height tell the same story.
+            paint(frame, pos(v), plo, phi, &cell.to_string())
         })
         .collect();
     let mut out = String::new();

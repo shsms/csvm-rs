@@ -691,6 +691,12 @@ impl<'a> Builder<'a> {
                 let (val, tail) = v?;
                 opts.xrange = Some(parse_range(&val, "-x/--xrange")?);
                 s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["-r", "--ramp"]) {
+                let (val, tail) = v?;
+                opts.ramp = Some(
+                    crate::color::parse_ramp(&val).map_err(|e| err(format!("-r/--ramp: {e}")))?,
+                );
+                s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-y", "--yrange"]) {
                 let (val, tail) = v?;
                 opts.yrange = Some(parse_range(&val, "-y/--yrange")?);

@@ -28,6 +28,11 @@ fn named(name: &str) -> Option<Rgb> {
     })
 }
 
+/// `c` as a `#rrggbb` literal — the hex form SVG and CSS want.
+pub fn rgb_hex(c: &Rgb) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.0, c.1, c.2)
+}
+
 /// The base-colour name for `c`, or a `#rrggbb` literal when it isn't one of the
 /// named colours (e.g. a value interpolated along a ramp). Inverse of [`named`];
 /// used for the terse `--explain` rendering.
@@ -42,7 +47,7 @@ fn rgb_name(c: Rgb) -> String {
         (0, 205, 205) => "cyan".into(),
         (229, 229, 229) => "white".into(),
         (127, 127, 127) => "gray".into(),
-        (r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+        (r, g, b) => rgb_hex(&Rgb(r, g, b)),
     }
 }
 

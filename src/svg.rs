@@ -5,7 +5,7 @@
 //! document.
 
 use crate::chart::{AxisRange, BarData, ChartData, Frame, bar_value, hist_len, value_pos};
-use crate::color::Rgb;
+use crate::color::{Ramp, rgb_hex};
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
 
@@ -37,8 +37,17 @@ pub struct Labels<'a> {
 /// The series colour for index `i` as an SVG hex string, from the shared
 /// terminal palette ([`crate::graph::series_rgb`]) so the two can't drift.
 fn series_hex(i: usize) -> String {
-    let Rgb(r, g, b) = series_rgb(i);
-    format!("#{r:02x}{g:02x}{b:02x}")
+    rgb_hex(&series_rgb(i))
+}
+
+/// The fill for a value `v` in `[lo, hi]` on `ramp` (`-r/--ramp`), or the
+/// default chart colour when there is no ramp. Unlike the terminal renderers
+/// this ignores `frame.color`: an SVG document always has colour.
+fn fill_at(ramp: Option<Ramp>, v: f64, lo: f64, hi: f64) -> String {
+    match ramp.and_then(|r| r.at(v, lo, hi).fg) {
+        Some(rgb) => rgb_hex(&rgb),
+        None => series_hex(0),
+    }
 }
 
 fn pw() -> f64 {
@@ -151,13 +160,18 @@ fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
 }
 
 /// Histogram: one filled bar per bin spanning the plot width. `log` puts the
-/// count axis on a log10 scale, as in the terminal chart.
+/// count axis on a log10 scale, as in the terminal chart, and `ramp` fills each
+/// bar by its count, as the terminal chart paints it.
+// One argument over clippy's bar, like `xy_chart`: the axis knobs are all
+// independent, and bundling them would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn hist(
     title: &str,
     lo: f64,
     hi: f64,
     counts: &[u64],
     log: bool,
+    ramp: Option<Ramp>,
     note: &str,
     labels: Labels,
 ) -> String {
@@ -175,8 +189,10 @@ pub fn hist(
         let y = T + ph() - bh;
         body.push_str(&format!(
             "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{bh:.2}\" \
-fill=\"#4fc3f7\" stroke=\"white\"/>\n",
+fill=\"{fill}\" stroke=\"white\"/>\n",
             w = (bw - 1.0).max(0.0),
+            // The ramp runs over the raw counts, as in the terminal chart.
+            fill = fill_at(ramp, c as f64, 0.0, max as f64),
         ));
     }
     header(title, &body, note, labels)
@@ -184,12 +200,15 @@ fill=\"#4fc3f7\" stroke=\"white\"/>\n",
 
 /// Horizontal bar chart: one labelled bar per row, anchored at a zero baseline
 /// (a value of 1 on a log axis). `log` draws each bar at its log10, as in the
-/// terminal chart, and a value a log axis cannot place gets no bar.
+/// terminal chart, and a value a log axis cannot place gets no bar. `ramp`
+/// fills each bar by where it sits on the value axis, as the terminal chart
+/// paints it.
 pub fn bars(
     title: &str,
     rows: &[(String, f64)],
     axis: AxisRange,
     log: bool,
+    ramp: Option<Ramp>,
     note: &str,
     labels: Labels,
 ) -> String {
@@ -228,9 +247,12 @@ pub fn bars(
         };
         let y = T + i as f64 * rh;
         body.push_str(&format!(
-            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{h:.2}\" fill=\"#4fc3f7\"/>\n\
+            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{h:.2}\" fill=\"{fill}\"/>\n\
 <text x=\"{lx}\" y=\"{ly:.2}\">{label} ({val})</text>\n",
             h = (rh - 2.0).max(0.0),
+            // A row a log axis cannot place has no bar; it keeps the low end of
+            // the ramp, which is what its zero-width rect would show anyway.
+            fill = fill_at(ramp, at.unwrap_or(lo), lo, hi),
             lx = L + 4.0,
             ly = y + rh / 2.0 + 4.0,
             label = esc(label),
@@ -243,6 +265,10 @@ pub fn bars(
 /// Sparkline as a single polyline across the plot width. `values` and `range`
 /// are real; `log` maps them onto the value axis as they are drawn, and the
 /// labels stay the real bounds.
+///
+/// `-r/--ramp` deliberately does not reach here: the terminal sparkline paints
+/// per cell because it *is* a row of cells, while this is one continuous
+/// stroke, so it stays in the default chart colour.
 pub fn spark(
     title: &str,
     values: &[f64],
@@ -375,13 +401,23 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
     };
     match data {
         // Keep the --svg contract even with nothing to plot: an empty chart.
-        ChartData::Hist(None) => hist(&frame.title, 0.0, 0.0, &[], frame.log, &note, labels),
+        ChartData::Hist(None) => hist(
+            &frame.title,
+            0.0,
+            0.0,
+            &[],
+            frame.log,
+            frame.ramp,
+            &note,
+            labels,
+        ),
         ChartData::Hist(Some(h)) => hist(
             &frame.title,
             h.lo,
             h.hi,
             &h.counts,
             frame.log,
+            frame.ramp,
             &note,
             labels,
         ),
@@ -390,6 +426,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             &single_series(b),
             b.axis,
             frame.log,
+            frame.ramp,
             &note,
             labels,
         ),
@@ -426,7 +463,16 @@ mod tests {
 
     #[test]
     fn hist_emits_a_rect_per_bin() {
-        let s = hist("h", 0.0, 10.0, &[3, 1, 4], false, "", Labels::default());
+        let s = hist(
+            "h",
+            0.0,
+            10.0,
+            &[3, 1, 4],
+            false,
+            None,
+            "",
+            Labels::default(),
+        );
         assert!(s.starts_with("<svg"));
         assert!(s.trim_end().ends_with("</svg>"));
         assert_eq!(s.matches("<rect").count(), 1 /*background*/ + 3);
@@ -440,6 +486,7 @@ mod tests {
             10.0,
             &[3, 1, 4],
             false,
+            None,
             "",
             Labels {
                 x: Some("v"),
@@ -448,7 +495,16 @@ mod tests {
         );
         assert!(s.contains(">v</text>") && s.contains(">n</text>"), "{s}");
         // No labels given: neither caption appears.
-        let bare = hist("h", 0.0, 10.0, &[3, 1, 4], false, "", Labels::default());
+        let bare = hist(
+            "h",
+            0.0,
+            10.0,
+            &[3, 1, 4],
+            false,
+            None,
+            "",
+            Labels::default(),
+        );
         assert!(
             !bare.contains(">v</text>") && !bare.contains(">n</text>"),
             "{bare}"
@@ -571,7 +627,7 @@ mod tests {
             ("c".to_string(), 0.0),
             ("d".to_string(), -5.0),
         ];
-        let s = bars("v", &rows, None, true, "", Labels::default());
+        let s = bars("v", &rows, None, true, None, "", Labels::default());
         // The two rows a log axis cannot place draw nothing but still print
         // their label and real value.
         assert_eq!(s.matches("width=\"0.00\"").count(), 2, "{s}");
@@ -583,6 +639,38 @@ mod tests {
             s.contains(">a (100)</text>") && s.contains(">b (0.5)</text>"),
             "{s}"
         );
+    }
+
+    #[test]
+    fn ramp_fills_hist_bars_by_count() {
+        let mut frame = Frame::new("h".into(), 80, 15, true);
+        frame.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let h = crate::chart::HistData {
+            lo: 0.0,
+            hi: 1.0,
+            counts: vec![0, 4],
+            total: 4,
+        };
+        let s = render(&frame, &ChartData::Hist(Some(h)));
+        assert!(
+            s.contains("fill=\"#0000ee\"") && s.contains("fill=\"#cd0000\""),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn ramp_fills_bar_rows_and_leaves_the_spark_polyline_alone() {
+        let ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let rows = [("a".to_string(), 0.0), ("b".to_string(), 4.0)];
+        let s = bars("v", &rows, None, false, ramp, "", Labels::default());
+        assert!(
+            s.contains("fill=\"#0000ee\"") && s.contains("fill=\"#cd0000\""),
+            "{s}"
+        );
+        // A sparkline is one polyline, so there is nothing to fill by value.
+        let sp = spark("v", &[1.0, 2.0], None, false, "", Labels::default());
+        assert_eq!(sp.matches("<polyline").count(), 1, "{sp}");
+        assert!(sp.contains("#4fc3f7"), "{sp}");
     }
 
     #[test]
@@ -600,6 +688,7 @@ mod tests {
             10.0,
             &[3, 1, 4],
             false,
+            None,
             "skipped 2 non-numeric",
             Labels {
                 x: Some("v"),
@@ -627,6 +716,7 @@ mod tests {
             1.0,
             &[1],
             false,
+            None,
             "skipped 2 non-numeric",
             Labels::default(),
         );

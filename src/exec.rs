@@ -1721,6 +1721,7 @@ fn render_graph<W: Write>(
         frame.glyphs = chart::Glyphs::ascii();
     }
     frame.log = g.opts.log;
+    frame.ramp = g.opts.ramp;
     frame.xlabel = g.opts.xlabel.clone();
     frame.ylabel = g.opts.ylabel.clone();
     let collected = chart::collect(text, g, width);
@@ -3068,6 +3069,23 @@ mod tests {
         assert!(!line(" -5").contains('\u{2588}'), "{out}");
         // The rows are still there — a bar chart drops nothing.
         assert!(out.contains("bars=4") && !out.contains("dropped"), "{out}");
+    }
+
+    #[test]
+    fn graph_ramp_paints_bars_by_value_when_colour_is_on() {
+        let plain = render_str("graph hist countZ -b 2 -r blue:red", INPUT, false);
+        assert!(!plain.contains("\x1b["), "{plain}");
+        let painted = render_str("graph hist countZ -b 2 -r blue:red", INPUT, true);
+        assert!(painted.contains("\x1b[38;2;"), "{painted}");
+        let bars = render_str(
+            "agg count by fieldA | graph bar fieldA count --ramp green:red",
+            INPUT,
+            true,
+        );
+        assert!(bars.contains("\x1b[38;2;"), "{bars}");
+        let spark = render_str("graph spark countZ -r green:red", INPUT, true);
+        assert!(spark.contains("\x1b[38;2;"), "{spark}");
+        assert!(parse("graph hist a -r nope").is_err());
     }
 
     #[test]

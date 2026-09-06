@@ -834,6 +834,10 @@ pub struct GraphOpts {
     /// Write the chart's reduced data as CSV (`-D`/`--data`) instead of drawing
     /// it. Exclusive with `--svg`.
     pub data: bool,
+    /// A two-colour gradient (`-r`/`--ramp`, `lo:hi`) painting hist bars, bar
+    /// rows and spark cells by value. Terminal colour needs `--color`; SVG
+    /// always has it.
+    pub ramp: Option<Ramp>,
 }
 
 impl Default for GraphOpts {
@@ -852,6 +856,7 @@ impl Default for GraphOpts {
             yrange: None,
             log: false,
             data: false,
+            ramp: None,
         }
     }
 }
