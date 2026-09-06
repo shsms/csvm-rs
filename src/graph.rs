@@ -21,11 +21,28 @@ fn fmt_to_step(v: f64, step: f64) -> String {
     format_num((v * factor).round() / factor)
 }
 
-/// Min and max of `values`, or `None` when empty. Shared by the chart renderers.
-pub(crate) fn minmax(values: &[f64]) -> Option<(f64, f64)> {
-    let mut it = values.iter().copied();
+/// Min and max of `values`, or `None` when empty. The chart data builders lean
+/// on it for their own bounds, and the terminal renderer for a spark's; it
+/// takes any iterator, so a caller need not gather the values into a slice
+/// first.
+pub(crate) fn minmax(values: impl IntoIterator<Item = f64>) -> Option<(f64, f64)> {
+    let mut it = values.into_iter();
     let first = it.next()?;
     Some(it.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v))))
+}
+
+/// The left gutter of a framed chart (scatter, line, heatmap): the wider of the
+/// two y-bound labels, which is what the gutter has to hold.
+pub(crate) fn gutter_width(lo: f64, hi: f64) -> usize {
+    format_num(hi).len().max(format_num(lo).len())
+}
+
+/// How many cells of a `width`-wide chart are left for the canvas once the
+/// gutter for the y bounds `[lo, hi]` and the axis rule are taken out. Shared
+/// with the heatmap collector, which sizes its grid to the canvas it will be
+/// drawn in.
+pub(crate) fn canvas_cells(width: usize, lo: f64, hi: f64) -> usize {
+    width.saturating_sub(gutter_width(lo, hi) + 3).max(4)
 }
 
 /// Draw `data` in the terminal within `frame`. Each kind has its own drawer;
@@ -42,6 +59,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         ChartData::Spark(s) => render_spark(frame, s),
         ChartData::Xy(xy) if xy.rows.is_empty() => empty_line(frame, "no numeric points to plot"),
         ChartData::Xy(xy) => render_xy(frame, xy, xy.connect),
+        ChartData::Heat(_) => empty_line(frame, "no numeric points to plot"),
     }
 }
 
@@ -272,7 +290,7 @@ fn pos_in(v: f64, lo: f64, span: f64, width: usize) -> usize {
 /// width by the collector), with a title and a min/max summary. Each cell is an
 /// eighth-height block scaled to the value range.
 fn render_spark(frame: &Frame, s: &SparkData) -> String {
-    let (dlo, dhi) = minmax(&s.values).unwrap_or((0.0, 0.0));
+    let (dlo, dhi) = minmax(s.values.iter().copied()).unwrap_or((0.0, 0.0));
     // An explicit range (`-y`) is the axis the levels scale to; the summary
     // still reports the data's own min and max.
     let (lo, hi) = s.range.unwrap_or((dlo, dhi));
@@ -611,8 +629,8 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     // values, whatever the axis does with them.
     let yhi_s = format_num(yhi);
     let ylo_s = format_num(ylo);
-    let gutter = yhi_s.len().max(ylo_s.len());
-    let wcells = frame.width.saturating_sub(gutter + 3).max(4);
+    let gutter = gutter_width(ylo, yhi);
+    let wcells = canvas_cells(frame.width, ylo, yhi);
     let hcells = frame.height.max(2);
 
     let map = |x: f64, y: f64, b: &Braille| {
@@ -709,8 +727,8 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
             // column's own range, over every plotted point.
             match has_by {
                 true => {
-                    let by: Vec<f64> = xy.rows.iter().filter_map(|r| r.color_by).collect();
-                    let (lo, hi) = minmax(&by).unwrap_or((0.0, 0.0));
+                    let by = xy.rows.iter().filter_map(|r| r.color_by);
+                    let (lo, hi) = minmax(by).unwrap_or((0.0, 0.0));
                     (vals, lo, hi)
                 }
                 false => (vals, 1.0, maxcount),

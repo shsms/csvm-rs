@@ -799,6 +799,9 @@ pub enum GraphKind {
     Scatter,
     /// `graph line X Y`: points connected on a braille canvas.
     Line,
+    /// `graph heatmap X Y`: point density binned into the canvas cells, each
+    /// shaded by how many points landed in it.
+    Heatmap,
 }
 
 /// Presentation options shared across chart kinds.

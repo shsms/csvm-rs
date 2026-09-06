@@ -1724,7 +1724,7 @@ fn render_graph<W: Write>(
     frame.ramp = g.opts.ramp;
     frame.xlabel = g.opts.xlabel.clone();
     frame.ylabel = g.opts.ylabel.clone();
-    let collected = chart::collect(text, g, width);
+    let collected = chart::collect(text, g, width, height);
     frame.notes = collected.notes;
     let drawn = if g.opts.data {
         chart::to_csv(&collected.data)
@@ -2019,6 +2019,7 @@ pub fn describe(plan: &Plan) -> String {
             GraphKind::Spark => "spark",
             GraphKind::Scatter => "scatter",
             GraphKind::Line => "line",
+            GraphKind::Heatmap => "heatmap",
         };
         let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
         out.push_str(&format!("graph: {kind} {cols:?}"));

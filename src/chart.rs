@@ -206,7 +206,7 @@ impl HistData {
     /// filtering — the values are already clipped to it.
     pub fn build(values: &[f64], bins: Option<usize>, span: AxisRange) -> Option<HistData> {
         // No values is still an empty chart, range or not.
-        let (dlo, dhi) = crate::graph::minmax(values)?;
+        let (dlo, dhi) = crate::graph::minmax(values.iter().copied())?;
         let (lo, hi) = span.unwrap_or((dlo, dhi));
         let n = values.len();
         let nbins = bins
@@ -228,6 +228,101 @@ impl HistData {
             total: n as u64,
         })
     }
+}
+
+/// A 2-D density grid: how many points fall in each of `cols` × `rows` equal
+/// cells over `[xlo, xhi]` × `[ylo, yhi]`. A scatter of millions of points is a
+/// blob; binning it to the canvas keeps the chart O(canvas) whatever the input
+/// size, and the count is what the cell is shaded by.
+pub struct HeatData {
+    /// The x column's name (the CSV header's first cell under `--data`).
+    pub xname: String,
+    /// The y column's name.
+    pub yname: String,
+    pub xlo: f64,
+    pub xhi: f64,
+    pub ylo: f64,
+    pub yhi: f64,
+    pub cols: usize,
+    pub rows: usize,
+    /// Row-major counts; row 0 is the lowest y band.
+    pub counts: Vec<u64>,
+    pub total: u64,
+    /// How to graduate the x axis, as for a scatter (the x column goes through
+    /// the same numeric / time / category modes).
+    pub xaxis: XAxis,
+}
+
+/// The extent a heatmap's grid spans, on both of its binned axes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Bounds {
+    pub xlo: f64,
+    pub xhi: f64,
+    pub ylo: f64,
+    pub yhi: f64,
+}
+
+impl HeatData {
+    /// The extent the grid spans: an explicit `xrange`/`yrange` where one was
+    /// given (`-x`/`-y` *is* the axis, so it sets the bin spans and the points
+    /// outside it are already clipped away), else the points' own spread on
+    /// that axis, folded in one pass. An axis with neither a range nor a point
+    /// spans nothing and reads `(0, 0)`.
+    ///
+    /// The collector asks for this before it counts the cells — the y bounds
+    /// decide how wide the canvas is, and so how many columns the grid has —
+    /// and hands the same answer to [`heat_counts`].
+    pub fn bounds(points: &[(f64, f64)], xrange: AxisRange, yrange: AxisRange) -> Bounds {
+        let mut it = points.iter().copied();
+        let spread = it.next().map(|(x, y)| {
+            it.fold((x, x, y, y), |(xlo, xhi, ylo, yhi), (x, y)| {
+                (xlo.min(x), xhi.max(x), ylo.min(y), yhi.max(y))
+            })
+        });
+        let (xlo, xhi) = xrange
+            .or_else(|| spread.map(|(xlo, xhi, _, _)| (xlo, xhi)))
+            .unwrap_or((0.0, 0.0));
+        let (ylo, yhi) = yrange
+            .or_else(|| spread.map(|(_, _, ylo, yhi)| (ylo, yhi)))
+            .unwrap_or((0.0, 0.0));
+        Bounds { xlo, xhi, ylo, yhi }
+    }
+
+    /// The lower edges of cell `i`'s x and y bands — the corner `--data` names
+    /// the cell by.
+    pub fn cell_lo(&self, i: usize) -> (f64, f64) {
+        let (cx, cy) = (i % self.cols, i / self.cols);
+        // Each corner is a step along its axis, so an axis too wide to
+        // subtract still names real numbers (see [`lerp`]).
+        (
+            lerp(self.xlo, self.xhi, cx, self.cols),
+            lerp(self.ylo, self.yhi, cy, self.rows),
+        )
+    }
+}
+
+/// Row-major counts of the `(x, y)` points falling in each of `cols` × `rows`
+/// equal cells over `b` (what [`HeatData::bounds`] worked out for the same
+/// points). Row 0 is the lowest y band. A chart whose points were all dropped
+/// still gets a grid of the right shape with nothing in it: the renderers
+/// report an empty chart from `total`, and `--data` still writes the column
+/// names. A dimension of zero is treated as one — a grid has to have a band
+/// for a point to fall in.
+pub fn heat_counts(points: &[(f64, f64)], cols: usize, rows: usize, b: Bounds) -> Vec<u64> {
+    let (cols, rows) = (cols.max(1), rows.max(1));
+    let mut counts = vec![0u64; cols * rows];
+    // Which band `v` falls in: the last one is inclusive of the high end, and
+    // a zero span puts everything in band 0.
+    let cell = |v: f64, lo: f64, hi: f64, n: usize| -> usize {
+        match axis_frac(v, lo, hi) {
+            Some(t) => ((t * n as f64).floor() as usize).min(n - 1),
+            None => 0,
+        }
+    };
+    for &(x, y) in points {
+        counts[cell(y, b.ylo, b.yhi, rows) * cols + cell(x, b.xlo, b.xhi, cols)] += 1;
+    }
+    counts
 }
 
 /// One bar row: its label and one value per series (`None` where the cell was
@@ -322,6 +417,8 @@ pub enum ChartData {
     Bar(BarData),
     Spark(SparkData),
     Xy(XyData),
+    /// Always present, empty (`total == 0`) when no point survived.
+    Heat(HeatData),
 }
 
 /// A collected chart: its data and the notes about what was dropped.
@@ -653,6 +750,7 @@ fn color_drops(xy: &XyData) -> u64 {
 pub fn default_title(g: &GraphSpec) -> String {
     match g.kind {
         GraphKind::Bar => g.cols[1].name.clone(),
+        GraphKind::Heatmap => format!("{} vs {}", g.cols[1].name, g.cols[0].name),
         GraphKind::Scatter | GraphKind::Line if g.cols.len() == 2 => {
             format!("{} vs {}", g.cols[1].name, g.cols[0].name)
         }
@@ -665,7 +763,7 @@ pub fn default_title(g: &GraphSpec) -> String {
 /// header) into the chart's data, with the notes about dropped rows. Cells that
 /// are not numbers are dropped *loudly* — counted here and reported by the
 /// renderer, the "strict and loud" policy.
-pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
+pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collected {
     let mut notes = Vec::new();
     let data = match g.kind {
         GraphKind::Hist => {
@@ -742,6 +840,52 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             notes.extend(dropped_note(dropped));
             ChartData::Xy(xy)
         }
+        GraphKind::Heatmap => {
+            // One y series and no colour column, so the x column goes through
+            // the same three modes a scatter's does.
+            let names = vec![g.cols[1].name.clone()];
+            let (mut xy, skipped) = collect_xy(
+                text,
+                &g.cols[0].name,
+                g.cols[0].pos,
+                &names,
+                &[g.cols[1].pos],
+                None,
+            );
+            let clipped = clip_xy(&mut xy, g.opts.xrange, g.opts.yrange);
+            if matches!(xy.xaxis, XAxis::Ends(..)) {
+                notes.push("even row spacing".to_string());
+            }
+            notes.extend(skipped_note(skipped));
+            notes.extend(clipped_note(clipped));
+            // `-l` is the *count* axis here: the y axis stays linear (it is one
+            // of the two binned dimensions), so nothing is dropped for it.
+            let points: Vec<(f64, f64)> = xy.series().into_iter().next().unwrap_or_default();
+            // Without `-b` the grid is the canvas: one cell per character the
+            // frame leaves for it, so a heatmap fills the chart it is drawn in.
+            // The y bounds size that canvas, so the grid's extent is worked out
+            // once here and handed to the builder.
+            let b = HeatData::bounds(&points, g.opts.xrange, g.opts.yrange);
+            let cols = g
+                .opts
+                .bins
+                .unwrap_or_else(|| crate::graph::canvas_cells(width, b.ylo, b.yhi))
+                .max(1);
+            let rows = g.opts.bins.unwrap_or(height).max(1);
+            ChartData::Heat(HeatData {
+                xname: g.cols[0].name.clone(),
+                yname: g.cols[1].name.clone(),
+                xlo: b.xlo,
+                xhi: b.xhi,
+                ylo: b.ylo,
+                yhi: b.yhi,
+                cols,
+                rows,
+                counts: heat_counts(&points, cols, rows, b),
+                total: points.len() as u64,
+                xaxis: xy.xaxis,
+            })
+        }
     };
     Collected { data, notes }
 }
@@ -790,6 +934,22 @@ pub fn to_csv(data: &ChartData) -> String {
             row(&[Field::Str("bucket"), Field::Str(&s.name)]);
             for (i, &v) in s.values.iter().enumerate() {
                 row(&[Field::Num((i + 1) as f64), Field::Num(v)]);
+            }
+        }
+        ChartData::Heat(h) => {
+            row(&[
+                Field::Str(&h.xname),
+                Field::Str(&h.yname),
+                Field::Str("count"),
+            ]);
+            // One row per non-empty cell, named by its lower corner — an empty
+            // cell is a row a `graph heatmap` never drew.
+            for (i, &c) in h.counts.iter().enumerate() {
+                if c == 0 {
+                    continue;
+                }
+                let (x, y) = h.cell_lo(i);
+                row(&[Field::Num(x), Field::Num(y), Field::Num(c as f64)]);
             }
         }
         ChartData::Xy(xy) => {
@@ -872,6 +1032,83 @@ mod tests {
         assert_eq!(
             HistData::build(&[5.0, 5.0], Some(2), None).unwrap().counts,
             [2, 0]
+        );
+    }
+
+    #[test]
+    fn heat_counts_bin_points_into_a_grid() {
+        let pts = [(0.0, 0.0), (1.0, 1.0), (1.0, 1.0), (0.5, 0.5)];
+        let b = HeatData::bounds(&pts, None, None);
+        // row 0 = low y. The bands are half-open, so only (0,0) is in the
+        // low-left cell: (0.5, 0.5) sits on the mid boundary and joins the two
+        // (1, 1)s in the top-right one.
+        assert_eq!(heat_counts(&pts, 2, 2, b), [1, 0, 0, 3]);
+        // Nothing to bin is still a grid of the right shape with nothing in it.
+        let b = HeatData::bounds(&[], None, None);
+        assert_eq!(heat_counts(&[], 2, 2, b), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn heat_counts_treats_a_zero_dimension_as_one() {
+        // A dimension of zero has no last band to fall into: `n - 1` used to
+        // wrap round and index past the end of the grid. One band it is.
+        let pts = [(0.0, 0.0), (1.0, 1.0)];
+        let b = HeatData::bounds(&pts, None, None);
+        assert_eq!(heat_counts(&pts, 0, 2, b), [1, 1]);
+        assert_eq!(heat_counts(&pts, 2, 0, b), [1, 1]);
+        assert_eq!(heat_counts(&pts, 0, 0, b), [2]);
+    }
+
+    #[test]
+    fn heat_counts_bin_an_axis_too_wide_to_subtract() {
+        // As for a histogram, `hi - lo` over -1e308..1e308 is infinity, so a
+        // column worked out from it is NaN and every point lands in column 0.
+        let pts = [(-1e308, 0.0), (0.0, 0.0), (1e308, 0.0)];
+        let b = HeatData::bounds(&pts, None, None);
+        assert_eq!(heat_counts(&pts, 4, 1, b), [1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn heat_bounds_take_the_ranges_over_the_points_own_spread() {
+        let pts = [(1.0, 2.0), (7.0, 3.0)];
+        // No range: the points' own extent on both axes.
+        assert_eq!(
+            HeatData::bounds(&pts, None, None),
+            Bounds {
+                xlo: 1.0,
+                xhi: 7.0,
+                ylo: 2.0,
+                yhi: 3.0
+            }
+        );
+        // A range *is* the axis, on each axis independently.
+        assert_eq!(
+            HeatData::bounds(&pts, Some((0.0, 100.0)), Some((0.0, 10.0))),
+            Bounds {
+                xlo: 0.0,
+                xhi: 100.0,
+                ylo: 0.0,
+                yhi: 10.0
+            }
+        );
+        assert_eq!(
+            HeatData::bounds(&pts, Some((0.0, 100.0)), None),
+            Bounds {
+                xlo: 0.0,
+                xhi: 100.0,
+                ylo: 2.0,
+                yhi: 3.0
+            }
+        );
+        // An axis with neither a range nor a point spans nothing.
+        assert_eq!(
+            HeatData::bounds(&[], None, None),
+            Bounds {
+                xlo: 0.0,
+                xhi: 0.0,
+                ylo: 0.0,
+                yhi: 0.0
+            }
         );
     }
 

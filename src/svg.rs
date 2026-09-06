@@ -362,7 +362,7 @@ pub fn spark(
     }
     // An explicit range (`-y`) is the axis, as in the terminal chart.
     let (lo, hi) = range
-        .or_else(|| crate::graph::minmax(values))
+        .or_else(|| crate::graph::minmax(values.iter().copied()))
         .unwrap_or((0.0, 0.0));
     let (plo, phi) = (value_pos(lo, log), value_pos(hi, log));
     let span = (phi - plo).max(f64::MIN_POSITIVE);
@@ -437,8 +437,8 @@ pub fn xy_chart(
     // `--color-by` spans the column's own range; with no `-r` the ramp is the
     // default one, so `-c` alone still colours.
     let ramp = points.ramp.unwrap_or_default();
-    let vals: Vec<f64> = points.by.iter().filter_map(|&v| v).collect();
-    let (clo, chi) = crate::graph::minmax(&vals).unwrap_or((0.0, 0.0));
+    let by = points.by.iter().filter_map(|&v| v);
+    let (clo, chi) = crate::graph::minmax(by).unwrap_or((0.0, 0.0));
 
     let mut body = axis_lines();
     body.push_str(&ylabels(ylo, yhi));
@@ -519,6 +519,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             labels,
         ),
         ChartData::Spark(s) => spark(&frame.title, &s.values, s.range, frame.log, &note, labels),
+        ChartData::Heat(_) => header(&frame.title, "", &note, labels),
         ChartData::Xy(xy) => {
             // Only a `-c/--color-by` chart colours its points, and that is the
             // plan's answer, not the data's — the terminal renderer branches on

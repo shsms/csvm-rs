@@ -1528,12 +1528,14 @@ fn subst_params(body: &str, params: &[String], args: &[&str]) -> String {
 }
 
 /// Validate the column count for a chart type: hist/spark take one, bar takes
-/// two, scatter/line take an x plus one or more y-series.
+/// two, scatter/line take an x plus one or more y-series, and a heatmap takes
+/// exactly an x and a y (its second dimension is binned, not a series).
 fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error> {
     let ok = match kind {
         GraphKind::Hist | GraphKind::Spark => n == 1,
         GraphKind::Bar => n >= 2,
         GraphKind::Scatter | GraphKind::Line => n >= 2,
+        GraphKind::Heatmap => n == 2,
     };
     if ok {
         return Ok(());
@@ -1542,6 +1544,7 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
         GraphKind::Hist | GraphKind::Spark => "one column",
         GraphKind::Bar => "a label column and one or more value columns",
         GraphKind::Scatter | GraphKind::Line => "an x column and one or more y columns",
+        GraphKind::Heatmap => "an x column and a y column",
     };
     Err(err(format!("graph {word} expects {want}, got {n}")))
 }
@@ -1581,7 +1584,10 @@ fn check_graph_flags(
         )));
     }
     if opts.xrange.is_some()
-        && !matches!(kind, GraphKind::Hist | GraphKind::Scatter | GraphKind::Line)
+        && !matches!(
+            kind,
+            GraphKind::Hist | GraphKind::Scatter | GraphKind::Line | GraphKind::Heatmap
+        )
     {
         return no("-x/--xrange");
     }
