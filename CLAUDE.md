@@ -254,18 +254,22 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`
   in `plan.rs`), not a stage — like `fmt`/`color` it renders in `exec::render`
   from the buffered output, reusing the whole executor upstream. The **data
-  model is `src/chart.rs`**: `exec::render_graph` builds the `Frame` (title,
-  labels, size, `Glyphs`, ramp, colour/log flags, notes) and `chart::collect`
-  reads the charted columns out of that buffer into one `ChartData` per kind
-  (`HistData` / `BarData` / `SparkData` / `XyData` / `HeatData`). Cells it
+  model is `src/chart.rs`**: `chart::frame` builds the `Frame` (title, labels,
+  size, `Glyphs`, ramp, colour/log flags, and the `Dest` — `Terminal`, `Svg` or
+  `Data` — worked out once from the flags, so what follows the terminal, what
+  caps a heatmap's grid and which consumer runs all read the one field) and
+  `chart::collect` reads the
+  charted columns out of that buffer, in that frame, into one `ChartData` per
+  kind (`HistData` / `BarData` / `SparkData` / `XyData` / `HeatData`). Cells it
   cannot use are dropped *loudly* — non-numeric or empty (`skipped N
   non-numeric`), outside an axis range (`clipped N out of range`), not positive
   under `-l` (`dropped N non-positive`), a non-numeric `-c` cell (`N
   non-numeric colour cells`) — each counted in a `chart::Drops`, which
-  `exec::render_graph` turns into `Frame.notes` in one fixed order (truncated,
-  skipped, clipped, dropped, colour, grid capped), printed under the chart: the
+  `exec::render_graph` — frame, collect, notes, then the consumer — turns into
+  `Frame.notes` in one fixed order (truncated, skipped, clipped, dropped,
+  colour, grid capped), printed under the chart: the
   "strict and loud" policy, worded and ordered in one place. **Three
-  consumers** read that one model: `graph::render` (the terminal chart,
+  consumers**, one per `Dest`, read that one model: `graph::render` (the terminal chart,
   `src/graph.rs`), `svg::render` (`-S`, `src/svg.rs`, hand-written XML, no dep) and
   `chart::to_csv` (`-D`, the chart's own data as CSV). The model keeps *real*
   values throughout: a log axis is applied at draw time (`chart::value_pos` /
@@ -330,7 +334,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `-D/--data`, `-S/--svg`. `chart::chart_size` sizes the chart: `-W`/`-H` win,
   else the terminal's width (`src/term.rs`: `$COLUMNS`, else a `TIOCGWINSZ`
   ioctl through `libc` — read only when stdout is a terminal and there is no
-  `-o`, and passed on by `exec::render_graph` only for a chart drawn *in* the
+  `-o`, and passed on by `chart::frame` only for a chart drawn *in* the
   terminal, so `-D` and `-S` do not change with the window) or `BASE_W`=80,
   and `BASE_H`=15 rows, both × `-s`, and the result
   clamped to the same `MAX_CELLS` ceiling the flags carry, so `-s` cannot ask

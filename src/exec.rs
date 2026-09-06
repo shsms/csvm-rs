@@ -16,7 +16,7 @@ use std::thread;
 use crossbeam_channel::bounded;
 use memchr::memchr;
 
-use crate::chart::{self, Frame};
+use crate::chart;
 use crate::color::Style;
 use crate::csv;
 use crate::error::Error;
@@ -1696,10 +1696,10 @@ pub fn render<W: Write>(
 /// Draw the `graph` sink's chart from the buffered CSV output. The plan ran
 /// normally to produce rows (header + data); this collects the charted columns
 /// into the chart model (dropping non-numeric/empty cells loudly) and hands the
-/// frame plus the data to one of the model's three consumers: `--data` writes
-/// the chart's own rows as CSV ([`chart::to_csv`]), `--svg` an SVG document
-/// ([`crate::svg::render`]), and otherwise the chart is drawn in the terminal
-/// ([`crate::graph::render`]).
+/// frame plus the data to the consumer its [`chart::Dest`] names: `--data`
+/// writes the chart's own rows as CSV ([`chart::to_csv`]), `--svg` an SVG
+/// document ([`crate::svg::render`]), and otherwise the chart is drawn in the
+/// terminal ([`crate::graph::render`]).
 fn render_graph<W: Write>(
     bytes: &[u8],
     g: &GraphSpec,
@@ -1709,35 +1709,15 @@ fn render_graph<W: Write>(
 ) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
-    let title = g
-        .opts
-        .title
-        .clone()
-        .unwrap_or_else(|| chart::default_title(g));
-    // The terminal (or 80) and 15 rows, times `scale`; `-W`/`-H` override.
-    // Only a chart drawn *in* the terminal follows the terminal: a `-D` dump
-    // and an `-S` document are output, not a picture in this window, so they
-    // must not come out differently depending on where they were run.
-    let term = term_width.filter(|_| !(g.opts.data || g.opts.svg));
-    let (width, height) = chart::chart_size(g.opts.scale, term, g.opts.width, g.opts.height);
-    let mut frame = Frame::new(title, width, height, color);
-    if g.opts.ascii {
-        frame.glyphs = chart::Glyphs::ascii();
-    }
-    frame.log = g.opts.log;
-    frame.ramp = g.opts.ramp;
-    frame.xlabel = g.opts.xlabel.clone();
-    frame.ylabel = g.opts.ylabel.clone();
-    let collected = chart::collect(text, g, width, height);
+    let mut frame = chart::frame(g, term_width, color);
+    let collected = chart::collect(text, g, &frame);
     // What the collector could not use, said out loud under the chart: one
     // wording and one order, whatever kind dropped what.
     frame.notes = collected.drops.notes();
-    let drawn = if g.opts.data {
-        chart::to_csv(&collected.data)
-    } else if g.opts.svg {
-        crate::svg::render(&frame, &collected.data)
-    } else {
-        crate::graph::render(&frame, &collected.data)
+    let drawn = match frame.dest {
+        chart::Dest::Data => chart::to_csv(&collected.data),
+        chart::Dest::Svg => crate::svg::render(&frame, &collected.data),
+        chart::Dest::Terminal => crate::graph::render(&frame, &collected.data),
     };
     output.write_all(drawn.as_bytes())?;
     Ok(())

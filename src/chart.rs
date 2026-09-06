@@ -115,9 +115,26 @@ pub fn chart_size(
     (w.clamp(16, MAX_CELLS), h.clamp(2, MAX_CELLS))
 }
 
+/// Where a chart is going. `-D` and `-S` are output — rows and a document —
+/// rather than a picture in this window, and the three differ in more than the
+/// consumer that writes them: what follows the terminal ([`frame`]), and how
+/// much of a grid the destination can hold ([`collect`]), are the same one
+/// question, asked once here instead of re-read off the flags at each site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dest {
+    /// Drawn in the terminal window.
+    Terminal,
+    /// An SVG document (`-S`).
+    Svg,
+    /// The chart's own data as CSV (`-D`).
+    Data,
+}
+
 /// Everything about a chart that is not its data.
 #[derive(Clone, Debug)]
 pub struct Frame {
+    /// What the chart will be drawn into.
+    pub dest: Dest,
     pub title: String,
     pub xlabel: Option<String>,
     pub ylabel: Option<String>,
@@ -136,10 +153,11 @@ pub struct Frame {
 }
 
 impl Frame {
-    /// A frame with the given title and size, drawn with the Unicode glyphs and
-    /// no labels, ramp, log scale or notes.
+    /// A frame with the given title and size, drawn in the terminal with the
+    /// Unicode glyphs and no labels, ramp, log scale or notes.
     pub fn new(title: String, width: usize, height: usize, color: bool) -> Self {
         Frame {
+            dest: Dest::Terminal,
             title,
             xlabel: None,
             ylabel: None,
@@ -908,11 +926,45 @@ pub fn default_title(g: &GraphSpec) -> String {
     }
 }
 
+/// The frame `g` asks to be drawn in: its title, axis captions, glyph set,
+/// ramp and log flag, the [`Dest`] the flags name, and the size [`chart_size`]
+/// works out.
+///
+/// Only a chart drawn *in* the terminal follows the terminal: a `-D` dump and
+/// an `-S` document are output, not a picture in this window, so they must not
+/// come out differently depending on where they were run. The notes are the
+/// one part left blank — they are what the collector could not use, so they
+/// are filled in once the data is in.
+pub fn frame(g: &GraphSpec, term_width: Option<usize>, color: bool) -> Frame {
+    let title = g.opts.title.clone().unwrap_or_else(|| default_title(g));
+    let dest = match (g.opts.data, g.opts.svg) {
+        (true, _) => Dest::Data,
+        (_, true) => Dest::Svg,
+        _ => Dest::Terminal,
+    };
+    let term = term_width.filter(|_| dest == Dest::Terminal);
+    let (width, height) = chart_size(g.opts.scale, term, g.opts.width, g.opts.height);
+    let mut frame = Frame::new(title, width, height, color);
+    frame.dest = dest;
+    if g.opts.ascii {
+        frame.glyphs = Glyphs::ascii();
+    }
+    frame.log = g.opts.log;
+    frame.ramp = g.opts.ramp;
+    frame.xlabel = g.opts.xlabel.clone();
+    frame.ylabel = g.opts.ylabel.clone();
+    frame
+}
+
 /// Read the charted columns out of the buffered output (its first line is the
 /// header) into the chart's data, with the counts of what it could not use.
 /// Cells that are not numbers are dropped *loudly* — counted here and reported
 /// by the renderer, the "strict and loud" policy.
-pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collected {
+///
+/// `f` is the frame the chart will be drawn in: a sparkline is bucketed to its
+/// width and a heatmap's grid sized to its canvas, so the data a chart holds
+/// already fits the picture it becomes.
+pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
     let mut drops = Drops::default();
     let data = match g.kind {
         GraphKind::Hist => {
@@ -927,7 +979,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             drops = d;
             ChartData::Spark(SparkData {
                 name: g.cols[0].name.clone(),
-                values: bucket(&values, width),
+                values: bucket(&values, f.width),
                 range: g.opts.yrange,
             })
         }
@@ -935,7 +987,10 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             let value_pos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             // The cap is on the *drawn* labels, one terminal line each.
             // `--data` writes CSV, not a picture, so it keeps every row.
-            let cap = if g.opts.data { usize::MAX } else { MAX_BARS };
+            let cap = match f.dest {
+                Dest::Data => usize::MAX,
+                _ => MAX_BARS,
+            };
             let (rows, skipped, truncated) = collect_bars(text, g.cols[0].pos, &value_pos, cap);
             (drops.skipped, drops.truncated) = (skipped, truncated);
             ChartData::Bar(BarData {
@@ -1006,14 +1061,12 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             // is read off `-b` *or*, without it, off the canvas: `-W 2000 -S`
             // asks for 1994 columns and gets the plot area's 640, the same
             // cut `-b 4096` gets and reported the same way.
-            let cols_fit = crate::graph::canvas_cells(width, b.ylo, b.yhi);
-            let rows_fit = height.max(1);
-            let (cols_max, rows_max) = if g.opts.data {
-                (MAX_CELLS, MAX_CELLS)
-            } else if g.opts.svg {
-                (crate::svg::PLOT_W as usize, crate::svg::PLOT_H as usize)
-            } else {
-                (cols_fit, rows_fit)
+            let cols_fit = crate::graph::canvas_cells(f.width, b.ylo, b.yhi);
+            let rows_fit = f.height.max(1);
+            let (cols_max, rows_max) = match f.dest {
+                Dest::Terminal => (cols_fit, rows_fit),
+                Dest::Svg => (crate::svg::PLOT_W as usize, crate::svg::PLOT_H as usize),
+                Dest::Data => (MAX_CELLS, MAX_CELLS),
             };
             let (ask_c, ask_r) = (
                 g.opts.bins.unwrap_or(cols_fit),

@@ -59,7 +59,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         }
         ChartData::Spark(s) => render_spark(frame, s),
         ChartData::Xy(xy) if xy.rows.is_empty() => empty_line(frame, "no numeric points to plot"),
-        ChartData::Xy(xy) => render_xy(frame, xy, xy.connect),
+        ChartData::Xy(xy) => render_xy(frame, xy),
         ChartData::Heat(h) if h.total == 0 => empty_line(frame, "no numeric points to plot"),
         ChartData::Heat(h) => render_heat(frame, h),
     }
@@ -633,7 +633,9 @@ fn x_label_row(xaxis: &XAxis, xlo: f64, xhi: f64, width: usize) -> String {
 /// points, never the pixels a `line` chart's connecting segments light up.
 /// Density counts points per *cell*, so only a terminal chart has it;
 /// `--color-by` colours an SVG's points too (see [`crate::svg::xy_chart`]).
-fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
+fn render_xy(frame: &Frame, xy: &XyData) -> String {
+    // A `line` chart joins each series' points; a `scatter` leaves them apart.
+    let connect = xy.connect;
     let series = xy.series();
     let total: usize = series.iter().map(Vec::len).sum();
     // The model frames the chart: the points' own extent, or an explicit
@@ -1047,7 +1049,6 @@ mod tests {
                 XAxis::Numeric,
                 false,
             ),
-            false,
         );
         assert!(s.starts_with("y vs x\n"));
         assert!(s.contains('┤')); // y-axis border
@@ -1064,7 +1065,6 @@ mod tests {
         let s = render_xy(
             &Frame::new("y vs t".to_string(), 40, 4, false),
             &xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]], ends, true),
-            true,
         );
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
     }
@@ -1163,7 +1163,6 @@ mod tests {
         let s = render_xy(
             &Frame::new("y vs x".to_string(), 80, 6, false),
             &xy_data(&["y"], &[&pts], XAxis::Numeric, false),
-            false,
         );
         // More than the two ends (0 and 100) — an intermediate tick near 50.
         assert!(s.contains("50"), "{s}");
@@ -1211,24 +1210,24 @@ mod tests {
         let plain = [None, None, None];
         // Density: the busy cell is the ramp's high end, the lone one its low
         // end. The top-right cell is drawn first, so blue comes before red.
-        let dense = render_xy(&f, &data(plain, None), false);
+        let dense = render_xy(&f, &data(plain, None));
         assert!(dense.contains(blue) && dense.contains(red), "{dense}");
         assert!(dense.find(blue) < dense.find(red), "{dense}");
         // A colour-by value wins over the count: the busy cell now holds the
         // low value, so the two colours swap places.
         let vals = [Some(0.0), Some(0.0), Some(5.0)];
-        let by = render_xy(&f, &data(vals, Some("z")), false);
+        let by = render_xy(&f, &data(vals, Some("z")));
         assert!(by.contains(blue) && by.contains(red), "{by}");
         assert!(by.find(red) < by.find(blue), "{by}");
         // `-c` alone colours: with no ramp it falls back to the default one.
         f.ramp = None;
-        let bare = render_xy(&f, &data(vals, Some("z")), false);
+        let bare = render_xy(&f, &data(vals, Some("z")));
         assert!(bare.contains("\x1b[38;2;"), "{bare}");
         // A colour column the chart found no number in is still a colour-by
         // chart: nothing is painted, and it never falls back to density.
-        assert!(!render_xy(&f, &data(plain, Some("z")), false).contains('\x1b'));
+        assert!(!render_xy(&f, &data(plain, Some("z"))).contains('\x1b'));
         // No ramp and no colour-by: no paint.
-        assert!(!render_xy(&f, &data(plain, None), false).contains('\x1b'));
+        assert!(!render_xy(&f, &data(plain, None)).contains('\x1b'));
     }
 
     #[test]
@@ -1240,7 +1239,6 @@ mod tests {
         let s = render_xy(
             &f,
             &xy_data(&["y"], &[&[(0.0, 0.0), (9.0, 9.0)]], XAxis::Numeric, true),
-            true,
         );
         // Two points, so two painted cells — the rest of the diagonal is plain.
         assert_eq!(s.matches("\x1b[38;2;").count(), 2, "{s}");
@@ -1256,7 +1254,6 @@ mod tests {
                 XAxis::Numeric,
                 false,
             ),
-            false,
         );
         assert!(s.contains('\x1b')); // coloured glyphs
         assert!(s.contains('●')); // legend markers
