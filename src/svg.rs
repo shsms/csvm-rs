@@ -1,9 +1,10 @@
 //! SVG rendering for the `graph` sink (`--svg`). Hand-written XML — no plotting
 //! dependency, so it ships in the default build; PNG (which would need a raster
-//! dependency) stays a feature-gated follow-up. Each function takes the same
-//! data the terminal renderers do (see `crate::graph`) and emits a standalone
-//! `<svg>` document.
+//! dependency) stays a feature-gated follow-up. It draws the same
+//! [`crate::chart`] model the terminal renderers do, as a standalone `<svg>`
+//! document.
 
+use crate::chart::{BarData, ChartData, Frame};
 use crate::color::Rgb;
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
@@ -192,7 +193,7 @@ pub fn spark(title: &str, values: &[f64], note: &str) -> String {
 
 /// Scatter (`connect=false`) or line (`connect=true`) of one or more y-series
 /// against a shared x. Series get distinct colours and a legend.
-pub fn xy(
+pub fn xy_chart(
     title: &str,
     names: &[String],
     series: &[Vec<(f64, f64)>],
@@ -267,6 +268,36 @@ pub fn xy(
     header(title, &body, note)
 }
 
+/// Emit `data` as a standalone SVG document, using `frame`'s title and notes.
+/// The per-kind emitters above carry the drawing; this picks the one that fits.
+pub fn render(frame: &Frame, data: &ChartData) -> String {
+    let note = frame.notes_line();
+    match data {
+        // Keep the --svg contract even with nothing to plot: an empty chart.
+        ChartData::Hist(None) => hist(&frame.title, 0.0, 0.0, &[], &note),
+        ChartData::Hist(Some(h)) => hist(&frame.title, h.lo, h.hi, &h.counts, &note),
+        ChartData::Bar(b) => bars(&frame.title, &single_series(b), &note),
+        ChartData::Spark(s) => spark(&frame.title, &s.values, &note),
+        ChartData::Xy(xy) => xy_chart(
+            &frame.title,
+            &xy.names,
+            &xy.series(),
+            xy.connect,
+            &note,
+            xy.xaxis.clone(),
+        ),
+    }
+}
+
+/// The first series of a bar chart as `(label, value)` rows; a row with no
+/// numeric first value is skipped.
+fn single_series(b: &BarData) -> Vec<(String, f64)> {
+    b.rows
+        .iter()
+        .filter_map(|(label, values)| Some((label.clone(), (*values.first()?)?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,15 +314,15 @@ mod tests {
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
         let series = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
         let names = ["y".to_string()];
-        assert!(xy("s", &names, &series, false, "", XAxis::Numeric).contains("<circle"));
-        assert!(xy("s", &names, &series, true, "", XAxis::Numeric).contains("<polyline"));
+        assert!(xy_chart("s", &names, &series, false, "", XAxis::Numeric).contains("<circle"));
+        assert!(xy_chart("s", &names, &series, true, "", XAxis::Numeric).contains("<polyline"));
     }
 
     #[test]
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
         let series = vec![vec![(0.0, 0.0)], vec![(1.0, 1.0)]];
         let names = ["a".to_string(), "b".to_string()];
-        let s = xy("m", &names, &series, false, "", XAxis::Numeric);
+        let s = xy_chart("m", &names, &series, false, "", XAxis::Numeric);
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
     }
@@ -301,7 +332,7 @@ mod tests {
         let series = vec![vec![(1.0, 0.0), (2.0, 1.0)]];
         let names = ["y".to_string()];
         let ends = XAxis::Ends("t0".to_string(), "t9".to_string());
-        let s = xy("y vs t", &names, &series, true, "", ends);
+        let s = xy_chart("y vs t", &names, &series, true, "", ends);
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
 

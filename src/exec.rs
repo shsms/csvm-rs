@@ -16,11 +16,11 @@ use std::thread;
 use crossbeam_channel::bounded;
 use memchr::memchr;
 
+use crate::chart::{self, Frame};
 use crate::color::Style;
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
-use crate::graph::Histogram;
 use crate::plan::{
     AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphSpec,
     GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
@@ -42,9 +42,6 @@ fn vis_width(s: &str) -> usize {
 /// An owned row, detached from any chunk buffer (used by the in-memory
 /// multi-sort fallback).
 type OwnedRow = Vec<Field<'static>>;
-
-/// `(x, y)` points per y-series, for `graph scatter`/`line` (see `collect_xy`).
-type XySeries = Vec<Vec<(f64, f64)>>;
 
 /// Knobs for a run: chunk size, worker count, and where sort spills its temp
 /// files.
@@ -1694,9 +1691,9 @@ pub fn render<W: Write>(
 }
 
 /// Draw the `graph` sink's chart from the buffered CSV output. The plan ran
-/// normally to produce rows (header + data); this pulls the charted columns,
-/// dropping non-numeric/empty cells loudly (counted and reported), and renders
-/// the chart text. The header (row 0) is skipped.
+/// normally to produce rows (header + data); this collects the charted columns
+/// into the chart model (dropping non-numeric/empty cells loudly) and hands the
+/// frame plus the data to the terminal or SVG renderer.
 fn render_graph<W: Write>(
     bytes: &[u8],
     g: &GraphSpec,
@@ -1705,244 +1702,23 @@ fn render_graph<W: Write>(
 ) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
-    // Default title: the value column, or "y vs x" for a single-series xy chart.
-    let title = g.opts.title.clone().unwrap_or_else(|| match g.kind {
-        GraphKind::Bar => g.cols[1].name.clone(),
-        GraphKind::Scatter | GraphKind::Line if g.cols.len() == 2 => {
-            format!("{} vs {}", g.cols[1].name, g.cols[0].name)
-        }
-        GraphKind::Scatter | GraphKind::Line => format!("vs {}", g.cols[0].name),
-        GraphKind::Hist | GraphKind::Spark => g.cols[0].name.clone(),
-    });
-
+    let title = g
+        .opts
+        .title
+        .clone()
+        .unwrap_or_else(|| chart::default_title(g));
     // One scale factor sets both chart dimensions.
     let (width, height) = crate::graph::chart_size(g.opts.scale);
-    let chart = match g.kind {
-        GraphKind::Hist => {
-            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
-            let note = skipped_note(skipped, 0);
-            match Histogram::build(&values, g.opts.bins, skipped) {
-                Some(h) if g.opts.svg => crate::svg::hist(&title, h.lo, h.hi, &h.counts, &note),
-                Some(h) => h.render(&title, width),
-                // Keep the --svg contract even with nothing to plot: an empty SVG.
-                None if g.opts.svg => crate::svg::hist(&title, 0.0, 0.0, &[], &note),
-                None => {
-                    format!("{title}: no numeric values to plot (skipped {skipped} non-numeric)\n")
-                }
-            }
-        }
-        GraphKind::Spark => {
-            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
-            if g.opts.svg {
-                crate::svg::spark(&title, &values, &skipped_note(skipped, 0))
-            } else {
-                crate::graph::render_spark(&title, &values, width, skipped)
-            }
-        }
-        GraphKind::Bar => {
-            let (rows, skipped, truncated) =
-                collect_label_value(text, g.cols[0].pos, g.cols[1].pos, crate::graph::MAX_BARS);
-            if g.opts.svg {
-                crate::svg::bars(&title, &rows, &skipped_note(skipped, truncated))
-            } else {
-                crate::graph::render_bars(&title, &rows, width, skipped, truncated)
-            }
-        }
-        GraphKind::Scatter | GraphKind::Line => {
-            let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
-            let ynames: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
-            let XyData {
-                series,
-                skipped,
-                xaxis,
-            } = collect_xy(text, g.cols[0].pos, &ypos);
-            let connect = g.kind == GraphKind::Line;
-            // Only the category/row-index axis distorts spacing; numeric and
-            // time axes are true.
-            let xnote = if matches!(xaxis, crate::graph::XAxis::Ends(..)) {
-                "even row spacing"
-            } else {
-                ""
-            };
-            if g.opts.svg {
-                let note = [skipped_note(skipped, 0), xnote.to_string()]
-                    .into_iter()
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                crate::svg::xy(&title, &ynames, &series, connect, &note, xaxis)
-            } else {
-                let title = if xnote.is_empty() {
-                    title
-                } else {
-                    format!("{title}  ({xnote})")
-                };
-                crate::graph::render_xy(
-                    &title, &ynames, &series, width, height, color, connect, skipped, xaxis,
-                )
-            }
-        }
+    let mut frame = Frame::new(title, width, height, color);
+    let collected = chart::collect(text, g, width);
+    frame.notes = collected.notes;
+    let drawn = if g.opts.svg {
+        crate::svg::render(&frame, &collected.data)
+    } else {
+        crate::graph::render(&frame, &collected.data)
     };
-    output.write_all(chart.as_bytes())?;
+    output.write_all(drawn.as_bytes())?;
     Ok(())
-}
-
-/// The result of collecting `graph scatter`/`line` data: the points per
-/// y-series, the dropped-point count, and how to graduate the x-axis.
-struct XyData {
-    series: XySeries,
-    skipped: u64,
-    xaxis: crate::graph::XAxis,
-}
-
-/// Collect `(x, y)` points per y-series from the buffered output (header
-/// skipped). A non-numeric y drops just that series' point (counted in
-/// `skipped`). The x column is handled in three modes:
-/// - **numeric** — plotted as-is, numeric axis labels;
-/// - **temporal** — if no value is numeric but every one parses as a timestamp,
-///   plot at true epoch positions and label the axis with formatted dates;
-/// - **row-index fallback** — otherwise (e.g. categories) plot against the
-///   1-based row ordinal, label the axis with the first/last raw cells, and flag
-///   even spacing.
-fn collect_xy(text: &str, xpos: usize, ypos: &[usize]) -> XyData {
-    // (numeric x, raw x text, y values) per data row.
-    let mut rows: Vec<(Option<f64>, String, Vec<Option<f64>>)> = Vec::new();
-    for_each_data_row(text, |r| {
-        let xcell = r
-            .get(xpos)
-            .map(|f| f.as_str().into_owned())
-            .unwrap_or_default();
-        let x = cell_num(r, xpos);
-        let ys = ypos.iter().map(|&p| cell_num(r, p)).collect();
-        rows.push((x, xcell, ys));
-    });
-
-    let mut series: Vec<Vec<(f64, f64)>> = vec![Vec::new(); ypos.len()];
-    let mut skipped = 0u64;
-    let push_row = |series: &mut XySeries, skipped: &mut u64, xv, ys: Vec<Option<f64>>| {
-        for (i, y) in ys.into_iter().enumerate() {
-            match y {
-                Some(y) => series[i].push((xv, y)),
-                None => *skipped += 1,
-            }
-        }
-    };
-
-    // Numeric x: plot as-is; rows with a non-numeric x are dropped.
-    if rows.iter().any(|(x, _, _)| x.is_some()) {
-        for (x, _, ys) in rows {
-            match x {
-                Some(xv) => push_row(&mut series, &mut skipped, xv, ys),
-                None => skipped += ys.len() as u64,
-            }
-        }
-        return XyData {
-            series,
-            skipped,
-            xaxis: crate::graph::XAxis::Numeric,
-        };
-    }
-
-    // No numeric x — does every cell parse as a timestamp? Then use a true time
-    // axis (real spacing; render formats the epoch ticks as dates).
-    let epochs: Vec<Option<f64>> = rows
-        .iter()
-        .map(|(_, raw, _)| crate::datetime::parse_epoch(raw))
-        .collect();
-    if !rows.is_empty() && epochs.iter().all(Option::is_some) {
-        for ((_, _, ys), e) in rows.into_iter().zip(&epochs) {
-            push_row(&mut series, &mut skipped, e.unwrap(), ys);
-        }
-        return XyData {
-            series,
-            skipped,
-            xaxis: crate::graph::XAxis::Time,
-        };
-    }
-
-    // Row-index fallback: plot against the 1-based ordinal, label with the raw
-    // first/last cells.
-    let xfirst = rows.first().map(|(_, r, _)| r.clone()).unwrap_or_default();
-    let xlast = rows.last().map(|(_, r, _)| r.clone()).unwrap_or_default();
-    for (idx, (_, _, ys)) in rows.into_iter().enumerate() {
-        push_row(&mut series, &mut skipped, (idx + 1) as f64, ys);
-    }
-    XyData {
-        series,
-        skipped,
-        xaxis: crate::graph::XAxis::Ends(xfirst, xlast),
-    }
-}
-
-/// Parse a cell as a finite f64 — the numeric-cell rule shared by the chart
-/// collectors. `None` for a missing, empty, or non-numeric cell.
-fn cell_num(row: &[Field], pos: usize) -> Option<f64> {
-    row.get(pos)
-        .and_then(|f| f.as_str().trim().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-}
-
-/// Apply `f` to each data row of the buffered CSV output, skipping the header.
-fn for_each_data_row(text: &str, mut f: impl FnMut(&[Field])) {
-    let mut first = true;
-    csv::parse_chunk(text, |r| {
-        if first {
-            first = false;
-        } else {
-            f(r);
-        }
-    });
-}
-
-/// The dropped-data footnote for an SVG chart (the "strict and loud" policy the
-/// terminal renderers already print); empty when nothing was dropped.
-fn skipped_note(skipped: u64, truncated: usize) -> String {
-    let mut parts = Vec::new();
-    if truncated > 0 {
-        parts.push(format!("+{truncated} more not shown"));
-    }
-    if skipped > 0 {
-        parts.push(format!("skipped {skipped} non-numeric"));
-    }
-    parts.join("  ")
-}
-
-/// Collect one column's finite numeric values from the buffered output (header
-/// skipped), counting non-numeric/empty cells as `skipped`.
-fn collect_numeric(text: &str, pos: usize) -> (Vec<f64>, u64) {
-    let mut values = Vec::new();
-    let mut skipped = 0u64;
-    for_each_data_row(text, |r| match cell_num(r, pos) {
-        Some(v) => values.push(v),
-        None => skipped += 1,
-    });
-    (values, skipped)
-}
-
-/// Collect `(label, value)` pairs for a bar chart (header skipped). Rows past
-/// `cap` numeric pairs are counted as `truncated` rather than drawn; non-numeric
-/// values are counted as `skipped`.
-fn collect_label_value(
-    text: &str,
-    label_pos: usize,
-    value_pos: usize,
-    cap: usize,
-) -> (Vec<(String, f64)>, u64, usize) {
-    let mut rows = Vec::new();
-    let mut skipped = 0u64;
-    let mut truncated = 0usize;
-    for_each_data_row(text, |r| match cell_num(r, value_pos) {
-        Some(v) => {
-            if rows.len() < cap {
-                let label = r.get(label_pos).map(|f| f.as_str().into_owned());
-                rows.push((label.unwrap_or_default(), v));
-            } else {
-                truncated += 1;
-            }
-        }
-        None => skipped += 1,
-    });
-    (rows, skipped, truncated)
 }
 
 /// The per-cell [`Style`] grid (`[row][col]`) for the colour rules over `rows`.

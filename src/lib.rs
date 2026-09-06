@@ -5,6 +5,7 @@
 //! into a plain-Rust execution plan once at startup, then run over the rows
 //! with no interpreter in the hot path. See `CLAUDE.md` for the architecture.
 
+pub mod chart;
 pub mod cli;
 pub mod color;
 pub mod csv;
