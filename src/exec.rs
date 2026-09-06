@@ -22,9 +22,9 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{
-    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphSpec,
-    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
-    apply_stmts,
+    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphOpts,
+    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
+    ValExpr, apply_stmts,
 };
 use crate::sort::{self, LineFormat, Sorter};
 use crate::stats::ColStats;
@@ -2029,12 +2029,42 @@ pub fn describe(plan: &Plan) -> String {
         };
         let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
         out.push_str(&format!("graph: {kind} {cols:?}"));
-        if let Some(b) = g.opts.bins {
-            out.push_str(&format!(" bins={b}"));
-        }
+        out.push_str(&describe_graph_opts(&g.opts));
         out.push('\n');
     }
     out
+}
+
+/// The chart options that are not the defaults, as ` word` or ` key=value` in
+/// one fixed order — what `--explain` adds after the kind and its columns. An
+/// option nobody set says nothing, so a plain chart stays a short line while a
+/// tuned one reads back everything that shapes it.
+fn describe_graph_opts(o: &GraphOpts) -> String {
+    let scale = GraphOpts::default().scale;
+    let range = |r: Option<(f64, f64)>, axis: &str| r.map(|(lo, hi)| format!("{axis}={lo}:{hi}"));
+    [
+        o.bins.map(|b| format!("bins={b}")),
+        o.width.map(|w| format!("w={w}")),
+        o.height.map(|h| format!("h={h}")),
+        (o.scale != scale).then(|| format!("scale={}", o.scale)),
+        // Quoted: a title or an axis caption is free text, so `title=z by
+        // row` would read as three options.
+        o.title.as_ref().map(|t| format!("title={t:?}")),
+        o.ascii.then(|| "ascii".to_string()),
+        range(o.xrange, "x"),
+        range(o.yrange, "y"),
+        o.log.then(|| "log".to_string()),
+        o.xlabel.as_ref().map(|t| format!("xlabel={t:?}")),
+        o.ylabel.as_ref().map(|t| format!("ylabel={t:?}")),
+        o.data.then(|| "data".to_string()),
+        o.svg.then(|| "svg".to_string()),
+        o.ramp.map(|r| format!("ramp={r}")),
+        o.color_by.as_ref().map(|c| format!("color_by={}", c.name)),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|opt| format!(" {opt}"))
+    .collect()
 }
 
 fn describe_color(rule: &ColorRule) -> String {
@@ -2515,6 +2545,37 @@ mod tests {
             run_str("cols nope", INPUT),
             Err(Error::Column { .. })
         ));
+    }
+
+    #[test]
+    fn describe_shows_the_graph_options_that_were_set() {
+        // An option left at its default says nothing, so a plain chart is one
+        // short line.
+        let plain = describe(&parse("graph hist countZ").unwrap());
+        assert!(plain.contains("graph: hist [\"countZ\"]\n"), "{plain}");
+        // Everything the script asked for shows, in one fixed order, so
+        // --explain is the whole chart spec and not just its kind. The free
+        // text — the title and the axis captions — is quoted, so one with
+        // spaces reads back as one option.
+        let mut plan = parse(
+            "graph scatter id countZ -b 7 -W 40 -H 6 -s 1.5 -t 'z by row' -A -x 0:10 -y 1:9 -l \
+             --xlabel 'row index' --ylabel z -S -r blue:red -c countZ",
+        )
+        .unwrap();
+        let _ = plan.resolve(&["id".into(), "countZ".into()]);
+        let d = describe(&plan);
+        assert!(
+            d.contains(
+                "graph: scatter [\"id\", \"countZ\"] bins=7 w=40 h=6 scale=1.5 \
+                 title=\"z by row\" ascii \
+                 x=0:10 y=1:9 log xlabel=\"row index\" ylabel=\"z\" svg ramp=blue:red \
+                 color_by=countZ\n"
+            ),
+            "{d}"
+        );
+        // `-D` is the other half of that pair.
+        let d = describe(&parse("graph hist countZ -D").unwrap());
+        assert!(d.contains("graph: hist [\"countZ\"] data\n"), "{d}");
     }
 
     #[test]

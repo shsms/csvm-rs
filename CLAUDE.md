@@ -347,7 +347,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `-r`/`-c` on several y-series, `-r` on a grouped bar, `-x` on bar/spark,
   `-y` on hist) and a
   non-positive `-y` bound under `-l` (heatmap excepted, its `-l` is the count
-  axis); `-D` and `-S` are exclusive, since both own the normal output. `-D`'s
+  axis); `-D` and `-S` are exclusive, since both own the normal output.
+  `--explain` reads the whole spec back (`exec::describe_graph_opts`): the
+  kind, its columns, and every option that is not a default, in one fixed
+  order. `-D`'s
   shapes: `bin_lo,bin_hi,count` per hist bin, every label and its values for
   bar (`--data` is never capped), `bucket,VALUE` per spark cell (so the row count is at most the
   chart width, which for `-D` is `-W` else 80 — a shorter series passes through as it is),
