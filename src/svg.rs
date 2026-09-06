@@ -457,6 +457,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
 mod tests {
     use super::*;
     use crate::chart::AxisRange;
+    use crate::chart::fixtures::{bar_data, heat_data, one_series, xy_data};
 
     /// A frame with the given title and nothing else set: an SVG is a fixed
     /// size, so only the title, the captions, the ramp, the log axis and the
@@ -481,57 +482,6 @@ mod tests {
             name: "v".to_string(),
             values: values.to_vec(),
             range,
-        }
-    }
-
-    /// A single-series bar chart, as `collect` builds it for
-    /// `graph bar LABEL VALUE`.
-    fn one_series(rows: &[(&str, f64)]) -> BarData {
-        bar_data(
-            &["v"],
-            &rows
-                .iter()
-                .map(|(l, v)| (l.to_string(), vec![Some(*v)]))
-                .collect::<Vec<BarRow>>(),
-            None,
-        )
-    }
-
-    /// A bar chart of `names` over `rows`, with an optional `-y` axis.
-    fn bar_data(names: &[&str], rows: &[BarRow], axis: AxisRange) -> BarData {
-        BarData {
-            label_name: "k".to_string(),
-            value_names: names.iter().map(|n| n.to_string()).collect(),
-            rows: rows.to_vec(),
-            axis,
-        }
-    }
-
-    /// An xy chart of one point list per series, as `collect` builds it: each
-    /// point is a row that only its own series has a value in.
-    fn xy_data(names: &[&str], series: &[&[(f64, f64)]], connect: bool, xaxis: XAxis) -> XyData {
-        let mut rows = Vec::new();
-        for (si, pts) in series.iter().enumerate() {
-            for &(x, y) in *pts {
-                let mut ys = vec![None; names.len()];
-                ys[si] = Some(y);
-                rows.push(crate::chart::XyRow {
-                    xcell: format_num(x),
-                    x,
-                    ys,
-                    color_by: None,
-                });
-            }
-        }
-        XyData {
-            xname: "x".to_string(),
-            names: names.iter().map(|n| n.to_string()).collect(),
-            rows,
-            xaxis,
-            connect,
-            xrange: None,
-            yrange: None,
-            color_by: None,
         }
     }
 
@@ -562,8 +512,8 @@ mod tests {
     #[test]
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
         let pts: &[(f64, f64)] = &[(0.0, 0.0), (1.0, 1.0)];
-        let scatter = xy_data(&["y"], &[pts], false, XAxis::Numeric);
-        let line = xy_data(&["y"], &[pts], true, XAxis::Numeric);
+        let scatter = xy_data(&["y"], &[pts], XAxis::Numeric, false);
+        let line = xy_data(&["y"], &[pts], XAxis::Numeric, true);
         assert!(xy_chart(&frame_for("s"), &scatter).contains("<circle"));
         assert!(xy_chart(&frame_for("s"), &line).contains("<polyline"));
     }
@@ -572,7 +522,7 @@ mod tests {
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
         let series: [&[(f64, f64)]; 2] = [&[(0.0, 0.0)], &[(1.0, 1.0)]];
         let names = ["a", "b"];
-        let scatter = xy_data(&names, &series, false, XAxis::Numeric);
+        let scatter = xy_data(&names, &series, XAxis::Numeric, false);
         let s = xy_chart(&frame_for("m"), &scatter);
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
@@ -581,7 +531,7 @@ mod tests {
         // polylines, so its only circles are the legend's — one per series.
         let line = xy_chart(
             &frame_for("m"),
-            &xy_data(&names, &series, true, XAxis::Numeric),
+            &xy_data(&names, &series, XAxis::Numeric, true),
         );
         assert_eq!(line.matches("<circle").count(), names.len(), "{line}");
         // ...and nothing but the background is a rect.
@@ -591,7 +541,7 @@ mod tests {
     #[test]
     fn xy_category_axis_shows_end_labels() {
         let ends = XAxis::Ends("t0".to_string(), "t9".to_string());
-        let xy = xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0)]], true, ends);
+        let xy = xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0)]], ends, true);
         let s = xy_chart(&frame_for("y vs t"), &xy);
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
@@ -604,7 +554,7 @@ mod tests {
             &spark_data(&[1.0, 2.0], Some((0.0, 100.0))),
         );
         assert!(s.contains(">100</text>"), "{s}");
-        let mut xy = xy_data(&["y"], &[&[(1.0, 1.0)]], false, XAxis::Numeric);
+        let mut xy = xy_data(&["y"], &[&[(1.0, 1.0)]], XAxis::Numeric, false);
         xy.yrange = Some((0.0, 100.0));
         let s = xy_chart(&frame_for("y"), &xy);
         assert!(s.contains(">100</text>"), "{s}");
@@ -694,19 +644,7 @@ mod tests {
 
     #[test]
     fn heat_emits_a_rect_per_non_empty_cell() {
-        let h = crate::chart::HeatData {
-            xname: "x".to_string(),
-            yname: "y".to_string(),
-            xlo: 0.0,
-            xhi: 1.0,
-            ylo: 0.0,
-            yhi: 1.0,
-            cols: 2,
-            rows: 2,
-            counts: vec![0, 1, 0, 4],
-            total: 5,
-            xaxis: XAxis::Numeric,
-        };
+        let h = heat_data(vec![0, 1, 0, 4]);
         let mut frame = frame_for("h");
         frame.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let s = heat(&frame, &h);

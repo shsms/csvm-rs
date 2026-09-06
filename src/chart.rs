@@ -1117,6 +1117,93 @@ pub fn to_csv(data: &ChartData) -> String {
     out
 }
 
+/// Chart data shaped the way [`collect`] builds it, for the tests of every
+/// module that reads the model — `chart`, `graph` and `svg` — so a renderer's
+/// idea of a chart's rows cannot drift from the collector's.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+    use crate::field::format_num;
+
+    /// A bar chart of `names` over `rows`, with an optional `-y` axis.
+    pub(crate) fn bar_data(names: &[&str], rows: &[BarRow], axis: AxisRange) -> BarData {
+        BarData {
+            label_name: "k".to_string(),
+            value_names: names.iter().map(|n| n.to_string()).collect(),
+            rows: rows.to_vec(),
+            axis,
+        }
+    }
+
+    /// A single-series bar chart, as `collect` builds it for
+    /// `graph bar LABEL VALUE`.
+    pub(crate) fn one_series(rows: &[(&str, f64)]) -> BarData {
+        let rows: Vec<BarRow> = rows
+            .iter()
+            .map(|(l, v)| (l.to_string(), vec![Some(*v)]))
+            .collect();
+        bar_data(&["v"], &rows, None)
+    }
+
+    /// An xy chart whose rows reproduce `series`. Every series shares the x
+    /// column, so this is one row per distinct x with a blank where a series
+    /// has no point there — the shape `collect_xy` produces.
+    pub(crate) fn xy_data(
+        names: &[&str],
+        series: &[&[(f64, f64)]],
+        xaxis: XAxis,
+        connect: bool,
+    ) -> XyData {
+        let mut xs: Vec<f64> = Vec::new();
+        for pts in series {
+            for &(x, _) in *pts {
+                if !xs.contains(&x) {
+                    xs.push(x);
+                }
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        XyData {
+            xname: "x".to_string(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            rows: xs
+                .iter()
+                .map(|&x| XyRow {
+                    xcell: format_num(x),
+                    x,
+                    ys: series
+                        .iter()
+                        .map(|pts| pts.iter().find(|(px, _)| *px == x).map(|&(_, y)| y))
+                        .collect(),
+                    color_by: None,
+                })
+                .collect(),
+            xaxis,
+            connect,
+            xrange: None,
+            yrange: None,
+            color_by: None,
+        }
+    }
+
+    /// A 2×2 heat grid over the unit square with the given row-major counts.
+    pub(crate) fn heat_data(counts: Vec<u64>) -> HeatData {
+        HeatData {
+            xname: "x".to_string(),
+            yname: "y".to_string(),
+            xlo: 0.0,
+            xhi: 1.0,
+            ylo: 0.0,
+            yhi: 1.0,
+            cols: 2,
+            rows: 2,
+            total: counts.iter().sum(),
+            counts,
+            xaxis: XAxis::Numeric,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1418,24 +1505,7 @@ mod tests {
 
     /// An xy chart of one series over `pts`, as `collect` builds it.
     fn xy_of(pts: &[(f64, f64)]) -> XyData {
-        XyData {
-            xname: "x".into(),
-            names: vec!["y".into()],
-            rows: pts
-                .iter()
-                .map(|&(x, y)| XyRow {
-                    xcell: x.to_string(),
-                    x,
-                    ys: vec![Some(y)],
-                    color_by: None,
-                })
-                .collect(),
-            xaxis: XAxis::Numeric,
-            connect: false,
-            xrange: None,
-            yrange: None,
-            color_by: None,
-        }
+        fixtures::xy_data(&["y"], &[pts], XAxis::Numeric, false)
     }
 
     #[test]
@@ -1463,12 +1533,7 @@ mod tests {
 
     #[test]
     fn bar_axis_bounds_anchor_at_zero_or_take_the_explicit_axis() {
-        let bar = |rows: Vec<BarRow>, axis| BarData {
-            label_name: "k".into(),
-            value_names: vec!["a".into(), "b".into()],
-            rows,
-            axis,
-        };
+        let bar = |rows: Vec<BarRow>, axis| fixtures::bar_data(&["a", "b"], &rows, axis);
         let rows = vec![
             ("x".to_string(), vec![Some(2.0), Some(5.0)]),
             ("y".to_string(), vec![Some(-3.0), None]),
@@ -1492,29 +1557,12 @@ mod tests {
 
     #[test]
     fn xy_series_drops_blank_ys_per_series() {
-        let d = XyData {
-            xname: "x".into(),
-            names: vec!["a".into(), "b".into()],
-            rows: vec![
-                XyRow {
-                    xcell: "1".into(),
-                    x: 1.0,
-                    ys: vec![Some(2.0), None],
-                    color_by: None,
-                },
-                XyRow {
-                    xcell: "2".into(),
-                    x: 2.0,
-                    ys: vec![Some(3.0), Some(4.0)],
-                    color_by: None,
-                },
-            ],
-            xaxis: XAxis::Numeric,
-            connect: false,
-            xrange: None,
-            yrange: None,
-            color_by: None,
-        };
+        let d = fixtures::xy_data(
+            &["a", "b"],
+            &[&[(1.0, 2.0), (2.0, 3.0)], &[(2.0, 4.0)]],
+            XAxis::Numeric,
+            false,
+        );
         assert_eq!(
             d.series(),
             vec![vec![(1.0, 2.0), (2.0, 3.0)], vec![(2.0, 4.0)]]

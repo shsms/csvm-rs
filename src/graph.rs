@@ -888,62 +888,7 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
 mod tests {
     use super::*;
     use crate::chart::XyRow;
-
-    /// A single-series `BarData` from `(label, value)` pairs, as `collect`
-    /// builds it for `graph bar`.
-    fn bar_data(rows: &[(String, f64)]) -> BarData {
-        BarData {
-            label_name: "label".to_string(),
-            value_names: vec!["v".to_string()],
-            rows: rows
-                .iter()
-                .map(|(l, v)| (l.clone(), vec![Some(*v)]))
-                .collect(),
-            axis: None,
-        }
-    }
-
-    /// An `XyData` whose rows reproduce `series`: every series shares the x
-    /// column, so one row per distinct x with a blank where a series has no
-    /// point there.
-    fn xy_data(
-        names: &[String],
-        series: &[Vec<(f64, f64)>],
-        xaxis: XAxis,
-        connect: bool,
-    ) -> XyData {
-        let mut xs: Vec<f64> = Vec::new();
-        for pts in series {
-            for &(x, _) in pts {
-                if !xs.contains(&x) {
-                    xs.push(x);
-                }
-            }
-        }
-        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let rows = xs
-            .iter()
-            .map(|&x| XyRow {
-                xcell: format_num(x),
-                x,
-                ys: series
-                    .iter()
-                    .map(|pts| pts.iter().find(|(px, _)| *px == x).map(|&(_, y)| y))
-                    .collect(),
-                color_by: None,
-            })
-            .collect();
-        XyData {
-            xname: "x".to_string(),
-            names: names.to_vec(),
-            rows,
-            xaxis,
-            connect,
-            xrange: None,
-            yrange: None,
-            color_by: None,
-        }
-    }
+    use crate::chart::fixtures::{bar_data, heat_data, one_series, xy_data};
 
     #[test]
     fn bins_span_min_to_max_inclusive() {
@@ -991,10 +936,9 @@ mod tests {
 
     #[test]
     fn bars_anchor_positive_at_left_edge() {
-        let rows = [("a".to_string(), 2.0), ("b".to_string(), 4.0)];
         let s = render_bars(
             &Frame::new("v".to_string(), 30, 15, false),
-            &bar_data(&rows),
+            &one_series(&[("a", 2.0), ("b", 4.0)]),
         );
         assert!(s.starts_with("v\n"));
         // All-positive: the zero baseline is the left edge, so bars start there.
@@ -1005,10 +949,9 @@ mod tests {
 
     #[test]
     fn bars_diverge_around_zero_for_negatives() {
-        let rows = [("pos".to_string(), 5.0), ("neg".to_string(), -5.0)];
         let s = render_bars(
             &Frame::new("d".to_string(), 40, 15, false),
-            &bar_data(&rows),
+            &one_series(&[("pos", 5.0), ("neg", -5.0)]),
         );
         let pos = s.lines().find(|l| l.contains("pos")).unwrap();
         let neg = s.lines().find(|l| l.contains("neg")).unwrap();
@@ -1019,8 +962,7 @@ mod tests {
 
     #[test]
     fn bars_clamp_to_an_explicit_axis_but_print_the_real_value() {
-        let rows = [("a".to_string(), 1.0), ("b".to_string(), 9.0)];
-        let mut b = bar_data(&rows);
+        let mut b = one_series(&[("a", 1.0), ("b", 9.0)]);
         b.axis = Some((0.0, 2.0));
         let s = render_bars(&Frame::new("v".to_string(), 40, 15, false), &b);
         // The drawn field of a row: between the axis rule and the printed value.
@@ -1043,11 +985,10 @@ mod tests {
 
     #[test]
     fn bars_report_skipped_and_truncated() {
-        let rows = [("a".to_string(), 1.0)];
         let mut f = Frame::new("v".to_string(), 30, 15, false);
         f.notes.push("+2 more not shown".to_string());
         f.notes.push("skipped 3 non-numeric".to_string());
-        let s = render_bars(&f, &bar_data(&rows));
+        let s = render_bars(&f, &one_series(&[("a", 1.0)]));
         assert!(s.contains("(+2 more not shown)"), "{s}");
         assert!(s.contains("(skipped 3 non-numeric)"), "{s}");
     }
@@ -1098,10 +1039,14 @@ mod tests {
 
     #[test]
     fn render_xy_frames_a_scatter() {
-        let pts = vec![vec![(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]];
         let s = render_xy(
             &Frame::new("y vs x".to_string(), 10, 4, false),
-            &xy_data(&["y".into()], &pts, XAxis::Numeric, false),
+            &xy_data(
+                &["y"],
+                &[&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]],
+                XAxis::Numeric,
+                false,
+            ),
             false,
         );
         assert!(s.starts_with("y vs x\n"));
@@ -1115,31 +1060,13 @@ mod tests {
     #[test]
     fn render_xy_uses_end_labels_for_a_category_axis() {
         // Row-index fallback: positions are 1,2,3 but the axis shows real ends.
-        let pts = vec![vec![(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]];
         let ends = XAxis::Ends("2024-01-01".to_string(), "2024-01-03".to_string());
         let s = render_xy(
             &Frame::new("y vs t".to_string(), 40, 4, false),
-            &xy_data(&["y".into()], &pts, ends, true),
+            &xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]], ends, true),
             true,
         );
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
-    }
-
-    /// A 2x2 heat grid over the unit square with the given row-major counts.
-    fn heat_data(counts: Vec<u64>) -> HeatData {
-        HeatData {
-            xname: "x".to_string(),
-            yname: "y".to_string(),
-            xlo: 0.0,
-            xhi: 1.0,
-            ylo: 0.0,
-            yhi: 1.0,
-            cols: 2,
-            rows: 2,
-            total: counts.iter().sum(),
-            counts,
-            xaxis: XAxis::Numeric,
-        }
     }
 
     #[test]
@@ -1232,10 +1159,10 @@ mod tests {
     #[test]
     fn render_xy_numeric_axis_has_intermediate_ticks() {
         // A wide numeric axis over 0..100 should graduate beyond just the ends.
-        let pts = vec![(0..=100).map(|i| (i as f64, i as f64)).collect()];
+        let pts: Vec<(f64, f64)> = (0..=100).map(|i| (i as f64, i as f64)).collect();
         let s = render_xy(
             &Frame::new("y vs x".to_string(), 80, 6, false),
-            &xy_data(&["y".into()], &pts, XAxis::Numeric, false),
+            &xy_data(&["y"], &[&pts], XAxis::Numeric, false),
             false,
         );
         // More than the two ends (0 and 100) — an intermediate tick near 50.
@@ -1248,7 +1175,7 @@ mod tests {
         f.notes.push("skipped 5 non-numeric".to_string());
         let s = render(
             &f,
-            &ChartData::Xy(xy_data(&["y".into()], &[vec![]], XAxis::Numeric, false)),
+            &ChartData::Xy(xy_data(&["y"], &[&[]], XAxis::Numeric, false)),
         );
         assert!(s.contains("no numeric points to plot"));
         assert!(s.contains("skipped 5"));
@@ -1310,10 +1237,9 @@ mod tests {
         // point; density counts points, so those cells stay unpainted.
         let mut f = Frame::new("y vs x".to_string(), 24, 4, true);
         f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
-        let pts = vec![vec![(0.0, 0.0), (9.0, 9.0)]];
         let s = render_xy(
             &f,
-            &xy_data(&["y".into()], &pts, XAxis::Numeric, true),
+            &xy_data(&["y"], &[&[(0.0, 0.0), (9.0, 9.0)]], XAxis::Numeric, true),
             true,
         );
         // Two points, so two painted cells — the rest of the diagonal is plain.
@@ -1322,11 +1248,14 @@ mod tests {
 
     #[test]
     fn render_xy_multi_series_adds_a_legend_when_coloured() {
-        let series = vec![vec![(0.0, 0.0)], vec![(0.0, 1.0)]];
-        let names = ["a".to_string(), "b".to_string()];
         let s = render_xy(
             &Frame::new("t".to_string(), 8, 4, true),
-            &xy_data(&names, &series, XAxis::Numeric, false),
+            &xy_data(
+                &["a", "b"],
+                &[&[(0.0, 0.0)], &[(0.0, 1.0)]],
+                XAxis::Numeric,
+                false,
+            ),
             false,
         );
         assert!(s.contains('\x1b')); // coloured glyphs
@@ -1335,15 +1264,14 @@ mod tests {
 
     #[test]
     fn render_bars_groups_the_series_of_a_row() {
-        let b = BarData {
-            label_name: "k".to_string(),
-            value_names: vec!["n".to_string(), "m".to_string()],
-            rows: vec![
+        let b = bar_data(
+            &["n", "m"],
+            &[
                 ("a".to_string(), vec![Some(1.0), Some(2.0)]),
                 ("b".to_string(), vec![Some(4.0), None]),
             ],
-            axis: None,
-        };
+            None,
+        );
         let s = render_bars(&Frame::new("t".to_string(), 40, 15, true), &b);
         let rows: Vec<&str> = s.lines().filter(|l| l.contains('│')).collect();
         assert_eq!(rows.len(), 4, "{s}");
