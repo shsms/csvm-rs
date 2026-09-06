@@ -17,6 +17,7 @@
 //! not known yet, so `Plan::resolve` decides again with the types it tracks
 //! by position.
 
+use crate::chart::MAX_CELLS;
 use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
@@ -651,7 +652,7 @@ impl<'a> Builder<'a> {
             let (word, after) = split_first_word(s);
             if let Some(v) = flag_value(word, after, &["-b", "--bins"]) {
                 let (val, tail) = v?;
-                opts.bins = Some(parse_positive(&val, "-b/--bins")?);
+                opts.bins = Some(parse_positive(&val, "-b/--bins", MAX_CELLS)?);
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-s", "--scale"]) {
                 let (val, tail) = v?;
@@ -683,11 +684,11 @@ impl<'a> Builder<'a> {
                 s = after;
             } else if let Some(v) = flag_value(word, after, &["-W", "--width"]) {
                 let (val, tail) = v?;
-                opts.width = Some(parse_positive(&val, "-W/--width")?);
+                opts.width = Some(parse_positive(&val, "-W/--width", MAX_CELLS)?);
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-H", "--height"]) {
                 let (val, tail) = v?;
-                opts.height = Some(parse_positive(&val, "-H/--height")?);
+                opts.height = Some(parse_positive(&val, "-H/--height", MAX_CELLS)?);
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-x", "--xrange"]) {
                 let (val, tail) = v?;
@@ -1622,12 +1623,17 @@ fn parse_range(s: &str, flag: &str) -> Result<(f64, f64), Error> {
     Ok((lo, hi))
 }
 
-/// Parse a positive-integer flag value (`--bins`).
-fn parse_positive(s: &str, name: &str) -> Result<usize, Error> {
+/// Parse a positive-integer flag value (`--bins`, `--width`, `--height`), up to
+/// `max`.
+fn parse_positive(s: &str, name: &str, max: usize) -> Result<usize, Error> {
     s.parse::<usize>()
         .ok()
-        .filter(|&n| n >= 1)
-        .ok_or_else(|| err(format!("{name} expects a positive integer, got `{s}`")))
+        .filter(|&n| (1..=max).contains(&n))
+        .ok_or_else(|| {
+            err(format!(
+                "{name} expects a positive integer up to {max}, got `{s}`"
+            ))
+        })
 }
 
 /// Parse the `--scale` factor: a positive, finite number.
@@ -2983,6 +2989,23 @@ mod tests {
         assert!(parse("graph scatter x y1,y2 -c z").is_err());
         assert!(parse("graph hist x -c z").is_err());
         assert!(parse("graph line x y1,y2 -r blue:red").is_err());
+    }
+
+    #[test]
+    fn graph_sizes_and_bins_are_capped() {
+        // A chart cell is a byte of memory (or four), so an unbounded -b/-W/-H
+        // asks the allocator for a chart no terminal could show.
+        assert!(parse("graph heatmap a b -b 4096").is_ok());
+        let e = parse("graph heatmap a b -b 4097").unwrap_err().to_string();
+        assert!(
+            e.contains("-b/--bins expects a positive integer up to 4096, got `4097`"),
+            "{e}"
+        );
+        assert!(parse("graph hist a -W 4097").is_err());
+        assert!(parse("graph hist a -H 4097").is_err());
+        assert!(parse("graph hist a -W 4096 -H 4096").is_ok());
+        // Same cap, a value far past it.
+        assert!(parse("graph heatmap a b -b 4294967296").is_err());
     }
 
     #[test]

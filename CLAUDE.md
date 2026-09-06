@@ -317,11 +317,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   axes — `-x/--xrange lo:hi`,
   `-y/--yrange lo:hi`, `-l/--log`, `--xlabel T`, `--ylabel T`; other —
   `-b/--bins N` (the hist bins, or an N×N heatmap grid; the other kinds accept
-  it and ignore it), `-t/--title T`, `-r/--ramp lo:hi`, `-c/--color-by COL`,
+  it and ignore it — it, `-W` and `-H` are capped at 4096 cells, since each one
+  sizes an allocation), `-t/--title T`, `-r/--ramp lo:hi`, `-c/--color-by COL`,
   `-D/--data`, `-S/--svg`. `chart::chart_size` sizes the chart: `-W`/`-H` win,
   else the terminal's width (`src/term.rs`: `$COLUMNS`, else a `TIOCGWINSZ`
   ioctl through `libc` — read only when stdout is a terminal and there is no
-  `-o`) or `BASE_W`=80, and `BASE_H`=15 rows, both × `-s`. A range *is* the
+  `-o`) or `BASE_W`=80, and `BASE_H`=15 rows, both × `-s`, and the result
+  clamped to the same `MAX_CELLS` ceiling the flags carry, so `-s` cannot ask
+  for the allocation `-W` may not. A range *is* the
   axis: the chart spans exactly it and the values outside are dropped and
   counted — except a bar, which clamps to the axis edge and still prints its
   real value. `-l` log10-scales the *value* axis: y for scatter/line/spark,

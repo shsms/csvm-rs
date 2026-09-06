@@ -305,8 +305,8 @@ by their output text (like a `by` key); sum/mean/stddev are blank for a non-nume
 it must be the last command. Cells that are not numbers are dropped from the plot and counted \
 in a note under it. The chart is as wide as the terminal (80 columns when the output is not a \
 terminal) and 15 rows tall; -s multiplies that default, and -W and -H set an exact size (never \
-smaller than 16 wide and 2 high). -A draws with plain ASCII, for a terminal without block \
-glyphs.\n\n\
+smaller than 16 wide and 2 high, and never larger than 4096). -A draws with plain ASCII, for \
+a terminal without block glyphs.\n\n\
 -l puts the value axis on a log10 scale: that axis is y for scatter, line and spark, the bar \
 length for bar, and the count for hist and heatmap. -y ranges that same axis, except on a \
 heatmap, where it ranges the y bins rather than the count; hist takes no -y, and its -x sets \
@@ -314,8 +314,8 @@ the span the bins cover. A range is the axis, so a value outside -x or -y is dro
 counted (`clipped N out of range`) — except a bar, which draws to the edge and still prints \
 its real value. On spark, scatter and line, -l drops the values that are not positive (counted \
 too); on hist and heatmap it draws a count as log10(count+1). -b sets the bin count: the bins \
-of a hist (Sturges' rule when -b is absent) and an N×N grid for a heatmap; the other kinds \
-ignore it.\n\n\
+of a hist (Sturges' rule when -b is absent) and an N×N grid for a heatmap, up to 4096; the \
+other kinds ignore it.\n\n\
 -D writes the chart's own data as CSV instead of drawing it: hist bin edges, the bar labels \
 and values, the spark's width buckets, the plotted points, or the heatmap's cell corners and \
 counts. -S emits an SVG document to the output instead of a terminal chart, so -D and -S are \

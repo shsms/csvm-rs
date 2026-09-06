@@ -91,9 +91,18 @@ pub type AxisRange = Option<(f64, f64)>;
 const BASE_W: usize = 80;
 const BASE_H: usize = 15;
 
+/// The most cells a chart dimension may ask for (`-b`, `-W`, `-H`, and what
+/// `-s` may scale a default up to). A chart is drawn into a buffer of
+/// `cols * rows` cells, so an unbounded value is an allocation no terminal
+/// could show — and a big enough one wraps that product round to some smaller
+/// count, leaving a buffer the drawing then indexes past the end of. 4096 is
+/// far past any terminal and keeps the product well inside a `usize`.
+pub const MAX_CELLS: usize = 4096;
+
 /// The chart size in cells: an explicit `width`/`height` wins; else the
 /// terminal width (or 80) and 15 rows, both times `scale`. Floors keep a
-/// tiny chart drawable.
+/// tiny chart drawable, and the same [`MAX_CELLS`] ceiling the flags carry
+/// caps the result, so a large `-s` cannot ask for the allocation `-W` may not.
 pub fn chart_size(
     scale: f64,
     term_width: Option<usize>,
@@ -103,7 +112,7 @@ pub fn chart_size(
     let scaled = |base: usize| (base as f64 * scale).round() as usize;
     let w = width.unwrap_or_else(|| scaled(term_width.unwrap_or(BASE_W)));
     let h = height.unwrap_or_else(|| scaled(BASE_H));
-    (w.max(16), h.max(2))
+    (w.clamp(16, MAX_CELLS), h.clamp(2, MAX_CELLS))
 }
 
 /// Everything about a chart that is not its data.
@@ -979,6 +988,8 @@ mod tests {
         // Floors: 16 wide, 2 high.
         assert_eq!(chart_size(0.01, None, None, None), (16, 2));
         assert_eq!(chart_size(1.0, None, Some(1), Some(1)), (16, 2));
+        // ...and the same ceiling `-W`/`-H` have, so `-s` cannot escape it.
+        assert_eq!(chart_size(1000.0, None, None, None), (4096, 4096));
     }
 
     #[test]
