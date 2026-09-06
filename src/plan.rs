@@ -808,6 +808,10 @@ pub struct GraphOpts {
     /// A single size multiplier over the base chart dimensions (1.0 = default).
     pub scale: f64,
     pub title: Option<String>,
+    /// The x-axis caption (`--xlabel`), printed under the tick row.
+    pub xlabel: Option<String>,
+    /// The y-axis caption (`--ylabel`), printed under the title.
+    pub ylabel: Option<String>,
     /// Emit an SVG document (to the normal output) instead of a terminal chart.
     pub svg: bool,
     /// An exact chart width in cells (`-W`/`--width`), overriding the terminal
@@ -835,6 +839,8 @@ impl Default for GraphOpts {
             bins: None,
             scale: 1.0,
             title: None,
+            xlabel: None,
+            ylabel: None,
             svg: false,
             width: None,
             height: None,

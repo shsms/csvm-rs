@@ -91,6 +91,10 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
     let mut out = String::new();
     out.push_str(&frame.title);
     out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
     for (edge, &count) in edges.iter().zip(&h.counts) {
         out.push_str(&format!(
             "{edge:>axis_w$} {axis_v}{} {count}\n",
@@ -101,6 +105,9 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
                 &frame.glyphs
             )
         ));
+    }
+    if let Some(x) = &frame.xlabel {
+        out.push_str(&format!("{:>axis_w$}  {x}\n", ""));
     }
     out.push_str(&format!(
         "n={}  min={}  max={}  bins={}",
@@ -162,6 +169,10 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
     let mut out = String::new();
     out.push_str(&frame.title);
     out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
     for (label, v, at) in &rows {
         // The drawn length is clamped to the axis; the printed value is real.
         let mut field = vec![' '; w];
@@ -177,6 +188,9 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
             "{label:>label_w$} {axis_v}{drawn} {}\n",
             format_num(*v)
         ));
+    }
+    if let Some(x) = &frame.xlabel {
+        out.push_str(&format!("{:>label_w$}  {x}\n", ""));
     }
     out.push_str(&format!("bars={}", rows.len()));
     out.push_str(&frame.notes_tail());
@@ -221,12 +235,19 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
             levels[level.min(7)]
         })
         .collect();
-    let mut out = format!(
-        "{}\n{line}\nmin={}  max={}",
-        frame.title,
-        format_num(dlo),
-        format_num(dhi)
-    );
+    let mut out = String::new();
+    out.push_str(&frame.title);
+    out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
+    out.push_str(&line);
+    out.push('\n');
+    if let Some(x) = &frame.xlabel {
+        out.push_str(&format!("  {x}\n"));
+    }
+    out.push_str(&format!("min={}  max={}", format_num(dlo), format_num(dhi)));
     out.push_str(&frame.notes_tail());
     out.push('\n');
     out
@@ -574,6 +595,10 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
         out.push_str("  (even row spacing)");
     }
     out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
     for cy in 0..hcells {
         // Gutter label: yhi on the first row, ylo on the last.
         let label = if cy == 0 {
@@ -616,6 +641,11 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
         "",
         x_label_row(&xy.xaxis, xlo, xhi, wcells)
     ));
+    if let Some(x) = &frame.xlabel {
+        let line = format!("{:>gutter$}  {:^wcells$}", "", x);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
 
     out.push_str(&format!("points={total}"));
     out.push_str(&tail_notes(frame));

@@ -1718,6 +1718,8 @@ fn render_graph<W: Write>(
         frame.glyphs = chart::Glyphs::ascii();
     }
     frame.log = g.opts.log;
+    frame.xlabel = g.opts.xlabel.clone();
+    frame.ylabel = g.opts.ylabel.clone();
     let collected = chart::collect(text, g, width);
     frame.notes = collected.notes;
     let drawn = if g.opts.svg {
@@ -2920,6 +2922,24 @@ mod tests {
     fn graph_title_overrides_the_column_name() {
         let out = render_str("graph hist countZ --title Counts", INPUT, false);
         assert!(out.starts_with("Counts\n"), "{out}");
+    }
+
+    #[test]
+    fn graph_axis_labels_print_under_the_title_and_under_the_ticks() {
+        let out = render_str(
+            "graph scatter id countZ --xlabel row --ylabel z",
+            INPUT,
+            false,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[1].trim(), "z", "{out}");
+        let tick_row = lines.iter().position(|l| l.contains('└')).unwrap();
+        assert!(lines[tick_row + 2].trim() == "row", "{out}");
+        let svg = render_str("graph hist countZ --xlabel v --ylabel n -S", INPUT, false);
+        assert!(
+            svg.contains(">v</text>") && svg.contains(">n</text>"),
+            "{svg}"
+        );
     }
 
     #[test]

@@ -659,6 +659,14 @@ impl<'a> Builder<'a> {
                 let (val, tail) = v?;
                 opts.title = Some(val);
                 s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["--xlabel"]) {
+                let (val, tail) = v?;
+                opts.xlabel = Some(val);
+                s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["--ylabel"]) {
+                let (val, tail) = v?;
+                opts.ylabel = Some(val);
+                s = tail.trim_start();
             } else if word == "-S" || word == "--svg" {
                 opts.svg = true;
                 s = after;
