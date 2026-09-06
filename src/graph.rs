@@ -7,7 +7,7 @@
 use crate::chart::{
     BarData, ChartData, Frame, Glyphs, HistData, SparkData, XyData, bar_value, hist_len, value_pos,
 };
-use crate::color::{Rgb, Style};
+use crate::color::{Ramp, Rgb, Style};
 use crate::field::format_num;
 
 /// Format `v` rounded to `step`'s precision (one digit finer than the step's
@@ -74,7 +74,14 @@ fn tail_notes(frame: &Frame) -> String {
 /// and `frame.color` are on; empty text is left alone so no chart grows a pair
 /// of escapes around nothing.
 fn paint(frame: &Frame, v: f64, lo: f64, hi: f64, text: &str) -> String {
-    match (&frame.ramp, frame.color) {
+    paint_with(frame.ramp, frame.color, v, lo, hi, text)
+}
+
+/// [`paint`] with the ramp given outright, for the one caller that has a ramp
+/// the frame does not: `-c/--color-by` colours with no `-r` on the command
+/// line (see [`render_xy`]).
+fn paint_with(ramp: Option<Ramp>, color: bool, v: f64, lo: f64, hi: f64, text: &str) -> String {
+    match (ramp, color) {
         (Some(r), true) if !text.is_empty() => r.at(v, lo, hi).paint(text),
         _ => text.to_string(),
     }
@@ -532,6 +539,15 @@ fn x_label_row(xaxis: &XAxis, xlo: f64, xhi: f64, width: usize) -> String {
 /// plotters). `xy.xaxis` selects how the bottom axis is graduated (numeric/time
 /// interpolate intermediate ticks; a category axis shows only the first/last
 /// cells) — a category axis says so in the title, since it distorts spacing.
+///
+/// A *single* series is painted per braille cell when colour is on: by the
+/// `-c/--color-by` value of the last point in the cell when the script named
+/// such a column, else — with `-r/--ramp` — by how many data points landed in
+/// it (density). `-c` implies the default ramp, so it colours with no `-r`
+/// given, and a cell with no point of its own stays plain: density counts data
+/// points, never the pixels a `line` chart's connecting segments light up.
+/// Density counts points per *cell*, so only a terminal chart has it;
+/// `--color-by` colours an SVG's points too (see [`crate::svg::xy_chart`]).
 fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     let series = xy.series();
     let total: usize = series.iter().map(Vec::len).sum();
@@ -610,6 +626,62 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
 
     let multi = series.len() > 1;
     let colors = frame.color;
+    // Whether this is a colour-by chart is the *plan's* answer, not the data's:
+    // a colour column with no numbers in it is still one, drawn plain, so it
+    // never quietly turns into a density chart the SVG would disagree with.
+    // `--color-by` takes a single y series, so it never meets the palette.
+    let has_by = !multi && xy.color_by.is_some();
+    // `-c/--color-by` implies the default ramp, so it colours without `-r`.
+    let ramp = frame.ramp.or_else(|| has_by.then(Ramp::default));
+    // One colour value per braille cell, with the ends of the ramp it runs on:
+    // the last `-c/--color-by` value seen in the cell, else how many data
+    // points landed in it (density). A cell with neither has no colour and
+    // stays plain. Only a single series is painted this way, and only with a
+    // ramp and terminal colour to paint it, so the grid is built only when it
+    // will show — it is one allocation the size of the canvas.
+    let cell: Option<(Vec<Option<f64>>, f64, f64)> =
+        (colors && !multi && ramp.is_some()).then(|| {
+            let mut vals: Vec<Option<f64>> = vec![None; wcells * hcells];
+            // The busiest cell is the density ramp's high end; one point is its
+            // low end, so an empty grid still spans 1..=1.
+            let mut maxcount = 1.0f64;
+            for r in &xy.rows {
+                let Some(y) = r.ys.first().copied().flatten() else {
+                    continue;
+                };
+                let (px, py) = map(r.x, y, &canvases[0]);
+                if px < 0 || py < 0 {
+                    continue;
+                }
+                let (cx, cy) = (px as usize / 2, py as usize / 4);
+                if cx >= wcells || cy >= hcells {
+                    continue;
+                }
+                let idx = cy * wcells + cx;
+                if has_by {
+                    // A cell keeps the last value it was given; a point whose
+                    // colour cell was not numeric leaves that alone rather than
+                    // blanking it.
+                    if r.color_by.is_some() {
+                        vals[idx] = r.color_by;
+                    }
+                } else {
+                    let n = vals[idx].unwrap_or(0.0) + 1.0;
+                    vals[idx] = Some(n);
+                    maxcount = maxcount.max(n);
+                }
+            }
+            // A colour-by column wins over the density: the ramp then spans the
+            // column's own range, over every plotted point.
+            match has_by {
+                true => {
+                    let by: Vec<f64> = xy.rows.iter().filter_map(|r| r.color_by).collect();
+                    let (lo, hi) = minmax(&by).unwrap_or((0.0, 0.0));
+                    (vals, lo, hi)
+                }
+                false => (vals, 1.0, maxcount),
+            }
+        });
     let mut out = String::new();
     // An evenly-spaced (category) x axis is flagged in the title, not the tail.
     out.push_str(&frame.title);
@@ -639,9 +711,19 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
             match hit {
                 None => out.push(' '),
                 Some((si, c)) => {
-                    let ch = (frame.glyphs.braille)(c.bits[cy * wcells + cx]).to_string();
+                    let idx = cy * wcells + cx;
+                    let ch = (frame.glyphs.braille)(c.bits[idx]).to_string();
                     if colors && multi {
                         out.push_str(&series_style(si).paint(&ch));
+                    } else if let Some((vals, lo, hi)) = &cell {
+                        // Only a cell holding a data point has a colour value —
+                        // a colour-by one or a density count. A cell lit by a
+                        // connecting segment alone has neither, so it is not
+                        // the ramp's low end: it keeps the plain glyph.
+                        match vals[idx] {
+                            Some(v) => out.push_str(&paint_with(ramp, colors, v, *lo, *hi, &ch)),
+                            None => out.push_str(&ch),
+                        }
                     } else {
                         out.push_str(&ch);
                     }
@@ -751,6 +833,7 @@ mod tests {
             connect,
             xrange: None,
             yrange: None,
+            color_by: None,
         }
     }
 
@@ -989,6 +1072,72 @@ mod tests {
         );
         assert!(s.contains("no numeric points to plot"));
         assert!(s.contains("skipped 5"));
+    }
+
+    #[test]
+    fn render_xy_paints_one_series_by_density_then_by_colour_by() {
+        let blue = "\x1b[38;2;0;0;238m";
+        let red = "\x1b[38;2;205;0;0m";
+        let mut f = Frame::new("y vs x".to_string(), 12, 4, true);
+        f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let row = |x: f64, y: f64, c: Option<f64>| XyRow {
+            xcell: format_num(x),
+            x,
+            ys: vec![Some(y)],
+            color_by: c,
+        };
+        // Two points share the bottom-left cell; a third sits alone top-right.
+        let data = |c: [Option<f64>; 3], by: Option<&str>| XyData {
+            xname: "x".to_string(),
+            names: vec!["y".to_string()],
+            rows: vec![
+                row(0.0, 0.0, c[0]),
+                row(0.0, 0.0, c[1]),
+                row(1.0, 1.0, c[2]),
+            ],
+            xaxis: XAxis::Numeric,
+            connect: false,
+            xrange: None,
+            yrange: None,
+            color_by: by.map(str::to_string),
+        };
+        let plain = [None, None, None];
+        // Density: the busy cell is the ramp's high end, the lone one its low
+        // end. The top-right cell is drawn first, so blue comes before red.
+        let dense = render_xy(&f, &data(plain, None), false);
+        assert!(dense.contains(blue) && dense.contains(red), "{dense}");
+        assert!(dense.find(blue) < dense.find(red), "{dense}");
+        // A colour-by value wins over the count: the busy cell now holds the
+        // low value, so the two colours swap places.
+        let vals = [Some(0.0), Some(0.0), Some(5.0)];
+        let by = render_xy(&f, &data(vals, Some("z")), false);
+        assert!(by.contains(blue) && by.contains(red), "{by}");
+        assert!(by.find(red) < by.find(blue), "{by}");
+        // `-c` alone colours: with no ramp it falls back to the default one.
+        f.ramp = None;
+        let bare = render_xy(&f, &data(vals, Some("z")), false);
+        assert!(bare.contains("\x1b[38;2;"), "{bare}");
+        // A colour column the chart found no number in is still a colour-by
+        // chart: nothing is painted, and it never falls back to density.
+        assert!(!render_xy(&f, &data(plain, Some("z")), false).contains('\x1b'));
+        // No ramp and no colour-by: no paint.
+        assert!(!render_xy(&f, &data(plain, None), false).contains('\x1b'));
+    }
+
+    #[test]
+    fn render_xy_density_leaves_the_line_between_points_plain() {
+        // A `line` chart's connecting segments light cells that hold no data
+        // point; density counts points, so those cells stay unpainted.
+        let mut f = Frame::new("y vs x".to_string(), 24, 4, true);
+        f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let pts = vec![vec![(0.0, 0.0), (9.0, 9.0)]];
+        let s = render_xy(
+            &f,
+            &xy_data(&["y".into()], &pts, XAxis::Numeric, true),
+            true,
+        );
+        // Two points, so two painted cells — the rest of the diagonal is plain.
+        assert_eq!(s.matches("\x1b[38;2;").count(), 2, "{s}");
     }
 
     #[test]

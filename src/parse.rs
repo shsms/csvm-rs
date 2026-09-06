@@ -697,6 +697,10 @@ impl<'a> Builder<'a> {
                     crate::color::parse_ramp(&val).map_err(|e| err(format!("-r/--ramp: {e}")))?,
                 );
                 s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["-c", "--color-by"]) {
+                let (val, tail) = v?;
+                opts.color_by = Some(ColRef::new(val));
+                s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-y", "--yrange"]) {
                 let (val, tail) = v?;
                 opts.yrange = Some(parse_range(&val, "-y/--yrange")?);
@@ -717,7 +721,7 @@ impl<'a> Builder<'a> {
         }
         let cols = split_list(&positional);
         check_graph_arity(kind, kind_word, cols.len())?;
-        check_graph_flags(kind, kind_word, &opts)?;
+        check_graph_flags(kind, kind_word, &opts, cols.len())?;
         self.graph = Some(GraphSpec {
             kind,
             cols: cols.into_iter().map(ColRef::new).collect(),
@@ -1542,10 +1546,32 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
     Err(err(format!("graph {word} expects {want}, got {n}")))
 }
 
-/// Reject a flag the chart kind has no use for (a `hist` bins along x only, and
-/// `bar`/`spark` have no x axis to range), or a range a log axis cannot span.
-fn check_graph_flags(kind: GraphKind, word: &str, opts: &GraphOpts) -> Result<(), Error> {
+/// Reject a flag the chart kind has no use for (a `hist` bins along x only,
+/// `bar`/`spark` have no x axis to range, and only a scatter/line has points to
+/// colour), or a range a log axis cannot span. `ncols` is the column count, so
+/// the one-y-series flags can be checked here too.
+fn check_graph_flags(
+    kind: GraphKind,
+    word: &str,
+    opts: &GraphOpts,
+    ncols: usize,
+) -> Result<(), Error> {
     let no = |flag: &str| Err(err(format!("graph {word} does not take {flag}")));
+    let xy = matches!(kind, GraphKind::Scatter | GraphKind::Line);
+    if opts.color_by.is_some() && !xy {
+        return no("-c/--color-by");
+    }
+    // Both colourings paint one value per point, and a cell shared by several
+    // series has no single value to paint, so they need one y series.
+    if xy && ncols > 2 {
+        let one = |flag: &str| Err(err(format!("graph {word} takes {flag} with one y series")));
+        if opts.color_by.is_some() {
+            return one("-c/--color-by");
+        }
+        if opts.ramp.is_some() {
+            return one("-r/--ramp");
+        }
+    }
     if opts.xrange.is_some()
         && !matches!(kind, GraphKind::Hist | GraphKind::Scatter | GraphKind::Line)
     {
@@ -2924,6 +2950,18 @@ mod tests {
             "{err}"
         );
         assert!(parse("graph spark a -l -y 1:9").is_ok());
+    }
+
+    #[test]
+    fn graph_color_by_needs_one_xy_series() {
+        let g = parse("graph scatter x y -c z -r blue:red")
+            .unwrap()
+            .graph
+            .unwrap();
+        assert_eq!(g.opts.color_by.as_ref().map(|c| c.name.as_str()), Some("z"));
+        assert!(parse("graph scatter x y1,y2 -c z").is_err());
+        assert!(parse("graph hist x -c z").is_err());
+        assert!(parse("graph line x y1,y2 -r blue:red").is_err());
     }
 
     #[test]

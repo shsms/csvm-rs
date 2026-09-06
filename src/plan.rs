@@ -838,6 +838,10 @@ pub struct GraphOpts {
     /// rows and spark cells by value. Terminal colour needs `--color`; SVG
     /// always has it.
     pub ramp: Option<Ramp>,
+    /// The column whose value colours each point of a one-series scatter/line
+    /// (`-c`/`--color-by`), mapped through the ramp. Without it a terminal
+    /// scatter/line ramps by point density instead.
+    pub color_by: Option<ColRef>,
 }
 
 impl Default for GraphOpts {
@@ -857,6 +861,7 @@ impl Default for GraphOpts {
             log: false,
             data: false,
             ramp: None,
+            color_by: None,
         }
     }
 }
@@ -1735,6 +1740,10 @@ impl Plan {
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
             for c in &mut g.cols {
+                c.resolve(&header)?;
+            }
+            // The colour-by column is charted too, so it resolves the same way.
+            if let Some(c) = &mut g.opts.color_by {
                 c.resolve(&header)?;
             }
         }

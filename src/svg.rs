@@ -34,6 +34,21 @@ pub struct Labels<'a> {
     pub y: Option<&'a str>,
 }
 
+/// How an xy chart's points are coloured by `-c/--color-by`: the ramp to map
+/// through and one value per point of the single plotted series, in the order
+/// [`crate::chart::XyData::series`] yields them (a point whose colour cell was
+/// not numeric has `None` and keeps the plain series colour). Empty when there
+/// is no `--color-by` — and there is no density counterpart here, since density
+/// counts points per *braille cell*, which only the terminal has.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Points<'a> {
+    /// The `-r/--ramp` gradient; `None` falls back to [`Ramp::default`], so
+    /// `--color-by` colours the points with no ramp given.
+    pub ramp: Option<Ramp>,
+    /// One colour-by value per plotted point, or empty for no `--color-by`.
+    pub by: &'a [Option<f64>],
+}
+
 /// The series colour for index `i` as an SVG hex string, from the shared
 /// terminal palette ([`crate::graph::series_rgb`]) so the two can't drift.
 fn series_hex(i: usize) -> String {
@@ -308,6 +323,12 @@ pub fn spark(
 /// against a shared x. Series get distinct colours and a legend. The ys and the
 /// y range are real; `axes.log` maps them onto the value axis as they are
 /// drawn, and the labels stay the real bounds.
+///
+/// `points` carries the `-c/--color-by` values: each circle is then filled with
+/// its own value's ramp colour. The terminal renderer also ramps by point
+/// *density*, which has no meaning here — density is a count of points per
+/// braille cell, and an SVG has no cells — so `-r` alone leaves an SVG's points
+/// in the plain series colour.
 #[allow(clippy::too_many_arguments)]
 pub fn xy_chart(
     title: &str,
@@ -318,6 +339,7 @@ pub fn xy_chart(
     xaxis: XAxis,
     axes: Axes,
     labels: Labels,
+    points: Points,
 ) -> String {
     let mut xlo = f64::INFINITY;
     let mut xhi = f64::NEG_INFINITY;
@@ -347,11 +369,19 @@ pub fn xy_chart(
         (px, py)
     };
 
+    // `--color-by` spans the column's own range; with no `-r` the ramp is the
+    // default one, so `-c` alone still colours.
+    let ramp = points.ramp.unwrap_or_default();
+    let vals: Vec<f64> = points.by.iter().filter_map(|&v| v).collect();
+    let (clo, chi) = crate::graph::minmax(&vals).unwrap_or((0.0, 0.0));
+
     let mut body = axis_lines();
     body.push_str(&ylabels(ylo, yhi));
     body.push_str(&xlabels(&xaxis, xlo, xhi));
     for (si, pts) in series.iter().enumerate() {
         let color = series_hex(si);
+        // The colour-by values describe the single plotted series.
+        let by: &[Option<f64>] = if si == 0 { points.by } else { &[] };
         if connect {
             let line: Vec<String> = pts
                 .iter()
@@ -365,10 +395,14 @@ pub fn xy_chart(
                 line.join(" ")
             ));
         } else {
-            for &(x, y) in pts {
+            for (pi, &(x, y)) in pts.iter().enumerate() {
                 let (px, py) = map(x, y);
+                let fill = match by.get(pi).copied().flatten() {
+                    Some(v) => fill_at(Some(ramp), v, clo, chi),
+                    None => color.clone(),
+                };
                 body.push_str(&format!(
-                    "<circle cx=\"{px:.2}\" cy=\"{py:.2}\" r=\"2\" fill=\"{color}\"/>\n"
+                    "<circle cx=\"{px:.2}\" cy=\"{py:.2}\" r=\"2\" fill=\"{fill}\"/>\n"
                 ));
             }
         }
@@ -431,20 +465,33 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             labels,
         ),
         ChartData::Spark(s) => spark(&frame.title, &s.values, s.range, frame.log, &note, labels),
-        ChartData::Xy(xy) => xy_chart(
-            &frame.title,
-            &xy.names,
-            &xy.series(),
-            xy.connect,
-            &note,
-            xy.xaxis.clone(),
-            Axes {
-                x: xy.xrange,
-                y: xy.yrange,
-                log: frame.log,
-            },
-            labels,
-        ),
+        ChartData::Xy(xy) => {
+            // Only a `-c/--color-by` chart colours its points, and that is the
+            // plan's answer, not the data's — the terminal renderer branches on
+            // the same flag, so the two cannot disagree.
+            let by = match xy.color_by {
+                Some(_) => xy.color_values(),
+                None => Vec::new(),
+            };
+            xy_chart(
+                &frame.title,
+                &xy.names,
+                &xy.series(),
+                xy.connect,
+                &note,
+                xy.xaxis.clone(),
+                Axes {
+                    x: xy.xrange,
+                    y: xy.yrange,
+                    log: frame.log,
+                },
+                labels,
+                Points {
+                    ramp: frame.ramp,
+                    by: &by,
+                },
+            )
+        }
     }
 }
 
@@ -524,7 +571,8 @@ mod tests {
                 "",
                 XAxis::Numeric,
                 Axes::default(),
-                Labels::default()
+                Labels::default(),
+                Points::default()
             )
             .contains("<circle")
         );
@@ -537,7 +585,8 @@ mod tests {
                 "",
                 XAxis::Numeric,
                 Axes::default(),
-                Labels::default()
+                Labels::default(),
+                Points::default()
             )
             .contains("<polyline")
         );
@@ -556,6 +605,7 @@ mod tests {
             XAxis::Numeric,
             Axes::default(),
             Labels::default(),
+            Points::default(),
         );
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
@@ -575,6 +625,7 @@ mod tests {
             ends,
             Axes::default(),
             Labels::default(),
+            Points::default(),
         );
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
@@ -605,6 +656,7 @@ mod tests {
                 ..Axes::default()
             },
             Labels::default(),
+            Points::default(),
         );
         assert!(s.contains(">100</text>"), "{s}");
     }

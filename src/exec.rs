@@ -3089,6 +3089,72 @@ mod tests {
     }
 
     #[test]
+    fn graph_scatter_ramps_by_density_or_by_a_column() {
+        let dense = render_str("graph scatter id countZ -r blue:red", INPUT, true);
+        assert!(dense.contains("\x1b[38;2;"), "{dense}");
+        let by = render_str(
+            "add countA = countZ + id | graph scatter id countZ -c countA -r blue:red",
+            INPUT,
+            true,
+        );
+        assert!(by.contains("\x1b[38;2;"), "{by}");
+        let svg = render_str(
+            "add countA = countZ + id | graph scatter id countZ -c countA -r blue:red -S",
+            INPUT,
+            false,
+        );
+        assert!(svg.matches("<circle").count() == 4, "{svg}");
+        assert!(
+            svg.contains("fill=\"#0000ee\"") || svg.contains("fill=\"#cd0000\""),
+            "{svg}"
+        );
+        // `-c` alone colours too: it implies the default ramp.
+        let bare = render_str(
+            "add countA = countZ + id | graph scatter id countZ -c countA",
+            INPUT,
+            true,
+        );
+        assert!(bare.contains("\x1b[38;2;"), "{bare}");
+        // An unknown colour-by column fails at resolve.
+        let mut plan = parse("graph scatter id countZ -c nope").unwrap();
+        assert!(plan.resolve(&["id".into(), "countZ".into()]).is_err());
+    }
+
+    #[test]
+    fn graph_color_by_counts_the_colour_cells_of_the_plotted_points() {
+        // The count is about the chart, so it is taken once the range has
+        // thrown rows away: only x=3 is plotted, and only its colour cell
+        // ("w") was unreadable — the "5" and "q" rows were never drawn.
+        let input = "x,y,c\n1,1,5\n2,2,q\n3,3,w\n";
+        let out = render_str("graph scatter x y -c c -x 3:4", input, false);
+        assert!(out.contains("points=1"), "{out}");
+        assert!(out.contains("(1 non-numeric colour cells)"), "{out}");
+        // A log axis drops rows the same way, and the count follows it too:
+        // only y=3 survives, with a readable colour.
+        let input = "x,y,c\n1,0,q\n2,3,7\n";
+        let out = render_str("graph scatter x y -c c -l", input, false);
+        assert!(!out.contains("colour cells"), "{out}");
+    }
+
+    #[test]
+    fn graph_color_by_without_numbers_is_loud_not_a_density_chart() {
+        // fieldA is all text, so no point gets a colour — but the chart stays a
+        // colour-by chart (it must not quietly ramp by density instead), and
+        // says how many colour cells it could not read.
+        let out = render_str("graph scatter id countZ -c fieldA -r blue:red", INPUT, true);
+        assert!(!out.contains("\x1b[38;2;"), "{out}");
+        assert!(out.contains("(4 non-numeric colour cells)"), "{out}");
+        // The SVG agrees: plain series-coloured points, and the same note.
+        let svg = render_str(
+            "graph scatter id countZ -c fieldA -r blue:red -S",
+            INPUT,
+            false,
+        );
+        assert_eq!(svg.matches("fill=\"#4fc3f7\"").count(), 4, "{svg}");
+        assert!(svg.contains("4 non-numeric colour cells"), "{svg}");
+    }
+
+    #[test]
     fn graph_spark_is_a_single_line() {
         let out = render_str("graph spark countZ", INPUT, false);
         assert!(out.starts_with("countZ\n"), "{out}");

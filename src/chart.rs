@@ -281,9 +281,26 @@ pub struct XyData {
     /// like the ys `yrange` bounds.
     pub xrange: AxisRange,
     pub yrange: AxisRange,
+    /// The `-c/--color-by` column's name, when the script asked for one. This
+    /// is the *plan's* answer, not the data's: a colour column whose every cell
+    /// was non-numeric still makes this a colour-by chart (drawn with no
+    /// colour, and counted in the notes), so the renderers never quietly fall
+    /// back to density.
+    pub color_by: Option<String>,
 }
 
 impl XyData {
+    /// The `-c/--color-by` value of every plotted point of the first series, in
+    /// the same order as `series()[0]`. `--color-by` needs a single y series
+    /// (the parser says so), so this is the whole per-point colouring.
+    pub fn color_values(&self) -> Vec<Option<f64>> {
+        self.rows
+            .iter()
+            .filter(|r| r.ys.first().is_some_and(Option::is_some))
+            .map(|r| r.color_by)
+            .collect()
+    }
+
     /// The plotted points per y-series.
     pub fn series(&self) -> Vec<Vec<(f64, f64)>> {
         let mut out = vec![Vec::new(); self.names.len()];
@@ -391,6 +408,13 @@ fn drop_non_positive(values: Vec<f64>) -> (Vec<f64>, u64) {
     let kept: Vec<f64> = values.into_iter().filter(|v| *v > 0.0).collect();
     let dropped = (before - kept.len()) as u64;
     (kept, dropped)
+}
+
+/// The note for `n` `-c/--color-by` cells that held no number, or none. Those
+/// points are still plotted, just left uncoloured — said out loud, like every
+/// other cell a chart could not use.
+fn color_note(n: u64) -> Option<String> {
+    (n > 0).then(|| format!("{n} non-numeric colour cells"))
 }
 
 /// The note for `n` values dropped as not positive under `--log`, or none.
@@ -525,12 +549,18 @@ pub(crate) fn bucket(values: &[f64], cols: usize) -> Vec<f64> {
 ///   plot at true epoch positions and label the axis with formatted dates;
 /// - **row-index fallback** — otherwise (e.g. categories) plot against the
 ///   1-based row ordinal and label the axis with the first/last raw cells.
+///
+/// `color_pos` is the `-c/--color-by` column: each row keeps its value there,
+/// for the renderers to map onto the ramp. A non-numeric colour cell simply
+/// leaves that point uncoloured (it is not a reason to drop the point); the
+/// caller counts those once the clipping is done, from the points it kept.
 fn collect_xy(
     text: &str,
     xname: &str,
     xpos: usize,
     names: &[String],
     ypos: &[usize],
+    color_pos: Option<usize>,
 ) -> (XyData, u64) {
     // Every data row becomes a row of the chart straight away, with the numeric
     // reading of its x cell as a provisional position (`NaN` where that cell
@@ -549,7 +579,7 @@ fn collect_xy(
                 .unwrap_or_default(),
             x: x.unwrap_or(f64::NAN),
             ys: ypos.iter().map(|&p| cell_num(r, p)).collect(),
-            color_by: None,
+            color_by: color_pos.and_then(|p| cell_num(r, p)),
         });
     });
 
@@ -602,9 +632,21 @@ fn collect_xy(
             connect: false,
             xrange: None,
             yrange: None,
+            color_by: None,
         },
         skipped,
     )
+}
+
+/// How many of the plotted points have no `-c/--color-by` value, or 0 when the
+/// chart was never asked for one. Only a *drawn* point can be missing a colour,
+/// so this is asked after the ranges and the log axis have taken their rows —
+/// a note about colour has to count the same points the chart does.
+fn color_drops(xy: &XyData) -> u64 {
+    match xy.color_by {
+        Some(_) => xy.color_values().iter().filter(|c| c.is_none()).count() as u64,
+        None => 0,
+    }
 }
 
 /// The default chart title: the value column, or `y vs x` for one series.
@@ -671,7 +713,15 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
             let names: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
-            let (mut xy, skipped) = collect_xy(text, &g.cols[0].name, g.cols[0].pos, &names, &ypos);
+            let (mut xy, skipped) = collect_xy(
+                text,
+                &g.cols[0].name,
+                g.cols[0].pos,
+                &names,
+                &ypos,
+                g.opts.color_by.as_ref().map(|c| c.pos),
+            );
+            xy.color_by = g.opts.color_by.as_ref().map(|c| c.name.clone());
             xy.connect = g.kind == GraphKind::Line;
             (xy.xrange, xy.yrange) = (g.opts.xrange, g.opts.yrange);
             // The ranges are in real values, so they clip before the log.
@@ -687,6 +737,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
                 notes.push("even row spacing".to_string());
             }
             notes.extend(skipped_note(skipped));
+            notes.extend(color_note(color_drops(&xy)));
             notes.extend(clipped_note(clipped));
             notes.extend(dropped_note(dropped));
             ChartData::Xy(xy)
@@ -908,6 +959,7 @@ mod tests {
             connect: false,
             xrange: None,
             yrange: None,
+            color_by: None,
         };
         assert_eq!(to_csv(&ChartData::Xy(xy)), "t,y\n2024-01-01,2\n");
     }
@@ -945,6 +997,7 @@ mod tests {
             connect: false,
             xrange: None,
             yrange: None,
+            color_by: None,
         };
         assert_eq!(to_csv(&ChartData::Xy(xy)), "x,y\n1,5000000000\n");
     }
@@ -972,6 +1025,7 @@ mod tests {
             connect: false,
             xrange: None,
             yrange: None,
+            color_by: None,
         };
         assert_eq!(
             d.series(),
