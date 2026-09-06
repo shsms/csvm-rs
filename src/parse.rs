@@ -626,7 +626,7 @@ impl<'a> Builder<'a> {
     /// `graph KIND COLS [-b N] [-s F] [-t T] [-S] [-W N] [-H N]` — a
     /// terminal-chart sink. Draws from the columns reaching it instead of
     /// emitting CSV, so it must be the last command. `hist COL`, `spark COL`,
-    /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`.
+    /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`, `heatmap X Y`.
     fn parse_graph(&mut self, rest: &str) -> Result<(), Error> {
         let (kind_word, rest) = split_first_word(rest.trim());
         let kind = match kind_word {
@@ -635,10 +635,12 @@ impl<'a> Builder<'a> {
             "spark" | "sparkline" => GraphKind::Spark,
             "scatter" => GraphKind::Scatter,
             "line" => GraphKind::Line,
+            "heatmap" | "heat" => GraphKind::Heatmap,
             "" => return Err(err("graph expects a chart type, e.g. graph hist amount")),
             other => {
                 return Err(err(format!(
-                    "graph: unknown chart type `{other}` (try: hist, bar, spark, scatter, line)"
+                    "graph: unknown chart type `{other}` \
+                     (try: hist, bar, spark, scatter, line, heatmap)"
                 )));
             }
         };
@@ -1595,8 +1597,10 @@ fn check_graph_flags(
         return no("-y/--yrange");
     }
     // A log axis has no room for a bound at or below zero: the range is the
-    // axis, and log10 of a non-positive number does not exist.
-    if opts.log && opts.yrange.is_some_and(|(lo, _)| lo <= 0.0) {
+    // axis, and log10 of a non-positive number does not exist. A heatmap is the
+    // exception — both of its own axes are binned, so its `-l` is the *count*
+    // axis and leaves the y range alone.
+    if opts.log && kind != GraphKind::Heatmap && opts.yrange.is_some_and(|(lo, _)| lo <= 0.0) {
         return Err(err(format!(
             "graph {word}: -l/--log needs a positive -y range"
         )));
@@ -2964,6 +2968,9 @@ mod tests {
             "{err}"
         );
         assert!(parse("graph spark a -l -y 1:9").is_ok());
+        // A heatmap's `-l` is its *count* axis — both of its own axes are
+        // binned — so its y range is free to run below zero.
+        assert!(parse("graph heatmap a b -l -y -3:3").is_ok());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! [`crate::chart`] model the terminal renderers do, as a standalone `<svg>`
 //! document.
 
-use crate::chart::{AxisRange, BarRow, ChartData, Frame, bar_value, hist_len, value_pos};
+use crate::chart::{AxisRange, BarRow, ChartData, Frame, HeatData, bar_value, hist_len, value_pos};
 use crate::color::{Ramp, rgb_hex};
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
@@ -478,6 +478,45 @@ pub fn xy_chart(
     header(title, &body, note, labels)
 }
 
+/// Heatmap: one filled rect per non-empty cell of the grid, on the same axes
+/// and labels as [`xy_chart`]. The fill runs along `ramp` (`-r/--ramp`, else
+/// the default one) from a count of one to the busiest cell, as the terminal
+/// chart paints it; `log` puts that count axis on a log10 scale. An empty cell
+/// draws nothing at all, so the page carries only the density that is there.
+pub fn heat(
+    title: &str,
+    h: &HeatData,
+    log: bool,
+    ramp: Option<Ramp>,
+    note: &str,
+    labels: Labels,
+) -> String {
+    let mut body = axis_lines();
+    body.push_str(&ylabels(h.ylo, h.yhi));
+    body.push_str(&xlabels(&h.xaxis, h.xlo, h.xhi));
+    let max = h.counts.iter().copied().max().unwrap_or(0);
+    let (lo, hi) = (hist_len(1, log), hist_len(max, log));
+    let (cw, ch) = (pw() / h.cols as f64, ph() / h.rows as f64);
+    // A heatmap has no other use for a colour, so it always has a ramp.
+    let ramp = Some(ramp.unwrap_or_default());
+    for (i, &c) in h.counts.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        // Row 0 of the grid is the lowest y band, which is the bottom of the
+        // plot area.
+        let (cx, cy) = (i % h.cols, i / h.cols);
+        let x = L + cx as f64 * cw;
+        let y = T + ph() - (cy + 1) as f64 * ch;
+        body.push_str(&format!(
+            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{cw:.2}\" height=\"{ch:.2}\" \
+fill=\"{fill}\"/>\n",
+            fill = fill_at(ramp, hist_len(c, log), lo, hi),
+        ));
+    }
+    header(title, &body, note, labels)
+}
+
 /// Emit `data` as a standalone SVG document, using `frame`'s title and notes.
 /// The per-kind emitters above carry the drawing; this picks the one that fits.
 pub fn render(frame: &Frame, data: &ChartData) -> String {
@@ -519,7 +558,7 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             labels,
         ),
         ChartData::Spark(s) => spark(&frame.title, &s.values, s.range, frame.log, &note, labels),
-        ChartData::Heat(_) => header(&frame.title, "", &note, labels),
+        ChartData::Heat(h) => heat(&frame.title, h, frame.log, frame.ramp, &note, labels),
         ChartData::Xy(xy) => {
             // Only a `-c/--color-by` chart colours its points, and that is the
             // plan's answer, not the data's — the terminal renderer branches on
@@ -816,6 +855,33 @@ mod tests {
         );
         assert!(s.contains(">b (3)</text>"), "{s}");
         assert_eq!(s.matches("width=\"0.00\"").count(), 1, "{s}");
+    }
+
+    #[test]
+    fn heat_emits_a_rect_per_non_empty_cell() {
+        let h = crate::chart::HeatData {
+            xname: "x".to_string(),
+            yname: "y".to_string(),
+            xlo: 0.0,
+            xhi: 1.0,
+            ylo: 0.0,
+            yhi: 1.0,
+            cols: 2,
+            rows: 2,
+            counts: vec![0, 1, 0, 4],
+            total: 5,
+            xaxis: XAxis::Numeric,
+        };
+        let ramp = crate::color::parse_ramp("blue:red").unwrap();
+        let s = heat("h", &h, false, Some(ramp), "", Labels::default());
+        // The background plus one rect per non-empty cell — an empty cell is
+        // not drawn at all.
+        assert_eq!(s.matches("<rect").count(), 1 + 2, "{s}");
+        // The ramp runs from a count of 1 to the busiest cell.
+        assert!(
+            s.contains("fill=\"#0000ee\"") && s.contains("fill=\"#cd0000\""),
+            "{s}"
+        );
     }
 
     #[test]

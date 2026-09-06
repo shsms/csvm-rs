@@ -3336,6 +3336,72 @@ mod tests {
     }
 
     #[test]
+    fn graph_heatmap_draws_a_shaded_grid() {
+        let plain = render_str("graph heatmap id countZ -b 4", INPUT, false);
+        assert!(plain.starts_with("countZ vs id\n"), "{plain}");
+        // Every point lands in a cell of its own, so the busiest cell holds
+        // one: no spread, and each drawn cell takes the lightest shade — what
+        // the ramp paints such a grid when colour is on.
+        assert!(
+            plain.contains('\u{2591}') && plain.contains("points=4"),
+            "{plain}"
+        );
+        assert!(!plain.contains('\u{2588}'), "{plain}");
+        let painted = render_str("graph heatmap id countZ -b 4", INPUT, true);
+        assert!(painted.contains("\x1b[38;2;"), "{painted}");
+        let data = render_str("graph heatmap id countZ -b 2 -D", INPUT, false);
+        assert!(data.starts_with("id,countZ,count\n"), "{data}");
+        // id 1..4 across two x bands and countZ 5,0,0,9 across two y bands:
+        // (1,5) is low x / high y, (2,0) low x / low y, (3,0) high x / low y
+        // and (4,9) high x / high y — one point in each of the four cells.
+        assert_eq!(data.lines().count(), 1 + 4, "{data}");
+        let svg = render_str("graph heatmap id countZ -b 2 -S", INPUT, false);
+        assert_eq!(svg.matches("<rect").count(), 1 + 4, "{svg}");
+        assert!(parse("graph heatmap a").is_err());
+        assert!(parse("graph heatmap a b -c d").is_err());
+    }
+
+    #[test]
+    fn graph_heatmap_bins_over_the_axis_range_not_the_points() {
+        // `-x` *is* the x axis, so the bands cover 0..100 whatever the ids
+        // are: the low corner is the range's 0, not id's own minimum of 1.
+        let data = render_str("graph heatmap id countZ -b 2 -x 0:100 -D", INPUT, false);
+        assert_eq!(data, "id,countZ,count\n0,0,2\n0,4.5,2\n", "{data}");
+        // With a point in the far band the second corner shows the range's
+        // own step of 50 as well.
+        let data = render_str(
+            "graph heatmap x y -b 2 -x 0:100 -D",
+            "x,y\n1,1\n60,2\n",
+            false,
+        );
+        assert_eq!(data, "x,y,count\n0,1,1\n50,1.5,1\n", "{data}");
+    }
+
+    #[test]
+    fn graph_heatmap_bins_an_axis_too_wide_to_subtract() {
+        // -1e308..1e308 is a span an f64 cannot hold: every point used to land
+        // in column 0 and every cell's corner printed as NaN.
+        let out = render_str(
+            "graph heatmap x y -b 4 -D",
+            "x,y\n-1e308,1\n0,2\n1e308,3\n",
+            false,
+        );
+        let rows: Vec<Vec<f64>> = out
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').map(|c| c.parse::<f64>().unwrap()).collect())
+            .collect();
+        // One point per cell, three cells, all corners real numbers.
+        assert_eq!(rows.len(), 3, "{out}");
+        assert!(rows.iter().flatten().all(|v| v.is_finite()), "{out}");
+        assert_eq!(
+            rows.iter().map(|r| r[0]).collect::<Vec<f64>>(),
+            [-1e308, 0.0, 5e307],
+            "{out}"
+        );
+    }
+
+    #[test]
     fn color_rule_for_a_dropped_column_is_skipped_not_fatal() {
         // A colour rule on countZ, then countZ dropped by `cols`: the rule is
         // inert (its column isn't in the output), so the run succeeds.

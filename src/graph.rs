@@ -1,11 +1,12 @@
 //! Terminal-native charts (the `graph` sink). Draws a [`crate::chart`] model
 //! with Unicode block and braille glyphs straight to the terminal — no plotting
 //! dependency, matching csvm's point-it-at-a-CSV-and-get-an-answer flow.
-//! Histogram, horizontal bar, sparkline, and braille scatter/line
-//! (multi-series, coloured).
+//! Histogram, horizontal bar, sparkline, braille scatter/line (multi-series,
+//! coloured) and shaded heatmap.
 
 use crate::chart::{
-    BarData, ChartData, Frame, Glyphs, HistData, SparkData, XyData, bar_value, hist_len, value_pos,
+    BarData, ChartData, Frame, Glyphs, HeatData, HistData, SparkData, XyData, bar_value, hist_len,
+    value_pos,
 };
 use crate::color::{Ramp, Rgb, Style};
 use crate::field::format_num;
@@ -59,7 +60,8 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         ChartData::Spark(s) => render_spark(frame, s),
         ChartData::Xy(xy) if xy.rows.is_empty() => empty_line(frame, "no numeric points to plot"),
         ChartData::Xy(xy) => render_xy(frame, xy, xy.connect),
-        ChartData::Heat(_) => empty_line(frame, "no numeric points to plot"),
+        ChartData::Heat(h) if h.total == 0 => empty_line(frame, "no numeric points to plot"),
+        ChartData::Heat(h) => render_heat(frame, h),
     }
 }
 
@@ -812,6 +814,101 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     out
 }
 
+/// The shade level of a cell holding `count` points, against the busiest cell's
+/// `max`: 0 (blank) for an empty cell, then 1..=4 over the four visible shades.
+/// `log` scales by the count's log, the same axis `hist_len` puts a histogram's
+/// bars on, so a few crowded cells don't flatten every other one to one shade.
+/// A grid whose busiest cell holds a single point has no spread to show, so
+/// every cell it does hold gets the lightest visible shade — the low end of the
+/// count axis, which is what the ramp paints such a grid ([`Ramp::at`] with
+/// hi == lo), so the chart reads the same with colour and without.
+fn shade_level(count: u64, max: u64, log: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let (lo, hi) = (hist_len(1, log), hist_len(max, log));
+    if hi <= lo {
+        return 1;
+    }
+    (1 + ((hist_len(count, log) - lo) / (hi - lo) * 3.0).round() as usize).min(4)
+}
+
+/// Draw a heatmap: the point counts of a `cols`×`rows` grid, in the same frame
+/// as [`render_xy`] — a y-bound gutter, the axis rule, and graduated x labels
+/// from `h.xaxis`. The grid *is* the canvas, so the chart is as big as the
+/// collector made it (`-b` gives an exact cell count).
+///
+/// A cell is shaded by how many points landed in it: with terminal colour on,
+/// the full block painted along the ramp (the frame's `-r/--ramp`, else the
+/// default one — a heatmap has no other use for a colour); with colour off, one
+/// of the five block shades, blank for a cell holding nothing. `-l/--log` is
+/// the *count* axis here, not the y axis: both dimensions are binned, so the
+/// log belongs to the density.
+fn render_heat(frame: &Frame, h: &HeatData) -> String {
+    let yhi_s = format_num(h.yhi);
+    let ylo_s = format_num(h.ylo);
+    let gutter = gutter_width(h.ylo, h.yhi);
+    let max = h.counts.iter().copied().max().unwrap_or(0);
+    // The ramp spans one point to the busiest cell, on the count axis.
+    let ramp = frame.ramp.unwrap_or_default();
+    let (clo, chi) = (hist_len(1, frame.log), hist_len(max, frame.log));
+
+    let mut out = String::new();
+    // An evenly-spaced (category) x axis is flagged in the title, as in an xy
+    // chart, since it distorts spacing the same way.
+    out.push_str(&frame.title);
+    if frame.notes.iter().any(|n| n == "even row spacing") {
+        out.push_str("  (even row spacing)");
+    }
+    out.push('\n');
+    if let Some(y) = &frame.ylabel {
+        out.push_str(y);
+        out.push('\n');
+    }
+    // Row 0 of the grid is the lowest y band, so the rows print in reverse.
+    for row in (0..h.rows).rev() {
+        let label = if row == h.rows - 1 {
+            &yhi_s
+        } else if row == 0 {
+            &ylo_s
+        } else {
+            ""
+        };
+        out.push_str(&format!("{label:>gutter$} {}", frame.glyphs.axis_tick));
+        for col in 0..h.cols {
+            let count = h.counts[row * h.cols + col];
+            if frame.color && count > 0 {
+                let cell = frame.glyphs.full.to_string();
+                let at = hist_len(count, frame.log);
+                out.push_str(&paint_with(Some(ramp), true, at, clo, chi, &cell));
+            } else {
+                out.push(frame.glyphs.shades[shade_level(count, max, frame.log)]);
+            }
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "{:>gutter$} {}{}\n",
+        "",
+        frame.glyphs.axis_corner,
+        frame.glyphs.axis_h.to_string().repeat(h.cols)
+    ));
+    out.push_str(&format!(
+        "{:>gutter$}  {}\n",
+        "",
+        x_label_row(&h.xaxis, h.xlo, h.xhi, h.cols)
+    ));
+    if let Some(x) = &frame.xlabel {
+        let line = format!("{:>gutter$}  {:^wcells$}", "", x, wcells = h.cols);
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out.push_str(&format!("points={}", h.total));
+    out.push_str(&tail_notes(frame));
+    out.push('\n');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1051,6 +1148,78 @@ mod tests {
             true,
         );
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
+    }
+
+    /// A 2x2 heat grid over the unit square with the given row-major counts.
+    fn heat_data(counts: Vec<u64>) -> HeatData {
+        HeatData {
+            xname: "x".to_string(),
+            yname: "y".to_string(),
+            xlo: 0.0,
+            xhi: 1.0,
+            ylo: 0.0,
+            yhi: 1.0,
+            cols: 2,
+            rows: 2,
+            total: counts.iter().sum(),
+            counts,
+            xaxis: XAxis::Numeric,
+        }
+    }
+
+    #[test]
+    fn render_heat_shades_cells_by_their_count() {
+        // Counts 0, 1, 2 and 4 over a busiest cell of 4: an empty cell is
+        // blank and the rest climb the five shades.
+        let h = heat_data(vec![0, 1, 2, 4]);
+        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, false), &h);
+        assert!(s.starts_with("y vs x\n"), "{s}");
+        let rows: Vec<&str> = s.lines().filter(|l| l.contains('┤')).collect();
+        assert_eq!(rows.len(), 2, "{s}");
+        // The top row is the high y band, so it holds the second half of the
+        // counts (2 and 4); the bottom row holds 0 and 1.
+        assert!(rows[0].ends_with("▒█"), "{s}");
+        assert!(rows[1].ends_with(" ░"), "{s}");
+        assert!(s.contains('└') && s.contains("points=7"), "{s}");
+    }
+
+    #[test]
+    fn render_heat_shades_a_uniform_grid_at_the_low_end() {
+        // Every non-empty cell holds one point, so there is no spread to show.
+        // The ramp gives such a grid its low end (`Ramp::at` with hi == lo), so
+        // the shades must give it the lightest non-empty one — the same chart
+        // with and without colour.
+        let h = heat_data(vec![0, 1, 1, 1]);
+        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, false), &h);
+        let rows: Vec<&str> = s.lines().filter(|l| l.contains('┤')).collect();
+        assert!(rows[0].ends_with("░░"), "{s}");
+        assert!(rows[1].ends_with(" ░"), "{s}");
+        let mut f = Frame::new("y vs x".to_string(), 12, 2, true);
+        f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let colored = render_heat(&f, &heat_data(vec![0, 1, 1, 1]));
+        assert_eq!(
+            colored.matches("\x1b[38;2;0;0;238m").count(),
+            3,
+            "{colored}"
+        );
+    }
+
+    #[test]
+    fn render_heat_paints_the_ramp_when_colour_is_on() {
+        let mut f = Frame::new("y vs x".to_string(), 12, 2, true);
+        f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
+        let s = render_heat(&f, &heat_data(vec![0, 1, 2, 4]));
+        // One painted glyph per non-empty cell; the lightest is the ramp's low
+        // end and the busiest its high end.
+        assert_eq!(s.matches("\x1b[38;2;").count(), 3, "{s}");
+        assert!(
+            s.contains("\x1b[38;2;0;0;238m") && s.contains("\x1b[38;2;205;0;0m"),
+            "{s}"
+        );
+        // `-c/--color-by` is not a heatmap flag, so the ramp is the frame's or
+        // the default one — colour alone is enough to paint.
+        f.ramp = None;
+        assert!(render_heat(&f, &heat_data(vec![0, 1, 2, 4])).contains("\x1b[38;2;"));
     }
 
     #[test]
