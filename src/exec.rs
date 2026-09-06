@@ -1717,6 +1717,7 @@ fn render_graph<W: Write>(
     if g.opts.ascii {
         frame.glyphs = chart::Glyphs::ascii();
     }
+    frame.log = g.opts.log;
     let collected = chart::collect(text, g, width);
     frame.notes = collected.notes;
     let drawn = if g.opts.svg {
@@ -2983,6 +2984,45 @@ mod tests {
         let labels = lines[summary - 1];
         assert!(labels.trim_end().ends_with('b'), "{out}");
         assert!(!labels.contains('c'), "{out}");
+    }
+
+    #[test]
+    fn graph_log_scales_the_value_axis_and_labels_real_values() {
+        // spark: values 5,0,0,9 -> the zeros are not positive under log.
+        let out = render_str("graph spark countZ -l", INPUT, false);
+        assert!(out.contains("min=5") && out.contains("max=9"), "{out}");
+        assert!(out.contains("dropped 2 non-positive"), "{out}");
+        // scatter: gutter shows real values.
+        let out = render_str("graph scatter id countZ --log", INPUT, false);
+        assert!(out.contains("9 \u{2524}") || out.contains("9 |"), "{out}");
+        assert!(out.contains("points=2"), "{out}");
+        // hist: bars shrink on log but counts print raw.
+        let lin = render_str("graph hist countZ -b 3", INPUT, false);
+        let log = render_str("graph hist countZ -b 3 -l", INPUT, false);
+        assert!(lin.contains(" 2\n") && log.contains(" 2\n"), "{log}");
+        assert_ne!(lin, log);
+    }
+
+    #[test]
+    fn graph_bar_log_draws_only_the_values_a_log_axis_can_place() {
+        // 0.5 is below the log baseline (a value of 1), so the axis runs from
+        // log10(0.5) to log10(100) and a bar can fall on either side of it —
+        // which is what makes a wrongly placed 0 or -5 show up as a bar here.
+        let input = "k,v\na,100\nb,0.5\nc,0\nd,-5\n";
+        let out = render_str("graph bar k v -l -W 40", input, false);
+        let line = |suffix: &str| {
+            out.lines()
+                .find(|l| l.ends_with(suffix))
+                .unwrap_or_else(|| panic!("no line ends with `{suffix}`: {out}"))
+        };
+        // Either side of the baseline bars; a zero or negative value has no
+        // log, so it prints its real value with no bar at all.
+        assert!(line(" 100").contains('\u{2588}'), "{out}");
+        assert!(line(" 0.5").contains('\u{2588}'), "{out}");
+        assert!(!line(" 0").contains('\u{2588}'), "{out}");
+        assert!(!line(" -5").contains('\u{2588}'), "{out}");
+        // The rows are still there — a bar chart drops nothing.
+        assert!(out.contains("bars=4") && !out.contains("dropped"), "{out}");
     }
 
     #[test]

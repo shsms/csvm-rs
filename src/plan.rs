@@ -824,6 +824,9 @@ pub struct GraphOpts {
     /// An explicit y-axis range (`-y`/`--yrange`), `lo:hi`. Values outside it
     /// are clipped for hist/spark/scatter/line; bars clamp to the edge.
     pub yrange: Option<(f64, f64)>,
+    /// Draw the value axis on a log10 scale (`-l`/`--log`). Values that are not
+    /// positive have no log, so they are dropped (and counted).
+    pub log: bool,
 }
 
 impl Default for GraphOpts {
@@ -838,6 +841,7 @@ impl Default for GraphOpts {
             ascii: false,
             xrange: None,
             yrange: None,
+            log: false,
         }
     }
 }

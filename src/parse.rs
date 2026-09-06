@@ -665,6 +665,9 @@ impl<'a> Builder<'a> {
             } else if word == "-A" || word == "--ascii" {
                 opts.ascii = true;
                 s = after;
+            } else if word == "-l" || word == "--log" {
+                opts.log = true;
+                s = after;
             } else if let Some(v) = flag_value(word, after, &["-W", "--width"]) {
                 let (val, tail) = v?;
                 opts.width = Some(parse_positive(&val, "-W/--width")?);
@@ -1518,8 +1521,8 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
     Err(err(format!("graph {word} expects {want}, got {n}")))
 }
 
-/// Reject a flag the chart kind has no use for: a `hist` bins along x only, and
-/// `bar`/`spark` have no x axis to range.
+/// Reject a flag the chart kind has no use for (a `hist` bins along x only, and
+/// `bar`/`spark` have no x axis to range), or a range a log axis cannot span.
 fn check_graph_flags(kind: GraphKind, word: &str, opts: &GraphOpts) -> Result<(), Error> {
     let no = |flag: &str| Err(err(format!("graph {word} does not take {flag}")));
     if opts.xrange.is_some()
@@ -1529,6 +1532,13 @@ fn check_graph_flags(kind: GraphKind, word: &str, opts: &GraphOpts) -> Result<()
     }
     if opts.yrange.is_some() && matches!(kind, GraphKind::Hist) {
         return no("-y/--yrange");
+    }
+    // A log axis has no room for a bound at or below zero: the range is the
+    // axis, and log10 of a non-positive number does not exist.
+    if opts.log && opts.yrange.is_some_and(|(lo, _)| lo <= 0.0) {
+        return Err(err(format!(
+            "graph {word}: -l/--log needs a positive -y range"
+        )));
     }
     Ok(())
 }
@@ -2872,6 +2882,27 @@ mod tests {
         assert!(parse("graph spark a -x 0:1").is_err());
         assert!(parse("graph bar a b -y 0:1").is_ok());
         assert!(parse("graph spark a -y 0:1").is_ok());
+    }
+
+    #[test]
+    fn graph_log_parses_and_needs_a_positive_y_range() {
+        assert!(parse("graph hist a -l").unwrap().graph.unwrap().opts.log);
+        assert!(
+            parse("graph spark a --log")
+                .unwrap()
+                .graph
+                .unwrap()
+                .opts
+                .log
+        );
+        assert!(!parse("graph spark a").unwrap().graph.unwrap().opts.log);
+        // A log axis cannot span a non-positive value.
+        let err = parse("graph spark a -l -y 0:9").unwrap_err().to_string();
+        assert!(
+            err.contains("graph spark") && err.contains("-l/--log"),
+            "{err}"
+        );
+        assert!(parse("graph spark a -l -y 1:9").is_ok());
     }
 
     #[test]

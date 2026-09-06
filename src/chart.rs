@@ -245,14 +245,18 @@ pub struct BarData {
 
 /// A sparkline's values, already bucketed to the chart width.
 pub struct SparkData {
+    /// The bucketed values, in the input's own units — a log axis maps them
+    /// through [`value_pos`] as they are drawn.
     pub values: Vec<f64>,
     /// An explicit value range (`-y`/`--yrange`): the levels scale to it
-    /// instead of to the values' own min/max.
+    /// instead of to the values' own min/max. Real units, like `values`.
     pub range: AxisRange,
 }
 
 /// One input row of an xy chart: the raw x cell, its plotted x, one y per
-/// series (`None` where the cell was not numeric), and the `--color-by` value.
+/// series (`None` where the cell was not numeric, or not positive under a log
+/// axis), and the `--color-by` value. The ys are in the input's own units — a
+/// log axis maps them through [`value_pos`] as they are drawn.
 pub struct XyRow {
     pub xcell: String,
     pub x: f64,
@@ -269,7 +273,8 @@ pub struct XyData {
     /// Join the points of each series (a `line` chart, not a `scatter`).
     pub connect: bool,
     /// Explicit axis ranges (`-x`/`-y`): the canvas spans these instead of the
-    /// points' own extent. The points are already clipped to them.
+    /// points' own extent. The points are already clipped to them. Real units,
+    /// like the ys `yrange` bounds.
     pub xrange: AxisRange,
     pub yrange: AxisRange,
 }
@@ -349,6 +354,75 @@ fn clipped_note(n: u64) -> Option<String> {
     (n > 0).then(|| format!("clipped {n} out of range"))
 }
 
+/// Where a real value `v` sits on the value axis: `v` itself, or its log10 on
+/// a log axis. The chart data keeps real values throughout — every renderer
+/// maps through this at draw time, so the labels, the summaries and `--data`
+/// all read the numbers that were in the input.
+pub fn value_pos(v: f64, log: bool) -> f64 {
+    if log { v.log10() } else { v }
+}
+
+/// Where a bar of real value `v` is drawn on the value axis: `v` itself, or its
+/// log10 on a log axis — `None` for a value a log axis cannot place.
+pub fn bar_value(v: f64, log: bool) -> Option<f64> {
+    match log {
+        true => (v > 0.0).then(|| v.log10()),
+        false => Some(v),
+    }
+}
+
+/// How long a histogram bin's bar is drawn: the count itself, or
+/// `log10(count + 1)` on a log axis — the `+ 1` keeps an empty bin at zero
+/// length and a count of 1 visible. The printed count stays raw.
+pub fn hist_len(count: u64, log: bool) -> f64 {
+    let count = count as f64;
+    if log { (count + 1.0).log10() } else { count }
+}
+
+/// Keep only the positive values — the ones a log axis can place; the count
+/// dropped goes to the note. The values themselves stay real: the log10 happens
+/// when they are drawn ([`value_pos`]).
+fn drop_non_positive(values: Vec<f64>) -> (Vec<f64>, u64) {
+    let before = values.len();
+    let kept: Vec<f64> = values.into_iter().filter(|v| *v > 0.0).collect();
+    let dropped = (before - kept.len()) as u64;
+    (kept, dropped)
+}
+
+/// The note for `n` values dropped as not positive under `--log`, or none.
+fn dropped_note(n: u64) -> Option<String> {
+    (n > 0).then(|| format!("dropped {n} non-positive"))
+}
+
+/// Blank each xy y a log axis cannot place (not positive, counted) and drop the
+/// rows left with no y at all. The kept ys stay real: the log10 happens when
+/// they are drawn ([`value_pos`]).
+fn drop_non_positive_xy(xy: &mut XyData) -> u64 {
+    let mut dropped = 0u64;
+    xy.rows.retain_mut(|r| {
+        for y in &mut r.ys {
+            if y.is_some_and(|v| v <= 0.0) {
+                *y = None;
+                dropped += 1;
+            }
+        }
+        r.ys.iter().any(Option::is_some)
+    });
+    refresh_ends(xy);
+    dropped
+}
+
+/// A category axis labels its ends with the raw cells, so they have to come
+/// from the rows that survived a drop, not the original first and last.
+fn refresh_ends(xy: &mut XyData) {
+    let XyData { rows, xaxis, .. } = xy;
+    if let XAxis::Ends(first, last) = xaxis {
+        let cell = |r: Option<&XyRow>| r.map(|r| r.xcell.clone()).unwrap_or_default();
+        *first = cell(rows.first());
+        *last = cell(rows.last());
+    }
+}
+
 /// Apply the axis ranges to already-collected xy rows: a row whose x falls
 /// outside `xrange` goes entirely, and a y outside `yrange` is blanked. Every
 /// plotted point lost is counted, so the chart still says what it dropped.
@@ -374,14 +448,7 @@ fn clip_xy(xy: &mut XyData, xrange: AxisRange, yrange: AxisRange) -> u64 {
         }
         r.ys.iter().any(Option::is_some)
     });
-    // A category axis labels its ends with the raw cells, so they have to come
-    // from the rows that survived the clip, not the original first and last.
-    let XyData { rows, xaxis, .. } = xy;
-    if let XAxis::Ends(first, last) = xaxis {
-        let cell = |r: Option<&XyRow>| r.map(|r| r.xcell.clone()).unwrap_or_default();
-        *first = cell(rows.first());
-        *last = cell(rows.last());
-    }
+    refresh_ends(xy);
     clipped
 }
 
@@ -564,9 +631,16 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
         }
         GraphKind::Spark => {
             let (values, skipped) = collect_numeric(text, g.cols[0].pos);
+            // The range is in real values, so it clips before the log.
             let (values, clipped) = clip(values, g.opts.yrange);
+            let (values, dropped) = if g.opts.log {
+                drop_non_positive(values)
+            } else {
+                (values, 0)
+            };
             notes.extend(skipped_note(skipped));
             notes.extend(clipped_note(clipped));
+            notes.extend(dropped_note(dropped));
             ChartData::Spark(SparkData {
                 values: bucket(&values, width),
                 range: g.opts.yrange,
@@ -592,7 +666,13 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             let (mut xy, skipped) = collect_xy(text, &g.cols[0].name, g.cols[0].pos, &names, &ypos);
             xy.connect = g.kind == GraphKind::Line;
             (xy.xrange, xy.yrange) = (g.opts.xrange, g.opts.yrange);
+            // The ranges are in real values, so they clip before the log.
             let clipped = clip_xy(&mut xy, g.opts.xrange, g.opts.yrange);
+            let dropped = if g.opts.log {
+                drop_non_positive_xy(&mut xy)
+            } else {
+                0
+            };
             // Only the category/row-index axis distorts spacing; numeric and
             // time axes are true.
             if matches!(xy.xaxis, XAxis::Ends(..)) {
@@ -600,6 +680,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             }
             notes.extend(skipped_note(skipped));
             notes.extend(clipped_note(clipped));
+            notes.extend(dropped_note(dropped));
             ChartData::Xy(xy)
         }
     };
@@ -695,6 +776,23 @@ mod tests {
         assert!(g.partial.is_none());
         assert_eq!((g.braille)(0), ' ');
         assert_eq!((g.braille)(0x40), '*');
+    }
+
+    #[test]
+    fn value_pos_maps_onto_the_axis_only_when_log() {
+        assert_eq!(value_pos(100.0, true), 2.0);
+        assert_eq!(value_pos(100.0, false), 100.0);
+    }
+
+    #[test]
+    fn hist_len_keeps_an_empty_bin_at_zero_and_a_count_of_one_visible() {
+        // log10(count + 1): the `+ 1` is what stops an empty bin drawing a
+        // bar of its own, and a lone point still gets one.
+        assert_eq!(hist_len(0, true), 0.0);
+        assert!(hist_len(1, true) > 0.0);
+        // Off the log axis the length is the count itself.
+        assert_eq!(hist_len(0, false), 0.0);
+        assert_eq!(hist_len(7, false), 7.0);
     }
 
     #[test]

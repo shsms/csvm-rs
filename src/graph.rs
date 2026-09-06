@@ -4,7 +4,9 @@
 //! Histogram, horizontal bar, sparkline, and braille scatter/line
 //! (multi-series, coloured).
 
-use crate::chart::{BarData, ChartData, Frame, Glyphs, HistData, SparkData, XyData};
+use crate::chart::{
+    BarData, ChartData, Frame, Glyphs, HistData, SparkData, XyData, bar_value, hist_len, value_pos,
+};
 use crate::color::{Rgb, Style};
 use crate::field::format_num;
 
@@ -92,7 +94,12 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
     for (edge, &count) in edges.iter().zip(&h.counts) {
         out.push_str(&format!(
             "{edge:>axis_w$} {axis_v}{} {count}\n",
-            bar(count, max_count, bars, &frame.glyphs)
+            bar_len(
+                hist_len(count, frame.log),
+                hist_len(max_count, frame.log),
+                bars,
+                &frame.glyphs
+            )
         ));
     }
     out.push_str(&format!(
@@ -112,28 +119,41 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
 /// to a common width. Best used after group-by, where there are few rows.
 fn render_bars(frame: &Frame, b: &BarData) -> String {
     // Only the first value series is drawn; `graph bar` takes one value column.
-    let rows: Vec<(&str, f64)> = b
+    // Each row keeps its real value (which is what prints) and the value the
+    // bar is drawn at: the same number, or its log10 on a log axis, where a
+    // value that is not positive has no bar at all.
+    let rows: Vec<(&str, f64, Option<f64>)> = b
         .rows
         .iter()
-        .filter_map(|(label, values)| Some((label.as_str(), (*values.first()?)?)))
+        .filter_map(|(label, values)| {
+            let v = (*values.first()?)?;
+            Some((label.as_str(), v, bar_value(v, frame.log)))
+        })
         .collect();
     let label_w = rows
         .iter()
-        .map(|(l, _)| l.chars().count())
+        .map(|(l, _, _)| l.chars().count())
         .max()
         .unwrap_or(0);
-    // The baseline is always 0, so a column of positive values bars from the
-    // left. An explicit axis (`-y`) replaces the data's own range: a bar past it
-    // draws to the edge, and the baseline moves onto the axis.
-    let (lo, hi) = b.axis.unwrap_or_else(|| {
-        let mut lo = 0.0f64;
-        let mut hi = 0.0f64;
-        for (_, v) in &rows {
-            lo = lo.min(*v);
-            hi = hi.max(*v);
-        }
-        (lo, hi)
-    });
+    // The baseline is always 0 — a real 0 on a linear axis, a value of 1 on a
+    // log one — so a column of larger values bars from the left. An explicit
+    // axis (`-y`) replaces the data's own range: a bar past it draws to the
+    // edge, and the baseline moves onto the axis.
+    // The bounds always have a bar value: the parser rejects a non-positive
+    // `-y` bound under `--log`, so the fallback here is the no-axis case.
+    let (lo, hi) = b
+        .axis
+        .and_then(|(lo, hi)| Some((bar_value(lo, frame.log)?, bar_value(hi, frame.log)?)))
+        .unwrap_or_else(|| {
+            let mut lo = 0.0f64;
+            let mut hi = 0.0f64;
+            for (_, _, at) in &rows {
+                let Some(v) = at else { continue };
+                lo = lo.min(*v);
+                hi = hi.max(*v);
+            }
+            (lo, hi)
+        });
     let span = hi - lo;
     let w = frame.width.saturating_sub(label_w + 14).max(10);
     let zero = pos_in(0.0f64.clamp(lo, hi), lo, span, w);
@@ -142,13 +162,15 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
     let mut out = String::new();
     out.push_str(&frame.title);
     out.push('\n');
-    for (label, v) in &rows {
+    for (label, v, at) in &rows {
         // The drawn length is clamped to the axis; the printed value is real.
-        let p = pos_in(v.clamp(lo, hi), lo, span, w);
-        let (from, to) = (zero.min(p), zero.max(p));
         let mut field = vec![' '; w];
-        for cell in field.iter_mut().take(to).skip(from) {
-            *cell = frame.glyphs.full;
+        if let Some(at) = at {
+            let p = pos_in(at.clamp(lo, hi), lo, span, w);
+            let (from, to) = (zero.min(p), zero.max(p));
+            for cell in field.iter_mut().take(to).skip(from) {
+                *cell = frame.glyphs.full;
+            }
         }
         let drawn: String = field.into_iter().collect();
         out.push_str(&format!(
@@ -180,7 +202,11 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
     // An explicit range (`-y`) is the axis the levels scale to; the summary
     // still reports the data's own min and max.
     let (lo, hi) = s.range.unwrap_or((dlo, dhi));
-    let span = hi - lo;
+    // The values are real; a log axis maps them (and its bounds) as they are
+    // drawn, so a level is a position on the axis, not a value.
+    let pos = |v: f64| value_pos(v, frame.log);
+    let (plo, phi) = (pos(lo), pos(hi));
+    let span = phi - plo;
     let levels = frame.glyphs.levels;
     let line: String = s
         .values
@@ -188,7 +214,7 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
         .map(|&v| {
             // A flat series sits mid-height; otherwise scale into the 8 levels.
             let level = if span > 0.0 {
-                (((v - lo) / span) * 7.0).round() as usize
+                (((pos(v) - plo) / span) * 7.0).round() as usize
             } else {
                 3
             };
@@ -206,14 +232,14 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
     out
 }
 
-/// A horizontal block bar `count/max` of the full width, drawn with `g`'s
-/// glyphs, with a fractional tail (when `g` has one) so short bars stay
-/// distinguishable.
-fn bar(count: u64, max: u64, width: usize, g: &Glyphs) -> String {
-    if max == 0 || width == 0 {
+/// A horizontal block bar `v/max` of the full width, drawn with `g`'s glyphs,
+/// with a fractional tail (when `g` has one) so short bars stay
+/// distinguishable. Lengths are `f64` so a log axis can pass its logs.
+fn bar_len(v: f64, max: f64, width: usize, g: &Glyphs) -> String {
+    if max <= 0.0 || v <= 0.0 || width == 0 {
         return String::new();
     }
-    let frac = count as f64 / max as f64 * width as f64;
+    let frac = v / max * width as f64;
     let full = frac.floor() as usize;
     let mut s: String = g.full.to_string().repeat(full.min(width));
     let rem = frac - full as f64;
@@ -482,9 +508,14 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     // the points' own extent (the points outside it are already clipped away).
     let (xlo, xhi) = xy.xrange.unwrap_or((xlo, xhi));
     let (ylo, yhi) = xy.yrange.unwrap_or((ylo, yhi));
-    let (xspan, yspan) = (xhi - xlo, yhi - ylo);
+    // The ys are real; a log axis maps them (and its bounds) onto the canvas
+    // here, at draw time.
+    let pos = |v: f64| value_pos(v, frame.log);
+    let (pylo, pyhi) = (pos(ylo), pos(yhi));
+    let (xspan, yspan) = (xhi - xlo, pyhi - pylo);
 
-    // Left gutter holds the y-axis labels (top = yhi, bottom = ylo).
+    // Left gutter holds the y-axis labels (top = yhi, bottom = ylo) — the real
+    // values, whatever the axis does with them.
     let yhi_s = format_num(yhi);
     let ylo_s = format_num(ylo);
     let gutter = yhi_s.len().max(ylo_s.len());
@@ -499,7 +530,7 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
         };
         // y is flipped: the top row is the high value.
         let py = if yspan > 0.0 {
-            ((b.ph() - 1) as f64 - (y - ylo) / yspan * (b.ph() - 1) as f64).round() as isize
+            ((b.ph() - 1) as f64 - (pos(y) - pylo) / yspan * (b.ph() - 1) as f64).round() as isize
         } else {
             (b.ph() / 2) as isize
         };
@@ -919,13 +950,41 @@ mod tests {
     }
 
     #[test]
+    fn spark_levels_follow_the_log_axis_over_real_values() {
+        // 1, 10, 100: linearly the first two share the bottom level; on a log
+        // axis they are evenly spread over the eight levels.
+        let s = SparkData {
+            values: vec![1.0, 10.0, 100.0],
+            range: None,
+        };
+        let mut frame = Frame::new("v".to_string(), 8, 4, false);
+        let line = |f: &Frame| render_spark(f, &s).lines().nth(1).unwrap().to_string();
+        let lin = line(&frame);
+        frame.log = true;
+        let log = line(&frame);
+        // Both axes run 1..100, so the ends match; only the middle moves.
+        assert_eq!(
+            (lin.chars().next(), lin.chars().last()),
+            (Some('▁'), Some('█'))
+        );
+        assert_eq!(
+            (log.chars().next(), log.chars().last()),
+            (Some('▁'), Some('█'))
+        );
+        assert_eq!(lin.chars().nth(1), Some('▂')); // 10 is a tenth of the way up
+        assert_eq!(log.chars().nth(1), Some('▅')); // and halfway up in log space
+        // The summary reports the real values on either axis.
+        assert!(render_spark(&frame, &s).contains("min=1  max=100"));
+    }
+
+    #[test]
     fn bar_scales_and_caps_at_width() {
         let g = Glyphs::unicode();
-        assert_eq!(bar(0, 10, 8, &g), "");
-        assert_eq!(bar(10, 10, 8, &g), "████████"); // full
-        assert!(bar(10, 10, 8, &g).chars().count() == 8);
+        assert_eq!(bar_len(0.0, 10.0, 8, &g), "");
+        assert_eq!(bar_len(10.0, 10.0, 8, &g), "████████"); // full
+        assert!(bar_len(10.0, 10.0, 8, &g).chars().count() == 8);
         // A partial bar gets an eighth-block tail.
-        let half = bar(1, 2, 4, &g);
+        let half = bar_len(1.0, 2.0, 4, &g);
         assert!(half.starts_with("██"));
     }
 }
