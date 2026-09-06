@@ -297,6 +297,17 @@ impl HeatData {
         Bounds { xlo, xhi, ylo, yhi }
     }
 
+    /// The ends of the count axis the cells are shaded along: one point at the
+    /// low end, the busiest cell at the high one, both through [`hist_len`] so
+    /// `log` scales them the way it scales the shades.
+    ///
+    /// Both renderers ask the model for this, so a cell cannot take one shade
+    /// in the terminal and another in the SVG.
+    pub fn count_bounds(&self, log: bool) -> (f64, f64) {
+        let max = self.counts.iter().copied().max().unwrap_or(0);
+        (hist_len(1, log), hist_len(max, log))
+    }
+
     /// The lower edges of cell `i`'s x and y bands — the corner `--data` names
     /// the cell by.
     pub fn cell_lo(&self, i: usize) -> (f64, f64) {
@@ -349,6 +360,36 @@ pub struct BarData {
     pub axis: AxisRange,
 }
 
+impl BarData {
+    /// The value axis the bars are drawn against, in axis units (`log` maps a
+    /// real value through [`bar_value`]): an explicit `-y` axis, else a
+    /// baseline at 0 stretched over every series' drawable values, so the bars
+    /// of a group read against one scale. A value a log axis cannot place has
+    /// no bar and so no say in the bounds.
+    ///
+    /// Both renderers ask the model for this, so a bar cannot land in one place
+    /// in the terminal and another in the SVG.
+    pub fn axis_bounds(&self, log: bool) -> (f64, f64) {
+        // The bounds of an explicit axis always have a bar value: the parser
+        // rejects a non-positive `-y` bound under `--log`, so the fallback here
+        // is the no-axis case.
+        self.axis
+            .and_then(|(lo, hi)| Some((bar_value(lo, log)?, bar_value(hi, log)?)))
+            .unwrap_or_else(|| {
+                let drawn = || {
+                    self.rows
+                        .iter()
+                        .flat_map(|(_, vs)| vs.iter().flatten())
+                        .filter_map(|&v| bar_value(v, log))
+                };
+                (
+                    drawn().fold(0.0_f64, f64::min),
+                    drawn().fold(0.0_f64, f64::max),
+                )
+            })
+    }
+}
+
 /// A sparkline's values, already bucketed to the chart width.
 pub struct SparkData {
     /// The charted column's name (the CSV value header under `--data`).
@@ -359,6 +400,20 @@ pub struct SparkData {
     /// An explicit value range (`-y`/`--yrange`): the levels scale to it
     /// instead of to the values' own min/max. Real units, like `values`.
     pub range: AxisRange,
+}
+
+impl SparkData {
+    /// The value axis the levels scale to: an explicit `-y` range, else the
+    /// values' own spread, else nothing at all. Real units, as the model keeps
+    /// them; a log axis maps them at draw time.
+    ///
+    /// Both renderers ask the model for this, so a cell cannot sit at one
+    /// height in the terminal and another in the SVG.
+    pub fn bounds(&self) -> (f64, f64) {
+        self.range
+            .or_else(|| crate::graph::minmax(self.values.iter().copied()))
+            .unwrap_or((0.0, 0.0))
+    }
 }
 
 /// One input row of an xy chart: the raw x cell, its plotted x, one y per
@@ -403,6 +458,44 @@ impl XyData {
             .filter(|r| r.ys.first().is_some_and(Option::is_some))
             .map(|r| r.color_by)
             .collect()
+    }
+
+    /// The chart's extent, `(xlo, xhi, ylo, yhi)` over the plotted points, with
+    /// an explicit `-x`/`-y` range in place of the points' own spread on that
+    /// axis — a range *is* the axis. The ys are real, as the model keeps them;
+    /// a log axis maps them at draw time. A chart with no point has no extent,
+    /// and the empty fold's infinities come back for the renderers to read as
+    /// "nothing to draw".
+    ///
+    /// Both renderers ask the model for this, so the terminal chart and the SVG
+    /// cannot frame the same points differently.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let (mut xlo, mut xhi) = (f64::INFINITY, f64::NEG_INFINITY);
+        let (mut ylo, mut yhi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for r in &self.rows {
+            for y in r.ys.iter().flatten() {
+                xlo = xlo.min(r.x);
+                xhi = xhi.max(r.x);
+                ylo = ylo.min(*y);
+                yhi = yhi.max(*y);
+            }
+        }
+        let (xlo, xhi) = self.xrange.unwrap_or((xlo, xhi));
+        let (ylo, yhi) = self.yrange.unwrap_or((ylo, yhi));
+        (xlo, xhi, ylo, yhi)
+    }
+
+    /// The ends of the `-c/--color-by` ramp: the lowest and highest colour
+    /// value over the plotted points, or `None` when no plotted point carried
+    /// one. One derivation for both renderers, so a point's colour does not
+    /// depend on which of them drew it.
+    pub fn color_bounds(&self) -> Option<(f64, f64)> {
+        crate::graph::minmax(
+            self.rows
+                .iter()
+                .filter(|r| r.ys.first().is_some_and(Option::is_some))
+                .filter_map(|r| r.color_by),
+        )
     }
 
     /// The plotted points per y-series.
@@ -1248,6 +1341,80 @@ mod tests {
             color_by: None,
         };
         assert_eq!(to_csv(&ChartData::Xy(xy)), "x,y\n1,5000000000\n");
+    }
+
+    /// An xy chart of one series over `pts`, as `collect` builds it.
+    fn xy_of(pts: &[(f64, f64)]) -> XyData {
+        XyData {
+            xname: "x".into(),
+            names: vec!["y".into()],
+            rows: pts
+                .iter()
+                .map(|&(x, y)| XyRow {
+                    xcell: x.to_string(),
+                    x,
+                    ys: vec![Some(y)],
+                    color_by: None,
+                })
+                .collect(),
+            xaxis: XAxis::Numeric,
+            connect: false,
+            xrange: None,
+            yrange: None,
+            color_by: None,
+        }
+    }
+
+    #[test]
+    fn xy_bounds_fold_the_points_unless_a_range_says_otherwise() {
+        let mut d = xy_of(&[(1.0, 20.0), (3.0, 5.0)]);
+        assert_eq!(d.bounds(), (1.0, 3.0, 5.0, 20.0));
+        // A range *is* the axis, on that axis alone.
+        d.xrange = Some((0.0, 10.0));
+        assert_eq!(d.bounds(), (0.0, 10.0, 5.0, 20.0));
+        d.yrange = Some((0.0, 100.0));
+        assert_eq!(d.bounds(), (0.0, 10.0, 0.0, 100.0));
+        // Nothing plotted has no extent; the renderers read that as an empty
+        // chart rather than drawing an axis over it.
+        assert!(!xy_of(&[]).bounds().0.is_finite());
+    }
+
+    #[test]
+    fn xy_color_bounds_span_the_plotted_points_colour_values() {
+        let mut d = xy_of(&[(1.0, 1.0), (2.0, 2.0), (3.0, 3.0)]);
+        assert_eq!(d.color_bounds(), None);
+        d.rows[0].color_by = Some(4.0);
+        d.rows[2].color_by = Some(-1.0);
+        assert_eq!(d.color_bounds(), Some((-1.0, 4.0)));
+    }
+
+    #[test]
+    fn bar_axis_bounds_anchor_at_zero_or_take_the_explicit_axis() {
+        let bar = |rows: Vec<BarRow>, axis| BarData {
+            label_name: "k".into(),
+            value_names: vec!["a".into(), "b".into()],
+            rows,
+            axis,
+        };
+        let rows = vec![
+            ("x".to_string(), vec![Some(2.0), Some(5.0)]),
+            ("y".to_string(), vec![Some(-3.0), None]),
+        ];
+        // The baseline is 0 and the axis spans every series, so a group reads
+        // against one scale.
+        assert_eq!(bar(rows.clone(), None).axis_bounds(false), (-3.0, 5.0));
+        // An explicit `-y` axis replaces that, through the drawn value.
+        assert_eq!(
+            bar(rows.clone(), Some((0.0, 10.0))).axis_bounds(false),
+            (0.0, 10.0)
+        );
+        assert_eq!(
+            bar(rows.clone(), Some((1.0, 100.0))).axis_bounds(true),
+            (0.0, 2.0)
+        );
+        // Under a log axis only the positive values are drawable.
+        assert_eq!(bar(rows, None).axis_bounds(true), (0.0, 0.6989700043360189));
+        assert_eq!(bar(Vec::new(), None).axis_bounds(false), (0.0, 0.0));
     }
 
     #[test]

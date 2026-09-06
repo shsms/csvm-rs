@@ -4,7 +4,9 @@
 //! [`crate::chart`] model the terminal renderers do, as a standalone `<svg>`
 //! document.
 
-use crate::chart::{AxisRange, BarRow, ChartData, Frame, HeatData, bar_value, hist_len, value_pos};
+use crate::chart::{
+    BarData, BarRow, ChartData, Frame, HeatData, SparkData, XyData, bar_value, hist_len, value_pos,
+};
 use crate::color::{Ramp, rgb_hex};
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
@@ -17,36 +19,12 @@ const R: f64 = 16.0;
 const T: f64 = 32.0;
 const B: f64 = 44.0;
 
-/// How an xy chart's axes are shaped: the explicit `-x`/`-y` ranges (`None` for
-/// the points' own extent) and whether the value axis is log10.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Axes {
-    pub x: AxisRange,
-    pub y: AxisRange,
-    pub log: bool,
-}
-
 /// Optional axis captions (`--xlabel`/`--ylabel`), drawn by [`header`] on every
 /// chart kind so the terminal and SVG output can't drift.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Labels<'a> {
     pub x: Option<&'a str>,
     pub y: Option<&'a str>,
-}
-
-/// How an xy chart's points are coloured by `-c/--color-by`: the ramp to map
-/// through and one value per point of the single plotted series, in the order
-/// [`crate::chart::XyData::series`] yields them (a point whose colour cell was
-/// not numeric has `None` and keeps the plain series colour). Empty when there
-/// is no `--color-by` — and there is no density counterpart here, since density
-/// counts points per *braille cell*, which only the terminal has.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Points<'a> {
-    /// The `-r/--ramp` gradient; `None` falls back to [`Ramp::default`], so
-    /// `--color-by` colours the points with no ramp given.
-    pub ramp: Option<Ramp>,
-    /// One colour-by value per plotted point, or empty for no `--color-by`.
-    pub by: &'a [Option<f64>],
 }
 
 /// The series colour for index `i` as an SVG hex string, from the shared
@@ -177,8 +155,8 @@ fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
 /// Histogram: one filled bar per bin spanning the plot width. `log` puts the
 /// count axis on a log10 scale, as in the terminal chart, and `ramp` fills each
 /// bar by its count, as the terminal chart paints it.
-// One argument over clippy's bar, like `xy_chart`: the axis knobs are all
-// independent, and bundling them would only move the list.
+// One argument over clippy's bar: the axis knobs are all independent, and
+// bundling them would only move the list.
 #[allow(clippy::too_many_arguments)]
 pub fn hist(
     title: &str,
@@ -217,24 +195,20 @@ fill=\"{fill}\" stroke=\"white\"/>\n",
 /// (a value of 1 on a log axis). `log` draws each bar at its log10, as in the
 /// terminal chart, and a value a log axis cannot place gets no bar.
 ///
-/// With several value columns each row is a *group*: `names` gives the series,
-/// a row's height is shared between them, and a legend names them — as in the
-/// terminal chart, where grouped bars take the series palette (the parser
-/// rejects a `-r/--ramp` there). A single series fills each bar by where it
-/// sits on the value axis, as the terminal chart paints it.
-// One argument over clippy's bar, like `hist`: the axis knobs are independent,
-// and bundling them would only move the list.
-#[allow(clippy::too_many_arguments)]
+/// With several value columns each row is a *group*: one bar per series,
+/// sharing the row's height, and a legend naming them — as in the terminal
+/// chart, where grouped bars take the series palette (the parser rejects a
+/// `-r/--ramp` there). A single series fills each bar by where it sits on the
+/// value axis, as the terminal chart paints it.
 pub fn bars(
     title: &str,
-    names: &[String],
-    rows: &[BarRow],
-    axis: AxisRange,
+    b: &BarData,
     log: bool,
     ramp: Option<Ramp>,
     note: &str,
     labels: Labels,
 ) -> String {
+    let (names, rows) = (&b.value_names, &b.rows);
     if rows.is_empty() {
         return header(title, "", note, labels);
     }
@@ -244,24 +218,10 @@ pub fn bars(
     // bar is drawn at.
     let value_at = |row: &BarRow, i: usize| row.1.get(i).copied().flatten();
     let at_of = |row: &BarRow, i: usize| value_at(row, i).and_then(|v| bar_value(v, log));
-    // An explicit axis (`-y`) replaces the data's own range, as in the terminal
-    // chart: a bar past it draws to the edge and the baseline moves onto it.
-    // The bounds always have a bar value: the parser rejects a non-positive
-    // `-y` bound under `--log`, so the fallback here is the no-axis case.
-    let (lo, hi) = axis
-        .and_then(|(lo, hi)| Some((bar_value(lo, log)?, bar_value(hi, log)?)))
-        .unwrap_or_else(|| {
-            // The axis spans every series, so the groups read against one scale.
-            let drawn = || {
-                rows.iter()
-                    .flat_map(|r| r.1.iter().flatten())
-                    .filter_map(|&v| bar_value(v, log))
-            };
-            (
-                drawn().fold(0.0_f64, f64::min),
-                drawn().fold(0.0_f64, f64::max),
-            )
-        });
+    // The model works out the value axis — an explicit `-y` one, else a
+    // baseline at 0 over every series — so these are the bounds the terminal
+    // chart draws against too.
+    let (lo, hi) = b.axis_bounds(log);
     let span = (hi - lo).max(f64::MIN_POSITIVE);
     let rh = ph() / rows.len() as f64;
     // A group's rows share the label row's height.
@@ -349,21 +309,14 @@ fn legend(names: &[String]) -> String {
 /// `-r/--ramp` deliberately does not reach here: the terminal sparkline paints
 /// per cell because it *is* a row of cells, while this is one continuous
 /// stroke, so it stays in the default chart colour.
-pub fn spark(
-    title: &str,
-    values: &[f64],
-    range: AxisRange,
-    log: bool,
-    note: &str,
-    labels: Labels,
-) -> String {
+pub fn spark(title: &str, s: &SparkData, log: bool, note: &str, labels: Labels) -> String {
+    let values = &s.values;
     if values.is_empty() {
         return header(title, "", note, labels);
     }
-    // An explicit range (`-y`) is the axis, as in the terminal chart.
-    let (lo, hi) = range
-        .or_else(|| crate::graph::minmax(values.iter().copied()))
-        .unwrap_or((0.0, 0.0));
+    // An explicit range (`-y`) is the axis, as in the terminal chart — the
+    // model works it out for both.
+    let (lo, hi) = s.bounds();
     let (plo, phi) = (value_pos(lo, log), value_pos(hi, log));
     let span = (phi - plo).max(f64::MIN_POSITIVE);
     let n = values.len().max(2);
@@ -378,76 +331,67 @@ pub fn spark(
         .collect();
     let mut body = ylabels(lo, hi);
     body.push_str(&format!(
-        "<polyline points=\"{}\" fill=\"none\" stroke=\"#4fc3f7\" stroke-width=\"1.5\"/>\n",
-        pts.join(" ")
+        "<polyline points=\"{}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1.5\"/>\n",
+        pts.join(" "),
+        stroke = series_hex(0),
     ));
     header(title, &body, note, labels)
 }
 
-/// Scatter (`connect=false`) or line (`connect=true`) of one or more y-series
-/// against a shared x. Series get distinct colours and a legend. The ys and the
-/// y range are real; `axes.log` maps them onto the value axis as they are
-/// drawn, and the labels stay the real bounds.
+/// Scatter, or line where `xy.connect` says so, of one or more y-series against
+/// a shared x. Series get distinct colours and a legend. The ys and the y range
+/// are real; `log` maps them onto the value axis as they are drawn, and the
+/// labels stay the real bounds.
 ///
-/// `points` carries the `-c/--color-by` values: each circle is then filled with
-/// its own value's ramp colour. The terminal renderer also ramps by point
-/// *density*, which has no meaning here — density is a count of points per
-/// braille cell, and an SVG has no cells — so `-r` alone leaves an SVG's points
-/// in the plain series colour.
-#[allow(clippy::too_many_arguments)]
+/// A `-c/--color-by` chart fills each circle with its own value's ramp colour.
+/// The terminal renderer also ramps by point *density*, which has no meaning
+/// here — density is a count of points per braille cell, and an SVG has no
+/// cells — so `-r` alone leaves an SVG's points in the plain series colour.
 pub fn xy_chart(
     title: &str,
-    names: &[String],
-    series: &[Vec<(f64, f64)>],
-    connect: bool,
+    xy: &XyData,
+    log: bool,
+    ramp: Option<Ramp>,
     note: &str,
-    xaxis: XAxis,
-    axes: Axes,
     labels: Labels,
-    points: Points,
 ) -> String {
-    let mut xlo = f64::INFINITY;
-    let mut xhi = f64::NEG_INFINITY;
-    let mut ylo = f64::INFINITY;
-    let mut yhi = f64::NEG_INFINITY;
-    for pts in series {
-        for &(x, y) in pts {
-            xlo = xlo.min(x);
-            xhi = xhi.max(x);
-            ylo = ylo.min(y);
-            yhi = yhi.max(y);
-        }
-    }
-    if !xlo.is_finite() {
+    let series = xy.series();
+    if series.iter().all(Vec::is_empty) {
         return header(title, "", note, labels);
     }
-    // An explicit range (`-x`/`-y`) is the axis: the plot spans it instead of
-    // the points' own extent (the points outside it are already clipped away).
-    let (xlo, xhi) = axes.x.unwrap_or((xlo, xhi));
-    let (ylo, yhi) = axes.y.unwrap_or((ylo, yhi));
-    let (pylo, pyhi) = (value_pos(ylo, axes.log), value_pos(yhi, axes.log));
+    // The model frames the chart: the points' own extent, or an explicit
+    // `-x`/`-y` range where one was given (the points outside it are already
+    // clipped away). The terminal chart asks it the same question.
+    let (xlo, xhi, ylo, yhi) = xy.bounds();
+    let (pylo, pyhi) = (value_pos(ylo, log), value_pos(yhi, log));
     let xspan = (xhi - xlo).max(f64::MIN_POSITIVE);
     let yspan = (pyhi - pylo).max(f64::MIN_POSITIVE);
     let map = |x: f64, y: f64| {
         let px = L + (x - xlo) / xspan * pw();
-        let py = T + ph() - (value_pos(y, axes.log) - pylo) / yspan * ph();
+        let py = T + ph() - (value_pos(y, log) - pylo) / yspan * ph();
         (px, py)
     };
 
-    // `--color-by` spans the column's own range; with no `-r` the ramp is the
-    // default one, so `-c` alone still colours.
-    let ramp = points.ramp.unwrap_or_default();
-    let by = points.by.iter().filter_map(|&v| v);
-    let (clo, chi) = crate::graph::minmax(by).unwrap_or((0.0, 0.0));
+    // Only a `-c/--color-by` chart colours its points, and that is the plan's
+    // answer, not the data's — the terminal renderer branches on the same flag,
+    // so the two cannot disagree. There is no density counterpart here: density
+    // counts points per *braille cell*, which only the terminal has. The ramp
+    // spans the column's own range, as the model derives it; with no `-r` it is
+    // the default one, so `-c` alone still colours.
+    let ramp = ramp.unwrap_or_default();
+    let by = xy.color_by.as_ref().map(|_| {
+        let (clo, chi) = xy.color_bounds().unwrap_or((0.0, 0.0));
+        (xy.color_values(), clo, chi)
+    });
 
     let mut body = axis_lines();
     body.push_str(&ylabels(ylo, yhi));
-    body.push_str(&xlabels(&xaxis, xlo, xhi));
+    body.push_str(&xlabels(&xy.xaxis, xlo, xhi));
     for (si, pts) in series.iter().enumerate() {
         let color = series_hex(si);
         // The colour-by values describe the single plotted series.
-        let by: &[Option<f64>] = if si == 0 { points.by } else { &[] };
-        if connect {
+        let by = by.as_ref().filter(|_| si == 0);
+        if xy.connect {
             let line: Vec<String> = pts
                 .iter()
                 .map(|&(x, y)| {
@@ -462,10 +406,12 @@ pub fn xy_chart(
         } else {
             for (pi, &(x, y)) in pts.iter().enumerate() {
                 let (px, py) = map(x, y);
-                let fill = match by.get(pi).copied().flatten() {
-                    Some(v) => fill_at(Some(ramp), v, clo, chi),
-                    None => color.clone(),
-                };
+                let fill = by
+                    .and_then(|(vals, clo, chi)| {
+                        let v = vals.get(pi).copied().flatten()?;
+                        Some(fill_at(Some(ramp), v, *clo, *chi))
+                    })
+                    .unwrap_or_else(|| color.clone());
                 body.push_str(&format!(
                     "<circle cx=\"{px:.2}\" cy=\"{py:.2}\" r=\"2\" fill=\"{fill}\"/>\n"
                 ));
@@ -473,7 +419,7 @@ pub fn xy_chart(
         }
     }
     if series.len() > 1 {
-        body.push_str(&legend(names));
+        body.push_str(&legend(&xy.names));
     }
     header(title, &body, note, labels)
 }
@@ -494,8 +440,7 @@ pub fn heat(
     let mut body = axis_lines();
     body.push_str(&ylabels(h.ylo, h.yhi));
     body.push_str(&xlabels(&h.xaxis, h.xlo, h.xhi));
-    let max = h.counts.iter().copied().max().unwrap_or(0);
-    let (lo, hi) = (hist_len(1, log), hist_len(max, log));
+    let (lo, hi) = h.count_bounds(log);
     let (cw, ch) = (pw() / h.cols as f64, ph() / h.rows as f64);
     // A heatmap has no other use for a colour, so it always has a ramp.
     let ramp = Some(ramp.unwrap_or_default());
@@ -547,61 +492,76 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
             &note,
             labels,
         ),
-        ChartData::Bar(b) => bars(
-            &frame.title,
-            &b.value_names,
-            &b.rows,
-            b.axis,
-            frame.log,
-            frame.ramp,
-            &note,
-            labels,
-        ),
-        ChartData::Spark(s) => spark(&frame.title, &s.values, s.range, frame.log, &note, labels),
+        ChartData::Bar(b) => bars(&frame.title, b, frame.log, frame.ramp, &note, labels),
+        ChartData::Spark(s) => spark(&frame.title, s, frame.log, &note, labels),
         ChartData::Heat(h) => heat(&frame.title, h, frame.log, frame.ramp, &note, labels),
-        ChartData::Xy(xy) => {
-            // Only a `-c/--color-by` chart colours its points, and that is the
-            // plan's answer, not the data's — the terminal renderer branches on
-            // the same flag, so the two cannot disagree.
-            let by = match xy.color_by {
-                Some(_) => xy.color_values(),
-                None => Vec::new(),
-            };
-            xy_chart(
-                &frame.title,
-                &xy.names,
-                &xy.series(),
-                xy.connect,
-                &note,
-                xy.xaxis.clone(),
-                Axes {
-                    x: xy.xrange,
-                    y: xy.yrange,
-                    log: frame.log,
-                },
-                labels,
-                Points {
-                    ramp: frame.ramp,
-                    by: &by,
-                },
-            )
-        }
+        ChartData::Xy(xy) => xy_chart(&frame.title, xy, frame.log, frame.ramp, &note, labels),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chart::AxisRange;
 
-    /// A single-series bar chart's name and rows, as `collect` builds them for
+    /// A sparkline over `values`, with an optional `-y` range.
+    fn spark_data(values: &[f64], range: AxisRange) -> SparkData {
+        SparkData {
+            name: "v".to_string(),
+            values: values.to_vec(),
+            range,
+        }
+    }
+
+    /// A single-series bar chart, as `collect` builds it for
     /// `graph bar LABEL VALUE`.
-    fn one_series(rows: &[(&str, f64)]) -> (Vec<String>, Vec<BarRow>) {
-        (
-            vec!["v".to_string()],
-            rows.iter()
+    fn one_series(rows: &[(&str, f64)]) -> BarData {
+        bar_data(
+            &["v"],
+            &rows
+                .iter()
                 .map(|(l, v)| (l.to_string(), vec![Some(*v)]))
-                .collect(),
+                .collect::<Vec<BarRow>>(),
+            None,
         )
+    }
+
+    /// A bar chart of `names` over `rows`, with an optional `-y` axis.
+    fn bar_data(names: &[&str], rows: &[BarRow], axis: AxisRange) -> BarData {
+        BarData {
+            label_name: "k".to_string(),
+            value_names: names.iter().map(|n| n.to_string()).collect(),
+            rows: rows.to_vec(),
+            axis,
+        }
+    }
+
+    /// An xy chart of one point list per series, as `collect` builds it: each
+    /// point is a row that only its own series has a value in.
+    fn xy_data(names: &[&str], series: &[&[(f64, f64)]], connect: bool, xaxis: XAxis) -> XyData {
+        let mut rows = Vec::new();
+        for (si, pts) in series.iter().enumerate() {
+            for &(x, y) in *pts {
+                let mut ys = vec![None; names.len()];
+                ys[si] = Some(y);
+                rows.push(crate::chart::XyRow {
+                    xcell: format_num(x),
+                    x,
+                    ys,
+                    color_by: None,
+                });
+            }
+        }
+        XyData {
+            xname: "x".to_string(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            rows,
+            xaxis,
+            connect,
+            xrange: None,
+            yrange: None,
+            color_by: None,
+        }
     }
 
     #[test]
@@ -656,53 +616,19 @@ mod tests {
 
     #[test]
     fn xy_scatter_emits_circles_and_line_emits_polyline() {
-        let series = vec![vec![(0.0, 0.0), (1.0, 1.0)]];
-        let names = ["y".to_string()];
-        assert!(
-            xy_chart(
-                "s",
-                &names,
-                &series,
-                false,
-                "",
-                XAxis::Numeric,
-                Axes::default(),
-                Labels::default(),
-                Points::default()
-            )
-            .contains("<circle")
-        );
-        assert!(
-            xy_chart(
-                "s",
-                &names,
-                &series,
-                true,
-                "",
-                XAxis::Numeric,
-                Axes::default(),
-                Labels::default(),
-                Points::default()
-            )
-            .contains("<polyline")
-        );
+        let pts: &[(f64, f64)] = &[(0.0, 0.0), (1.0, 1.0)];
+        let scatter = xy_data(&["y"], &[pts], false, XAxis::Numeric);
+        let line = xy_data(&["y"], &[pts], true, XAxis::Numeric);
+        assert!(xy_chart("s", &scatter, false, None, "", Labels::default()).contains("<circle"));
+        assert!(xy_chart("s", &line, false, None, "", Labels::default()).contains("<polyline"));
     }
 
     #[test]
     fn xy_multi_series_uses_distinct_colours_and_a_legend() {
-        let series = vec![vec![(0.0, 0.0)], vec![(1.0, 1.0)]];
-        let names = ["a".to_string(), "b".to_string()];
-        let s = xy_chart(
-            "m",
-            &names,
-            &series,
-            false,
-            "",
-            XAxis::Numeric,
-            Axes::default(),
-            Labels::default(),
-            Points::default(),
-        );
+        let series: [&[(f64, f64)]; 2] = [&[(0.0, 0.0)], &[(1.0, 1.0)]];
+        let names = ["a", "b"];
+        let scatter = xy_data(&names, &series, false, XAxis::Numeric);
+        let s = xy_chart("m", &scatter, false, None, "", Labels::default());
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
         // The legend marker is the round one the terminal charts print, and it
@@ -710,14 +636,11 @@ mod tests {
         // polylines, so its only circles are the legend's — one per series.
         let line = xy_chart(
             "m",
-            &names,
-            &series,
-            true,
+            &xy_data(&names, &series, true, XAxis::Numeric),
+            false,
+            None,
             "",
-            XAxis::Numeric,
-            Axes::default(),
             Labels::default(),
-            Points::default(),
         );
         assert_eq!(line.matches("<circle").count(), names.len(), "{line}");
         // ...and nothing but the background is a rect.
@@ -726,20 +649,9 @@ mod tests {
 
     #[test]
     fn xy_category_axis_shows_end_labels() {
-        let series = vec![vec![(1.0, 0.0), (2.0, 1.0)]];
-        let names = ["y".to_string()];
         let ends = XAxis::Ends("t0".to_string(), "t9".to_string());
-        let s = xy_chart(
-            "y vs t",
-            &names,
-            &series,
-            true,
-            "",
-            ends,
-            Axes::default(),
-            Labels::default(),
-            Points::default(),
-        );
+        let xy = xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0)]], true, ends);
+        let s = xy_chart("y vs t", &xy, false, None, "", Labels::default());
         assert!(s.contains(">t0</text>") && s.contains(">t9</text>"), "{s}");
     }
 
@@ -748,29 +660,15 @@ mod tests {
         // The y labels come from the range, not the values' own min/max.
         let s = spark(
             "v",
-            &[1.0, 2.0],
-            Some((0.0, 100.0)),
+            &spark_data(&[1.0, 2.0], Some((0.0, 100.0))),
             false,
             "",
             Labels::default(),
         );
         assert!(s.contains(">100</text>"), "{s}");
-        let series = vec![vec![(1.0, 1.0)]];
-        let names = ["y".to_string()];
-        let s = xy_chart(
-            "y",
-            &names,
-            &series,
-            false,
-            "",
-            XAxis::Numeric,
-            Axes {
-                y: Some((0.0, 100.0)),
-                ..Axes::default()
-            },
-            Labels::default(),
-            Points::default(),
-        );
+        let mut xy = xy_data(&["y"], &[&[(1.0, 1.0)]], false, XAxis::Numeric);
+        xy.yrange = Some((0.0, 100.0));
+        let s = xy_chart("y", &xy, false, None, "", Labels::default());
         assert!(s.contains(">100</text>"), "{s}");
     }
 
@@ -778,7 +676,13 @@ mod tests {
     fn log_labels_show_the_real_value() {
         // The spark values are real; the log axis is applied as they are drawn,
         // so the y labels are the real bounds.
-        let s = spark("v", &[1.0, 100.0], None, true, "", Labels::default());
+        let s = spark(
+            "v",
+            &spark_data(&[1.0, 100.0], None),
+            true,
+            "",
+            Labels::default(),
+        );
         assert!(s.contains(">100</text>") && s.contains(">1</text>"), "{s}");
     }
 
@@ -786,8 +690,8 @@ mod tests {
     fn log_bars_leave_the_non_positive_rows_empty() {
         // As in the terminal chart: 0.5 puts the baseline (a value of 1) inside
         // the plot, so a wrongly placed 0 or -5 would draw a visible bar.
-        let (names, rows) = one_series(&[("a", 100.0), ("b", 0.5), ("c", 0.0), ("d", -5.0)]);
-        let s = bars("v", &names, &rows, None, true, None, "", Labels::default());
+        let b = one_series(&[("a", 100.0), ("b", 0.5), ("c", 0.0), ("d", -5.0)]);
+        let s = bars("v", &b, true, None, "", Labels::default());
         // The two rows a log axis cannot place draw nothing but still print
         // their label and real value.
         assert_eq!(s.matches("width=\"0.00\"").count(), 2, "{s}");
@@ -821,14 +725,20 @@ mod tests {
     #[test]
     fn ramp_fills_bar_rows_and_leaves_the_spark_polyline_alone() {
         let ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
-        let (names, rows) = one_series(&[("a", 0.0), ("b", 4.0)]);
-        let s = bars("v", &names, &rows, None, false, ramp, "", Labels::default());
+        let b = one_series(&[("a", 0.0), ("b", 4.0)]);
+        let s = bars("v", &b, false, ramp, "", Labels::default());
         assert!(
             s.contains("fill=\"#0000ee\"") && s.contains("fill=\"#cd0000\""),
             "{s}"
         );
         // A sparkline is one polyline, so there is nothing to fill by value.
-        let sp = spark("v", &[1.0, 2.0], None, false, "", Labels::default());
+        let sp = spark(
+            "v",
+            &spark_data(&[1.0, 2.0], None),
+            false,
+            "",
+            Labels::default(),
+        );
         assert_eq!(sp.matches("<polyline").count(), 1, "{sp}");
         assert!(sp.contains("#4fc3f7"), "{sp}");
     }
@@ -837,12 +747,12 @@ mod tests {
     fn bars_group_the_series_of_a_row_with_a_legend() {
         // Two labels x two series: a rect per sub-row, and a legend naming both
         // series (the background rect is the only other one).
-        let names = ["n".to_string(), "m".to_string()];
         let rows = [
             ("a".to_string(), vec![Some(1.0), Some(2.0)]),
             ("b".to_string(), vec![Some(3.0), None]),
         ];
-        let s = bars("v", &names, &rows, None, false, None, "", Labels::default());
+        let b = bar_data(&["n", "m"], &rows, None);
+        let s = bars("v", &b, false, None, "", Labels::default());
         assert_eq!(s.matches("<rect").count(), 1 /*background*/ + 4, "{s}");
         // The series palette colours the sub-rows, and both names are legended.
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"), "{s}");
@@ -886,7 +796,13 @@ mod tests {
 
     #[test]
     fn titles_are_xml_escaped() {
-        let s = spark("a & b <x>", &[1.0, 2.0], None, false, "", Labels::default());
+        let s = spark(
+            "a & b <x>",
+            &spark_data(&[1.0, 2.0], None),
+            false,
+            "",
+            Labels::default(),
+        );
         assert!(s.contains("a &amp; b &lt;x&gt;"));
     }
 
@@ -933,7 +849,13 @@ mod tests {
         );
         assert!(s.contains("skipped 2 non-numeric"));
         // An empty note adds no footer text element beyond title/labels.
-        let bare = spark("v", &[1.0, 2.0], None, false, "", Labels::default());
+        let bare = spark(
+            "v",
+            &spark_data(&[1.0, 2.0], None),
+            false,
+            "",
+            Labels::default(),
+        );
         assert!(!bare.contains("skipped"));
     }
 }

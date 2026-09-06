@@ -183,26 +183,9 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
     // The baseline is always 0 — a real 0 on a linear axis, a value of 1 on a
     // log one — so a column of larger values bars from the left. An explicit
     // axis (`-y`) replaces the data's own range: a bar past it draws to the
-    // edge, and the baseline moves onto the axis.
-    // The bounds always have a bar value: the parser rejects a non-positive
-    // `-y` bound under `--log`, so the fallback here is the no-axis case.
-    let (lo, hi) = b
-        .axis
-        .and_then(|(lo, hi)| Some((bar_value(lo, frame.log)?, bar_value(hi, frame.log)?)))
-        .unwrap_or_else(|| {
-            // The axis spans every series' drawable values, so the groups are
-            // read against one scale.
-            let mut lo = 0.0f64;
-            let mut hi = 0.0f64;
-            for v in b.rows.iter().flat_map(|(_, vs)| vs.iter().flatten()) {
-                let Some(v) = bar_value(*v, frame.log) else {
-                    continue;
-                };
-                lo = lo.min(v);
-                hi = hi.max(v);
-            }
-            (lo, hi)
-        });
+    // edge, and the baseline moves onto the axis. The model works the bounds
+    // out, so the SVG draws the same bars.
+    let (lo, hi) = b.axis_bounds(frame.log);
     let span = hi - lo;
     let w = frame.width.saturating_sub(label_w + 14).max(10);
     let zero = pos_in(0.0f64.clamp(lo, hi), lo, span, w);
@@ -294,8 +277,9 @@ fn pos_in(v: f64, lo: f64, span: f64, width: usize) -> usize {
 fn render_spark(frame: &Frame, s: &SparkData) -> String {
     let (dlo, dhi) = minmax(s.values.iter().copied()).unwrap_or((0.0, 0.0));
     // An explicit range (`-y`) is the axis the levels scale to; the summary
-    // still reports the data's own min and max.
-    let (lo, hi) = s.range.unwrap_or((dlo, dhi));
+    // still reports the data's own min and max. The model works the axis out,
+    // so the SVG draws the same line.
+    let (lo, hi) = s.bounds();
     // The values are real; a log axis maps them (and its bounds) as they are
     // drawn, so a level is a position on the axis, not a value.
     let pos = |v: f64| value_pos(v, frame.log);
@@ -605,22 +589,10 @@ fn x_label_row(xaxis: &XAxis, xlo: f64, xhi: f64, width: usize) -> String {
 fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     let series = xy.series();
     let total: usize = series.iter().map(Vec::len).sum();
-    let mut xlo = f64::INFINITY;
-    let mut xhi = f64::NEG_INFINITY;
-    let mut ylo = f64::INFINITY;
-    let mut yhi = f64::NEG_INFINITY;
-    for pts in &series {
-        for &(x, y) in pts {
-            xlo = xlo.min(x);
-            xhi = xhi.max(x);
-            ylo = ylo.min(y);
-            yhi = yhi.max(y);
-        }
-    }
-    // An explicit range (`-x`/`-y`) is the axis: the canvas spans it instead of
-    // the points' own extent (the points outside it are already clipped away).
-    let (xlo, xhi) = xy.xrange.unwrap_or((xlo, xhi));
-    let (ylo, yhi) = xy.yrange.unwrap_or((ylo, yhi));
+    // The model frames the chart: the points' own extent, or an explicit
+    // `-x`/`-y` range where one was given (the points outside it are already
+    // clipped away). The SVG asks it the same question.
+    let (xlo, xhi, ylo, yhi) = xy.bounds();
     // The ys are real; a log axis maps them (and its bounds) onto the canvas
     // here, at draw time.
     let pos = |v: f64| value_pos(v, frame.log);
@@ -729,8 +701,7 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
             // column's own range, over every plotted point.
             match has_by {
                 true => {
-                    let by = xy.rows.iter().filter_map(|r| r.color_by);
-                    let (lo, hi) = minmax(by).unwrap_or((0.0, 0.0));
+                    let (lo, hi) = xy.color_bounds().unwrap_or((0.0, 0.0));
                     (vals, lo, hi)
                 }
                 false => (vals, 1.0, maxcount),
@@ -849,9 +820,10 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
     let ylo_s = format_num(h.ylo);
     let gutter = gutter_width(h.ylo, h.yhi);
     let max = h.counts.iter().copied().max().unwrap_or(0);
-    // The ramp spans one point to the busiest cell, on the count axis.
+    // The ramp spans one point to the busiest cell, on the count axis — the
+    // model's derivation, so the SVG shades the same cell the same way.
     let ramp = frame.ramp.unwrap_or_default();
-    let (clo, chi) = (hist_len(1, frame.log), hist_len(max, frame.log));
+    let (clo, chi) = h.count_bounds(frame.log);
 
     let mut out = String::new();
     // An evenly-spaced (category) x axis is flagged in the title, as in an xy
