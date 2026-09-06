@@ -664,3 +664,11 @@ fn add_rejects_a_position_that_is_out_of_range() {
     let err = run("add 0 = num(qty)", input, 1).unwrap_err();
     assert!(err.contains("column index 0 is out of range"), "{err}");
 }
+
+#[test]
+fn graph_data_output_feeds_another_run() {
+    // countZ is 5,0,0,9,2 over [0,9]: 0,0,2 in [0,4.5) and 5,9 in [4.5,9].
+    let bins = run("graph hist countZ -b 2 -D", INPUT, 1).unwrap();
+    let again = run("select count > 1 | cols bin_lo,count", &bins, 1).unwrap();
+    assert_eq!(again, "bin_lo,count\n0,3\n4.5,2\n");
+}

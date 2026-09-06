@@ -1696,7 +1696,10 @@ pub fn render<W: Write>(
 /// Draw the `graph` sink's chart from the buffered CSV output. The plan ran
 /// normally to produce rows (header + data); this collects the charted columns
 /// into the chart model (dropping non-numeric/empty cells loudly) and hands the
-/// frame plus the data to the terminal or SVG renderer.
+/// frame plus the data to one of the model's three consumers: `--data` writes
+/// the chart's own rows as CSV ([`chart::to_csv`]), `--svg` an SVG document
+/// ([`crate::svg::render`]), and otherwise the chart is drawn in the terminal
+/// ([`crate::graph::render`]).
 fn render_graph<W: Write>(
     bytes: &[u8],
     g: &GraphSpec,
@@ -1722,7 +1725,9 @@ fn render_graph<W: Write>(
     frame.ylabel = g.opts.ylabel.clone();
     let collected = chart::collect(text, g, width);
     frame.notes = collected.notes;
-    let drawn = if g.opts.svg {
+    let drawn = if g.opts.data {
+        chart::to_csv(&collected.data)
+    } else if g.opts.svg {
         crate::svg::render(&frame, &collected.data)
     } else {
         crate::graph::render(&frame, &collected.data)
@@ -2954,6 +2959,26 @@ mod tests {
     }
 
     #[test]
+    fn graph_bar_data_is_never_capped() {
+        // The drawn chart caps the labels at MAX_BARS (one terminal line each),
+        // but `--data` is a CSV of the whole column, not a picture, so it keeps
+        // every row: a header plus one line per label.
+        let mut input = String::from("k,v\n");
+        for i in 0..60 {
+            input.push_str(&format!("k{i},{i}\n"));
+        }
+        let data = render_str("graph bar k v -D", &input, false);
+        assert_eq!(data.lines().count(), 61, "{data}");
+        assert!(data.contains("\nk59,59\n"), "{data}");
+        // The drawn chart still says what it left out.
+        let out = render_str("graph bar k v", &input, false);
+        assert!(
+            out.contains("bars=50") && out.contains("+10 more not shown"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn graph_ranges_clip_and_report() {
         // countZ is 5,0,0,9: an x range of 0:6 on hist drops the 9.
         let out = render_str("graph hist countZ -b 2 -x 0:6", INPUT, false);
@@ -3097,6 +3122,54 @@ mod tests {
         assert!(out.starts_with("<svg"), "{out}");
         assert!(out.trim_end().ends_with("</svg>"), "{out}");
         assert!(out.contains("skipped 4 non-numeric"), "{out}");
+    }
+
+    #[test]
+    fn graph_data_emits_csv_instead_of_a_picture() {
+        // countZ is 5,0,0,9 over [0,9]: 0,0 fall in [0,4.5) and 5,9 in [4.5,9].
+        let out = render_str("graph hist countZ -b 2 -D", INPUT, false);
+        assert_eq!(out, "bin_lo,bin_hi,count\n0,4.5,2\n4.5,9,2\n");
+        let out = render_str("graph scatter id countZ --data", INPUT, false);
+        assert_eq!(out, "id,countZ\n1,5\n2,0\n3,0\n4,9\n");
+        assert!(parse("graph hist a -D -S").is_err());
+    }
+
+    #[test]
+    fn graph_data_bins_an_axis_too_wide_to_subtract() {
+        // -1e308 to 1e308 is a span an f64 cannot hold: worked out as
+        // `hi - lo` it is infinity, which put every value in bin 0 and printed
+        // every edge as NaN or inf. The bins divide the axis all the same.
+        let out = render_str("graph hist v -b 4 -D", "v\n-1e308\n0\n1e308\n", false);
+        let rows: Vec<Vec<f64>> = out
+            .lines()
+            .skip(1)
+            .map(|l| l.split(',').map(|c| c.parse::<f64>().unwrap()).collect())
+            .collect();
+        assert_eq!(rows.len(), 4, "{out}");
+        assert!(rows.iter().flatten().all(|v| v.is_finite()), "{out}");
+        assert_eq!(
+            rows.iter().map(|r| r[2]).collect::<Vec<f64>>(),
+            [1.0, 0.0, 1.0, 1.0],
+            "{out}"
+        );
+        // The first bin starts where the values do, the third at the midpoint,
+        // and the last ends at the top.
+        assert_eq!((rows[0][0], rows[2][0], rows[3][1]), (-1e308, 0.0, 1e308));
+    }
+
+    #[test]
+    fn graph_data_keeps_real_values_under_a_log_axis() {
+        // The log axis is a way of drawing, not a change to the data: --data
+        // writes the numbers that reached the sink, big ones exactly.
+        let input = "v\n10\n100\n5000000000\n";
+        let out = render_str("graph spark v -l -D", input, false);
+        assert_eq!(out, "bucket,v\n1,10\n2,100\n3,5000000000\n");
+        let out = render_str(
+            "graph scatter i v --log --data",
+            "i,v\n1,5000000000\n",
+            false,
+        );
+        assert_eq!(out, "i,v\n1,5000000000\n");
     }
 
     #[test]

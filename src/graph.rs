@@ -681,6 +681,7 @@ mod tests {
     /// builds it for `graph bar`.
     fn bar_data(rows: &[(String, f64)]) -> BarData {
         BarData {
+            label_name: "label".to_string(),
             value_names: vec!["v".to_string()],
             rows: rows
                 .iter()
@@ -843,6 +844,7 @@ mod tests {
         let s = render_spark(
             &Frame::new("v".to_string(), 4, 15, false),
             &SparkData {
+                name: "v".to_string(),
                 values: vec![1.0, 2.0, 3.0, 4.0],
                 range: None,
             },
@@ -861,6 +863,7 @@ mod tests {
         let s = render_spark(
             &Frame::new("v".to_string(), 10, 15, false),
             &SparkData {
+                name: "v".to_string(),
                 values: crate::chart::bucket(&vals, 10),
                 range: None,
             },
@@ -984,6 +987,7 @@ mod tests {
         // 1, 10, 100: linearly the first two share the bottom level; on a log
         // axis they are evenly spread over the eight levels.
         let s = SparkData {
+            name: "v".to_string(),
             values: vec![1.0, 10.0, 100.0],
             range: None,
         };

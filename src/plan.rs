@@ -831,6 +831,9 @@ pub struct GraphOpts {
     /// Draw the value axis on a log10 scale (`-l`/`--log`). Values that are not
     /// positive have no log, so they are dropped (and counted).
     pub log: bool,
+    /// Write the chart's reduced data as CSV (`-D`/`--data`) instead of drawing
+    /// it. Exclusive with `--svg`.
+    pub data: bool,
 }
 
 impl Default for GraphOpts {
@@ -848,6 +851,7 @@ impl Default for GraphOpts {
             xrange: None,
             yrange: None,
             log: false,
+            data: false,
         }
     }
 }

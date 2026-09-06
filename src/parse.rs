@@ -673,6 +673,9 @@ impl<'a> Builder<'a> {
             } else if word == "-A" || word == "--ascii" {
                 opts.ascii = true;
                 s = after;
+            } else if word == "-D" || word == "--data" {
+                opts.data = true;
+                s = after;
             } else if word == "-l" || word == "--log" {
                 opts.log = true;
                 s = after;
@@ -701,6 +704,10 @@ impl<'a> Builder<'a> {
                 positional.push_str(word);
                 s = after;
             }
+        }
+        // Both write to the normal output, so only one of them can have it.
+        if opts.data && opts.svg {
+            return Err(err("graph: -D/--data and -S/--svg are exclusive"));
         }
         let cols = split_list(&positional);
         check_graph_arity(kind, kind_word, cols.len())?;

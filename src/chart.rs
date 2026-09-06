@@ -236,6 +236,8 @@ pub type BarRow = (String, Vec<Option<f64>>);
 
 /// Labelled bars: one row per label, one value per series.
 pub struct BarData {
+    /// The label column's name (the CSV header's first cell under `--data`).
+    pub label_name: String,
     pub value_names: Vec<String>,
     pub rows: Vec<BarRow>,
     /// An explicit value axis (`-y`/`--yrange`) instead of the data's own
@@ -245,6 +247,8 @@ pub struct BarData {
 
 /// A sparkline's values, already bucketed to the chart width.
 pub struct SparkData {
+    /// The charted column's name (the CSV value header under `--data`).
+    pub name: String,
     /// The bucketed values, in the input's own units — a log axis maps them
     /// through [`value_pos`] as they are drawn.
     pub values: Vec<f64>,
@@ -642,19 +646,23 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
             notes.extend(clipped_note(clipped));
             notes.extend(dropped_note(dropped));
             ChartData::Spark(SparkData {
+                name: g.cols[0].name.clone(),
                 values: bucket(&values, width),
                 range: g.opts.yrange,
             })
         }
         GraphKind::Bar => {
             let value_pos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
-            let (rows, skipped, truncated) =
-                collect_bars(text, g.cols[0].pos, &value_pos, MAX_BARS);
+            // The cap is on the *drawn* labels, one terminal line each.
+            // `--data` writes CSV, not a picture, so it keeps every row.
+            let cap = if g.opts.data { usize::MAX } else { MAX_BARS };
+            let (rows, skipped, truncated) = collect_bars(text, g.cols[0].pos, &value_pos, cap);
             if truncated > 0 {
                 notes.push(format!("+{truncated} more not shown"));
             }
             notes.extend(skipped_note(skipped));
             ChartData::Bar(BarData {
+                label_name: g.cols[0].name.clone(),
                 value_names: g.cols[1..].iter().map(|c| c.name.clone()).collect(),
                 rows,
                 axis: g.opts.yrange,
@@ -685,6 +693,66 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
         }
     };
     Collected { data, notes }
+}
+
+/// The chart's reduced data as CSV (header first), for `--data`: the bins,
+/// bars or points a chart would have drawn, written as rows instead. The model
+/// holds real values whatever the axis is (a log axis maps them at draw time),
+/// so the numbers here are the ones that came out of the pipeline.
+pub fn to_csv(data: &ChartData) -> String {
+    let mut out = String::new();
+    let mut row = |cells: &[Field]| csv::write_row(&mut out, cells);
+    // A blank cell for a value the chart had none for.
+    let cell = |v: Option<f64>| v.map_or(Field::Str(""), Field::Num);
+    match data {
+        ChartData::Hist(h) => {
+            row(&[
+                Field::Str("bin_lo"),
+                Field::Str("bin_hi"),
+                Field::Str("count"),
+            ]);
+            if let Some(h) = h {
+                let n = h.counts.len();
+                for (i, &c) in h.counts.iter().enumerate() {
+                    // Each edge is its own step along the axis rather than a
+                    // multiple of one bin's width, so an axis too wide to
+                    // subtract still writes real numbers (see [`lerp`]).
+                    row(&[
+                        Field::Num(lerp(h.lo, h.hi, i, n)),
+                        Field::Num(lerp(h.lo, h.hi, i + 1, n)),
+                        Field::Num(c as f64),
+                    ]);
+                }
+            }
+        }
+        ChartData::Bar(b) => {
+            let mut header = vec![Field::Str(&b.label_name)];
+            header.extend(b.value_names.iter().map(|n| Field::Str(n)));
+            row(&header);
+            for (label, values) in &b.rows {
+                let mut cells = vec![Field::Str(label)];
+                cells.extend(values.iter().copied().map(cell));
+                row(&cells);
+            }
+        }
+        ChartData::Spark(s) => {
+            row(&[Field::Str("bucket"), Field::Str(&s.name)]);
+            for (i, &v) in s.values.iter().enumerate() {
+                row(&[Field::Num((i + 1) as f64), Field::Num(v)]);
+            }
+        }
+        ChartData::Xy(xy) => {
+            let mut header = vec![Field::Str(&xy.xname)];
+            header.extend(xy.names.iter().map(|n| Field::Str(n)));
+            row(&header);
+            for r in &xy.rows {
+                let mut cells = vec![Field::Str(&r.xcell)];
+                cells.extend(r.ys.iter().copied().map(cell));
+                row(&cells);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -793,6 +861,92 @@ mod tests {
         // Off the log axis the length is the count itself.
         assert_eq!(hist_len(0, false), 0.0);
         assert_eq!(hist_len(7, false), 7.0);
+    }
+
+    #[test]
+    fn to_csv_writes_each_kind_as_rows() {
+        let h = HistData {
+            lo: 0.0,
+            hi: 10.0,
+            counts: vec![3, 1],
+            total: 4,
+        };
+        assert_eq!(
+            to_csv(&ChartData::Hist(Some(h))),
+            "bin_lo,bin_hi,count\n0,5,3\n5,10,1\n"
+        );
+        assert_eq!(to_csv(&ChartData::Hist(None)), "bin_lo,bin_hi,count\n");
+        let b = BarData {
+            label_name: "label".into(),
+            value_names: vec!["n".into(), "m".into()],
+            rows: vec![
+                ("a".into(), vec![Some(1.0), None]),
+                ("b, c".into(), vec![Some(2.0), Some(3.0)]),
+            ],
+            axis: None,
+        };
+        assert_eq!(
+            to_csv(&ChartData::Bar(b)),
+            "label,n,m\na,1,\n\"b, c\",2,3\n"
+        );
+        let s = SparkData {
+            name: "value".into(),
+            values: vec![1.5, 2.0],
+            range: None,
+        };
+        assert_eq!(to_csv(&ChartData::Spark(s)), "bucket,value\n1,1.5\n2,2\n");
+        let xy = XyData {
+            xname: "t".into(),
+            names: vec!["y".into()],
+            rows: vec![XyRow {
+                xcell: "2024-01-01".into(),
+                x: 0.0,
+                ys: vec![Some(2.0)],
+                color_by: None,
+            }],
+            xaxis: XAxis::Time,
+            connect: false,
+            xrange: None,
+            yrange: None,
+        };
+        assert_eq!(to_csv(&ChartData::Xy(xy)), "t,y\n2024-01-01,2\n");
+    }
+
+    #[test]
+    fn to_csv_writes_real_values_under_a_log_axis() {
+        // The model keeps real values whatever the axis is, so `--data` needs
+        // no undoing and nothing is lost to a round trip through log10.
+        let s = SparkData {
+            name: "v".into(),
+            values: vec![10.0, 100.0, 1000.0],
+            range: None,
+        };
+        assert_eq!(
+            to_csv(&ChartData::Spark(s)),
+            "bucket,v\n1,10\n2,100\n3,1000\n"
+        );
+        // A magnitude that 10f64.powf(v.log10()) would not return exactly.
+        let s = SparkData {
+            name: "v".into(),
+            values: vec![5000000000.0],
+            range: None,
+        };
+        assert_eq!(to_csv(&ChartData::Spark(s)), "bucket,v\n1,5000000000\n");
+        let xy = XyData {
+            xname: "x".into(),
+            names: vec!["y".into()],
+            rows: vec![XyRow {
+                xcell: "1".into(),
+                x: 1.0,
+                ys: vec![Some(5000000000.0)],
+                color_by: None,
+            }],
+            xaxis: XAxis::Numeric,
+            connect: false,
+            xrange: None,
+            yrange: None,
+        };
+        assert_eq!(to_csv(&ChartData::Xy(xy)), "x,y\n1,5000000000\n");
     }
 
     #[test]
