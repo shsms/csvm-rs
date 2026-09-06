@@ -1714,6 +1714,9 @@ fn render_graph<W: Write>(
     // The terminal (or 80) and 15 rows, times `scale`; `-W`/`-H` override.
     let (width, height) = chart::chart_size(g.opts.scale, term_width, g.opts.width, g.opts.height);
     let mut frame = Frame::new(title, width, height, color);
+    if g.opts.ascii {
+        frame.glyphs = chart::Glyphs::ascii();
+    }
     let collected = chart::collect(text, g, width);
     frame.notes = collected.notes;
     let drawn = if g.opts.svg {
@@ -2942,6 +2945,25 @@ mod tests {
         assert!(out.starts_with("countZ vs id\n"), "{out}");
         assert!(out.contains('┤') && out.contains('└'), "{out}");
         assert!(out.contains("points=4"), "{out}");
+    }
+
+    #[test]
+    fn graph_ascii_mode_draws_with_ascii_only() {
+        for script in [
+            "graph hist countZ -A",
+            "graph spark countZ --ascii",
+            "graph scatter id countZ -A",
+            "graph line id countZ -A",
+            "agg count by fieldA | graph bar fieldA count -A",
+        ] {
+            let out = render_str(script, INPUT, false);
+            assert!(out.is_ascii(), "{script}: {out}");
+            assert!(out.contains('#') || out.contains('*'), "{script}: {out}");
+        }
+        // Multi-series with colour on draws a legend marker too; it must stay
+        // ASCII, not fall back to the Unicode `●`.
+        let out = render_str("graph line id fieldA,countZ -A", INPUT, true);
+        assert!(out.is_ascii(), "{out}");
     }
 
     #[test]

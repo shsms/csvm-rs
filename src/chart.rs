@@ -30,12 +30,20 @@ pub struct Glyphs {
     pub shades: [char; 5],
     /// A braille cell from its dot bits (0 = empty).
     pub braille: fn(u8) -> char,
+    /// The multi-series legend marker.
+    pub legend: char,
 }
 
 /// The braille cell for `bits`: the glyphs start at U+2800 and the dot bits
 /// index into that block.
 fn braille_unicode(bits: u8) -> char {
     char::from_u32(0x2800 + bits as u32).unwrap_or(' ')
+}
+
+/// The ASCII braille stand-in: any lit dot draws `*`, an empty cell draws a
+/// space.
+fn braille_ascii(bits: u8) -> char {
+    if bits == 0 { ' ' } else { '*' }
 }
 
 impl Glyphs {
@@ -51,6 +59,25 @@ impl Glyphs {
             axis_tick: '┤',
             shades: [' ', '░', '▒', '▓', '█'],
             braille: braille_unicode,
+            legend: '●',
+        }
+    }
+
+    /// Plain ASCII, for terminals without block glyphs: `#` bars with no
+    /// partial cells, `" .:-=+*#"` spark levels, `| + - |` axes, `" .:*#"`
+    /// shades, `*` for any lit braille cell or the legend marker.
+    pub fn ascii() -> Self {
+        Glyphs {
+            full: '#',
+            partial: None,
+            levels: [' ', '.', ':', '-', '=', '+', '*', '#'],
+            axis_v: '|',
+            axis_corner: '+',
+            axis_h: '-',
+            axis_tick: '|',
+            shades: [' ', '.', ':', '*', '#'],
+            braille: braille_ascii,
+            legend: '*',
         }
     }
 }
@@ -559,6 +586,28 @@ mod tests {
             HistData::build(&[5.0, 5.0], Some(2)).unwrap().counts,
             [2, 0]
         );
+    }
+
+    #[test]
+    fn ascii_glyphs_are_all_ascii() {
+        let g = Glyphs::ascii();
+        let all: String = [
+            g.full,
+            g.axis_v,
+            g.axis_corner,
+            g.axis_h,
+            g.axis_tick,
+            g.legend,
+        ]
+        .into_iter()
+        .chain(g.levels)
+        .chain(g.shades)
+        .chain((0u8..=255).map(g.braille))
+        .collect();
+        assert!(all.is_ascii(), "{all}");
+        assert!(g.partial.is_none());
+        assert_eq!((g.braille)(0), ' ');
+        assert_eq!((g.braille)(0x40), '*');
     }
 
     #[test]

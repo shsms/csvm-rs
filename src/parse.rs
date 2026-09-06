@@ -662,6 +662,9 @@ impl<'a> Builder<'a> {
             } else if word == "-S" || word == "--svg" {
                 opts.svg = true;
                 s = after;
+            } else if word == "-A" || word == "--ascii" {
+                opts.ascii = true;
+                s = after;
             } else if let Some(v) = flag_value(word, after, &["-W", "--width"]) {
                 let (val, tail) = v?;
                 opts.width = Some(parse_positive(&val, "-W/--width")?);

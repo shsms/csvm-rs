@@ -815,6 +815,9 @@ pub struct GraphOpts {
     pub width: Option<usize>,
     /// An exact chart height in cells (`-H`/`--height`), overriding `scale`.
     pub height: Option<usize>,
+    /// Draw with the plain-ASCII glyph set (`-A`/`--ascii`), for terminals
+    /// without block/braille glyphs.
+    pub ascii: bool,
 }
 
 impl Default for GraphOpts {
@@ -826,6 +829,7 @@ impl Default for GraphOpts {
             svg: false,
             width: None,
             height: None,
+            ascii: false,
         }
     }
 }

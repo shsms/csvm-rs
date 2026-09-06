@@ -583,7 +583,10 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
             .enumerate()
             .map(|(i, n)| {
                 if colors {
-                    format!("{} {n}", series_style(i).paint("●"))
+                    format!(
+                        "{} {n}",
+                        series_style(i).paint(&frame.glyphs.legend.to_string())
+                    )
                 } else {
                     n.clone()
                 }
