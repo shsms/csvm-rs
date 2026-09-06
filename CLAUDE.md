@@ -330,7 +330,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `-D/--data`, `-S/--svg`. `chart::chart_size` sizes the chart: `-W`/`-H` win,
   else the terminal's width (`src/term.rs`: `$COLUMNS`, else a `TIOCGWINSZ`
   ioctl through `libc` — read only when stdout is a terminal and there is no
-  `-o`) or `BASE_W`=80, and `BASE_H`=15 rows, both × `-s`, and the result
+  `-o`, and passed on by `exec::render_graph` only for a chart drawn *in* the
+  terminal, so `-D` and `-S` do not change with the window) or `BASE_W`=80,
+  and `BASE_H`=15 rows, both × `-s`, and the result
   clamped to the same `MAX_CELLS` ceiling the flags carry, so `-s` cannot ask
   for the allocation `-W` may not. A range *is* the
   axis: the chart spans exactly it and the values outside are dropped and
@@ -347,8 +349,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   non-positive `-y` bound under `-l` (heatmap excepted, its `-l` is the count
   axis); `-D` and `-S` are exclusive, since both own the normal output. `-D`'s
   shapes: `bin_lo,bin_hi,count` per hist bin, every label and its values for
-  bar (`--data` is never capped), `bucket,VALUE` per spark cell (so the row count is at most the chart
-  width — a shorter series passes through as it is; pin the width with `-W`),
+  bar (`--data` is never capped), `bucket,VALUE` per spark cell (so the row count is at most the
+  chart width, which for `-D` is `-W` else 80 — a shorter series passes through as it is),
   the raw x cell plus the numeric ys for scatter/line, and `X,Y,count` lower
   corners of the non-empty cells for heatmap. `-r/--ramp` means "colour by
   value", and which value depends on the kind: the bin count for hist, the bar

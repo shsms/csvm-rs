@@ -1715,7 +1715,11 @@ fn render_graph<W: Write>(
         .clone()
         .unwrap_or_else(|| chart::default_title(g));
     // The terminal (or 80) and 15 rows, times `scale`; `-W`/`-H` override.
-    let (width, height) = chart::chart_size(g.opts.scale, term_width, g.opts.width, g.opts.height);
+    // Only a chart drawn *in* the terminal follows the terminal: a `-D` dump
+    // and an `-S` document are output, not a picture in this window, so they
+    // must not come out differently depending on where they were run.
+    let term = term_width.filter(|_| !(g.opts.data || g.opts.svg));
+    let (width, height) = chart::chart_size(g.opts.scale, term, g.opts.width, g.opts.height);
     let mut frame = Frame::new(title, width, height, color);
     if g.opts.ascii {
         frame.glyphs = chart::Glyphs::ascii();
@@ -3261,6 +3265,46 @@ mod tests {
         // The first bin starts where the values do, the third at the midpoint,
         // and the last ends at the top.
         assert_eq!((rows[0][0], rows[2][0], rows[3][1]), (-1e308, 0.0, 1e308));
+    }
+
+    #[test]
+    fn graph_data_and_svg_do_not_follow_the_terminal() {
+        // A spark's bucket count is its chart's width, and a chart drawn in the
+        // terminal is as wide as the terminal. `-D` and `-S` are output, not a
+        // picture in this window, so they size the same wherever they run.
+        // The series has to be longer than the chart for the width to show at
+        // all: a short one passes through as it is whatever the width says.
+        let mut long = String::from("v\n");
+        for i in 0..200 {
+            long.push_str(&format!("{i}\n"));
+        }
+        // The default 80 columns, not the 200 the terminal claims.
+        let data = |term| render_str_term("graph spark v -D", &long, false, term);
+        assert_eq!(
+            data(Some(200)).lines().count(),
+            1 + 80,
+            "{}",
+            data(Some(200))
+        );
+        assert_eq!(data(Some(200)), data(None));
+        let svg = |term| render_str_term("graph spark v -S", &long, false, term);
+        // One polyline point per bucket, again 80 of them.
+        let points = |s: &str| {
+            s.split("points=\"")
+                .nth(1)
+                .and_then(|t| t.split('"').next())
+                .map(|t| t.split_whitespace().count())
+                .unwrap_or(0)
+        };
+        assert_eq!(points(&svg(Some(200))), 80, "{}", svg(Some(200)));
+        assert_eq!(svg(Some(200)), svg(None));
+        // `-W` still pins the bucket count, terminal or no terminal.
+        let mut long = String::from("v\n");
+        for i in 0..40 {
+            long.push_str(&format!("{i}\n"));
+        }
+        let pinned = render_str_term("graph spark v -D -W 20", &long, false, Some(200));
+        assert_eq!(pinned.lines().count(), 1 + 20, "{pinned}");
     }
 
     #[test]

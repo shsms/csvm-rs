@@ -305,8 +305,9 @@ by their output text (like a `by` key); sum/mean/stddev are blank for a non-nume
 it must be the last command. Cells that are not numbers are dropped from the plot and counted \
 in a note under it. The chart is as wide as the terminal (80 columns when the output is not a \
 terminal) and 15 rows tall; -s multiplies that default, and -W and -H set an exact size (never \
-smaller than 16 wide and 2 high, and never larger than 4096). -A draws with plain ASCII, for \
-a terminal without block glyphs.\n\n\
+smaller than 16 wide and 2 high, and never larger than 4096). -D and -S are output rather than \
+a picture in this window, so they never follow the terminal: they size from -W and -H, else the \
+80-by-15 default. -A draws with plain ASCII, for a terminal without block glyphs.\n\n\
 -l puts the value axis on a log10 scale: that axis is y for scatter, line and spark, the bar \
 length for bar, and the count for hist and heatmap. -y ranges that same axis, except on a \
 heatmap, where it ranges the y bins rather than the count; hist takes no -y, and its -x sets \
@@ -320,8 +321,8 @@ terminal, the plot area's pixels in an SVG (so a cell is never smaller than a pi
 cut down to fit is reported as `grid capped to CxR`; -D draws nothing, so it keeps the whole \
 -b.\n\n\
 -D writes the chart's own data as CSV instead of drawing it: hist bin edges, the bar labels \
-and values, the spark's width buckets, the plotted points, or the heatmap's cell corners and \
-counts. -S emits an SVG document to the output instead of a terminal chart, so -D and -S are \
+and values, the spark's buckets (as many as the chart is wide, so -W pins the row count), the \
+plotted points, or the heatmap's cell corners and counts. -S emits an SVG document to the output instead of a terminal chart, so -D and -S are \
 exclusive. -r colours by value: in the terminal (with --color) it paints hist bars by count, \
 spark cells and single-series bars by value, and a one-y-series scatter or line by how many \
 points share a cell; an SVG always has colour, and takes the ramp for hist, a single-series \
