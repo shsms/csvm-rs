@@ -143,22 +143,21 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
 /// Draw one labelled horizontal bar per row, anchored at a zero baseline so
 /// negative values extend left (a diverging bar chart). Labels are right-aligned
 /// to a common width. Best used after group-by, where there are few rows.
+///
+/// With several value columns the row becomes a *group*: one line per series,
+/// the label on the first of them and blank on the rest, followed by a legend.
+/// Grouped bars take the series palette; a colour has to mean either "which
+/// series" or "how big", so the parser rejects a `-r/--ramp` there. A single
+/// series ramps by value.
 fn render_bars(frame: &Frame, b: &BarData) -> String {
-    // Only the first value series is drawn; `graph bar` takes one value column.
-    // Each row keeps its real value (which is what prints) and the value the
-    // bar is drawn at: the same number, or its log10 on a log axis, where a
-    // value that is not positive has no bar at all.
-    let rows: Vec<(&str, f64, Option<f64>)> = b
+    // A row carries one value per series; `None` is a cell that was not a
+    // number, which prints its label and nothing else.
+    let nseries = b.value_names.len().max(1);
+    let multi = nseries > 1;
+    let label_w = b
         .rows
         .iter()
-        .filter_map(|(label, values)| {
-            let v = (*values.first()?)?;
-            Some((label.as_str(), v, bar_value(v, frame.log)))
-        })
-        .collect();
-    let label_w = rows
-        .iter()
-        .map(|(l, _, _)| l.chars().count())
+        .map(|(l, _)| l.chars().count())
         .max()
         .unwrap_or(0);
     // The baseline is always 0 — a real 0 on a linear axis, a value of 1 on a
@@ -171,12 +170,16 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
         .axis
         .and_then(|(lo, hi)| Some((bar_value(lo, frame.log)?, bar_value(hi, frame.log)?)))
         .unwrap_or_else(|| {
+            // The axis spans every series' drawable values, so the groups are
+            // read against one scale.
             let mut lo = 0.0f64;
             let mut hi = 0.0f64;
-            for (_, _, at) in &rows {
-                let Some(v) = at else { continue };
-                lo = lo.min(*v);
-                hi = hi.max(*v);
+            for v in b.rows.iter().flat_map(|(_, vs)| vs.iter().flatten()) {
+                let Some(v) = bar_value(*v, frame.log) else {
+                    continue;
+                };
+                lo = lo.min(v);
+                hi = hi.max(v);
             }
             (lo, hi)
         });
@@ -192,36 +195,67 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
         out.push_str(y);
         out.push('\n');
     }
-    for (label, v, at) in &rows {
-        // The drawn length is clamped to the axis; the printed value is real.
-        let mut field = vec![' '; w];
-        if let Some(at) = at {
-            let p = pos_in(at.clamp(lo, hi), lo, span, w);
-            let (from, to) = (zero.min(p), zero.max(p));
-            for cell in field.iter_mut().take(to).skip(from) {
-                *cell = frame.glyphs.full;
+    for row in &b.rows {
+        for i in 0..nseries {
+            // Each series keeps its real value (which is what prints) and the
+            // value the bar is drawn at: the same number, or its log10 on a log
+            // axis, where a value that is not positive has no bar at all.
+            let v = row.1.get(i).copied().flatten();
+            let at = v.and_then(|v| bar_value(v, frame.log));
+            // The drawn length is clamped to the axis; the printed value is real.
+            let mut field = vec![' '; w];
+            if let Some(at) = at {
+                let p = pos_in(at.clamp(lo, hi), lo, span, w);
+                let (from, to) = (zero.min(p), zero.max(p));
+                for cell in field.iter_mut().take(to).skip(from) {
+                    *cell = frame.glyphs.full;
+                }
             }
+            let drawn: String = field.into_iter().collect();
+            // One series: the ramp runs over the same bounds the bars are drawn
+            // against, so a colour is a position on the axis. Several: the
+            // series palette says which column a bar belongs to. A row a log
+            // axis cannot place has no bar to paint either way.
+            let drawn = match at {
+                Some(_) if multi && frame.color => series_style(i).paint(&drawn),
+                Some(at) => paint(frame, at, lo, hi, &drawn),
+                None => drawn,
+            };
+            // The label heads its group; the rows below it line up under a gap.
+            let label = if i == 0 { row.0.as_str() } else { "" };
+            let value = v.map(format_num).unwrap_or_default();
+            out.push_str(&format!("{label:>label_w$} {axis_v}{drawn} {value}\n"));
         }
-        let drawn: String = field.into_iter().collect();
-        // The ramp runs over the same bounds the bars are drawn against, so a
-        // colour is a position on the axis; a row a log axis cannot place has
-        // no bar to paint.
-        let drawn = match at {
-            Some(at) => paint(frame, *at, lo, hi, &drawn),
-            None => drawn,
-        };
-        out.push_str(&format!(
-            "{label:>label_w$} {axis_v}{drawn} {}\n",
-            format_num(*v)
-        ));
     }
     if let Some(x) = &frame.xlabel {
         out.push_str(&format!("{:>label_w$}  {x}\n", ""));
     }
-    out.push_str(&format!("bars={}", rows.len()));
+    // The count is of labels — the bars of a group belong to one row.
+    out.push_str(&format!("bars={}", b.rows.len()));
     out.push_str(&frame.notes_tail());
     out.push('\n');
+    if multi {
+        out.push_str(&legend_line(&b.value_names, &frame.glyphs, frame.color));
+    }
     out
+}
+
+/// The `● name` legend line of a multi-series chart: one entry per series,
+/// painted in that series' colour. Colour is what tells the series apart, so
+/// with it off the markers go too and only the names are listed.
+fn legend_line(names: &[String], glyphs: &Glyphs, color: bool) -> String {
+    let entries: Vec<String> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            if color {
+                series_style(i).paint(&format!("{} {n}", glyphs.legend))
+            } else {
+                n.clone()
+            }
+        })
+        .collect();
+    format!("{}\n", entries.join("  "))
 }
 
 /// Column position of `v` within a `width`-wide field spanning `[lo, lo+span]`.
@@ -755,23 +789,7 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     out.push_str(&tail_notes(frame));
     out.push('\n');
     if multi {
-        let legend: Vec<String> = xy
-            .names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| {
-                if colors {
-                    format!(
-                        "{} {n}",
-                        series_style(i).paint(&frame.glyphs.legend.to_string())
-                    )
-                } else {
-                    n.clone()
-                }
-            })
-            .collect();
-        out.push_str(&legend.join("  "));
-        out.push('\n');
+        out.push_str(&legend_line(&xy.names, &frame.glyphs, colors));
     }
     out
 }
@@ -1151,6 +1169,40 @@ mod tests {
         );
         assert!(s.contains('\x1b')); // coloured glyphs
         assert!(s.contains('●')); // legend markers
+    }
+
+    #[test]
+    fn render_bars_groups_the_series_of_a_row() {
+        let b = BarData {
+            label_name: "k".to_string(),
+            value_names: vec!["n".to_string(), "m".to_string()],
+            rows: vec![
+                ("a".to_string(), vec![Some(1.0), Some(2.0)]),
+                ("b".to_string(), vec![Some(4.0), None]),
+            ],
+            axis: None,
+        };
+        let s = render_bars(&Frame::new("t".to_string(), 40, 15, true), &b);
+        let rows: Vec<&str> = s.lines().filter(|l| l.contains('│')).collect();
+        assert_eq!(rows.len(), 4, "{s}");
+        // The label prints on the first series' row and is blank on the rest.
+        assert!(
+            rows[0].starts_with("a │") && rows[1].starts_with("  │"),
+            "{s}"
+        );
+        assert!(
+            rows[2].starts_with("b │") && rows[3].starts_with("  │"),
+            "{s}"
+        );
+        // A row with no value draws no bar and prints no number.
+        assert!(
+            !rows[3].contains('█') && rows[3].trim_end().ends_with('│'),
+            "{s}"
+        );
+        // Several series take the palette, and the summary counts labels.
+        assert!(s.contains("\x1b[38;2;"), "{s}");
+        assert!(s.contains("bars=2"), "{s}");
+        assert!(s.contains("● n") && s.contains("● m"), "{s}");
     }
 
     #[test]

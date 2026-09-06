@@ -4,7 +4,7 @@
 //! [`crate::chart`] model the terminal renderers do, as a standalone `<svg>`
 //! document.
 
-use crate::chart::{AxisRange, BarData, ChartData, Frame, bar_value, hist_len, value_pos};
+use crate::chart::{AxisRange, BarRow, ChartData, Frame, bar_value, hist_len, value_pos};
 use crate::color::{Ramp, rgb_hex};
 use crate::field::format_num;
 use crate::graph::{XAxis, series_rgb};
@@ -215,12 +215,20 @@ fill=\"{fill}\" stroke=\"white\"/>\n",
 
 /// Horizontal bar chart: one labelled bar per row, anchored at a zero baseline
 /// (a value of 1 on a log axis). `log` draws each bar at its log10, as in the
-/// terminal chart, and a value a log axis cannot place gets no bar. `ramp`
-/// fills each bar by where it sits on the value axis, as the terminal chart
-/// paints it.
+/// terminal chart, and a value a log axis cannot place gets no bar.
+///
+/// With several value columns each row is a *group*: `names` gives the series,
+/// a row's height is shared between them, and a legend names them — as in the
+/// terminal chart, where grouped bars take the series palette (the parser
+/// rejects a `-r/--ramp` there). A single series fills each bar by where it
+/// sits on the value axis, as the terminal chart paints it.
+// One argument over clippy's bar, like `hist`: the axis knobs are independent,
+// and bundling them would only move the list.
+#[allow(clippy::too_many_arguments)]
 pub fn bars(
     title: &str,
-    rows: &[(String, f64)],
+    names: &[String],
+    rows: &[BarRow],
     axis: AxisRange,
     log: bool,
     ramp: Option<Ramp>,
@@ -230,9 +238,12 @@ pub fn bars(
     if rows.is_empty() {
         return header(title, "", note, labels);
     }
-    // Each row keeps its real value (which is what prints) and the value the
+    let nseries = names.len().max(1);
+    let multi = nseries > 1;
+    // Each series keeps its real value (which is what prints) and the value the
     // bar is drawn at.
-    let at: Vec<Option<f64>> = rows.iter().map(|(_, v)| bar_value(*v, log)).collect();
+    let value_at = |row: &BarRow, i: usize| row.1.get(i).copied().flatten();
+    let at_of = |row: &BarRow, i: usize| value_at(row, i).and_then(|v| bar_value(v, log));
     // An explicit axis (`-y`) replaces the data's own range, as in the terminal
     // chart: a bar past it draws to the edge and the baseline moves onto it.
     // The bounds always have a bar value: the parser rejects a non-positive
@@ -240,41 +251,95 @@ pub fn bars(
     let (lo, hi) = axis
         .and_then(|(lo, hi)| Some((bar_value(lo, log)?, bar_value(hi, log)?)))
         .unwrap_or_else(|| {
-            let drawn = || at.iter().flatten().copied();
+            // The axis spans every series, so the groups read against one scale.
+            let drawn = || {
+                rows.iter()
+                    .flat_map(|r| r.1.iter().flatten())
+                    .filter_map(|&v| bar_value(v, log))
+            };
             (
                 drawn().fold(0.0_f64, f64::min),
                 drawn().fold(0.0_f64, f64::max),
             )
         });
     let span = (hi - lo).max(f64::MIN_POSITIVE);
-    let n = rows.len();
-    let rh = ph() / n as f64;
+    let rh = ph() / rows.len() as f64;
+    // A group's rows share the label row's height.
+    let sh = rh / nseries as f64;
     let zero = L + (0.0_f64.clamp(lo, hi) - lo) / span * pw();
     let mut body = axis_lines();
-    for (i, ((label, v), at)) in rows.iter().zip(&at).enumerate() {
-        // The drawn length is clamped to the axis; the printed value is real.
-        let (x, w) = match at {
-            Some(at) => {
-                let vx = L + (at.clamp(lo, hi) - lo) / span * pw();
-                (zero.min(vx), (vx - zero).abs())
-            }
-            None => (zero, 0.0),
-        };
-        let y = T + i as f64 * rh;
-        body.push_str(&format!(
-            "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{h:.2}\" fill=\"{fill}\"/>\n\
-<text x=\"{lx}\" y=\"{ly:.2}\">{label} ({val})</text>\n",
-            h = (rh - 2.0).max(0.0),
-            // A row a log axis cannot place has no bar; it keeps the low end of
-            // the ramp, which is what its zero-width rect would show anyway.
-            fill = fill_at(ramp, at.unwrap_or(lo), lo, hi),
-            lx = L + 4.0,
-            ly = y + rh / 2.0 + 4.0,
-            label = esc(label),
-            val = format_num(*v),
-        ));
+    for (ri, row) in rows.iter().enumerate() {
+        for i in 0..nseries {
+            let at = at_of(row, i);
+            // The drawn length is clamped to the axis; the printed value is real.
+            let (x, w) = match at {
+                Some(at) => {
+                    let vx = L + (at.clamp(lo, hi) - lo) / span * pw();
+                    (zero.min(vx), (vx - zero).abs())
+                }
+                None => (zero, 0.0),
+            };
+            let y = T + ri as f64 * rh + i as f64 * sh;
+            // The label heads its group; every row of it prints its own value.
+            let text = match (i == 0, value_at(row, i)) {
+                (true, Some(v)) => format!("{} ({})", esc(&row.0), format_num(v)),
+                (true, None) => esc(&row.0),
+                (false, Some(v)) => format!("({})", format_num(v)),
+                (false, None) => String::new(),
+            };
+            let label = if text.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "<text x=\"{lx}\" y=\"{ly:.2}\">{text}</text>\n",
+                    lx = L + 4.0,
+                    ly = y + sh / 2.0 + 4.0,
+                )
+            };
+            body.push_str(&format!(
+                "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{h:.2}\" \
+fill=\"{fill}\"/>\n{label}",
+                h = (sh - 2.0).max(0.0),
+                // A row a log axis cannot place has no bar; it keeps the low end
+                // of the ramp, which is what its zero-width rect would show
+                // anyway.
+                fill = if multi {
+                    series_hex(i)
+                } else {
+                    fill_at(ramp, at.unwrap_or(lo), lo, hi)
+                },
+            ));
+        }
+    }
+    if multi {
+        body.push_str(&legend(names));
     }
     header(title, &body, note, labels)
+}
+
+/// The series legend of a multi-series chart, top right of the plot area: a
+/// round marker in the series colour and its name — the same `● name` the
+/// terminal charts print, so the two cannot drift. It is the one legend for
+/// every chart that has series: grouped bars and the xy (scatter/line) charts
+/// alike.
+fn legend(names: &[String]) -> String {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let y = T + 4.0 + i as f64 * 16.0;
+            format!(
+                "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"5\" fill=\"{color}\"/>\n\
+<text x=\"{tx}\" y=\"{ty}\">{n}</text>\n",
+                cx = L + pw() - 85.0,
+                cy = y + 5.0,
+                tx = L + pw() - 76.0,
+                ty = y + 9.0,
+                color = series_hex(i),
+                n = esc(name),
+            )
+        })
+        .collect()
 }
 
 /// Sparkline as a single polyline across the plot width. `values` and `range`
@@ -408,19 +473,7 @@ pub fn xy_chart(
         }
     }
     if series.len() > 1 {
-        for (i, name) in names.iter().enumerate() {
-            let color = series_hex(i);
-            let y = T + 4.0 + i as f64 * 16.0;
-            body.push_str(&format!(
-                "<rect x=\"{lx}\" y=\"{ry}\" width=\"10\" height=\"10\" fill=\"{color}\"/>\n\
-<text x=\"{tx}\" y=\"{ty}\">{n}</text>\n",
-                lx = L + pw() - 90.0,
-                ry = y,
-                tx = L + pw() - 76.0,
-                ty = y + 9.0,
-                n = esc(name),
-            ));
-        }
+        body.push_str(&legend(names));
     }
     header(title, &body, note, labels)
 }
@@ -457,7 +510,8 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         ),
         ChartData::Bar(b) => bars(
             &frame.title,
-            &single_series(b),
+            &b.value_names,
+            &b.rows,
             b.axis,
             frame.log,
             frame.ramp,
@@ -495,18 +549,20 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
     }
 }
 
-/// The first series of a bar chart as `(label, value)` rows; a row with no
-/// numeric first value is skipped.
-fn single_series(b: &BarData) -> Vec<(String, f64)> {
-    b.rows
-        .iter()
-        .filter_map(|(label, values)| Some((label.clone(), (*values.first()?)?)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A single-series bar chart's name and rows, as `collect` builds them for
+    /// `graph bar LABEL VALUE`.
+    fn one_series(rows: &[(&str, f64)]) -> (Vec<String>, Vec<BarRow>) {
+        (
+            vec!["v".to_string()],
+            rows.iter()
+                .map(|(l, v)| (l.to_string(), vec![Some(*v)]))
+                .collect(),
+        )
+    }
 
     #[test]
     fn hist_emits_a_rect_per_bin() {
@@ -609,6 +665,23 @@ mod tests {
         );
         assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"));
         assert!(s.contains(">a</text>") && s.contains(">b</text>"));
+        // The legend marker is the round one the terminal charts print, and it
+        // is the same helper the bar chart uses. A line chart draws its data as
+        // polylines, so its only circles are the legend's — one per series.
+        let line = xy_chart(
+            "m",
+            &names,
+            &series,
+            true,
+            "",
+            XAxis::Numeric,
+            Axes::default(),
+            Labels::default(),
+            Points::default(),
+        );
+        assert_eq!(line.matches("<circle").count(), names.len(), "{line}");
+        // ...and nothing but the background is a rect.
+        assert_eq!(line.matches("<rect").count(), 1, "{line}");
     }
 
     #[test]
@@ -673,13 +746,8 @@ mod tests {
     fn log_bars_leave_the_non_positive_rows_empty() {
         // As in the terminal chart: 0.5 puts the baseline (a value of 1) inside
         // the plot, so a wrongly placed 0 or -5 would draw a visible bar.
-        let rows = [
-            ("a".to_string(), 100.0),
-            ("b".to_string(), 0.5),
-            ("c".to_string(), 0.0),
-            ("d".to_string(), -5.0),
-        ];
-        let s = bars("v", &rows, None, true, None, "", Labels::default());
+        let (names, rows) = one_series(&[("a", 100.0), ("b", 0.5), ("c", 0.0), ("d", -5.0)]);
+        let s = bars("v", &names, &rows, None, true, None, "", Labels::default());
         // The two rows a log axis cannot place draw nothing but still print
         // their label and real value.
         assert_eq!(s.matches("width=\"0.00\"").count(), 2, "{s}");
@@ -713,8 +781,8 @@ mod tests {
     #[test]
     fn ramp_fills_bar_rows_and_leaves_the_spark_polyline_alone() {
         let ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
-        let rows = [("a".to_string(), 0.0), ("b".to_string(), 4.0)];
-        let s = bars("v", &rows, None, false, ramp, "", Labels::default());
+        let (names, rows) = one_series(&[("a", 0.0), ("b", 4.0)]);
+        let s = bars("v", &names, &rows, None, false, ramp, "", Labels::default());
         assert!(
             s.contains("fill=\"#0000ee\"") && s.contains("fill=\"#cd0000\""),
             "{s}"
@@ -723,6 +791,30 @@ mod tests {
         let sp = spark("v", &[1.0, 2.0], None, false, "", Labels::default());
         assert_eq!(sp.matches("<polyline").count(), 1, "{sp}");
         assert!(sp.contains("#4fc3f7"), "{sp}");
+    }
+
+    #[test]
+    fn bars_group_the_series_of_a_row_with_a_legend() {
+        // Two labels x two series: a rect per sub-row, and a legend naming both
+        // series (the background rect is the only other one).
+        let names = ["n".to_string(), "m".to_string()];
+        let rows = [
+            ("a".to_string(), vec![Some(1.0), Some(2.0)]),
+            ("b".to_string(), vec![Some(3.0), None]),
+        ];
+        let s = bars("v", &names, &rows, None, false, None, "", Labels::default());
+        assert_eq!(s.matches("<rect").count(), 1 /*background*/ + 4, "{s}");
+        // The series palette colours the sub-rows, and both names are legended.
+        assert!(s.contains("#4fc3f7") && s.contains("#ff8a65"), "{s}");
+        assert!(s.contains(">n</text>") && s.contains(">m</text>"), "{s}");
+        // The label prints on the first series' row, the value on each; a row
+        // with no value prints neither a bar nor a number.
+        assert!(
+            s.contains(">a (1)</text>") && s.contains(">(2)</text>"),
+            "{s}"
+        );
+        assert!(s.contains(">b (3)</text>"), "{s}");
+        assert_eq!(s.matches("width=\"0.00\"").count(), 1, "{s}");
     }
 
     #[test]

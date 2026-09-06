@@ -2980,6 +2980,25 @@ mod tests {
     }
 
     #[test]
+    fn graph_bar_groups_several_value_columns_with_a_legend() {
+        // countA is countZ + id: 6, 2, 3, 13 beside countZ's 5, 0, 0, 9.
+        let script = "add countA = countZ + id | graph bar fieldA countA,countZ";
+        let out = render_str(script, INPUT, true);
+        // 4 labels x 2 series = 8 bar rows; the label prints once per group.
+        assert_eq!(out.matches('│').count(), 8, "{out}");
+        assert_eq!(out.matches("t │").count(), 3, "{out}");
+        assert!(
+            out.contains("● countA") && out.contains("● countZ"),
+            "{out}"
+        );
+        assert!(out.contains("bars=4"), "{out}");
+        let data = render_str(&format!("{script} -D"), INPUT, false);
+        assert!(data.starts_with("fieldA,countA,countZ\nt,6,5\n"), "{data}");
+        let svg = render_str(&format!("{script} -S"), INPUT, false);
+        assert_eq!(svg.matches("<rect").count(), 1 + 8, "{svg}");
+    }
+
+    #[test]
     fn graph_ranges_clip_and_report() {
         // countZ is 5,0,0,9: an x range of 0:6 on hist drops the 9.
         let out = render_str("graph hist countZ -b 2 -x 0:6", INPUT, false);

@@ -1532,7 +1532,7 @@ fn subst_params(body: &str, params: &[String], args: &[&str]) -> String {
 fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error> {
     let ok = match kind {
         GraphKind::Hist | GraphKind::Spark => n == 1,
-        GraphKind::Bar => n == 2,
+        GraphKind::Bar => n >= 2,
         GraphKind::Scatter | GraphKind::Line => n >= 2,
     };
     if ok {
@@ -1540,7 +1540,7 @@ fn check_graph_arity(kind: GraphKind, word: &str, n: usize) -> Result<(), Error>
     }
     let want = match kind {
         GraphKind::Hist | GraphKind::Spark => "one column",
-        GraphKind::Bar => "two columns (label value)",
+        GraphKind::Bar => "a label column and one or more value columns",
         GraphKind::Scatter | GraphKind::Line => "an x column and one or more y columns",
     };
     Err(err(format!("graph {word} expects {want}, got {n}")))
@@ -1571,6 +1571,14 @@ fn check_graph_flags(
         if opts.ramp.is_some() {
             return one("-r/--ramp");
         }
+    }
+    // Same rule on a grouped bar: with several value columns the series
+    // palette says which column a bar belongs to, so a ramp by value has
+    // nowhere to paint.
+    if kind == GraphKind::Bar && opts.ramp.is_some() && ncols > 2 {
+        return Err(err(format!(
+            "graph {word} takes -r/--ramp with one value column"
+        )));
     }
     if opts.xrange.is_some()
         && !matches!(kind, GraphKind::Hist | GraphKind::Scatter | GraphKind::Line)
@@ -2962,6 +2970,21 @@ mod tests {
         assert!(parse("graph scatter x y1,y2 -c z").is_err());
         assert!(parse("graph hist x -c z").is_err());
         assert!(parse("graph line x y1,y2 -r blue:red").is_err());
+    }
+
+    #[test]
+    fn graph_ramp_needs_one_bar_value_column() {
+        // One value column ramps by value; a group takes the series palette,
+        // so a ramp there would have no meaning and is rejected.
+        assert!(parse("graph bar k v -r blue:red").is_ok());
+        let e = parse("graph bar k v1,v2 -r blue:red")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("graph bar takes -r/--ramp with one value column"),
+            "{e}"
+        );
+        assert!(parse("graph bar k v1,v2").is_ok());
     }
 
     #[test]
