@@ -19,6 +19,13 @@ const R: f64 = 16.0;
 const T: f64 = 32.0;
 const B: f64 = 44.0;
 
+/// The plot area in pixels: the document less those insets. Public because it
+/// is a limit on the *data* as well as on the drawing — a heatmap grid finer
+/// than this has cells smaller than a pixel, so [`crate::chart::collect`] caps
+/// the grid it builds to these.
+pub const PLOT_W: f64 = W - L - R;
+pub const PLOT_H: f64 = H - T - B;
+
 /// Optional axis captions (`--xlabel`/`--ylabel`), drawn by [`header`] on every
 /// chart kind so the terminal and SVG output can't drift.
 #[derive(Clone, Copy, Debug, Default)]
@@ -41,13 +48,6 @@ fn fill_at(ramp: Option<Ramp>, v: f64, lo: f64, hi: f64) -> String {
         Some(rgb) => rgb_hex(&rgb),
         None => series_hex(0),
     }
-}
-
-fn pw() -> f64 {
-    W - L - R
-}
-fn ph() -> f64 {
-    H - T - B
 }
 
 /// Minimal XML text escaping for titles and labels.
@@ -80,7 +80,7 @@ fn header(title: &str, body: &str, note: &str, labels: Labels) -> String {
     let xlabel = match labels.x {
         Some(x) => format!(
             "<text x=\"{}\" y=\"{}\" text-anchor=\"middle\">{}</text>\n",
-            L + pw() / 2.0,
+            L + PLOT_W / 2.0,
             H - B + 24.0,
             esc(x)
         ),
@@ -99,12 +99,12 @@ viewBox=\"0 0 {W} {H}\" font-family=\"sans-serif\" font-size=\"12\">\n\
 
 /// The L-shaped x/y axis lines bounding the plot area.
 fn axis_lines() -> String {
-    let (x0, y0, x1, y1) = (L, T, L, T + ph());
+    let (x0, y0, x1, y1) = (L, T, L, T + PLOT_H);
     format!(
         "<line x1=\"{x0}\" y1=\"{y0}\" x2=\"{x1}\" y2=\"{y1}\" stroke=\"#888\"/>\n\
 <line x1=\"{L}\" y1=\"{by}\" x2=\"{rx}\" y2=\"{by}\" stroke=\"#888\"/>\n",
-        by = T + ph(),
-        rx = L + pw(),
+        by = T + PLOT_H,
+        rx = L + PLOT_W,
     )
 }
 
@@ -116,7 +116,7 @@ fn ylabels(lo: f64, hi: f64) -> String {
 <text x=\"{x}\" y=\"{by}\" text-anchor=\"end\">{lo}</text>\n",
         x = L - 6.0,
         ty = T + 4.0,
-        by = T + ph(),
+        by = T + PLOT_H,
         hi = format_num(hi),
         lo = format_num(lo),
     )
@@ -129,9 +129,9 @@ fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
     // Tick count from the plot width and the axis's label size (~7px per char);
     // the labels themselves come from the shared `graph::axis_ticks`.
     let label_px = crate::graph::axis_label_width(xaxis, xlo, xhi) as f64 * 7.0 + 12.0;
-    let target = ((pw() / label_px) as usize).clamp(2, 7);
+    let target = ((PLOT_W / label_px) as usize).clamp(2, 7);
     let labels = crate::graph::axis_ticks(xaxis, xlo, xhi, target);
-    let y = T + ph() + 16.0;
+    let y = T + PLOT_H + 16.0;
     labels
         .iter()
         .map(|(t, lab)| {
@@ -143,7 +143,7 @@ fn xlabels(xaxis: &XAxis, xlo: f64, xhi: f64) -> String {
             } else {
                 "middle"
             };
-            let x = L + t * pw();
+            let x = L + t * PLOT_W;
             format!(
                 "<text x=\"{x:.1}\" y=\"{y}\" text-anchor=\"{anchor}\">{}</text>\n",
                 esc(lab)
@@ -170,16 +170,16 @@ pub fn hist(
 ) -> String {
     let n = counts.len().max(1);
     let max = counts.iter().copied().max().unwrap_or(0).max(1);
-    let bw = pw() / n as f64;
+    let bw = PLOT_W / n as f64;
     let mut body = axis_lines();
     // The labels stay raw counts: log10(0 + 1) is 0 and the top of the axis is
     // the max either way.
     body.push_str(&ylabels(0.0, max as f64));
     body.push_str(&xlabels(&XAxis::Numeric, lo, hi));
     for (i, &c) in counts.iter().enumerate() {
-        let bh = hist_len(c, log) / hist_len(max, log) * ph();
+        let bh = hist_len(c, log) / hist_len(max, log) * PLOT_H;
         let x = L + i as f64 * bw;
-        let y = T + ph() - bh;
+        let y = T + PLOT_H - bh;
         body.push_str(&format!(
             "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{w:.2}\" height=\"{bh:.2}\" \
 fill=\"{fill}\" stroke=\"white\"/>\n",
@@ -223,10 +223,10 @@ pub fn bars(
     // chart draws against too.
     let (lo, hi) = b.axis_bounds(log);
     let span = (hi - lo).max(f64::MIN_POSITIVE);
-    let rh = ph() / rows.len() as f64;
+    let rh = PLOT_H / rows.len() as f64;
     // A group's rows share the label row's height.
     let sh = rh / nseries as f64;
-    let zero = L + (0.0_f64.clamp(lo, hi) - lo) / span * pw();
+    let zero = L + (0.0_f64.clamp(lo, hi) - lo) / span * PLOT_W;
     let mut body = axis_lines();
     for (ri, row) in rows.iter().enumerate() {
         for i in 0..nseries {
@@ -234,7 +234,7 @@ pub fn bars(
             // The drawn length is clamped to the axis; the printed value is real.
             let (x, w) = match at {
                 Some(at) => {
-                    let vx = L + (at.clamp(lo, hi) - lo) / span * pw();
+                    let vx = L + (at.clamp(lo, hi) - lo) / span * PLOT_W;
                     (zero.min(vx), (vx - zero).abs())
                 }
                 None => (zero, 0.0),
@@ -291,9 +291,9 @@ fn legend(names: &[String]) -> String {
             format!(
                 "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"5\" fill=\"{color}\"/>\n\
 <text x=\"{tx}\" y=\"{ty}\">{n}</text>\n",
-                cx = L + pw() - 85.0,
+                cx = L + PLOT_W - 85.0,
                 cy = y + 5.0,
-                tx = L + pw() - 76.0,
+                tx = L + PLOT_W - 76.0,
                 ty = y + 9.0,
                 color = series_hex(i),
                 n = esc(name),
@@ -324,8 +324,8 @@ pub fn spark(title: &str, s: &SparkData, log: bool, note: &str, labels: Labels) 
         .iter()
         .enumerate()
         .map(|(i, &v)| {
-            let x = L + i as f64 / (n - 1) as f64 * pw();
-            let y = T + ph() - (value_pos(v, log) - plo) / span * ph();
+            let x = L + i as f64 / (n - 1) as f64 * PLOT_W;
+            let y = T + PLOT_H - (value_pos(v, log) - plo) / span * PLOT_H;
             format!("{x:.2},{y:.2}")
         })
         .collect();
@@ -367,8 +367,8 @@ pub fn xy_chart(
     let xspan = (xhi - xlo).max(f64::MIN_POSITIVE);
     let yspan = (pyhi - pylo).max(f64::MIN_POSITIVE);
     let map = |x: f64, y: f64| {
-        let px = L + (x - xlo) / xspan * pw();
-        let py = T + ph() - (value_pos(y, log) - pylo) / yspan * ph();
+        let px = L + (x - xlo) / xspan * PLOT_W;
+        let py = T + PLOT_H - (value_pos(y, log) - pylo) / yspan * PLOT_H;
         (px, py)
     };
 
@@ -441,7 +441,7 @@ pub fn heat(
     body.push_str(&ylabels(h.ylo, h.yhi));
     body.push_str(&xlabels(&h.xaxis, h.xlo, h.xhi));
     let (lo, hi) = h.count_bounds(log);
-    let (cw, ch) = (pw() / h.cols as f64, ph() / h.rows as f64);
+    let (cw, ch) = (PLOT_W / h.cols as f64, PLOT_H / h.rows as f64);
     // A heatmap has no other use for a colour, so it always has a ramp.
     let ramp = Some(ramp.unwrap_or_default());
     for (i, &c) in h.counts.iter().enumerate() {
@@ -452,7 +452,7 @@ pub fn heat(
         // plot area.
         let (cx, cy) = (i % h.cols, i / h.cols);
         let x = L + cx as f64 * cw;
-        let y = T + ph() - (cy + 1) as f64 * ch;
+        let y = T + PLOT_H - (cy + 1) as f64 * ch;
         body.push_str(&format!(
             "<rect x=\"{x:.2}\" y=\"{y:.2}\" width=\"{cw:.2}\" height=\"{ch:.2}\" \
 fill=\"{fill}\"/>\n",
@@ -466,6 +466,13 @@ fill=\"{fill}\"/>\n",
 /// The per-kind emitters above carry the drawing; this picks the one that fits.
 pub fn render(frame: &Frame, data: &ChartData) -> String {
     let note = frame.notes_line();
+    // A category x axis distorts the spacing; the terminal chart says so in its
+    // title, and an SVG has only its footer note to say it in.
+    let spaced = |xaxis: &XAxis| match crate::graph::spacing_note(xaxis) {
+        Some(n) if note.is_empty() => n.to_string(),
+        Some(n) => format!("{note}  {n}"),
+        None => note.clone(),
+    };
     let labels = Labels {
         x: frame.xlabel.as_deref(),
         y: frame.ylabel.as_deref(),
@@ -494,8 +501,22 @@ pub fn render(frame: &Frame, data: &ChartData) -> String {
         ),
         ChartData::Bar(b) => bars(&frame.title, b, frame.log, frame.ramp, &note, labels),
         ChartData::Spark(s) => spark(&frame.title, s, frame.log, &note, labels),
-        ChartData::Heat(h) => heat(&frame.title, h, frame.log, frame.ramp, &note, labels),
-        ChartData::Xy(xy) => xy_chart(&frame.title, xy, frame.log, frame.ramp, &note, labels),
+        ChartData::Heat(h) => heat(
+            &frame.title,
+            h,
+            frame.log,
+            frame.ramp,
+            &spaced(&h.xaxis),
+            labels,
+        ),
+        ChartData::Xy(xy) => xy_chart(
+            &frame.title,
+            xy,
+            frame.log,
+            frame.ramp,
+            &spaced(&xy.xaxis),
+            labels,
+        ),
     }
 }
 

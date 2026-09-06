@@ -315,7 +315,10 @@ counted (`clipped N out of range`) — except a bar, which draws to the edge and
 its real value. On spark, scatter and line, -l drops the values that are not positive (counted \
 too); on hist and heatmap it draws a count as log10(count+1). -b sets the bin count: the bins \
 of a hist (Sturges' rule when -b is absent) and an N×N grid for a heatmap, up to 4096; the \
-other kinds ignore it.\n\n\
+other kinds ignore it. A heatmap's grid is capped to what draws it: the canvas in the \
+terminal, the plot area's pixels in an SVG (so a cell is never smaller than a pixel). A grid \
+cut down to fit is reported as `grid capped to CxR`; -D draws nothing, so it keeps the whole \
+-b.\n\n\
 -D writes the chart's own data as CSV instead of drawing it: hist bin edges, the bar labels \
 and values, the spark's width buckets, the plotted points, or the heatmap's cell corners and \
 counts. -S emits an SVG document to the output instead of a terminal chart, so -D and -S are \

@@ -1725,7 +1725,9 @@ fn render_graph<W: Write>(
     frame.xlabel = g.opts.xlabel.clone();
     frame.ylabel = g.opts.ylabel.clone();
     let collected = chart::collect(text, g, width, height);
-    frame.notes = collected.notes;
+    // What the collector could not use, said out loud under the chart: one
+    // wording and one order, whatever kind dropped what.
+    frame.notes = collected.drops.notes();
     let drawn = if g.opts.data {
         chart::to_csv(&collected.data)
     } else if g.opts.svg {
@@ -3399,6 +3401,76 @@ mod tests {
             [-1e308, 0.0, 5e307],
             "{out}"
         );
+    }
+
+    #[test]
+    fn graph_heatmap_grid_is_capped_to_the_canvas() {
+        // `-b N` asks for an N x N grid, but a heatmap's grid *is* its canvas:
+        // 4096 rows in a six-row chart printed a 4100-line, 16 MB picture. The
+        // grid is capped to what the frame can draw, and the chart says so.
+        let out = render_str("graph heatmap id countZ -b 4096 -W 40 -H 6", INPUT, false);
+        assert!(out.contains("(grid capped to 36x6)"), "{out}");
+        assert!(out.lines().count() < 16, "{out}");
+        // A grid the canvas can hold is left exactly as asked for.
+        let small = render_str("graph heatmap id countZ -b 3 -D", INPUT, false);
+        assert!(!small.contains("grid capped"), "{small}");
+        let plain = render_str("graph heatmap id countZ -b 3", INPUT, false);
+        assert!(!plain.contains("grid capped"), "{plain}");
+    }
+
+    #[test]
+    fn graph_heatmap_grid_is_capped_only_where_it_is_drawn() {
+        // The cap is a property of the picture in this window: `-D` is data,
+        // not a chart, so `-b` stands there whole. id runs 1..4 over 20
+        // columns (steps of 0.15) and countZ 0..9 over 20 rows (steps of
+        // 0.45) — corners the 36x6 canvas grid could not name.
+        let data = render_str("graph heatmap id countZ -b 20 -W 40 -H 6 -D", INPUT, false);
+        assert_eq!(
+            data, "id,countZ,count\n1.9,0,1\n2.95,0,1\n1,4.95,1\n3.85,8.55,1\n",
+            "{data}"
+        );
+        // The same flags drawn in the terminal still cut the grid to the six
+        // rows the canvas has, and say so.
+        let drawn = render_str("graph heatmap id countZ -b 20 -W 40 -H 6", INPUT, false);
+        assert!(drawn.contains("(grid capped to 20x6)"), "{drawn}");
+        assert_eq!(
+            drawn.lines().filter(|l| l.contains('┤')).count(),
+            6,
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn graph_heatmap_grid_is_capped_to_the_svg_plot_pixels() {
+        // An SVG has no cells, but it does have pixels: `-b 4096` asked for
+        // 16.7M rects a hundredth of a pixel wide, which is a picture of
+        // nothing (and a grid of millions of bins to count into). The grid is
+        // cut to the plot area, so a cell is at least a pixel, and the cut is
+        // said out loud in the footer like every other thing a chart could not
+        // do.
+        let big = render_str("graph heatmap id countZ -b 4096 -S", INPUT, false);
+        assert!(big.contains("grid capped to 640x364"), "{big}");
+        // The background plus one rect per non-empty cell, each a pixel wide.
+        assert_eq!(big.matches("<rect").count(), 1 + 4, "{big}");
+        assert!(big.contains("width=\"1.00\" height=\"1.00\""), "{big}");
+        // A grid the plot area can hold is left exactly as it was asked for.
+        let small = render_str("graph heatmap id countZ -b 20 -S", INPUT, false);
+        assert!(!small.contains("grid capped"), "{small}");
+        assert!(
+            small.contains("width=\"32.00\" height=\"18.20\""),
+            "{small}"
+        );
+    }
+
+    #[test]
+    fn graph_heatmap_grid_capped_by_the_svg_is_reported_without_b() {
+        // The cut is measured against what was *asked for*, not against `-b`:
+        // `-W 2000` asks the canvas for 1994 columns, and the SVG's plot area
+        // gives 640 of them. That is the same cut `-b 4096` gets, so it is
+        // said out loud too — reading the note off `-b` alone left the grid an
+        // SVG silently shrank unmentioned.
+        let out = render_str("graph heatmap id countZ -W 2000 -S", INPUT, false);
+        assert!(out.contains("grid capped to 640x"), "{out}");
     }
 
     #[test]

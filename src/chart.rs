@@ -523,10 +523,52 @@ pub enum ChartData {
     Heat(HeatData),
 }
 
-/// A collected chart: its data and the notes about what was dropped.
+/// What a chart could not use, counted rather than described. Every collector
+/// reports the same five counts, and one place turns them into the notes a
+/// chart prints under itself — so the wording and the order of the notes do not
+/// depend on which kind dropped what.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drops {
+    /// Cells that held no number.
+    pub skipped: u64,
+    /// Values outside an `-x`/`-y` range.
+    pub clipped: u64,
+    /// Values a log axis cannot place (not positive).
+    pub dropped: u64,
+    /// `-c/--color-by` cells that held no number. Those points are still
+    /// plotted, just left uncoloured.
+    pub color: u64,
+    /// Bar labels past the drawn cap.
+    pub truncated: usize,
+    /// The grid a heatmap's `-b` was cut down to, when what draws it — the
+    /// terminal canvas, an SVG's plot area — could not hold the one it asked
+    /// for.
+    pub grid_capped: Option<(usize, usize)>,
+}
+
+impl Drops {
+    /// The notes for what was dropped, in one fixed order, empty where nothing
+    /// was. This is the whole "strict and loud" wording.
+    pub fn notes(&self) -> Vec<String> {
+        [
+            (self.truncated > 0).then(|| format!("+{} more not shown", self.truncated)),
+            (self.skipped > 0).then(|| format!("skipped {} non-numeric", self.skipped)),
+            (self.clipped > 0).then(|| format!("clipped {} out of range", self.clipped)),
+            (self.dropped > 0).then(|| format!("dropped {} non-positive", self.dropped)),
+            (self.color > 0).then(|| format!("{} non-numeric colour cells", self.color)),
+            self.grid_capped
+                .map(|(c, r)| format!("grid capped to {c}x{r}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+/// A collected chart: its data and the counts of what it could not use.
 pub struct Collected {
     pub data: ChartData,
-    pub notes: Vec<String>,
+    pub drops: Drops,
 }
 
 /// Parse a cell as a finite f64: the numeric-cell rule shared by every chart.
@@ -549,13 +591,7 @@ fn for_each_data_row(text: &str, mut f: impl FnMut(&[Field])) {
     });
 }
 
-/// The note for `n` dropped non-numeric cells, or none.
-fn skipped_note(n: u64) -> Option<String> {
-    (n > 0).then(|| format!("skipped {n} non-numeric"))
-}
-
-/// Keep the values inside `range` (when given); the count dropped goes to the
-/// note.
+/// Keep the values inside `range` (when given); the count dropped is reported.
 fn clip(values: Vec<f64>, range: AxisRange) -> (Vec<f64>, u64) {
     let Some((lo, hi)) = range else {
         return (values, 0);
@@ -567,11 +603,6 @@ fn clip(values: Vec<f64>, range: AxisRange) -> (Vec<f64>, u64) {
         .collect();
     let dropped = (before - kept.len()) as u64;
     (kept, dropped)
-}
-
-/// The note for `n` values dropped for falling outside an axis range, or none.
-fn clipped_note(n: u64) -> Option<String> {
-    (n > 0).then(|| format!("clipped {n} out of range"))
 }
 
 /// Where a real value `v` sits on the value axis: `v` itself, or its log10 on
@@ -600,25 +631,13 @@ pub fn hist_len(count: u64, log: bool) -> f64 {
 }
 
 /// Keep only the positive values — the ones a log axis can place; the count
-/// dropped goes to the note. The values themselves stay real: the log10 happens
-/// when they are drawn ([`value_pos`]).
+/// dropped is reported. The values themselves stay real: the log10 happens when
+/// they are drawn ([`value_pos`]).
 fn drop_non_positive(values: Vec<f64>) -> (Vec<f64>, u64) {
     let before = values.len();
     let kept: Vec<f64> = values.into_iter().filter(|v| *v > 0.0).collect();
     let dropped = (before - kept.len()) as u64;
     (kept, dropped)
-}
-
-/// The note for `n` `-c/--color-by` cells that held no number, or none. Those
-/// points are still plotted, just left uncoloured — said out loud, like every
-/// other cell a chart could not use.
-fn color_note(n: u64) -> Option<String> {
-    (n > 0).then(|| format!("{n} non-numeric colour cells"))
-}
-
-/// The note for `n` values dropped as not positive under `--log`, or none.
-fn dropped_note(n: u64) -> Option<String> {
-    (n > 0).then(|| format!("dropped {n} non-positive"))
 }
 
 /// Blank each xy y a log axis cannot place (not positive, counted) and drop the
@@ -688,6 +707,34 @@ fn collect_numeric(text: &str, pos: usize) -> (Vec<f64>, u64) {
         None => skipped += 1,
     });
     (values, skipped)
+}
+
+/// One column's values, ready to chart, and what it took to get there: the
+/// finite numbers in it, inside `range`, and under `log` the positive ones —
+/// each pass counting what it threw away. The range is in real values, so it
+/// clips before the log.
+///
+/// The hist and spark collectors are this same pipeline. They differ in which
+/// axis their range came off — a hist's `-x`, a spark's `-y` — and in `log`: a
+/// spark passes `-l` on, a hist passes `false`, because its value axis is the
+/// bin count and no input value is dropped for it.
+fn numeric_values(text: &str, pos: usize, range: AxisRange, log: bool) -> (Vec<f64>, Drops) {
+    let (values, skipped) = collect_numeric(text, pos);
+    let (values, clipped) = clip(values, range);
+    let (values, dropped) = if log {
+        drop_non_positive(values)
+    } else {
+        (values, 0)
+    };
+    (
+        values,
+        Drops {
+            skipped,
+            clipped,
+            dropped,
+            ..Drops::default()
+        },
+    )
 }
 
 /// Default cap on the number of bar labels drawn (one terminal line each);
@@ -862,31 +909,22 @@ pub fn default_title(g: &GraphSpec) -> String {
 }
 
 /// Read the charted columns out of the buffered output (its first line is the
-/// header) into the chart's data, with the notes about dropped rows. Cells that
-/// are not numbers are dropped *loudly* — counted here and reported by the
-/// renderer, the "strict and loud" policy.
+/// header) into the chart's data, with the counts of what it could not use.
+/// Cells that are not numbers are dropped *loudly* — counted here and reported
+/// by the renderer, the "strict and loud" policy.
 pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collected {
-    let mut notes = Vec::new();
+    let mut drops = Drops::default();
     let data = match g.kind {
         GraphKind::Hist => {
-            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
-            let (values, clipped) = clip(values, g.opts.xrange);
-            notes.extend(skipped_note(skipped));
-            notes.extend(clipped_note(clipped));
+            // A hist's range is its `-x`, the span the bins cover, and its
+            // value axis is the count — so `-l` is no reason to drop a value.
+            let (values, d) = numeric_values(text, g.cols[0].pos, g.opts.xrange, false);
+            drops = d;
             ChartData::Hist(HistData::build(&values, g.opts.bins, g.opts.xrange))
         }
         GraphKind::Spark => {
-            let (values, skipped) = collect_numeric(text, g.cols[0].pos);
-            // The range is in real values, so it clips before the log.
-            let (values, clipped) = clip(values, g.opts.yrange);
-            let (values, dropped) = if g.opts.log {
-                drop_non_positive(values)
-            } else {
-                (values, 0)
-            };
-            notes.extend(skipped_note(skipped));
-            notes.extend(clipped_note(clipped));
-            notes.extend(dropped_note(dropped));
+            let (values, d) = numeric_values(text, g.cols[0].pos, g.opts.yrange, g.opts.log);
+            drops = d;
             ChartData::Spark(SparkData {
                 name: g.cols[0].name.clone(),
                 values: bucket(&values, width),
@@ -899,10 +937,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             // `--data` writes CSV, not a picture, so it keeps every row.
             let cap = if g.opts.data { usize::MAX } else { MAX_BARS };
             let (rows, skipped, truncated) = collect_bars(text, g.cols[0].pos, &value_pos, cap);
-            if truncated > 0 {
-                notes.push(format!("+{truncated} more not shown"));
-            }
-            notes.extend(skipped_note(skipped));
+            (drops.skipped, drops.truncated) = (skipped, truncated);
             ChartData::Bar(BarData {
                 label_name: g.cols[0].name.clone(),
                 value_names: g.cols[1..].iter().map(|c| c.name.clone()).collect(),
@@ -931,15 +966,8 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             } else {
                 0
             };
-            // Only the category/row-index axis distorts spacing; numeric and
-            // time axes are true.
-            if matches!(xy.xaxis, XAxis::Ends(..)) {
-                notes.push("even row spacing".to_string());
-            }
-            notes.extend(skipped_note(skipped));
-            notes.extend(color_note(color_drops(&xy)));
-            notes.extend(clipped_note(clipped));
-            notes.extend(dropped_note(dropped));
+            (drops.skipped, drops.clipped, drops.dropped, drops.color) =
+                (skipped, clipped, dropped, color_drops(&xy));
             ChartData::Xy(xy)
         }
         GraphKind::Heatmap => {
@@ -955,11 +983,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
                 None,
             );
             let clipped = clip_xy(&mut xy, g.opts.xrange, g.opts.yrange);
-            if matches!(xy.xaxis, XAxis::Ends(..)) {
-                notes.push("even row spacing".to_string());
-            }
-            notes.extend(skipped_note(skipped));
-            notes.extend(clipped_note(clipped));
+            (drops.skipped, drops.clipped) = (skipped, clipped);
             // `-l` is the *count* axis here: the y axis stays linear (it is one
             // of the two binned dimensions), so nothing is dropped for it.
             let points: Vec<(f64, f64)> = xy.series().into_iter().next().unwrap_or_default();
@@ -968,12 +992,37 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             // The y bounds size that canvas, so the grid's extent is worked out
             // once here and handed to the builder.
             let b = HeatData::bounds(&points, g.opts.xrange, g.opts.yrange);
-            let cols = g
-                .opts
-                .bins
-                .unwrap_or_else(|| crate::graph::canvas_cells(width, b.ylo, b.yhi))
-                .max(1);
-            let rows = g.opts.bins.unwrap_or(height).max(1);
+            // A grid is capped to whatever has to draw it. In the terminal it
+            // *is* the canvas, so `-b N` cannot ask for more of it than the
+            // frame has: a 4096-row grid in a 15-row chart is 4096 lines of
+            // output, not a picture. An SVG has no cells but it does have
+            // pixels, and a grid finer than the plot area draws cells under a
+            // pixel — a picture of nothing, counted into a grid of millions of
+            // bins. Either cut is said out loud like every other thing a chart
+            // could not do. `-D` draws nothing at all, so there `-b` stands
+            // whole, up to the [`MAX_CELLS`] the flag itself carries.
+            //
+            // The cut is what was asked for against what was got, so the ask
+            // is read off `-b` *or*, without it, off the canvas: `-W 2000 -S`
+            // asks for 1994 columns and gets the plot area's 640, the same
+            // cut `-b 4096` gets and reported the same way.
+            let cols_fit = crate::graph::canvas_cells(width, b.ylo, b.yhi);
+            let rows_fit = height.max(1);
+            let (cols_max, rows_max) = if g.opts.data {
+                (MAX_CELLS, MAX_CELLS)
+            } else if g.opts.svg {
+                (crate::svg::PLOT_W as usize, crate::svg::PLOT_H as usize)
+            } else {
+                (cols_fit, rows_fit)
+            };
+            let (ask_c, ask_r) = (
+                g.opts.bins.unwrap_or(cols_fit),
+                g.opts.bins.unwrap_or(rows_fit),
+            );
+            let (cols, rows) = (ask_c.clamp(1, cols_max), ask_r.clamp(1, rows_max));
+            if cols < ask_c || rows < ask_r {
+                drops.grid_capped = Some((cols, rows));
+            }
             ChartData::Heat(HeatData {
                 xname: g.cols[0].name.clone(),
                 yname: g.cols[1].name.clone(),
@@ -989,7 +1038,7 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize, height: usize) -> Collec
             })
         }
     };
-    Collected { data, notes }
+    Collected { data, drops }
 }
 
 /// The chart's reduced data as CSV (header first), for `--data`: the bins,
@@ -1110,6 +1159,30 @@ mod tests {
         assert_eq!(edges[0], lo);
         assert_eq!(edges[n], hi);
         assert!(edges.windows(2).all(|w| w[0] <= w[1]), "{edges:?}");
+    }
+
+    #[test]
+    fn drops_notes_read_in_one_fixed_order() {
+        assert!(Drops::default().notes().is_empty());
+        let d = Drops {
+            skipped: 1,
+            clipped: 2,
+            dropped: 3,
+            color: 4,
+            truncated: 5,
+            grid_capped: Some((6, 7)),
+        };
+        assert_eq!(
+            d.notes(),
+            [
+                "+5 more not shown",
+                "skipped 1 non-numeric",
+                "clipped 2 out of range",
+                "dropped 3 non-positive",
+                "4 non-numeric colour cells",
+                "grid capped to 6x7",
+            ]
+        );
     }
 
     #[test]

@@ -78,17 +78,6 @@ fn empty_line(frame: &Frame, message: &str) -> String {
     s
 }
 
-/// The notes shown in the summary tail: the spacing note goes into the title
-/// instead (see [`render_xy`]), so it is left out here.
-fn tail_notes(frame: &Frame) -> String {
-    frame
-        .notes
-        .iter()
-        .filter(|n| n.as_str() != "even row spacing")
-        .map(|n| format!("  ({n})"))
-        .collect()
-}
-
 /// Paint `text` with the frame's ramp at `v` in `[lo, hi]` — the `-r/--ramp`
 /// gradient. Terminal colour is opt-in, so this is a no-op unless both a ramp
 /// and `frame.color` are on; empty text is left alone so no chart grows a pair
@@ -550,6 +539,14 @@ pub(crate) fn axis_ticks(xaxis: &XAxis, xlo: f64, xhi: f64, target: usize) -> Ve
     }
 }
 
+/// The caveat a category (row-index) x axis carries: the points are spaced by
+/// row order, not by their real x. Both renderers read it off the axis — the
+/// terminal chart puts it in the title, the SVG in its footer note — so nothing
+/// has to carry it along as a note.
+pub(crate) fn spacing_note(xaxis: &XAxis) -> Option<&'static str> {
+    matches!(xaxis, XAxis::Ends(..)).then_some("even row spacing")
+}
+
 /// A representative axis label width in chars, for choosing how many ticks fit.
 pub(crate) fn axis_label_width(xaxis: &XAxis, xlo: f64, xhi: f64) -> usize {
     match xaxis {
@@ -710,8 +707,8 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     let mut out = String::new();
     // An evenly-spaced (category) x axis is flagged in the title, not the tail.
     out.push_str(&frame.title);
-    if frame.notes.iter().any(|n| n == "even row spacing") {
-        out.push_str("  (even row spacing)");
+    if let Some(note) = spacing_note(&xy.xaxis) {
+        out.push_str(&format!("  ({note})"));
     }
     out.push('\n');
     if let Some(y) = &frame.ylabel {
@@ -777,7 +774,7 @@ fn render_xy(frame: &Frame, xy: &XyData, connect: bool) -> String {
     }
 
     out.push_str(&format!("points={total}"));
-    out.push_str(&tail_notes(frame));
+    out.push_str(&frame.notes_tail());
     out.push('\n');
     if multi {
         out.push_str(&legend_line(&xy.names, &frame.glyphs, colors));
@@ -829,8 +826,8 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
     // An evenly-spaced (category) x axis is flagged in the title, as in an xy
     // chart, since it distorts spacing the same way.
     out.push_str(&frame.title);
-    if frame.notes.iter().any(|n| n == "even row spacing") {
-        out.push_str("  (even row spacing)");
+    if let Some(note) = spacing_note(&h.xaxis) {
+        out.push_str(&format!("  ({note})"));
     }
     out.push('\n');
     if let Some(y) = &frame.ylabel {
@@ -876,7 +873,7 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
         out.push('\n');
     }
     out.push_str(&format!("points={}", h.total));
-    out.push_str(&tail_notes(frame));
+    out.push_str(&frame.notes_tail());
     out.push('\n');
     out
 }

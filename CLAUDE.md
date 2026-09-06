@@ -261,10 +261,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   cannot use are dropped *loudly* — non-numeric or empty (`skipped N
   non-numeric`), outside an axis range (`clipped N out of range`), not positive
   under `-l` (`dropped N non-positive`), a non-numeric `-c` cell (`N
-  non-numeric colour cells`) — each counted into `Frame.notes` and printed
-  under the chart, the "strict and loud" policy. **Three consumers** read that
-  one model: `graph::render` (the terminal chart, `src/graph.rs`),
-  `svg::render` (`-S`, `src/svg.rs`, hand-written XML, no dep) and
+  non-numeric colour cells`) — each counted in a `chart::Drops`, which
+  `exec::render_graph` turns into `Frame.notes` in one fixed order (truncated,
+  skipped, clipped, dropped, colour, grid capped), printed under the chart: the
+  "strict and loud" policy, worded and ordered in one place. **Three
+  consumers** read that one model: `graph::render` (the terminal chart,
+  `src/graph.rs`), `svg::render` (`-S`, `src/svg.rs`, hand-written XML, no dep) and
   `chart::to_csv` (`-D`, the chart's own data as CSV). The model keeps *real*
   values throughout: a log axis is applied at draw time (`chart::value_pos` /
   `bar_value` / `hist_len`), so the labels, the summaries and `--data` all read
@@ -290,8 +292,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     (plotted as-is); else **temporal** — if every X cell parses as a timestamp
     (`crate::datetime::parse_epoch`, no dep), plot at true epoch positions;
     else the **row-index fallback** (categories) — plot against the 1-based
-    ordinal and flag `even row spacing` (so an `-x` range there ranges over row
-    ordinals). A partially-numeric X keeps the strict drop-bad-rows behaviour.
+    ordinal, which the renderers read off the axis (`graph::spacing_note`) to
+    flag as `even row spacing`, in the terminal title and the SVG footer note
+    (so an `-x` range there ranges over row ordinals). A partially-numeric X keeps the strict drop-bad-rows behaviour.
     The bottom axis is *graduated* with intermediate ticks
     (`x_label_row`/`place_ticks`): numeric uses round 1/2/5×10ⁿ values
     (`nice_ticks`), time interpolates and drops the date to `HH:MM:SS` when
@@ -303,10 +306,15 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
     only by a connecting segment has no count and stays plain). Density is a
     per-cell count, so it is terminal-only; `-c` colours the SVG's points too,
     though an SVG `line` is one polyline and shows no per-point colour.
-  - `graph heatmap X Y` — a 2-D histogram: `HeatData::build` counts the points
-    in each cell of a grid (the canvas by default, an N×N grid with `-b N`) and
-    shades them by that count — the full block painted along the ramp when
-    terminal colour is on (`-r`, else the default `Ramp`), else one of five
+  - `graph heatmap X Y` — a 2-D histogram: `chart::heat_counts` counts the
+    points in each cell of a grid (the canvas by default, an N×N grid with
+    `-b N`, itself capped to whatever draws it — the canvas *in the terminal*,
+    where the grid *is* the canvas, and `svg::PLOT_W`×`PLOT_H` pixels in an
+    SVG, so a cell is at least a pixel; either cut is reported as `grid capped
+    to CxR`, in the terminal tail or the SVG footer, while `-D` draws nothing
+    and keeps the whole `-b`, up to `MAX_CELLS`) and shades them by that
+    count — the full block painted along the ramp when terminal colour is on
+    (`-r`, else the default `Ramp`), else one of five
     block shades. `-l` is the *count* axis here, not y: both of a heatmap's
     own axes are binned. The X column goes through the same three modes a
     scatter's does.
