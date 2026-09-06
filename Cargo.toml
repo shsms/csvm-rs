@@ -39,6 +39,8 @@ unicode-width = "0.2"
 # Optional: arrow-backed `.parquet` reader, gated behind the `parquet` feature.
 parquet = { version = "59", optional = true }
 arrow = { version = "59", optional = true, default-features = false }
+# Terminal size (TIOCGWINSZ) for the default chart width.
+libc = "0.2"
 
 [dev-dependencies]
 # Reference RFC-4180 parser, used only to confirm our scanner's conformance.

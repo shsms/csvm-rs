@@ -49,7 +49,7 @@ fn run_with_header(
     // mirror it here). Colour off.
     if plan.output == csvm::plan::OutputFormat::Aligned || plan.graph.is_some() {
         let mut aligned = Vec::new();
-        exec::render(&out, &plan, false, &mut aligned).map_err(|e| e.to_string())?;
+        exec::render(&out, &plan, false, None, &mut aligned).map_err(|e| e.to_string())?;
         out = aligned;
     }
     String::from_utf8(out).map_err(|e| e.to_string())

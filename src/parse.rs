@@ -623,7 +623,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `graph KIND COLS [-b N] [-s F] [-t T] [-S]` — a
+    /// `graph KIND COLS [-b N] [-s F] [-t T] [-S] [-W N] [-H N]` — a
     /// terminal-chart sink. Draws from the columns reaching it instead of
     /// emitting CSV, so it must be the last command. `hist COL`, `spark COL`,
     /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`.
@@ -662,6 +662,14 @@ impl<'a> Builder<'a> {
             } else if word == "-S" || word == "--svg" {
                 opts.svg = true;
                 s = after;
+            } else if let Some(v) = flag_value(word, after, &["-W", "--width"]) {
+                let (val, tail) = v?;
+                opts.width = Some(parse_positive(&val, "-W/--width")?);
+                s = tail.trim_start();
+            } else if let Some(v) = flag_value(word, after, &["-H", "--height"]) {
+                let (val, tail) = v?;
+                opts.height = Some(parse_positive(&val, "-H/--height")?);
+                s = tail.trim_start();
             } else if word.starts_with('-') && word != "-" {
                 return Err(err(format!("graph: unknown flag `{word}`")));
             } else {

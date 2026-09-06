@@ -1651,17 +1651,20 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
 /// Render buffered output `bytes` to `output`, applying the plan's colour rules
 /// (when `color` is on) and aligning columns when the plan's output is
 /// `Aligned`. Width is measured by *visible* characters, so ANSI escapes never
-/// throw off alignment.
+/// throw off alignment. `term_width` is the terminal's column count (`None`
+/// when stdout isn't a terminal), used only as the `graph` sink's default
+/// chart width.
 pub fn render<W: Write>(
     bytes: &[u8],
     plan: &Plan,
     color: bool,
+    term_width: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
     // The graph sink draws a chart from the buffered output instead of emitting
     // rows; it takes precedence over alignment/colour (which become no-ops).
     if let Some(g) = &plan.graph {
-        return render_graph(bytes, g, color, output);
+        return render_graph(bytes, g, color, term_width, output);
     }
     let aligned = plan.output == OutputFormat::Aligned;
     let want_color = color && !plan.colors.is_empty();
@@ -1698,6 +1701,7 @@ fn render_graph<W: Write>(
     bytes: &[u8],
     g: &GraphSpec,
     color: bool,
+    term_width: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
     let text = std::str::from_utf8(bytes)
@@ -1707,8 +1711,8 @@ fn render_graph<W: Write>(
         .title
         .clone()
         .unwrap_or_else(|| chart::default_title(g));
-    // One scale factor sets both chart dimensions.
-    let (width, height) = crate::graph::chart_size(g.opts.scale);
+    // The terminal (or 80) and 15 rows, times `scale`; `-W`/`-H` override.
+    let (width, height) = chart::chart_size(g.opts.scale, term_width, g.opts.width, g.opts.height);
     let mut frame = Frame::new(title, width, height, color);
     let collected = chart::collect(text, g, width);
     frame.notes = collected.notes;
@@ -2210,8 +2214,20 @@ mod tests {
         Ok(String::from_utf8(out).unwrap())
     }
 
-    /// Run a script into a buffer, then render it (optionally with colour).
+    /// Run a script into a buffer, then render it (optionally with colour),
+    /// as if stdout were not a terminal (no default chart width).
     fn render_str(script: &str, input: &str, color: bool) -> String {
+        render_str_term(script, input, color, None)
+    }
+
+    /// `render_str`, but with a chosen terminal width (for the `graph` sink's
+    /// default chart size).
+    fn render_str_term(
+        script: &str,
+        input: &str,
+        color: bool,
+        term_width: Option<usize>,
+    ) -> String {
         let mut plan = parse(script).unwrap();
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader).unwrap();
@@ -2225,7 +2241,7 @@ mod tests {
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
         let mut out = Vec::new();
-        render(&buf, &plan, color, &mut out).unwrap();
+        render(&buf, &plan, color, term_width, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -2868,6 +2884,17 @@ mod tests {
         assert!(out.contains("max=9"));
         assert!(out.contains("bins=2"));
         assert!(out.contains('█')); // something was drawn
+    }
+
+    #[test]
+    fn graph_width_flag_narrows_the_chart_and_terminal_width_widens_it() {
+        let narrow = render_str("graph hist countZ --bins 2 -W 30", INPUT, false);
+        let wide = render_str_term("graph hist countZ --bins 2", INPUT, false, Some(160));
+        let longest = |s: &str| s.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(longest(&narrow) <= 30, "{narrow}");
+        assert!(longest(&wide) > 80, "{wide}");
+        assert!(parse("graph hist a -W 0").is_err());
+        assert!(parse("graph hist a --height 3").is_ok());
     }
 
     #[test]

@@ -810,6 +810,11 @@ pub struct GraphOpts {
     pub title: Option<String>,
     /// Emit an SVG document (to the normal output) instead of a terminal chart.
     pub svg: bool,
+    /// An exact chart width in cells (`-W`/`--width`), overriding the terminal
+    /// width and `scale`.
+    pub width: Option<usize>,
+    /// An exact chart height in cells (`-H`/`--height`), overriding `scale`.
+    pub height: Option<usize>,
 }
 
 impl Default for GraphOpts {
@@ -819,6 +824,8 @@ impl Default for GraphOpts {
             scale: 1.0,
             title: None,
             svg: false,
+            width: None,
+            height: None,
         }
     }
 }

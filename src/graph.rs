@@ -8,18 +8,6 @@ use crate::chart::{BarData, ChartData, Frame, Glyphs, HistData, SparkData, XyDat
 use crate::color::{Rgb, Style};
 use crate::field::format_num;
 
-/// Base chart dimensions at `scale = 1.0`: total width in columns and the
-/// scatter/line canvas height in rows. A single `--scale` multiplies both.
-const BASE_W: usize = 80;
-const BASE_H: usize = 15;
-
-/// Resolve a `--scale` factor to a `(width, height)` in terminal cells, clamped
-/// so a tiny scale still leaves room to draw.
-pub fn chart_size(scale: f64) -> (usize, usize) {
-    let dim = |base: usize, min: usize| ((base as f64 * scale).round() as usize).max(min);
-    (dim(BASE_W, 16), dim(BASE_H, 2))
-}
-
 /// Format `v` rounded to `step`'s precision (one digit finer than the step's
 /// magnitude), then trimmed — keeps bin-edge labels readable.
 fn fmt_to_step(v: f64, step: f64) -> String {

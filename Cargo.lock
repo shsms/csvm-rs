@@ -518,6 +518,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "csv",
+ "libc",
  "memchr",
  "parquet",
  "regex",

@@ -157,7 +157,7 @@ fn align(c: &mut Criterion) {
     group.bench_function("render", |b| {
         b.iter(|| {
             let mut out = Vec::new();
-            exec::render(&csv_out, &plan, false, &mut out).expect("fmt failed");
+            exec::render(&csv_out, &plan, false, None, &mut out).expect("fmt failed");
             black_box(&out);
         });
     });

@@ -22,6 +22,7 @@ pub mod plan;
 pub mod sort;
 pub mod stats;
 pub mod svg;
+pub mod term;
 
 pub use error::Error;
 

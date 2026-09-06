@@ -55,6 +55,25 @@ impl Glyphs {
     }
 }
 
+/// Base chart dimensions at scale 1: width in cells, canvas rows.
+const BASE_W: usize = 80;
+const BASE_H: usize = 15;
+
+/// The chart size in cells: an explicit `width`/`height` wins; else the
+/// terminal width (or 80) and 15 rows, both times `scale`. Floors keep a
+/// tiny chart drawable.
+pub fn chart_size(
+    scale: f64,
+    term_width: Option<usize>,
+    width: Option<usize>,
+    height: Option<usize>,
+) -> (usize, usize) {
+    let scaled = |base: usize| (base as f64 * scale).round() as usize;
+    let w = width.unwrap_or_else(|| scaled(term_width.unwrap_or(BASE_W)));
+    let h = height.unwrap_or_else(|| scaled(BASE_H));
+    (w.max(16), h.max(2))
+}
+
 /// Everything about a chart that is not its data.
 #[derive(Clone, Debug)]
 pub struct Frame {
@@ -476,6 +495,17 @@ pub fn collect(text: &str, g: &GraphSpec, width: usize) -> Collected {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chart_size_follows_the_terminal_then_scale_then_overrides() {
+        assert_eq!(chart_size(1.0, None, None, None), (80, 15));
+        assert_eq!(chart_size(1.0, Some(120), None, None), (120, 15));
+        assert_eq!(chart_size(0.5, Some(120), None, None), (60, 8));
+        assert_eq!(chart_size(2.0, Some(120), Some(40), Some(3)), (40, 3));
+        // Floors: 16 wide, 2 high.
+        assert_eq!(chart_size(0.01, None, None, None), (16, 2));
+        assert_eq!(chart_size(1.0, None, Some(1), Some(1)), (16, 2));
+    }
 
     #[test]
     fn frame_notes_render_as_a_tail_and_a_line() {

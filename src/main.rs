@@ -75,6 +75,13 @@ fn run() -> Result<(), String> {
     }
 
     let color_on = color_enabled(args.color, args.out_file.as_deref());
+    // The graph sink's default width: the terminal's columns, but only when
+    // stdout is actually a terminal (matches `color_enabled`'s auto check).
+    let term_width = if stdout_is_tty(args.out_file.as_deref()) {
+        csvm::term::columns()
+    } else {
+        None
+    };
     let mut output = open_output(&args)?;
     // Aligning needs all rows (for column widths), colouring needs all rows (for
     // gradient ranges), and a graph draws from the whole output — so each of
@@ -85,7 +92,7 @@ fn run() -> Result<(), String> {
     {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
-        exec::render(&buf, &plan, color_on, &mut output).map_err(|e| e.to_string())?;
+        exec::render(&buf, &plan, color_on, term_width, &mut output).map_err(|e| e.to_string())?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }
@@ -108,9 +115,16 @@ fn color_enabled(when: cli::ColorWhen, out_file: Option<&str>) -> bool {
             if std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0") {
                 return true;
             }
-            out_file.is_none_or(|p| p == "-") && io::stdout().is_terminal()
+            stdout_is_tty(out_file)
         }
     }
+}
+
+/// Whether the output goes to a terminal: stdout (no `-o`, or `-o -`) and that
+/// stdout is one. Both the colour default and the chart's default width ask
+/// this, so they cannot disagree about where the output is going.
+fn stdout_is_tty(out_file: Option<&str>) -> bool {
+    out_file.is_none_or(|p| p == "-") && io::stdout().is_terminal()
 }
 
 /// Open the input and determine its header. With `--header` the input has no
