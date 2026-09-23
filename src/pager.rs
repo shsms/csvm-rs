@@ -8,6 +8,7 @@
 //! table's lines are cut off instead of wrapped, with its header row kept on
 //! screen when the table is taller than the window.
 
+use std::cell::OnceCell;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -174,6 +175,8 @@ fn less_release(cmd: &str) -> Option<u32> {
 /// not come back while the pager still owns the terminal.
 pub struct Pager {
     cmd: String,
+    /// The `less` release, once asked for (see [`Pager::release`]).
+    release: OnceCell<Option<u32>>,
     input: Option<BufWriter<ChildStdin>>,
     child: Child,
 }
@@ -195,9 +198,14 @@ impl Pager {
             .arg(format!("{cmd} \"$@\""))
             .arg(cmd)
             .stdin(Stdio::piped());
+        let release = OnceCell::new();
         if table && is_less(cmd) {
             // The release only matters for a tall table's header.
-            let version = if tall { less_release(cmd) } else { None };
+            let version = if tall {
+                *release.get_or_init(|| less_release(cmd))
+            } else {
+                None
+            };
             command.args(table_args(version, tall));
         }
         if std::env::var_os("LESS").is_none() {
@@ -215,6 +223,7 @@ impl Pager {
         }
         Some(Pager {
             cmd: cmd.to_string(),
+            release,
             input,
             child,
         })
@@ -228,7 +237,13 @@ impl Pager {
     /// Whether the pager shows OSC 8 hyperlinks as links. Only a `less` known
     /// to pass them through does; any other pager may show their escapes.
     pub fn shows_links(&self) -> bool {
-        is_less(&self.cmd) && links_at(less_release(&self.cmd))
+        is_less(&self.cmd) && links_at(self.release())
+    }
+
+    /// The release of the `less` the pager runs, asked for once: it costs a
+    /// run of `less --version`.
+    fn release(&self) -> Option<u32> {
+        *self.release.get_or_init(|| less_release(&self.cmd))
     }
 
     fn input(&mut self) -> io::Result<&mut BufWriter<ChildStdin>> {

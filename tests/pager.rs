@@ -24,7 +24,7 @@ impl FakeLess {
             &less,
             format!(
                 "#!/bin/sh\n\
-                 [ \"$1\" = --version ] && {{ echo 'less 668 (fake)'; exit 0; }}\n\
+                 [ \"$1\" = --version ] && {{ echo . >> '{d}/versions'; echo 'less 668 (fake)'; exit 0; }}\n\
                  echo \"$*\" > '{d}/args'\n\
                  echo \"$LESS\" > '{d}/env'\n\
                  cat > '{d}/input'\n",
@@ -180,6 +180,20 @@ fn links_reach_a_less_that_shows_them() {
         input.contains("\x1b]8;;https://example.org\x1b\\"),
         "{input:?}"
     );
+}
+
+#[test]
+fn a_tall_table_with_links_asks_less_its_release_once() {
+    if !have_script() {
+        return;
+    }
+    // The header and the links both depend on the release.
+    let data = temp_csv("site\nhttps://a.example\nhttps://b.example\n");
+    let path = data.to_str().unwrap();
+    let fake = FakeLess::new("release");
+    on_terminal(&fake.less(), 3, &["--color", "always", "fmt", path]);
+    assert_eq!(fake.saved("args").unwrap().trim(), "-S --header=1");
+    assert_eq!(fake.saved("versions").unwrap().lines().count(), 1);
 }
 
 #[test]
