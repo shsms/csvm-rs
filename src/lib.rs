@@ -21,6 +21,7 @@ pub mod pager;
 pub mod parquet;
 pub mod parse;
 pub mod plan;
+pub mod progress;
 pub mod sort;
 pub mod stats;
 pub mod svg;

@@ -42,6 +42,7 @@ fn run_with_header(
         threads,
         temp_dir: std::env::temp_dir(),
         sort_buffer: 8 << 20,
+        progress: Default::default(),
     };
     let mut out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;
@@ -366,6 +367,7 @@ fn run_file_with_header(
         threads,
         temp_dir: std::env::temp_dir(),
         sort_buffer: 8 << 20,
+        progress: Default::default(),
     };
     let mut out = Vec::new();
     exec::run_file(

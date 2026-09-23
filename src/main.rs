@@ -6,6 +6,7 @@ use std::process;
 use csvm::cli::{self, Parsed};
 use csvm::console::Console;
 use csvm::plan::OutputFormat;
+use csvm::progress::{Counted, Progress};
 use csvm::{exec, parse};
 
 fn main() {
@@ -108,6 +109,7 @@ fn run() -> Result<(), Failure> {
         threads: args.threads,
         temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
         sort_buffer: args.sort_buffer,
+        progress: Progress::default(),
     };
 
     let (mut source, header) = open_source(&args)?;
@@ -291,7 +293,11 @@ fn run_into<W: Write + Send>(
             data_start,
             file_len,
         } => exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output),
-        Source::Stream(reader) => exec::run(plan, out_header, opts, reader, output),
+        Source::Stream(reader) => {
+            // A stream is read here, not by the executor, so count it here.
+            let mut counted = BufReader::new(Counted::new(reader, opts.progress.clone()));
+            exec::run(plan, out_header, opts, &mut counted, output)
+        }
         #[cfg(feature = "parquet")]
         Source::Parquet { path } => exec::run_parquet(plan, out_header, opts, path, output),
     }

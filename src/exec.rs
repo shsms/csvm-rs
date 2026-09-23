@@ -27,6 +27,7 @@ use crate::plan::{
     GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
     ValExpr, apply_stmts,
 };
+use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
 use crate::stats::ColStats;
 use unicode_width::UnicodeWidthStr;
@@ -44,14 +45,17 @@ fn vis_width(s: &str) -> usize {
 /// multi-sort fallback).
 type OwnedRow = Vec<Field<'static>>;
 
-/// Knobs for a run: chunk size, worker count, and where sort spills its temp
-/// files.
+/// Knobs for a run: chunk size, worker count, where sort spills its temp
+/// files, and what counts the input read (for the progress meter).
 #[derive(Clone, Debug)]
 pub struct RunOpts {
     pub chunk_size: usize,
     pub threads: usize,
     pub temp_dir: PathBuf,
     pub sort_buffer: usize,
+    /// Where the readers of an input file count the bytes they consume. The
+    /// caller counts a stream it hands in itself.
+    pub progress: Progress,
 }
 
 /// Read and parse the header line from `input`.
@@ -736,7 +740,7 @@ pub fn run_file<W: Write + Send>(
 
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(data_start))?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(Counted::new(file, opts.progress.clone()));
     run_body(plan, opts, &mut reader, output)
 }
 
@@ -1476,10 +1480,15 @@ fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>,
     let path = Path::new(&j.file);
     let (_, data_start, file_len) = read_header_from_path(path)?;
     let mut buf: Vec<u8> = Vec::new();
+    // The progress is of the main input, so the right file is not counted.
+    let opts = RunOpts {
+        progress: Progress::default(),
+        ..opts.clone()
+    };
     run_file(
         &j.right_plan,
         &j.right_header,
-        opts,
+        &opts,
         path,
         data_start,
         file_len,
@@ -2387,6 +2396,7 @@ mod tests {
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            progress: Default::default(),
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2405,6 +2415,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1, // spill after every row
+            progress: Default::default(),
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2444,6 +2455,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            progress: Default::default(),
         };
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
@@ -2647,6 +2659,7 @@ mod tests {
                 threads: 4,
                 temp_dir: std::env::temp_dir(),
                 sort_buffer: 1,
+                progress: Default::default(),
             };
             let mut out = Vec::new();
             run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
@@ -2846,29 +2859,8 @@ mod tests {
             std::env::temp_dir().join(format!("csvm-stats-shard-{}.csv", std::process::id()));
         std::fs::write(&path, &csv).unwrap();
 
-        let run_threads = |threads: usize| -> String {
-            let mut plan = parse("stats").unwrap();
-            let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
-            let out_header = plan.resolve(&header).unwrap();
-            let opts = RunOpts {
-                chunk_size: 256,
-                threads,
-                temp_dir: std::env::temp_dir(),
-                sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            };
-            let mut out = Vec::new();
-            run_file(
-                &plan,
-                &out_header,
-                &opts,
-                &path,
-                data_start,
-                file_len,
-                &mut out,
-            )
-            .unwrap();
-            String::from_utf8(out).unwrap()
-        };
+        let run_threads =
+            |threads: usize| run_file_with("stats", &path, threads, Progress::default());
 
         let serial = run_threads(1); // reader/streaming path
         let parallel = run_threads(8); // sharded path
@@ -3030,6 +3022,64 @@ mod tests {
         assert_eq!(lines[2], "f,0");
     }
 
+    /// The output of `script` run over the file at `path` with `threads`
+    /// workers, counting what it reads into `progress`.
+    fn run_file_with(script: &str, path: &Path, threads: usize, progress: Progress) -> String {
+        let mut plan = parse(script).unwrap();
+        prepare_joins(&mut plan).unwrap();
+        let (header, data_start, file_len) = read_header_from_path(path).unwrap();
+        let out_header = plan.resolve(&header).unwrap();
+        let opts = RunOpts {
+            chunk_size: 256,
+            threads,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            progress,
+        };
+        let mut out = Vec::new();
+        run_file(
+            &plan,
+            &out_header,
+            &opts,
+            path,
+            data_start,
+            file_len,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// The bytes a run of `script` over the file at `path` with `threads`
+    /// workers counts, and the bytes of data the file holds.
+    fn counted(script: &str, path: &Path, threads: usize) -> (u64, u64) {
+        let progress = Progress::counting();
+        run_file_with(script, path, threads, progress.clone());
+        let (_, data_start, file_len) = read_header_from_path(path).unwrap();
+        (progress.get(), file_len - data_start)
+    }
+
+    #[test]
+    fn a_file_run_counts_its_input_once_and_nothing_else() {
+        let dir = std::env::temp_dir();
+        let left = dir.join(format!("csvm-count-left-{}.csv", std::process::id()));
+        let right = dir.join(format!("csvm-count-right-{}.csv", std::process::id()));
+        let mut csv = String::from("k,v\n");
+        for i in 0..500 {
+            csv.push_str(&format!("{},{i}\n", i % 7));
+        }
+        std::fs::write(&left, &csv).unwrap();
+        std::fs::write(&right, "k,w\n1,x\n2,y\n").unwrap();
+        // A join's right file is not the input the progress is a share of.
+        let join = format!("join {} on k", right.display());
+        for script in ["select v > 3", "sort v=nr", join.as_str()] {
+            let (read, total) = counted(script, &left, 1);
+            assert_eq!(read, total, "{script}");
+        }
+        std::fs::remove_file(&left).ok();
+        std::fs::remove_file(&right).ok();
+    }
+
     #[test]
     fn group_sharded_matches_serial() {
         // A CSV with several keys, fractional values, text and empties, enough
@@ -3055,30 +3105,13 @@ mod tests {
             std::env::temp_dir().join(format!("csvm-group-shard-{}.csv", std::process::id()));
         std::fs::write(&path, &csv).unwrap();
 
-        let run_threads = |threads: usize| -> String {
-            let mut plan =
-                parse("agg count, count_distinct(price), sum(price), mean(price), min(price), max(price), stddev(price) by region")
-                    .unwrap();
-            let (header, data_start, file_len) = read_header_from_path(&path).unwrap();
-            let out_header = plan.resolve(&header).unwrap();
-            let opts = RunOpts {
-                chunk_size: 256,
-                threads,
-                temp_dir: std::env::temp_dir(),
-                sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            };
-            let mut out = Vec::new();
-            run_file(
-                &plan,
-                &out_header,
-                &opts,
+        let run_threads = |threads: usize| {
+            run_file_with(
+                "agg count, count_distinct(price), sum(price), mean(price), min(price), max(price), stddev(price) by region",
                 &path,
-                data_start,
-                file_len,
-                &mut out,
+                threads,
+                Progress::default(),
             )
-            .unwrap();
-            String::from_utf8(out).unwrap()
         };
 
         let serial = run_threads(1); // streaming reader path
@@ -4022,6 +4055,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            progress: Default::default(),
         };
         let mut out = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
