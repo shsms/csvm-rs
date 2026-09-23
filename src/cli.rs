@@ -33,6 +33,18 @@ pub struct Args {
     pub format: Option<InputFormat>,
 }
 
+impl Args {
+    /// The input file's path, or `None` for stdin (no input given, or `-`).
+    pub fn in_path(&self) -> Option<&str> {
+        self.in_file.as_deref().filter(|p| *p != "-")
+    }
+
+    /// The output file's path, or `None` for stdout (no `-o`, or `-o -`).
+    pub fn out_path(&self) -> Option<&str> {
+        self.out_file.as_deref().filter(|p| *p != "-")
+    }
+}
+
 /// `--header`: how a headerless input's columns are named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Header {

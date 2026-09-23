@@ -544,7 +544,10 @@ names, so the whole input is data (file shards start at byte 0); `--header -`
 auto-names the columns `c1,c2,…` (main peeks the first line to count them — for
 stdin it reads the line and chains it back). It applies to the main input only:
 a `join` right file always carries its own header. `--color` honors
-`NO_COLOR`/`CLICOLOR_FORCE` under `auto`. Help lives in one registry
+`NO_COLOR`/`CLICOLOR_FORCE` under `auto`. How output is shown is decided in
+the library, not in `main`: `main` reads a `console::Console` (the flags, the
+variables, and what stdout goes to, a `console::Sink`) and asks it.
+Help lives in one registry
 (`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
 or alias) a command's forms + example, `csvm help TOPIC` the `operators`/
 `colors`/`types`/`sizes` pages; a test cross-checks the registry against

@@ -8,6 +8,7 @@
 pub mod chart;
 pub mod cli;
 pub mod color;
+pub mod console;
 pub mod csv;
 pub mod datetime;
 pub mod error;
