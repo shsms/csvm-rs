@@ -130,8 +130,6 @@ fn run() -> Result<(), Failure> {
 
     // Colour, when on, is drawn at the depth the terminal announces.
     let color = console.color();
-    // The graph sink's default width.
-    let term_width = console.width();
     let mut output = open_output(&args)?;
     // Aligning needs all rows (for column widths), colouring needs all rows (for
     // gradient ranges), and a graph draws from the whole output — so each of
@@ -152,7 +150,7 @@ fn run() -> Result<(), Failure> {
         {
             output = Box::new(p);
         }
-        exec::render(&buf, &plan, color, term_width, &mut output)?;
+        exec::render(&buf, &plan, &console.screen(), &mut output)?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }

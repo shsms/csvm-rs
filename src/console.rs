@@ -4,6 +4,7 @@
 
 use crate::cli::{Args, ColorWhen};
 use crate::color::Depth;
+use crate::exec::Screen;
 use crate::pager::{self, Pager};
 use crate::term;
 use std::io::{self, IsTerminal, Write};
@@ -140,6 +141,14 @@ impl Console {
         match self.pager(false, false) {
             Some(p) => Box::new(p),
             None => Box::new(io::stdout()),
+        }
+    }
+
+    /// What rendering needs to know about where its output is shown.
+    pub fn screen(&self) -> Screen {
+        Screen {
+            color: self.color(),
+            width: self.width(),
         }
     }
 }

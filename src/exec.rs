@@ -1649,23 +1649,31 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
     Ok(())
 }
 
+/// What [`render`] knows about where its output will be shown.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Screen {
+    /// The depth colour is drawn at, or `None` with colour off.
+    pub color: Option<Depth>,
+    /// The terminal's column count when the output is shown in one (`None`
+    /// when stdout isn't a terminal): a chart's default width.
+    pub width: Option<usize>,
+}
+
 /// Render buffered output `bytes` to `output`, applying the plan's colour rules
-/// (when `color` is on) and aligning columns when the plan's output is
+/// (when the screen has colour) and aligning columns when the plan's output is
 /// `Aligned`. Width is measured by *visible* characters, so ANSI escapes never
-/// throw off alignment. `term_width` is the terminal's column count (`None`
-/// when stdout isn't a terminal), used only as the `graph` sink's default
-/// chart width.
+/// throw off alignment.
 pub fn render<W: Write>(
     bytes: &[u8],
     plan: &Plan,
-    color: Option<Depth>,
-    term_width: Option<usize>,
+    screen: &Screen,
     output: &mut W,
 ) -> Result<(), Error> {
+    let color = screen.color;
     // The graph sink draws a chart from the buffered output instead of emitting
     // rows; it takes precedence over alignment/colour (which become no-ops).
     if let Some(g) = &plan.graph {
-        return render_graph(bytes, g, color, term_width, output);
+        return render_graph(bytes, g, color, screen.width, output);
     }
     let aligned = plan.output == OutputFormat::Aligned;
     let depth = color.unwrap_or(Depth::Truecolor);
@@ -2289,6 +2297,15 @@ mod tests {
         color: bool,
         term_width: Option<usize>,
     ) -> String {
+        let screen = Screen {
+            color: color.then_some(Depth::Truecolor),
+            width: term_width,
+        };
+        render_on(script, input, &screen)
+    }
+
+    /// Run a script into a buffer, then render it for `screen`.
+    fn render_on(script: &str, input: &str, screen: &Screen) -> String {
         let mut plan = parse(script).unwrap();
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader).unwrap();
@@ -2302,8 +2319,7 @@ mod tests {
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
         let mut out = Vec::new();
-        let color = color.then_some(Depth::Truecolor);
-        render(&buf, &plan, color, term_width, &mut out).unwrap();
+        render(&buf, &plan, screen, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
