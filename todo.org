@@ -26,12 +26,28 @@ git history; this file is the "what next / what was decided" scratchpad.
   alloc per 64 KiB. Hoist a caller-owned buffer through the serial loops.
 
 ** TODO Interface simplifications
+- Script errors found at resolve time (an unknown column, a join key) are
+  not placed in the script the way compile errors are (=Error::At=): a
+  =ColRef= keeps its name but not where it was written. Carrying a span on
+  the refs would let =main= mark the column with =^= too.
 - The =join= item grammar has a documented ambiguity: a keyless file after an
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
   distinct item separator, removes the trap.
 
 ** TODO Correctness / edges
+- =RunOpts.progress= rides along into every nested run, so a =run_file= for a
+  second file counts toward the main input unless its caller opts out (the
+  join's right file does, with a non-counting =Progress=). A =progress=
+  parameter on =run_file= would make the choice explicit at each call, but
+  =run_file= is already at clippy's argument limit; bundling the input's
+  path and byte range into one value would make room.
+- =Color::Base(u8)= accepts any index, though only 0-8 name a base colour
+  (=parse_style= builds it through =base_index=, so none reaches it today).
+  A small enum of the nine colours would let the compiler rule out a tenth.
+- =fmt= pads an empty cell in a right-justified (numeric) *last* column with
+  spaces, so that row ends in trailing whitespace (=name,n / ab,= prints
+  =ab      =). With colour on the cell shows =∅= and the padding is needed.
 - Sharded =stats= / =group= reduce in =-n= ranges, so the documented
   low-order-digit float drift of =sum=/=mean=/=stddev= (hundreds of ULP on a
   few hundred thousand rows) is now the default behaviour (threads default
@@ -400,6 +416,14 @@ below the chart rather than coercing to 0. Settle this before the binning code.
   re-parse the serialized output (the buffer reuse =fmt=/=color= share), so a
   column of sub-1e-6 values collapses to 0. A faithful fix feeds the charts raw
   =Field::Num= values instead of re-parsing — a deep change to the sink design.
+- Real images in the terminal: draw a chart as pixels through the kitty
+  graphics protocol or sixel, where the terminal has one, instead of block
+  and braille glyphs. Needs a design pass before code: which protocols (and
+  how to tell a terminal has one: a query escape, =$TERM=/=$TERM_PROGRAM=), and
+  where the pixels come from — a raster renderer of our own over the
+  =chart.rs= model, or rasterizing the SVG with a dependency (=resvg=), which
+  runs into the "no plotting crate as a hard dep" non-goal above unless it is
+  a cargo feature like =parquet=. Shares the raster half with PNG export.
 
 ** Follow-ups — done (see git history)
 - [X] 2026-09-06 =graph hist= colour: =-r/--ramp lo:hi= paints each bar along
