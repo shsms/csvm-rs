@@ -45,7 +45,7 @@ options (--flag VALUE or --flag=VALUE):
       --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
       --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;
                        also caps sort workers at SZ / 2M)
-      --color WHEN     auto (TTY only) | always | never
+      --color WHEN     auto (a TTY, not TERM=dumb) | always | never
       --explain        print the compiled plan and exit
   -h, --help           show this help
   -V, --version        print version and exit";
@@ -475,8 +475,8 @@ attributes) and it colours the foreground only; the ramp defaults to green:red.\
 A named colour in a predicate rule is the terminal's own, so it follows your theme. \
 Gradients are exact colours: 24-bit when COLORTERM is truecolor or 24bit, else the \
 nearest of the 256-colour palette (set COLORTERM=truecolor to force 24-bit).\n\n\
-Emission is gated by --color auto|always|never (auto = only when stdout is a TTY); \
-NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
+Emission is gated by --color auto|always|never (auto = only when stdout is a TTY and \
+TERM is not dumb); NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
     },
     Topic {
         name: "expr",

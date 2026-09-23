@@ -220,7 +220,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   points and a chart's series colours are exact RGB, written as 24-bit colour
   when `$COLORTERM` is `truecolor`/`24bit` and as the nearest 256-colour
   palette entry otherwise (`color::Depth`, picked by `console::Console`).
-  `--color auto|always|never` gates emission (auto = TTY).
+  `--color auto|always|never` gates emission (auto = a TTY that is not
+  `TERM=dumb`).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`add NAME = EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`

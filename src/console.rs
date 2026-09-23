@@ -32,6 +32,8 @@ pub struct Console {
     pub force_color: bool,
     /// The depth `$COLORTERM` announces (see [`Depth::from_colorterm`]).
     pub depth: Depth,
+    /// `TERM=dumb`: the terminal prints text and nothing else.
+    pub dumb: bool,
     /// Where stdout goes.
     pub stdout: Sink,
     /// The terminal's column count, when it is known (see [`term::columns`]).
@@ -47,6 +49,7 @@ impl Console {
             no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             force_color: std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0"),
             depth: Depth::from_colorterm(std::env::var("COLORTERM").ok().as_deref()),
+            dumb: std::env::var_os("TERM").is_some_and(|t| t == "dumb"),
             stdout: if args.out_path().is_some() {
                 Sink::File
             } else {
@@ -64,14 +67,14 @@ impl Console {
 
     /// Whether to colour a stream: an explicit `--color always`/`never` wins.
     /// Under `auto`, `NO_COLOR` turns colour off and `CLICOLOR_FORCE` on, else
-    /// the stream must go to a `terminal`.
+    /// the stream must go to a `terminal`, and not `TERM=dumb`.
     fn colors(&self, terminal: bool) -> bool {
         match self.color {
             ColorWhen::Always => true,
             ColorWhen::Never => false,
             ColorWhen::Auto if self.no_color => false,
             ColorWhen::Auto if self.force_color => true,
-            ColorWhen::Auto => terminal,
+            ColorWhen::Auto => terminal && !self.dumb,
         }
     }
 
@@ -122,6 +125,7 @@ mod tests {
             no_color: false,
             force_color: false,
             depth: Depth::Ansi256,
+            dumb: false,
             stdout: Sink::Terminal,
             columns: Some(80),
         }
@@ -186,5 +190,22 @@ mod tests {
         };
         assert_eq!(truecolor.color(), Some(Depth::Truecolor));
         assert_eq!(terminal().color(), Some(Depth::Ansi256));
+    }
+
+    #[test]
+    fn a_dumb_terminal_gets_no_colour_unless_forced() {
+        let dumb = Console {
+            dumb: true,
+            ..terminal()
+        };
+        assert_eq!(dumb.color(), None);
+        assert_eq!(
+            Console {
+                color: ColorWhen::Always,
+                ..dumb
+            }
+            .color(),
+            Some(Depth::Ansi256)
+        );
     }
 }
