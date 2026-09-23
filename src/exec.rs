@@ -707,7 +707,7 @@ pub fn run_file<W: Write + Send>(
         && opts.threads > 1
         && !stateful
     {
-        return run_sharded(stmts, opts.threads, path, data_start, file_len, output);
+        return run_sharded(stmts, opts, path, data_start, file_len, output);
     }
 
     // `stats` reduces associatively, so shard it over the file too.
@@ -715,14 +715,7 @@ pub fn run_file<W: Write + Send>(
         && !stateful
         && let Some((pre, stats, post)) = stats_shape(plan)
     {
-        let merged = run_stats_sharded(
-            pre,
-            &stats.positions,
-            opts.threads,
-            path,
-            data_start,
-            file_len,
-        )?;
+        let merged = run_stats_sharded(pre, &stats.positions, opts, path, data_start, file_len)?;
         let rows = apply_stages_over_rows(post, profile_rows(stats, &merged), opts)?;
         return write_rows(output, &rows);
     }
@@ -733,7 +726,7 @@ pub fn run_file<W: Write + Send>(
         && !stateful
         && let Some((pre, g, post)) = group_shape(plan)
     {
-        let grouper = run_group_sharded(pre, g, opts.threads, path, data_start, file_len)?;
+        let grouper = run_group_sharded(pre, g, opts, path, data_start, file_len)?;
         let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
         return write_rows(output, &rows);
     }
@@ -976,20 +969,23 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
 /// order.
 fn run_sharded<W: Write>(
     stmts: &[Stmt],
-    threads: usize,
+    opts: &RunOpts,
     path: &Path,
     data_start: u64,
     file_len: u64,
     output: &mut W,
 ) -> Result<(), Error> {
-    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
+    let progress = &opts.progress;
     if ranges.is_empty() {
         return Ok(()); // header only, no data rows
     }
     let results: Vec<Result<String, Error>> = thread::scope(|scope| {
         let handles: Vec<_> = ranges
             .into_iter()
-            .map(|(start, end)| scope.spawn(move || process_range(stmts, path, start, end)))
+            .map(|(start, end)| {
+                scope.spawn(move || process_range(stmts, path, start, end, progress))
+            })
             .collect();
         handles
             .into_iter()
@@ -1057,9 +1053,42 @@ fn snap_to_newline(file: &mut File, pos: u64, file_len: u64) -> Result<u64, Erro
     }
 }
 
+/// How much of a shard's range is parsed between two additions to the run's
+/// [`Progress`].
+const PROGRESS_PIECE: usize = 4 << 20;
+
+/// [`csv::parse_chunk`] over `text` a piece of about [`PROGRESS_PIECE`] bytes
+/// at a time, each ending at a line break, counting each piece into `progress`
+/// once its rows are done. A shard reads its whole range up front, so the
+/// counting has to follow the parsing for the meter to move with the work.
+/// No row spans a line, so the rows are the ones a single call would give.
+fn parse_counted<'a>(
+    text: &'a str,
+    progress: &Progress,
+    mut on_row: impl FnMut(&mut Vec<Field<'a>>),
+) {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let cut = match rest.as_bytes().get(PROGRESS_PIECE..) {
+            Some(tail) => memchr(b'\n', tail).map_or(rest.len(), |i| PROGRESS_PIECE + i + 1),
+            None => rest.len(),
+        };
+        let (piece, tail) = rest.split_at(cut);
+        csv::parse_chunk(piece, &mut on_row);
+        progress.add(piece.len() as u64);
+        rest = tail;
+    }
+}
+
 /// Read one shard's byte range, parse it, apply the statements, and return the
 /// serialized survivors.
-fn process_range(stmts: &[Stmt], path: &Path, start: u64, end: u64) -> Result<String, Error> {
+fn process_range(
+    stmts: &[Stmt],
+    path: &Path,
+    start: u64,
+    end: u64,
+    progress: &Progress,
+) -> Result<String, Error> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::with_capacity((end - start) as usize);
@@ -1070,7 +1099,7 @@ fn process_range(stmts: &[Stmt], path: &Path, start: u64, end: u64) -> Result<St
     let mut out = String::with_capacity(bytes.len() / 2 + 64);
     let mut scratch: Vec<Field> = Vec::new();
     let mut err: Option<Error> = None;
-    csv::parse_chunk(text, |row| {
+    parse_counted(text, progress, |row| {
         if err.is_some() {
             return;
         }
@@ -1095,6 +1124,7 @@ fn stats_over_range(
     path: &Path,
     start: u64,
     end: u64,
+    progress: &Progress,
 ) -> Result<Vec<ColStats>, Error> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -1106,7 +1136,7 @@ fn stats_over_range(
     let mut accs: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
     let mut scratch: Vec<Field> = Vec::new();
     let mut err: Option<Error> = None;
-    csv::parse_chunk(text, |row| {
+    parse_counted(text, progress, |row| {
         if err.is_some() {
             return;
         }
@@ -1134,19 +1164,21 @@ fn stats_over_range(
 fn run_stats_sharded(
     pre: &[Stmt],
     positions: &[usize],
-    threads: usize,
+    opts: &RunOpts,
     path: &Path,
     data_start: u64,
     file_len: u64,
 ) -> Result<Vec<ColStats>, Error> {
     let mut merged: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
-    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
+    let progress = &opts.progress;
     if !ranges.is_empty() {
         let partials: Vec<Result<Vec<ColStats>, Error>> = thread::scope(|scope| {
             let handles: Vec<_> = ranges
                 .into_iter()
                 .map(|(start, end)| {
-                    scope.spawn(move || stats_over_range(pre, positions, path, start, end))
+                    scope
+                        .spawn(move || stats_over_range(pre, positions, path, start, end, progress))
                 })
                 .collect();
             handles
@@ -1177,6 +1209,7 @@ fn group_over_range<'a>(
     path: &Path,
     start: u64,
     end: u64,
+    progress: &Progress,
 ) -> Result<Grouper<'a>, Error> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -1188,7 +1221,7 @@ fn group_over_range<'a>(
     let mut grouper = Grouper::new(g);
     let mut scratch: Vec<Field> = Vec::new();
     let mut err: Option<Error> = None;
-    csv::parse_chunk(text, |row| {
+    parse_counted(text, progress, |row| {
         if err.is_some() {
             return;
         }
@@ -1213,18 +1246,21 @@ fn group_over_range<'a>(
 fn run_group_sharded<'a>(
     pre: &[Stmt],
     g: &'a GroupStmt,
-    threads: usize,
+    opts: &RunOpts,
     path: &Path,
     data_start: u64,
     file_len: u64,
 ) -> Result<Grouper<'a>, Error> {
     let mut merged = Grouper::new(g);
-    let ranges = shard_ranges(path, data_start, file_len, threads)?;
+    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
+    let progress = &opts.progress;
     if !ranges.is_empty() {
         let partials: Vec<Result<Grouper, Error>> = thread::scope(|scope| {
             let handles: Vec<_> = ranges
                 .into_iter()
-                .map(|(start, end)| scope.spawn(move || group_over_range(pre, g, path, start, end)))
+                .map(|(start, end)| {
+                    scope.spawn(move || group_over_range(pre, g, path, start, end, progress))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -3081,6 +3117,22 @@ mod tests {
     }
 
     #[test]
+    fn a_sharded_run_counts_every_shard() {
+        let path =
+            std::env::temp_dir().join(format!("csvm-count-shards-{}.csv", std::process::id()));
+        let mut csv = String::from("k,v\n");
+        for i in 0..2000 {
+            csv.push_str(&format!("{},{i}\n", i % 7));
+        }
+        std::fs::write(&path, &csv).unwrap();
+        for script in ["select v > 3", "stats v", "agg count by k"] {
+            let (read, total) = counted(script, &path, 4);
+            assert_eq!(read, total, "{script}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn group_sharded_matches_serial() {
         // A CSV with several keys, fractional values, text and empties, enough
         // rows to split into several shards. Group it single-threaded (streaming
@@ -3925,6 +3977,31 @@ mod tests {
             assert!(short.ends_with('…'), "{short:?}");
             assert_eq!(cut(text, 80), text);
         }
+    }
+
+    #[test]
+    fn parse_counted_gives_every_row_and_counts_every_byte() {
+        // A bit over two pieces, so it is parsed in three.
+        let line = "12345,some text\n";
+        let text = line.repeat(2 * PROGRESS_PIECE / line.len() + 100);
+        let progress = Progress::counting();
+        let (mut rows, mut counted_midway) = (0usize, Vec::new());
+        parse_counted(&text, &progress, |row| {
+            assert_eq!(row.len(), 2);
+            rows += 1;
+            counted_midway.push(progress.get());
+        });
+        assert_eq!(rows, text.lines().count());
+        assert_eq!(progress.get(), text.len() as u64);
+        // The count moved while rows were still coming, a piece at a time.
+        counted_midway.dedup();
+        assert_eq!(counted_midway.len(), 3, "{counted_midway:?}");
+        // Text with no trailing newline keeps its last row.
+        let mut last = Vec::new();
+        parse_counted("a,b\nc,d", &Progress::default(), |row| {
+            last = row.iter().map(|f| f.as_str().into_owned()).collect()
+        });
+        assert_eq!(last, ["c", "d"]);
     }
 
     #[test]
