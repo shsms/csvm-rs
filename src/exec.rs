@@ -1926,7 +1926,9 @@ fn align_and_write<W: Write>(
     let mut line = String::new();
     for (ri, row) in rows.iter().enumerate() {
         line.clear();
-        let last = row.len().saturating_sub(1);
+        // Where the last cell with something in it ends: the line stops
+        // there, so empty cells at its end leave no padding behind.
+        let mut end = 0;
         for (i, field) in row.iter().enumerate() {
             if i > 0 {
                 line.push_str("  ");
@@ -1936,6 +1938,7 @@ fn align_and_write<W: Write>(
                 widths[i],
             );
             let pad = widths[i].saturating_sub(vis_width(&text));
+            let has_content = !text.is_empty();
             let painted: Cow<str> = match color {
                 Some(depth) => {
                     let mut style = style_at(styles, ri, i);
@@ -1953,22 +1956,23 @@ fn align_and_write<W: Write>(
             } else {
                 painted
             };
+            let padding = " ".repeat(pad);
             if numeric[i] {
-                // Right-justify: pad on the left (so never a trailing space).
-                for _ in 0..pad {
-                    line.push(' ');
-                }
+                // Right-justify: pad on the left.
+                line.push_str(&padding);
                 line.push_str(&painted);
             } else {
                 line.push_str(&painted);
-                // Left-justify: pad on the right, except the last column.
-                if i != last {
-                    for _ in 0..pad {
-                        line.push(' ');
-                    }
-                }
+            }
+            if has_content {
+                end = line.len();
+            }
+            if !numeric[i] {
+                // Left-justify: pad on the right.
+                line.push_str(&padding);
             }
         }
+        line.truncate(end);
         line.push('\n');
         output.write_all(line.as_bytes())?;
     }
@@ -3859,7 +3863,11 @@ mod tests {
         );
         // With colour off the table is plain, and an empty cell is a gap.
         let plain = render_str("fmt", "name,n\nab,\n,22\n", false);
-        assert_eq!(plain, "name   n\nab      \n      22\n");
+        assert_eq!(plain, "name   n\nab\n      22\n");
+        // A line ends at its last cell with something in it, so an empty last
+        // cell leaves no padding behind; a cell's own spaces stay.
+        let empty_ends = render_str("fmt", "a,b,c\nxx,,\ny,z  ,\n", false);
+        assert_eq!(empty_ends, "a   b    c\nxx\ny   z  \n");
     }
 
     #[test]
