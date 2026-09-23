@@ -281,7 +281,6 @@ mod tests {
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1 << 20,
-            progress: Default::default(),
         };
         let mut plan = crate::parse::parse(script).unwrap();
         let header = read_header(path).unwrap();
@@ -359,7 +358,6 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1 << 20,
-            progress: Default::default(),
         };
         let run = |script: &str| -> String {
             let mut plan = crate::parse::parse(script).unwrap();

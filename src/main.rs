@@ -105,12 +105,11 @@ fn run() -> Result<(), Failure> {
     };
     // Parse the pipe script into a plan here, once.
     let mut plan = parse::parse(&script).map_err(|e| script_error(&script, &e, &console))?;
-    let mut opts = exec::RunOpts {
+    let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,
         temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
         sort_buffer: args.sort_buffer,
-        progress: Progress::default(),
     };
 
     let (mut source, header) = open_source(&args)?;
@@ -141,12 +140,14 @@ fn run() -> Result<(), Failure> {
         || (color.is_some() && !plan.colors.is_empty());
     // A slow run shows how far it has read on stderr, when nothing else is
     // drawing on the terminal meanwhile.
-    if console.meter(buffered) {
-        opts.progress = Progress::counting();
-    }
+    let progress = if console.meter(buffered) {
+        Progress::counting()
+    } else {
+        Progress::default()
+    };
     if buffered {
         let mut buf: Vec<u8> = Vec::new();
-        run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
+        run_into(&mut source, &plan, &out_header, &opts, &progress, &mut buf)?;
         // A table or a chart is read on screen, so a long one is paged. The
         // pager starts only now, with the run done, so it never sits waiting
         // on a slow pipeline. A table prints a line for each line of the
@@ -163,7 +164,14 @@ fn run() -> Result<(), Failure> {
         }
         exec::render(&buf, &plan, &screen, &mut output)?;
     } else {
-        run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
+        run_into(
+            &mut source,
+            &plan,
+            &out_header,
+            &opts,
+            &progress,
+            &mut output,
+        )?;
     }
     output.flush()?;
     Ok(())
@@ -298,20 +306,22 @@ fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     Err("parquet input requires building csvm with --features parquet".to_string())
 }
 
-/// Run the plan over `source` into `output`. While it runs, a meter on stderr
-/// shows the input read so far when `opts.progress` counts it (never for
-/// parquet, whose reader counts nothing); the meter is gone when this returns.
+/// Run the plan over `source` into `output`, counting the input read into
+/// `progress`. While it runs, a meter on stderr shows the count when
+/// `progress` keeps one (never for parquet, whose reader counts nothing); the
+/// meter is gone when this returns.
 fn run_into<W: Write + Send>(
     source: &mut Source,
     plan: &csvm::plan::Plan,
     out_header: &[String],
     opts: &exec::RunOpts,
+    progress: &Progress,
     output: &mut W,
 ) -> Result<(), csvm::error::Error> {
     let meter = |total| {
-        opts.progress
+        progress
             .is_counting()
-            .then(|| Meter::start(opts.progress.clone(), total))
+            .then(|| Meter::start(progress.clone(), total))
     };
     match source {
         Source::File {
@@ -320,12 +330,17 @@ fn run_into<W: Write + Send>(
             file_len,
         } => {
             let _meter = meter(Some(file_len.saturating_sub(*data_start)));
-            exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output)
+            let input = exec::InputFile {
+                path,
+                data_start: *data_start,
+                len: *file_len,
+            };
+            exec::run_file(plan, out_header, opts, input, progress, output)
         }
         Source::Stream(reader) => {
             let _meter = meter(None);
             // A stream is read here, not by the executor, so count it here.
-            let mut counted = BufReader::new(Counted::new(reader, opts.progress.clone()));
+            let mut counted = BufReader::new(Counted::new(reader, progress.clone()));
             exec::run(plan, out_header, opts, &mut counted, output)
         }
         #[cfg(feature = "parquet")]

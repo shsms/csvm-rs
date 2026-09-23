@@ -22,7 +22,6 @@ fn run(script: &str, left: &str) -> Result<String, String> {
         threads: 1,
         temp_dir: std::env::temp_dir(),
         sort_buffer: 1 << 20,
-        progress: Default::default(),
     };
     let mut out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;

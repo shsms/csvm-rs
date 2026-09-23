@@ -45,17 +45,23 @@ fn vis_width(s: &str) -> usize {
 /// multi-sort fallback).
 type OwnedRow = Vec<Field<'static>>;
 
-/// Knobs for a run: chunk size, worker count, where sort spills its temp
-/// files, and what counts the input read (for the progress meter).
+/// Knobs for a run: chunk size, worker count, and where sort spills its temp
+/// files.
 #[derive(Clone, Debug)]
 pub struct RunOpts {
     pub chunk_size: usize,
     pub threads: usize,
     pub temp_dir: PathBuf,
     pub sort_buffer: usize,
-    /// Where the readers of an input file count the bytes they consume. The
-    /// caller counts a stream it hands in itself.
-    pub progress: Progress,
+}
+
+/// A seekable input file: its path, and where its data lies, from
+/// `data_start` (past the header line, if it has one) to its `len`.
+#[derive(Clone, Copy, Debug)]
+pub struct InputFile<'a> {
+    pub path: &'a Path,
+    pub data_start: u64,
+    pub len: u64,
 }
 
 /// Read and parse the header line from `input`.
@@ -687,14 +693,14 @@ pub fn read_header_from_path(path: &Path) -> Result<(Vec<String>, u64, u64), Err
 
 /// Run a plan over a seekable file. A lone transform stage with `threads > 1`
 /// is **sharded**: each worker reads its own byte range, with no central reader
-/// or channel. Everything else falls back to the reader-based path.
+/// or channel. Everything else falls back to the reader-based path. The bytes
+/// of `input` consumed are counted into `progress`.
 pub fn run_file<W: Write + Send>(
     plan: &Plan,
     out_header: &[String],
     opts: &RunOpts,
-    path: &Path,
-    data_start: u64,
-    file_len: u64,
+    input: InputFile,
+    progress: &Progress,
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
@@ -707,7 +713,7 @@ pub fn run_file<W: Write + Send>(
         && opts.threads > 1
         && !stateful
     {
-        return run_sharded(stmts, opts, path, data_start, file_len, output);
+        return run_sharded(stmts, input, opts.threads, progress, output);
     }
 
     // `stats` reduces associatively, so shard it over the file too.
@@ -715,7 +721,7 @@ pub fn run_file<W: Write + Send>(
         && !stateful
         && let Some((pre, stats, post)) = stats_shape(plan)
     {
-        let merged = run_stats_sharded(pre, &stats.positions, opts, path, data_start, file_len)?;
+        let merged = run_stats_sharded(pre, &stats.positions, input, opts.threads, progress)?;
         let rows = apply_stages_over_rows(post, profile_rows(stats, &merged), opts)?;
         return write_rows(output, &rows);
     }
@@ -726,14 +732,14 @@ pub fn run_file<W: Write + Send>(
         && !stateful
         && let Some((pre, g, post)) = group_shape(plan)
     {
-        let grouper = run_group_sharded(pre, g, opts, path, data_start, file_len)?;
+        let grouper = run_group_sharded(pre, g, input, opts.threads, progress)?;
         let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
         return write_rows(output, &rows);
     }
 
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(data_start))?;
-    let mut reader = BufReader::new(Counted::new(file, opts.progress.clone()));
+    let mut file = File::open(input.path)?;
+    file.seek(SeekFrom::Start(input.data_start))?;
+    let mut reader = BufReader::new(Counted::new(file, progress.clone()));
     run_body(plan, opts, &mut reader, output)
 }
 
@@ -969,14 +975,13 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
 /// order.
 fn run_sharded<W: Write>(
     stmts: &[Stmt],
-    opts: &RunOpts,
-    path: &Path,
-    data_start: u64,
-    file_len: u64,
+    input: InputFile,
+    threads: usize,
+    progress: &Progress,
     output: &mut W,
 ) -> Result<(), Error> {
-    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
-    let progress = &opts.progress;
+    let ranges = shard_ranges(input, threads)?;
+    let path = input.path;
     if ranges.is_empty() {
         return Ok(()); // header only, no data rows
     }
@@ -1001,15 +1006,15 @@ fn run_sharded<W: Write>(
     Ok(())
 }
 
-/// Divide `[data_start, file_len)` into up to `n` contiguous ranges, each
-/// starting and ending on a line boundary, so every row falls in exactly one
-/// shard. Empty ranges (more threads than lines) are dropped.
-fn shard_ranges(
-    path: &Path,
-    data_start: u64,
-    file_len: u64,
-    n: usize,
-) -> Result<Vec<(u64, u64)>, Error> {
+/// Divide `input`'s data into up to `n` contiguous ranges, each starting and
+/// ending on a line boundary, so every row falls in exactly one shard. Empty
+/// ranges (more threads than lines) are dropped.
+fn shard_ranges(input: InputFile, n: usize) -> Result<Vec<(u64, u64)>, Error> {
+    let InputFile {
+        path,
+        data_start,
+        len: file_len,
+    } = input;
     if data_start >= file_len {
         return Ok(Vec::new());
     }
@@ -1164,14 +1169,13 @@ fn stats_over_range(
 fn run_stats_sharded(
     pre: &[Stmt],
     positions: &[usize],
-    opts: &RunOpts,
-    path: &Path,
-    data_start: u64,
-    file_len: u64,
+    input: InputFile,
+    threads: usize,
+    progress: &Progress,
 ) -> Result<Vec<ColStats>, Error> {
     let mut merged: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
-    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
-    let progress = &opts.progress;
+    let ranges = shard_ranges(input, threads)?;
+    let path = input.path;
     if !ranges.is_empty() {
         let partials: Vec<Result<Vec<ColStats>, Error>> = thread::scope(|scope| {
             let handles: Vec<_> = ranges
@@ -1246,14 +1250,13 @@ fn group_over_range<'a>(
 fn run_group_sharded<'a>(
     pre: &[Stmt],
     g: &'a GroupStmt,
-    opts: &RunOpts,
-    path: &Path,
-    data_start: u64,
-    file_len: u64,
+    input: InputFile,
+    threads: usize,
+    progress: &Progress,
 ) -> Result<Grouper<'a>, Error> {
     let mut merged = Grouper::new(g);
-    let ranges = shard_ranges(path, data_start, file_len, opts.threads)?;
-    let progress = &opts.progress;
+    let ranges = shard_ranges(input, threads)?;
+    let path = input.path;
     if !ranges.is_empty() {
         let partials: Vec<Result<Grouper, Error>> = thread::scope(|scope| {
             let handles: Vec<_> = ranges
@@ -1516,18 +1519,18 @@ fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>,
     let path = Path::new(&j.file);
     let (_, data_start, file_len) = read_header_from_path(path)?;
     let mut buf: Vec<u8> = Vec::new();
-    // The progress is of the main input, so the right file is not counted.
-    let opts = RunOpts {
-        progress: Progress::default(),
-        ..opts.clone()
+    let right = InputFile {
+        path,
+        data_start,
+        len: file_len,
     };
+    // The progress is of the main input, so the right file is not counted.
     run_file(
         &j.right_plan,
         &j.right_header,
-        &opts,
-        path,
-        data_start,
-        file_len,
+        opts,
+        right,
+        &Progress::default(),
         &mut buf,
     )?;
     // Drop the header line the executor wrote; parse the rest into owned rows.
@@ -2436,7 +2439,6 @@ mod tests {
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            progress: Default::default(),
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2455,7 +2457,6 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1, // spill after every row
-            progress: Default::default(),
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2495,7 +2496,6 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            progress: Default::default(),
         };
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
@@ -2699,7 +2699,6 @@ mod tests {
                 threads: 4,
                 temp_dir: std::env::temp_dir(),
                 sort_buffer: 1,
-                progress: Default::default(),
             };
             let mut out = Vec::new();
             run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
@@ -3074,16 +3073,18 @@ mod tests {
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            progress,
         };
         let mut out = Vec::new();
         run_file(
             &plan,
             &out_header,
             &opts,
-            path,
-            data_start,
-            file_len,
+            InputFile {
+                path,
+                data_start,
+                len: file_len,
+            },
+            &progress,
             &mut out,
         )
         .unwrap();
@@ -4140,7 +4141,6 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
-            progress: Default::default(),
         };
         let mut out = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();

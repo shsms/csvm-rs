@@ -584,11 +584,13 @@ terminal (not `TERM=dumb`), a `fmt` table, a `graph` chart, help and
 (`Console::fills`) — never a shorter one, as `--header` turns `-F` off.
 Dropping the `Pager` waits for it; `--no-pager` or a pager of `cat` / empty
 turns it off. A run past a second draws a progress line on stderr
-(`src/progress.rs`): `RunOpts.progress` is a shared byte count that the
-executor's file reader (`progress::Counted`) and the shard workers
+(`src/progress.rs`): a `progress::Progress` is a shared byte count that
+`run_file` takes with its `exec::InputFile` (the path and data range), and
+that its file reader (`progress::Counted`) and the shard workers
 (`parse_counted`, per ~4 MiB piece, so the count follows the parsing rather
-than the up-front read) add to, and `main` counts a stdin stream itself; a
-`progress::Meter` thread redraws the line and clears it on drop.
+than the up-front read) add to. `main` passes its counter in and counts a
+stdin stream itself; a join's right file runs with one that counts nothing.
+A `progress::Meter` thread redraws the line and clears it on drop.
 `Console::meter` turns it on when stderr is a terminal (not `TERM=dumb`) that
 nothing else draws on: stdout a file, or the terminal with buffered
 `fmt`/`color`/`graph` output — not a pipe (it may feed `less`) — and the input
