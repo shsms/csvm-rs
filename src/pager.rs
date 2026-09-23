@@ -54,6 +54,11 @@ fn release_in_banner(banner: &str) -> Option<u32> {
 /// option under the changes from 590 to 608).
 const LESS_HEADER_SINCE: u32 = 608;
 
+/// The first general `less` release that passes OSC 8 hyperlinks through
+/// under `-R` (its NEWS lists them under the changes from 563 to 581); an
+/// older one shows their escapes as text.
+const LESS_LINKS_SINCE: u32 = 581;
+
 /// The options a table gets from `less` at `version`: cut long lines off
 /// instead of wrapping them (`-S`, so a wide table scrolls sideways and keeps
 /// its columns lined up) and, when `tall` (the table does not fit on one
@@ -66,6 +71,11 @@ fn table_args(version: Option<u32>, tall: bool) -> Vec<&'static str> {
         args.push("--header=1");
     }
     args
+}
+
+/// Whether `less` at `version` passes OSC 8 hyperlinks through.
+fn links_at(version: Option<u32>) -> bool {
+    version.is_some_and(|v| v >= LESS_LINKS_SINCE)
 }
 
 /// Whether the pager `cmd` can be run, as far as `sh`, which runs it, can find
@@ -111,6 +121,7 @@ fn less_release(cmd: &str) -> Option<u32> {
 /// closes the pipe and waits for the pager to exit, so the shell prompt does
 /// not come back while the pager still owns the terminal.
 pub struct Pager {
+    cmd: String,
     input: Option<BufWriter<ChildStdin>>,
     child: Child,
 }
@@ -150,12 +161,22 @@ impl Pager {
         unsafe {
             libc::signal(libc::SIGINT, libc::SIG_IGN);
         }
-        Some(Pager { input, child })
+        Some(Pager {
+            cmd: cmd.to_string(),
+            input,
+            child,
+        })
     }
 
     #[cfg(not(unix))]
     pub fn start(_cmd: &str, _table: bool, _tall: bool) -> Option<Pager> {
         None
+    }
+
+    /// Whether the pager shows OSC 8 hyperlinks as links. Only a `less` known
+    /// to pass them through does; any other pager may show their escapes.
+    pub fn shows_links(&self) -> bool {
+        is_less(&self.cmd) && links_at(less_release(&self.cmd))
     }
 
     fn input(&mut self) -> io::Result<&mut BufWriter<ChildStdin>> {
@@ -237,6 +258,14 @@ mod tests {
         ] {
             assert!(!runnable(cannot), "{cannot}");
         }
+    }
+
+    #[test]
+    fn links_pass_through_from_the_first_release_that_has_them() {
+        assert!(links_at(Some(668)));
+        assert!(links_at(Some(581)));
+        assert!(!links_at(Some(580)));
+        assert!(!links_at(None));
     }
 
     #[test]
