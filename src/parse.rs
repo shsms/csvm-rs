@@ -28,16 +28,19 @@ use crate::plan::{
 };
 
 /// Compile a pipe script into an executable [`Plan`].
+/// A compile error that can be placed in the script is an [`Error::At`], its
+/// span a byte range of `script`: the stage it is in.
 pub fn parse(script: &str) -> Result<Plan, Error> {
     let script = strip_comments(script);
     let (fns, rest) = parse_prologue(&script)?;
-    parse_stages(rest, &fns, 0)
+    parse_stages(rest, &fns, 0, &script)
 }
 
 /// Parse stage text into a plan. Sub-pipelines and fragment bodies re-enter
-/// here with the shared fn table and their expansion depth.
-fn parse_stages(script: &str, fns: &FnTable, depth: usize) -> Result<Plan, Error> {
-    let mut builder = Builder::new(fns, depth);
+/// here with the shared fn table and their expansion depth; `top` is the
+/// whole script, which error spans are offsets into.
+fn parse_stages(script: &str, fns: &FnTable, depth: usize, top: &str) -> Result<Plan, Error> {
+    let mut builder = Builder::new(fns, depth, top);
     for stage in split_stages(script) {
         let stage = stage.trim();
         // Skip blank stages: a blank or comment-only line in a multi-line `-f`
@@ -45,7 +48,9 @@ fn parse_stages(script: &str, fns: &FnTable, depth: usize) -> Result<Plan, Error
         if stage.is_empty() {
             continue;
         }
-        builder.parse_stage(stage)?;
+        builder
+            .parse_stage(stage)
+            .map_err(|e| place_on(top, stage, e))?;
     }
     if builder.items.is_empty()
         && builder.output == OutputFormat::Csv
@@ -59,6 +64,22 @@ fn parse_stages(script: &str, fns: &FnTable, depth: usize) -> Result<Plan, Error
 
 fn err(msg: impl Into<String>) -> Error {
     Error::Compile(msg.into())
+}
+
+/// Where `part` starts in `script`, when it is a slice of it (and not, say,
+/// text a fragment call expanded to).
+fn offset_in(script: &str, part: &str) -> Option<usize> {
+    let (s, p) = (script.as_ptr() as usize, part.as_ptr() as usize);
+    (p >= s && p + part.len() <= s + script.len()).then(|| p - s)
+}
+
+/// `e` placed on the whole of `part`, a slice of `script`, unless it has a
+/// place already (or `part` is not in `script`).
+fn place_on(script: &str, part: &str, e: Error) -> Error {
+    match offset_in(script, part) {
+        Some(at) => e.at(at..at + part.len()),
+        None => e,
+    }
 }
 
 /// Known command names, for the "did you mean …?" hint on an unknown verb and
@@ -219,6 +240,8 @@ struct Builder<'a> {
     fns: &'a FnTable,
     /// Current fragment-expansion depth; `MAX_FN_DEPTH` stops recursion.
     depth: usize,
+    /// The whole script, for placing an error in it.
+    script: &'a str,
     items: Vec<Item>,
     output: OutputFormat,
     /// Colour rules from `color` commands (plan metadata, not stages).
@@ -228,10 +251,11 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(fns: &'a FnTable, depth: usize) -> Self {
+    fn new(fns: &'a FnTable, depth: usize, script: &'a str) -> Self {
         Builder {
             fns,
             depth,
+            script,
             items: Vec::new(),
             output: OutputFormat::Csv,
             colors: Vec::new(),
@@ -319,18 +343,22 @@ impl<'a> Builder<'a> {
             "add" => self.parse_add(rest),
             "fmt" => self.parse_fmt(rest),
             "fn" => Err(err("fn definitions must come before the first stage")),
-            other => Err(err(if self.fns.contains_key(other) {
-                format!(
-                    "unknown command: {other} (`{other}` is a fragment — call it as `{other}(ARGS)`)"
-                )
-            } else {
-                let mut cands: Vec<String> = COMMANDS.iter().map(|s| s.to_string()).collect();
-                cands.extend(self.fns.keys().cloned());
-                match crate::error::did_you_mean(other, &cands) {
-                    Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
-                    None => format!("unknown command: {other}"),
-                }
-            })),
+            other => Err(place_on(
+                self.script,
+                other,
+                err(if self.fns.contains_key(other) {
+                    format!(
+                        "unknown command: {other} (`{other}` is a fragment — call it as `{other}(ARGS)`)"
+                    )
+                } else {
+                    let mut cands: Vec<String> = COMMANDS.iter().map(|s| s.to_string()).collect();
+                    cands.extend(self.fns.keys().cloned());
+                    match crate::error::did_you_mean(other, &cands) {
+                        Some(s) => format!("unknown command: {other} (did you mean `{s}`?)"),
+                        None => format!("unknown command: {other}"),
+                    }
+                }),
+            )),
         };
         result.map_err(|e| self.hint_fragment(e))
     }
@@ -338,15 +366,21 @@ impl<'a> Builder<'a> {
     /// A fragment name used inside an expression fails as an unknown
     /// function; point at the whole-stage call form.
     fn hint_fragment(&self, e: Error) -> Error {
-        let Error::Compile(msg) = &e else { return e };
+        let Error::Compile(msg) = e.unplaced() else {
+            return e;
+        };
         let Some(tail) = msg.strip_prefix("unknown function: ") else {
             return e;
         };
         let name = tail.split([' ', '(']).next().unwrap_or("");
         if self.fns.contains_key(name) {
-            return err(format!(
+            let hinted = err(format!(
                 "unknown function: {name} (`{name}` is a fragment — fragments expand only as whole stages)"
             ));
+            return match e.span() {
+                Some(span) => hinted.at(span),
+                None => hinted,
+            };
         }
         e
     }
@@ -510,7 +544,7 @@ impl<'a> Builder<'a> {
                 if inner.trim().is_empty() {
                     Box::new(identity_plan())
                 } else {
-                    Box::new(parse_stages(inner, self.fns, self.depth)?)
+                    Box::new(parse_stages(inner, self.fns, self.depth, self.script)?)
                 }
             } else {
                 Box::new(identity_plan())
@@ -1053,12 +1087,16 @@ fn strip_comments(script: &str) -> String {
                     out.push(c);
                 }
                 '#' => {
-                    // Drop through end of line, keeping the newline itself.
+                    // Blank through end of line, keeping the newline itself,
+                    // so everything after the comment stays at its offset in
+                    // the script (where an error's span points).
+                    out.push(' ');
                     for d in chars.by_ref() {
                         if d == '\n' {
                             out.push('\n');
                             break;
                         }
+                        out.extend(std::iter::repeat_n(' ', d.len_utf8()));
                     }
                 }
                 _ => out.push(c),
@@ -2295,6 +2333,23 @@ fn check_arity(func: Func, n: usize) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_are_placed_on_their_stage() {
+        let span = |script: &str| parse(script).unwrap_err().span();
+        assert_eq!(span("cols a | agg bogus(a)"), Some(9..21));
+        // An unknown command's word.
+        assert_eq!(span("cols a | selct a"), Some(9..14));
+        // A comment keeps the offsets after it the script's own.
+        assert_eq!(span("cols a # note\nselct a"), Some(14..19));
+        // A fragment's body is not where it is called: the call stage.
+        assert_eq!(span("fn f(x) { select x >> 1 }\nf(a)"), Some(26..30));
+        // The message itself is unchanged by its place.
+        assert_eq!(
+            parse("cols a | selct a").unwrap_err().to_string(),
+            "unknown command: selct (did you mean `select`?)"
+        );
+    }
 
     #[test]
     fn cols_keep_and_exclude() {

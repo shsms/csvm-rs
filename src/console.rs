@@ -103,6 +103,12 @@ impl Console {
             .then_some(self.depth)
     }
 
+    /// Whether an error on stderr is coloured, by the rules stdout's colour
+    /// follows.
+    pub fn error_color(&self) -> bool {
+        self.colors(self.stderr_terminal)
+    }
+
     /// Whether to colour a stream: an explicit `--color always`/`never` wins.
     /// Under `auto`, `NO_COLOR` turns colour off and `CLICOLOR_FORCE` on, else
     /// the stream must go to a `terminal`, and not `TERM=dumb`.
@@ -414,5 +420,21 @@ mod tests {
         ] {
             assert!(!quiet.meter(true), "{quiet:?}");
         }
+    }
+
+    #[test]
+    fn errors_are_coloured_by_stderr_under_the_same_rules() {
+        // stderr on the terminal colours errors, whatever stdout is.
+        assert!(to(Sink::File).error_color());
+        let piped = Console {
+            stderr_terminal: false,
+            ..terminal()
+        };
+        assert!(!piped.error_color());
+        let forced = Console {
+            force_color: true,
+            ..piped
+        };
+        assert!(forced.error_color());
     }
 }

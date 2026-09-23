@@ -96,6 +96,7 @@ fn run() -> Result<(), Failure> {
         }
     };
 
+    let console = Console::read(&args);
     // The pipeline is either the SCRIPT positional or, with `-f`, a file.
     let script = match &args.script_file {
         Some(path) => std::fs::read_to_string(path)
@@ -103,7 +104,7 @@ fn run() -> Result<(), Failure> {
         None => args.script.clone(),
     };
     // Parse the pipe script into a plan here, once.
-    let mut plan = parse::parse(&script).map_err(|e| e.to_string())?;
+    let mut plan = parse::parse(&script).map_err(|e| script_error(&script, &e, &console))?;
     let mut opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,
@@ -117,7 +118,6 @@ fn run() -> Result<(), Failure> {
     exec::prepare_joins(&mut plan)?;
     let out_header = plan.resolve(&header)?;
 
-    let console = Console::read(&args);
     if args.explain {
         // The plan goes to stdout even with -o, so it pages by stdout.
         let explain = Console {
@@ -167,6 +167,19 @@ fn run() -> Result<(), Failure> {
     }
     output.flush()?;
     Ok(())
+}
+
+/// A script error's message and, when the parser placed it, the line of the
+/// script it is on with the place marked (in colour when the console colours
+/// errors).
+fn script_error(script: &str, e: &csvm::error::Error, console: &Console) -> String {
+    let Some(span) = e.span() else {
+        return e.to_string();
+    };
+    format!(
+        "{e}\n{}",
+        csvm::error::excerpt(script, span, console.error_color())
+    )
 }
 
 /// Open the input and determine its header. With `--header` the input has no
