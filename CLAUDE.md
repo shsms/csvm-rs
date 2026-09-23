@@ -102,7 +102,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   Among the stages at the front of a plan that pass rows on one at a time
   (transforms, stateful ones too, `tail +N`, `uniq`), it stops the reading
   once full, wherever it sits: `RowChain` in `exec.rs` runs those stages
-  row by row as the input is read (`scan`), and
+  row by row as the input is read (`scan`; for parquet, per batch), and
   streams the rows out when nothing follows, else hands them to the rest of
   the plan, which runs in memory over them (so `uniq id | head 19 | sort
   qty` reads only up to its 19th distinct id). After a single `sort` it is
@@ -532,9 +532,10 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   into contiguous per-worker blocks (`partition_row_groups`), each worker decodes
   its block via `ParquetReader::open_row_groups`, and the serialized outputs
   concatenate in file order — the parquet mirror of CSV's `run_sharded` (~3.2× on
-  4 cores; a single-row-group file can't shard). Anything blocking
-  (sort/group/tail/uniq/join, or a stateful `add`) materializes and runs the
-  staged in-memory path — mirroring `run_body`'s dispatch.
+  4 cores; a single-row-group file can't shard). Anything else materializes:
+  the stages at the front that pass rows on one at a time run through
+  `RowChain` as the batches decode, so a full `head` among them stops the
+  decoding, and the rest runs on the staged in-memory path.
 - Follow-ups (`todo.org`): column/row-group projection push-down (only decode the
   columns the plan touches), more column types (temporal/decimal/dictionary), and
   parquet *output* (the `Sink` half). `gen_parquet` (feature-gated example) writes

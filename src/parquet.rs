@@ -462,6 +462,17 @@ mod tests {
     }
 
     #[test]
+    fn a_head_stops_the_reading_before_a_blocking_stage() {
+        let path = write_n("head", 20_000);
+        let progress = Progress::counting();
+        let out = run_counted(&path, "select id >= 5 | head 2 | sort id=nr", 1, &progress);
+        assert_eq!(out, "id,amount\n6,6\n5,5\n");
+        // One batch, not the whole file.
+        assert!(progress.get() < 20_000, "{}", progress.get());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     fn sharded_read_matches_serial_across_row_groups() {
         // 5000 rows with 512-row groups ⇒ ~10 row groups, enough to shard 4 ways.
         let path = write_n("rg", 5000);

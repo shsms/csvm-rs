@@ -939,9 +939,10 @@ pub fn run_file<W: Write + Send>(
 /// Run a plan over a `.parquet` file (feature `parquet`). Batches decode to
 /// owned, typed rows (numeric columns are already `Field::Num`, so no cast is
 /// needed). A pure transform streams batch by batch (O(batch) memory), and
-/// with `-n>1` shards across row groups; anything blocking (sort/group/tail/
-/// uniq/join, or a stateful `add`) materializes every batch and runs the staged
-/// in-memory path.
+/// with `-n>1` shards across row groups. Anything else runs the stages at the
+/// front that pass rows on one at a time as batches decode, stopping once a
+/// full `head` among them lets no more rows through, and the rest over the
+/// rows they kept.
 #[cfg(feature = "parquet")]
 pub fn run_parquet<W: Write + Send>(
     plan: &Plan,
@@ -976,13 +977,26 @@ pub fn run_parquet<W: Write + Send>(
         return Ok(());
     }
 
-    // Otherwise materialize all rows, then run the stages in order.
+    // Otherwise materialize the rows, then run the stages in order. The
+    // stages at the front that pass rows on one at a time run as they are
+    // read, so a full `head` among them stops the reading.
     let mut reader = crate::parquet::ParquetReader::open(path, progress)?;
+    let (mut chain, rest) = RowChain::front(&plan.stages);
     let mut rows: Vec<OwnedRow> = Vec::new();
-    while let Some(batch) = reader.next_batch() {
-        rows.extend(batch?);
+    let mut scratch: Vec<Field> = Vec::new();
+    while !chain.done()
+        && let Some(batch) = reader.next_batch()
+    {
+        for mut row in batch? {
+            if chain.done() {
+                break;
+            }
+            if chain.pass(&mut row, &mut scratch)? {
+                rows.push(row);
+            }
+        }
     }
-    let rows = apply_stages_over_rows(&plan.stages, rows, opts)?;
+    let rows = apply_stages_over_rows(rest, rows, opts)?;
     write_rows(output, &rows)
 }
 
