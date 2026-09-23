@@ -87,7 +87,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
-| `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified |
+| `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified; in colour, a bold header and a dim `∅` for an empty cell |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL V[,V2…]` | one horizontal bar per row and value column (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |

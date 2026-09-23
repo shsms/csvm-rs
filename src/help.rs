@@ -439,7 +439,8 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         summary: "whitespace-align the table",
         synopsis: &["fmt             align columns like `column -t` (takes no arguments)"],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
-the final output, so it composes after everything else.",
+the final output, so it composes after everything else. With colour on (see --color) the \
+header row is bold and an empty cell shows a dim ∅.",
         examples: &["csvm 'stats | fmt' data.csv"],
     },
 ];

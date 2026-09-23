@@ -255,6 +255,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
+  With colour on, the header row is bold and an empty data cell shows a dim
+  `∅` (`EMPTY_CELL`), layered over whatever the `color` rules paint there.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
   parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`

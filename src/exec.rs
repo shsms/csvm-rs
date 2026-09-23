@@ -6,6 +6,7 @@
 //! runs stage by stage. Parallelism and external-merge sort are layered on in
 //! later modules.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -1688,7 +1689,7 @@ pub fn render<W: Write>(
         None
     };
     if aligned {
-        align_and_write(&rows, styles.as_deref(), depth, output)
+        align_and_write(&rows, styles.as_deref(), color, output)
     } else {
         write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
@@ -1803,23 +1804,39 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
         .unwrap_or_default()
 }
 
+/// What an empty data cell shows in a coloured table, dimmed, so a blank value
+/// reads as a value and not as a gap in the row.
+const EMPTY_CELL: &str = "∅";
+
 /// Whitespace-align columns (`fmt` / `column -t`): each column padded to its
 /// widest cell, two spaces between. A numeric column (every data cell reads as a
 /// number) is right-justified; text columns left-justified, trailing column
 /// unpadded. Padding is by visible width; the painted text carries the colour.
+/// With colour on (`color` is its depth) the header row is bold and an empty
+/// data cell shows [`EMPTY_CELL`], dimmed over whatever the rules paint there.
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
-    depth: Depth,
+    color: Option<Depth>,
     output: &mut W,
 ) -> Result<(), Error> {
+    let marked = |ri: usize, field: &str| color.is_some() && ri > 0 && field.is_empty();
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
-    for row in rows {
+    for (ri, row) in rows.iter().enumerate() {
         for (i, field) in row.iter().enumerate() {
-            widths[i] = widths[i].max(vis_width(field));
+            let text = if marked(ri, field) { EMPTY_CELL } else { field };
+            widths[i] = widths[i].max(vis_width(text));
         }
     }
+    let bold = Style {
+        bold: true,
+        ..Style::default()
+    };
+    let dim = Style {
+        dim: true,
+        ..Style::default()
+    };
 
     // Right-justify a column when every data cell reads as a number (blanks
     // allowed, but at least one must be a real number).
@@ -1845,8 +1862,20 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 line.push_str("  ");
             }
-            let pad = widths[i].saturating_sub(vis_width(field));
-            let painted = style_at(styles, ri, i).paint(field, depth);
+            let text = if marked(ri, field) { EMPTY_CELL } else { field };
+            let pad = widths[i].saturating_sub(vis_width(text));
+            let painted: Cow<str> = match color {
+                Some(depth) => {
+                    let mut style = style_at(styles, ri, i);
+                    if ri == 0 {
+                        style = style.over(bold);
+                    } else if marked(ri, field) {
+                        style = style.over(dim);
+                    }
+                    style.paint(text, depth).into()
+                }
+                None => text.into(),
+            };
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
                 for _ in 0..pad {
@@ -3581,6 +3610,33 @@ mod tests {
         // Colour off ⇒ no escapes (aligned, but plain).
         let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn fmt_in_colour_bolds_the_header_and_marks_empty_cells() {
+        let out = render_str("fmt", "name,n\nab,\n,22\n", true);
+        let lines: Vec<&str> = out.lines().collect();
+        let bold = |s: &str| format!("\x1b[1m{s}\x1b[0m");
+        let dim = |s: &str| format!("\x1b[2m{s}\x1b[0m");
+        // The marker is a cell one column wide, so the columns still line up.
+        assert_eq!(
+            lines,
+            [
+                format!("{}   {}", bold("name"), bold("n")),
+                format!("ab     {}", dim("∅")),
+                format!("{}     22", dim("∅")),
+            ]
+        );
+        // With colour off the table is plain, and an empty cell is a gap.
+        let plain = render_str("fmt", "name,n\nab,\n,22\n", false);
+        assert_eq!(plain, "name   n\nab      \n      22\n");
+    }
+
+    #[test]
+    fn fmt_marks_empty_cells_under_colour_rules_too() {
+        // A row rule paints the marker with the rest of the row, dimmed.
+        let out = render_str("color red n > 1 | fmt", "a,n\n,2\n", true);
+        assert!(out.contains("\x1b[2;31m∅\x1b[0m"), "{out:?}");
     }
 
     #[test]
