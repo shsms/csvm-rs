@@ -1662,6 +1662,9 @@ pub struct Screen {
     /// shown on the terminal as it is, not through a pager that scrolls a wide
     /// table sideways.
     pub fit: bool,
+    /// Make a `fmt` table's web addresses clickable (OSC 8 hyperlinks), for a
+    /// terminal, or a pager, that shows them as links and not as escapes.
+    pub links: bool,
 }
 
 /// Render buffered output `bytes` to `output`, applying the plan's colour rules
@@ -1702,8 +1705,7 @@ pub fn render<W: Write>(
         None
     };
     if aligned {
-        let fit_to = screen.width.filter(|_| screen.fit);
-        align_and_write(&rows, styles.as_deref(), color, fit_to, output)
+        align_and_write(&rows, styles.as_deref(), screen, output)
     } else {
         write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
@@ -1826,17 +1828,19 @@ const EMPTY_CELL: &str = "∅";
 /// widest cell, two spaces between. A numeric column (every data cell reads as a
 /// number) is right-justified; text columns left-justified, trailing column
 /// unpadded. Padding is by visible width; the painted text carries the colour.
-/// With colour on (`color` is its depth) the header row is bold and an empty
-/// data cell shows [`EMPTY_CELL`], dimmed over whatever the rules paint there.
-/// With `fit_to`, text columns are cut so the lines fit that many columns
-/// (see [`fit_widths`]).
+/// With colour on the header row is bold and an empty data cell shows
+/// [`EMPTY_CELL`], dimmed over whatever the rules paint there. When the screen
+/// fits tables, text columns are cut so the lines fit its width (see
+/// [`fit_widths`]); when it shows links, a web address links to itself, whole
+/// even when its text is cut.
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
-    color: Option<Depth>,
-    fit_to: Option<usize>,
+    screen: &Screen,
     output: &mut W,
 ) -> Result<(), Error> {
+    let color = screen.color;
+    let fit_to = screen.width.filter(|_| screen.fit);
     let marked = |ri: usize, field: &str| color.is_some() && ri > 0 && field.is_empty();
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
@@ -1899,6 +1903,11 @@ fn align_and_write<W: Write>(
                 }
                 None => text,
             };
+            let painted = if screen.links && ri > 0 && is_web_address(field) {
+                hyperlink(field, &painted).into()
+            } else {
+                painted
+            };
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
                 for _ in 0..pad {
@@ -1919,6 +1928,23 @@ fn align_and_write<W: Write>(
         output.write_all(line.as_bytes())?;
     }
     Ok(())
+}
+
+/// Whether a cell is a web address a terminal can open: `http://` or
+/// `https://` and more, with no spaces or control characters. The last
+/// condition also keeps the cell from ending the link's escape early.
+fn is_web_address(cell: &str) -> bool {
+    let rest = cell
+        .strip_prefix("https://")
+        .or_else(|| cell.strip_prefix("http://"));
+    rest.is_some_and(|r| !r.is_empty())
+        && !cell.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// `text` as a link to `url`: an OSC 8 hyperlink, which a terminal that knows
+/// them shows as `text` and opens on a click, and one that does not ignores.
+fn hyperlink(url: &str, text: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
 /// The narrowest a text column is cut to when fitting a table: past this a cut
@@ -2402,6 +2428,7 @@ mod tests {
             color: color.then_some(Depth::Truecolor),
             width: term_width,
             fit: false,
+            links: false,
         };
         render_on(script, input, &screen)
     }
@@ -3765,7 +3792,42 @@ mod tests {
             color: None,
             width: Some(width),
             fit: true,
+            links: false,
         }
+    }
+
+    #[test]
+    fn fmt_links_web_addresses_on_a_screen_that_shows_links() {
+        let input = "site,n\nhttps://example.org/a/long/path,1\nnot a url,2\n";
+        let link = |url: &str, text: &str| format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\");
+        let screen = Screen {
+            links: true,
+            ..fitting(80)
+        };
+        let out = render_on("fmt", input, &screen);
+        let url = "https://example.org/a/long/path";
+        assert!(out.contains(&link(url, url)), "{out:?}");
+        assert_eq!(out.matches("\x1b]8;;").count(), 2, "{out:?}");
+        // A cut address still opens the whole one.
+        let narrow = Screen {
+            links: true,
+            ..fitting(16)
+        };
+        let out = render_on("fmt", input, &narrow);
+        assert!(out.contains(&link(url, "https://exam…")), "{out:?}");
+        // Without links, no escapes at all.
+        assert!(!render_on("fmt", input, &fitting(80)).contains('\x1b'));
+    }
+
+    #[test]
+    fn web_addresses_are_http_or_https_with_no_spaces() {
+        assert!(is_web_address("https://example.org"));
+        assert!(is_web_address("http://x"));
+        assert!(!is_web_address("https://"));
+        assert!(!is_web_address("ftp://example.org"));
+        assert!(!is_web_address("https://a b"));
+        assert!(!is_web_address("https://a\x1b\\"));
+        assert!(!is_web_address("see https://example.org"));
     }
 
     #[test]

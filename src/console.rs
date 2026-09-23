@@ -145,14 +145,24 @@ impl Console {
         }
     }
 
+    /// Whether a table's web addresses become links. A link is an escape like a
+    /// colour, and only a terminal opens it, so it needs colour on and stdout
+    /// the terminal.
+    pub fn links(&self) -> bool {
+        self.color().is_some() && self.stdout == Sink::Terminal
+    }
+
     /// What rendering needs to know about where its output is shown, through
     /// `pager` when there is one: a paged table is not fitted, since the pager
-    /// scrolls it sideways.
+    /// scrolls it sideways, and links only reach a pager that shows them.
     pub fn screen(&self, pager: Option<&Pager>) -> Screen {
         Screen {
             color: self.color(),
             width: self.width(),
             fit: pager.is_none(),
+            // Asking a pager costs a run of `less --version`, so only when
+            // links are on.
+            links: self.links() && pager.is_none_or(Pager::shows_links),
         }
     }
 }
@@ -327,5 +337,24 @@ mod tests {
     #[test]
     fn a_table_is_fitted_unless_a_pager_scrolls_it() {
         assert!(terminal().screen(None).fit);
+    }
+
+    #[test]
+    fn links_need_colour_and_the_terminal() {
+        assert!(terminal().links());
+        assert!(terminal().screen(None).links);
+        // Forced colour into a file or a pipe writes no links.
+        for stdout in [Sink::File, Sink::Pipe] {
+            let forced = Console {
+                color: ColorWhen::Always,
+                ..to(stdout)
+            };
+            assert!(forced.color().is_some() && !forced.links(), "{forced:?}");
+        }
+        let plain = Console {
+            color: ColorWhen::Never,
+            ..terminal()
+        };
+        assert!(!plain.links());
     }
 }

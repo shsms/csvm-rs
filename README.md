@@ -59,7 +59,11 @@ wrapping, and one taller than the window also `--header=1` (less 608 and
 later), so its header row stays on screen. `--no-pager`, or
 `CSVM_PAGER`/`PAGER` set to `cat` or empty, turns it off; so does
 `TERM=dumb`. A `fmt` table shown on the terminal with no pager is fitted to
-the window instead: text columns are cut with `…`, numbers never are.
+the window instead: text columns are cut with `…`, numbers never are. With
+colour on, a cell holding an `http://` or `https://` address is a clickable
+link (an OSC 8 hyperlink) in terminals that support them: only on the
+terminal, never into a file or a pipe, and through a pager only when it is
+`less` 581 or later, which passes them on.
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by

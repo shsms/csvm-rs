@@ -184,6 +184,22 @@ fn a_paged_table_keeps_its_wide_cells_whole() {
 }
 
 #[test]
+fn links_reach_a_less_that_shows_them() {
+    if !have_script() {
+        return;
+    }
+    let data = temp_csv("site\nhttps://example.org\n");
+    let path = data.to_str().unwrap();
+    let fake = FakeLess::new("links");
+    on_terminal(&fake.less(), 24, &["--color", "always", "fmt", path]);
+    let input = fake.saved("input").unwrap();
+    assert!(
+        input.contains("\x1b]8;;https://example.org\x1b\\"),
+        "{input:?}"
+    );
+}
+
+#[test]
 fn help_goes_through_less_without_the_table_options() {
     if !have_script() {
         return;

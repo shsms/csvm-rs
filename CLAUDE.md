@@ -261,7 +261,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `fit`); with `fit` — a terminal and no pager, which would scroll sideways
   instead — `fit_widths` cuts every text column wider than one shared cap
   (the widest that fits, floor `MIN_FIT`) and `cut` ends a cut cell in `…`.
-  Numeric columns are never cut.
+  Numeric columns are never cut. With `Screen.links` (`Console::links`:
+  colour on and stdout the terminal; through a pager, only one that
+  `Pager::shows_links` — `less` 581+), a cell that
+  `is_web_address` (`http(s)://`, no spaces or control characters) is wrapped
+  in an OSC 8 hyperlink to its whole text, even when the shown text is cut.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
   parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`

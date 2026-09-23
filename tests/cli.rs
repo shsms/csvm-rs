@@ -207,3 +207,12 @@ fn gradients_are_24_bit_only_where_colorterm_says_so() {
     let exact = run(Some("truecolor"));
     assert!(exact.contains("\x1b[38;2;"), "{exact:?}");
 }
+
+#[test]
+fn forced_colour_into_a_pipe_writes_no_links() {
+    // Colour may be forced into a pipe, but a link only works on a terminal.
+    let (ok, out, err) = csvm(&["--color", "always", "fmt"], "site\nhttps://example.org\n");
+    assert!(ok, "{err}");
+    assert!(out.contains("\x1b["), "{out:?}");
+    assert!(!out.contains("\x1b]8;;"), "{out:?}");
+}
