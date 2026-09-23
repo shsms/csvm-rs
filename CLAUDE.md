@@ -398,7 +398,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `add`). The grammar is **single-pass**: each position parses once as a
   boolean-or-value (`BV` in `ExprParser`) and lookahead settles which — no
   backtracking, so parse time is linear in the script and errors point at the
-  offending token.
+  offending token. They point at it in the script too: a compile error that
+  can be placed is an `Error::At`, its span a byte range of the whole script
+  (`strip_comments` blanks each comment with spaces, so the offsets after it
+  hold). `lex_expr` records each token's range; `Builder::place_in` puts
+  an expression error on the part the parser names (`ExprParser::fail_on`:
+  a whole call, an operator's operand), else on the token at its cursor; an
+  unknown command goes on its word, and the stage loop puts anything unplaced
+  on its stage. Text that is not a slice of the script
+  (a fragment's expansion) falls back to the calling stage. `Error::At`
+  displays as the bare message; `main` adds `error::excerpt`, the script
+  line with `^` markers (bold red when stderr takes colour). Resolve-time
+  errors (an unknown column) are not placed yet.
 
 ## Implicit conversions (there are no conversion commands)
 

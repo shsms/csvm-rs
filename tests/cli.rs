@@ -216,3 +216,14 @@ fn forced_colour_into_a_pipe_writes_no_links() {
     assert!(out.contains("\x1b["), "{out:?}");
     assert!(!out.contains("\x1b]8;;"), "{out:?}");
 }
+
+#[test]
+fn a_script_error_shows_where_it_is() {
+    let (ok, _, err) = csvm(&["cols a | select a >> 1"], "a\n1\n");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "csvm: expected a column, number, string, or function, found '>'\n  \
+         cols a | select a >> 1\n                     ^\n"
+    );
+}

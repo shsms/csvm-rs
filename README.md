@@ -74,6 +74,14 @@ meanwhile: output to a file, or a `fmt` table or chart still being built.
 Output into a pipe (which may be feeding `less`) or input typed at the terminal
 gets none, and `--no-progress` turns it off. Parquet input shows none.
 
+A script error shows the line it is on with the place marked:
+
+```
+csvm: expected a column, number, string, or function, found '>'
+  cols a | select a >> 1
+                     ^
+```
+
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by
 default; `-n 1` runs serially). A streaming input

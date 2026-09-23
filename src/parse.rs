@@ -26,10 +26,12 @@ use crate::plan::{
     OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage, StatsStmt,
     Stmt, UniqStmt, ValExpr,
 };
+use std::ops::Range;
 
 /// Compile a pipe script into an executable [`Plan`].
 /// A compile error that can be placed in the script is an [`Error::At`], its
-/// span a byte range of `script`: the stage it is in.
+/// span a byte range of `script`: the token an expression stopped at, else
+/// the stage it is in.
 pub fn parse(script: &str) -> Result<Plan, Error> {
     let script = strip_comments(script);
     let (fns, rest) = parse_prologue(&script)?;
@@ -383,6 +385,33 @@ impl<'a> Builder<'a> {
             };
         }
         e
+    }
+
+    /// Parse the expression `src`, a slice of the stage being parsed, with
+    /// `parse`. An error is placed on the part the parser names, else on the
+    /// token it stopped at, or on the token the lexer was reading.
+    fn parse_expr<T>(
+        &self,
+        src: &str,
+        parse: impl FnOnce(&mut ExprParser) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let (toks, spans) = lex_expr(src).map_err(|(e, at)| self.place_in(src, at, e))?;
+        let mut parser = ExprParser {
+            toks,
+            spans,
+            end: src.len(),
+            pos: 0,
+            fail_span: None,
+        };
+        parse(&mut parser).map_err(|e| self.place_in(src, parser.error_span(), e))
+    }
+
+    /// `e`, from the expression `src`, placed on the byte range `at` of it.
+    fn place_in(&self, src: &str, at: Range<usize>, e: Error) -> Error {
+        match offset_in(self.script, src) {
+            Some(base) => e.at(base + at.start..base + at.end),
+            None => e,
+        }
     }
 
     /// Instantiate fragment `name` and splice its stages in at this position:
@@ -797,9 +826,7 @@ impl<'a> Builder<'a> {
         if expr_src.is_empty() {
             return Err(err("color expects a condition expression"));
         }
-        let toks = lex_expr(expr_src)?;
-        let mut parser = ExprParser { toks, pos: 0 };
-        let expr = parser.parse()?;
+        let expr = self.parse_expr(expr_src, ExprParser::parse)?;
         // Colour rules render from the buffered output rows, where there is no
         // previous-row/rownum context to read. (Checked here rather than at
         // resolve time, where an unresolvable rule is silently dropped.)
@@ -936,9 +963,7 @@ impl<'a> Builder<'a> {
         if expr_src.is_empty() {
             return Err(err("add expects an expression after `=`"));
         }
-        let toks = lex_expr(expr_src)?;
-        let mut parser = ExprParser { toks, pos: 0 };
-        let expr = parser.parse_value_top()?;
+        let expr = self.parse_expr(expr_src, ExprParser::parse_value_top)?;
         let stateful = expr.is_stateful();
         self.items.push(Item::Stmt(Stmt::Add(AddStmt {
             name,
@@ -1001,9 +1026,7 @@ impl<'a> Builder<'a> {
         if expr_src.is_empty() {
             return Err(err("select expects an expression"));
         }
-        let toks = lex_expr(expr_src)?;
-        let mut parser = ExprParser { toks, pos: 0 };
-        let expr = parser.parse()?;
+        let expr = self.parse_expr(expr_src, ExprParser::parse)?;
         let expr = if negate {
             BoolExpr::Not(Box::new(expr))
         } else {
@@ -1789,9 +1812,38 @@ enum ETok {
     Sym(&'static str),
 }
 
-fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
+/// The tokens of the expression `s`, each with its byte range in `s`. An
+/// error comes with the range of the first character of the token the lexer
+/// was reading.
+#[allow(
+    clippy::type_complexity,
+    reason = "the two halves of a lex, as the one caller wants them"
+)]
+fn lex_expr(s: &str) -> Result<(Vec<ETok>, Vec<Range<usize>>), (Error, Range<usize>)> {
     let cs: Vec<char> = s.chars().collect();
-    let mut toks = Vec::new();
+    // The byte offset of each char, and of the end.
+    let bytes: Vec<usize> = s.char_indices().map(|(b, _)| b).chain([s.len()]).collect();
+    let (mut toks, mut spans, mut at) = (Vec::new(), Vec::new(), 0);
+    match lex_tokens(&cs, &mut toks, &mut spans, &mut at) {
+        Ok(()) => Ok((
+            toks,
+            spans
+                .into_iter()
+                .map(|r| bytes[r.start]..bytes[r.end])
+                .collect(),
+        )),
+        Err(e) => Err((e, bytes[at]..bytes[(at + 1).min(cs.len())])),
+    }
+}
+
+/// Lex `cs` into `toks`, with each token's char range in `spans`; `at` is the
+/// char the token being lexed starts at, which an error is placed on.
+fn lex_tokens(
+    cs: &[char],
+    toks: &mut Vec<ETok>,
+    spans: &mut Vec<Range<usize>>,
+    at: &mut usize,
+) -> Result<(), Error> {
     let mut i = 0;
     while i < cs.len() {
         let c = cs[i];
@@ -1799,9 +1851,10 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             i += 1;
             continue;
         }
+        *at = i;
         match c {
-            '(' => push_sym(&mut toks, "(", &mut i),
-            ')' => push_sym(&mut toks, ")", &mut i),
+            '(' => push_sym(toks, "(", &mut i),
+            ')' => push_sym(toks, ")", &mut i),
             '\'' | '"' => {
                 i += 1;
                 let mut lit = String::new();
@@ -1834,49 +1887,49 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
                 toks.push(ETok::Ident(name));
             }
             '=' => match cs.get(i + 1) {
-                Some('=') => push2(&mut toks, "==", &mut i),
-                Some('~') => push2(&mut toks, "=~", &mut i),
-                _ => push_sym(&mut toks, "==", &mut i), // a lone `=` means equals
+                Some('=') => push2(toks, "==", &mut i),
+                Some('~') => push2(toks, "=~", &mut i),
+                _ => push_sym(toks, "==", &mut i), // a lone `=` means equals
             },
             '!' => match cs.get(i + 1) {
-                Some('=') => push2(&mut toks, "!=", &mut i),
-                Some('~') => push2(&mut toks, "!~", &mut i),
-                _ => push_sym(&mut toks, "!", &mut i),
+                Some('=') => push2(toks, "!=", &mut i),
+                Some('~') => push2(toks, "!~", &mut i),
+                _ => push_sym(toks, "!", &mut i),
             },
             '<' => match cs.get(i + 1) {
-                Some('=') => push2(&mut toks, "<=", &mut i),
-                _ => push_sym(&mut toks, "<", &mut i),
+                Some('=') => push2(toks, "<=", &mut i),
+                _ => push_sym(toks, "<", &mut i),
             },
             '>' => match cs.get(i + 1) {
-                Some('=') => push2(&mut toks, ">=", &mut i),
-                _ => push_sym(&mut toks, ">", &mut i),
+                Some('=') => push2(toks, ">=", &mut i),
+                _ => push_sym(toks, ">", &mut i),
             },
-            '&' if cs.get(i + 1) == Some(&'&') => push2(&mut toks, "&&", &mut i),
-            '|' if cs.get(i + 1) == Some(&'|') => push2(&mut toks, "||", &mut i),
+            '&' if cs.get(i + 1) == Some(&'&') => push2(toks, "&&", &mut i),
+            '|' if cs.get(i + 1) == Some(&'|') => push2(toks, "||", &mut i),
             // Affix operators: begins-with / contains / ends-with. A lone
             // `^`/`$` is reserved (no exponent operator), so it errors.
-            '^' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "^=", &mut i),
-            '$' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "$=", &mut i),
-            '*' if cs.get(i + 1) == Some(&'=') => push2(&mut toks, "*=", &mut i),
+            '^' if cs.get(i + 1) == Some(&'=') => push2(toks, "^=", &mut i),
+            '$' if cs.get(i + 1) == Some(&'=') => push2(toks, "$=", &mut i),
+            '*' if cs.get(i + 1) == Some(&'=') => push2(toks, "*=", &mut i),
             // `++` is string concat (for `add`); kept distinct from `+`.
-            '+' if cs.get(i + 1) == Some(&'+') => push2(&mut toks, "++", &mut i),
+            '+' if cs.get(i + 1) == Some(&'+') => push2(toks, "++", &mut i),
             // A leading `+`/`-` is part of a numeric literal only in *unary*
             // position (expression start, or right after an operator/`(`). After
             // a value it is the binary add/subtract operator — so `amount - 5`
             // subtracts, while `a > -5` compares against negative five.
-            '-' | '+' if !ends_value(&toks) && starts_number(&cs[i + 1..]) => {
-                lex_number(&cs, &mut i, &mut toks)?;
+            '-' | '+' if !ends_value(toks) && starts_number(&cs[i + 1..]) => {
+                lex_number(cs, &mut i, toks)?;
             }
             // Arithmetic / value-expression operators (used by `add`).
-            '+' => push_sym(&mut toks, "+", &mut i),
-            '-' => push_sym(&mut toks, "-", &mut i),
-            '*' => push_sym(&mut toks, "*", &mut i),
-            '/' => push_sym(&mut toks, "/", &mut i),
-            '%' => push_sym(&mut toks, "%", &mut i),
-            '?' => push_sym(&mut toks, "?", &mut i),
-            ':' => push_sym(&mut toks, ":", &mut i),
-            ',' => push_sym(&mut toks, ",", &mut i),
-            _ if starts_number(&cs[i..]) => lex_number(&cs, &mut i, &mut toks)?,
+            '+' => push_sym(toks, "+", &mut i),
+            '-' => push_sym(toks, "-", &mut i),
+            '*' => push_sym(toks, "*", &mut i),
+            '/' => push_sym(toks, "/", &mut i),
+            '%' => push_sym(toks, "%", &mut i),
+            '?' => push_sym(toks, "?", &mut i),
+            ':' => push_sym(toks, ":", &mut i),
+            ',' => push_sym(toks, ",", &mut i),
+            _ if starts_number(&cs[i..]) => lex_number(cs, &mut i, toks)?,
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
                 while i < cs.len() && (cs[i].is_alphanumeric() || cs[i] == '_' || cs[i] == '.') {
@@ -1892,8 +1945,9 @@ fn lex_expr(s: &str) -> Result<Vec<ETok>, Error> {
             }
             other => return Err(err(format!("unexpected character '{other}' in expression"))),
         }
+        spans.push(*at..i);
     }
-    Ok(toks)
+    Ok(())
 }
 
 /// Whether the last lexed token completes a value (a literal, a column, or a
@@ -1954,7 +2008,14 @@ fn lex_number(cs: &[char], i: &mut usize, toks: &mut Vec<ETok>) -> Result<(), Er
 
 struct ExprParser {
     toks: Vec<ETok>,
+    /// Each token's byte range in the expression.
+    spans: Vec<Range<usize>>,
+    /// The expression's length, where "end of expression" is.
+    end: usize,
     pos: usize,
+    /// Where the error being returned is, when that is not the token at the
+    /// cursor: a part already read past, such as a call to its `)`.
+    fail_span: Option<Range<usize>>,
 }
 
 /// A parsed subexpression that is either a boolean or a value. The unified
@@ -1966,6 +2027,27 @@ enum BV {
 }
 
 impl ExprParser {
+    /// The byte range a parse error is placed on: the part it names when one
+    /// was given ([`ExprParser::fail_on`]), else the token at the cursor, or
+    /// the end of the expression past the last one.
+    fn error_span(&self) -> Range<usize> {
+        if let Some(span) = &self.fail_span {
+            return span.clone();
+        }
+        self.spans
+            .get(self.pos)
+            .cloned()
+            .unwrap_or(self.end..self.end)
+    }
+
+    /// `e`, about the part of the expression made of the tokens at `tokens`
+    /// (indices, the end one past the last), placed on that part.
+    fn fail_on(&mut self, tokens: Range<usize>, e: Error) -> Error {
+        let last = tokens.end.saturating_sub(1).max(tokens.start);
+        self.fail_span = Some(self.spans[tokens.start].start..self.spans[last].end);
+        e
+    }
+
     /// The token at the cursor, quoted, for an error message — or "end of
     /// expression" when the cursor is past the last token.
     fn here(&self) -> String {
@@ -2065,7 +2147,9 @@ impl ExprParser {
     /// following operator. Without one it stays a value — the enclosing level
     /// decides whether that is acceptable.
     fn parse_bv_cmp(&mut self) -> Result<BV, Error> {
+        let lhs_at = self.pos;
         let lhs = self.parse_concat()?;
+        let lhs_tokens = lhs_at..self.pos;
         let op = match self.toks.get(self.pos) {
             Some(ETok::Sym(s))
                 if matches!(
@@ -2078,16 +2162,22 @@ impl ExprParser {
             _ => return Ok(BV::V(lhs)),
         };
         self.pos += 1;
+        let rhs_at = self.pos;
         if op == "=~" || op == "!~" {
             let ValExpr::Col(col) = lhs else {
-                return Err(err("left side of =~ must be a column"));
+                return Err(self.fail_on(lhs_tokens, err("left side of =~ must be a column")));
             };
             let pattern = match self.parse_concat()? {
                 ValExpr::Str(s) => s,
-                _ => return Err(err("=~ pattern must be a string")),
+                _ => {
+                    let e = err("=~ pattern must be a string");
+                    return Err(self.fail_on(rhs_at..self.pos, e));
+                }
             };
-            let regex = regex::Regex::new(&pattern)
-                .map_err(|e| err(format!("invalid regex '{pattern}': {e}")))?;
+            let regex = regex::Regex::new(&pattern).map_err(|e| {
+                let e = err(format!("invalid regex '{pattern}': {e}"));
+                self.fail_on(rhs_at..self.pos, e)
+            })?;
             return Ok(BV::B(BoolExpr::Match {
                 col,
                 regex,
@@ -2102,11 +2192,15 @@ impl ExprParser {
         };
         if let Some(kind) = affix {
             let ValExpr::Col(col) = lhs else {
-                return Err(err(format!("left side of {op} must be a column")));
+                let e = err(format!("left side of {op} must be a column"));
+                return Err(self.fail_on(lhs_tokens, e));
             };
             let needle = match self.parse_concat()? {
                 ValExpr::Str(s) => s,
-                _ => return Err(err(format!("{op} needs a string literal on the right"))),
+                _ => {
+                    let e = err(format!("{op} needs a string literal on the right"));
+                    return Err(self.fail_on(rhs_at..self.pos, e));
+                }
             };
             return Ok(BV::B(BoolExpr::Affix { col, needle, kind }));
         }
@@ -2273,6 +2367,7 @@ impl ExprParser {
 
     /// Parse a call `name(...)` — the opening `(` already consumed.
     fn parse_call(&mut self, name: &str) -> Result<ValExpr, Error> {
+        let name_at = self.pos - 2;
         if name == "rownum" {
             if !self.eat(")") {
                 return Err(err("rownum() takes no arguments"));
@@ -2282,17 +2377,19 @@ impl ExprParser {
         let args = self.parse_args()?;
         if name == "prev" {
             let [ValExpr::Col(c)] = &args[..] else {
-                return Err(err("prev() takes a single column, e.g. prev(amount)"));
+                let e = err("prev() takes a single column, e.g. prev(amount)");
+                return Err(self.fail_on(name_at..self.pos, e));
             };
             return Ok(ValExpr::Prev(c.clone()));
         }
-        let func = Func::from_name(name).ok_or_else(|| {
-            err(match crate::error::did_you_mean(name, Func::NAMES) {
+        let Some(func) = Func::from_name(name) else {
+            let e = err(match crate::error::did_you_mean(name, Func::NAMES) {
                 Some(s) => format!("unknown function: {name} (did you mean `{s}`?)"),
                 None => format!("unknown function: {name}"),
-            })
-        })?;
-        check_arity(func, args.len())?;
+            });
+            return Err(self.fail_on(name_at..self.pos, e));
+        };
+        check_arity(func, args.len()).map_err(|e| self.fail_on(name_at..self.pos, e))?;
         Ok(ValExpr::Func(func, args))
     }
 
@@ -2335,19 +2432,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn errors_are_placed_on_their_stage() {
+    fn errors_are_placed_in_the_script() {
         let span = |script: &str| parse(script).unwrap_err().span();
-        assert_eq!(span("cols a | agg bogus(a)"), Some(9..21));
-        // An unknown command's word.
-        assert_eq!(span("cols a | selct a"), Some(9..14));
+        // The token an expression stopped at, or the character it could not
+        // lex.
+        assert_eq!(span("select a >> 1"), Some(10..11));
+        assert_eq!(span("select a @ 1"), Some(9..10));
+        assert_eq!(span("add b = a +"), Some(11..11)); // the end
         // A comment keeps the offsets after it the script's own.
-        assert_eq!(span("cols a # note\nselct a"), Some(14..19));
+        assert_eq!(span("cols a # note\nselect a >> 1"), Some(24..25));
+        // An unknown command's word; a call, from its name to its `)`.
+        assert_eq!(span("cols a | selct a"), Some(9..14));
+        assert_eq!(span("add c = pow(a)"), Some(8..14));
+        // The operand an operator's error is about, read past by then.
+        assert_eq!(span("select 1 =~ 'x'"), Some(7..8));
+        assert_eq!(span("select a =~ b && b > 1"), Some(12..13));
+        assert_eq!(span("select a =~ '(' && b > 1"), Some(12..15));
+        assert_eq!(span("select 1 ^= 'x' && b > 1"), Some(7..8));
+        assert_eq!(span("select a $= b"), Some(12..13));
+        // Inside a join's sub-pipeline, still the token.
+        assert_eq!(span("join (select x >> 1) r.csv on k"), Some(16..17));
+        // Anything else: the stage it is in.
+        assert_eq!(span("cols a | agg bogus(a)"), Some(9..21));
         // A fragment's body is not where it is called: the call stage.
         assert_eq!(span("fn f(x) { select x >> 1 }\nf(a)"), Some(26..30));
         // The message itself is unchanged by its place.
         assert_eq!(
-            parse("cols a | selct a").unwrap_err().to_string(),
-            "unknown command: selct (did you mean `select`?)"
+            parse("select a >> 1").unwrap_err().to_string(),
+            "expected a column, number, string, or function, found '>'"
         );
     }
 
