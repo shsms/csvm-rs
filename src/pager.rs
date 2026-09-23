@@ -19,15 +19,72 @@ pub fn command(csvm_pager: Option<&str>, pager: Option<&str>) -> Option<String> 
     (!cmd.is_empty() && cmd != "cat").then(|| cmd.to_string())
 }
 
-/// The program `cmd` runs: its first word that is not a variable assignment
-/// (`LESS=-i less` runs `less`).
-fn program(cmd: &str) -> &str {
-    cmd.split_whitespace()
-        .find(|word| !is_assignment(word))
-        .unwrap_or("")
+/// A word of a shell command: its text as written, and what it says once its
+/// quotes and backslashes are taken away.
+#[derive(Debug)]
+struct Word<'a> {
+    raw: &'a str,
+    text: String,
 }
 
-/// Whether `word` sets a variable for the command after it: `NAME=value`.
+/// The words of `cmd` as `sh` splits them: at whitespace outside quotes, with
+/// `'…'`, `"…"` and a backslash quoting what they hold. `None` when a quote is
+/// left open, or a backslash ends the command.
+fn words(cmd: &str) -> Option<Vec<Word<'_>>> {
+    let mut words = Vec::new();
+    let mut chars = cmd.char_indices().peekable();
+    loop {
+        while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+        let Some(&(start, _)) = chars.peek() else {
+            return Some(words);
+        };
+        let mut text = String::new();
+        while let Some((_, c)) = chars.next_if(|(_, c)| !c.is_whitespace()) {
+            match c {
+                '\'' => loop {
+                    match chars.next()?.1 {
+                        '\'' => break,
+                        c => text.push(c),
+                    }
+                },
+                '"' => loop {
+                    match chars.next()?.1 {
+                        '"' => break,
+                        '\\' => {
+                            let c = chars.next()?.1;
+                            // Inside double quotes a backslash quotes only
+                            // these.
+                            if !matches!(c, '"' | '\\' | '$' | '`') {
+                                text.push('\\');
+                            }
+                            text.push(c);
+                        }
+                        c => text.push(c),
+                    }
+                },
+                '\\' => text.push(chars.next()?.1),
+                c => text.push(c),
+            }
+        }
+        let end = chars.peek().map_or(cmd.len(), |&(i, _)| i);
+        words.push(Word {
+            raw: &cmd[start..end],
+            text,
+        });
+    }
+}
+
+/// The program `cmd` runs: its first word that is not a variable assignment
+/// (`LESS=-i less` runs `less`). `None` when it has none, or `sh` could not
+/// read it (see [`words`]).
+fn program(cmd: &str) -> Option<Word<'_>> {
+    words(cmd)?
+        .into_iter()
+        .find(|word| !is_assignment(word.raw))
+}
+
+/// Whether `word`, as written, sets a variable for the command after it:
+/// `NAME=value`.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
         name.starts_with(|c: char| c == '_' || c.is_ascii_alphabetic())
@@ -37,9 +94,11 @@ fn is_assignment(word: &str) -> bool {
 
 /// Whether `cmd` runs `less`, by the file name of its program.
 fn is_less(cmd: &str) -> bool {
-    Path::new(program(cmd))
-        .file_name()
-        .is_some_and(|n| n == "less")
+    program(cmd).is_some_and(|program| {
+        Path::new(&program.text)
+            .file_name()
+            .is_some_and(|n| n == "less")
+    })
 }
 
 /// The release number in `less --version`'s first line (`less 668 (…)`); a
@@ -79,27 +138,20 @@ fn links_at(version: Option<u32>) -> bool {
 }
 
 /// Whether the pager `cmd` can be run, as far as `sh`, which runs it, can find
-/// its program: `~` and `$VAR` mean what they mean to the shell. A pager whose
-/// program `sh` cannot find is not started, and the output goes to stdout
-/// instead. A command that quotes or escapes its program, or anything before
-/// it, is left to `sh` whole, since a single word of it may not parse alone.
+/// its program: given the program as written, `~`, `$VAR` and quotes mean what
+/// they mean to the shell. A pager whose program `sh` cannot find is not
+/// started, and the output goes to stdout instead. A command `sh` cannot read
+/// (a quote left open) is left to it, to report.
 fn runnable(cmd: &str) -> bool {
-    let program = program(cmd);
-    if program.is_empty() {
-        return false;
-    }
-    // The words before the program are all assignments (see [`program`]).
-    let quoted = cmd
-        .split_whitespace()
-        .take_while(|word| is_assignment(word))
-        .chain([program])
-        .any(|word| word.contains(['\'', '"', '\\']));
-    if quoted {
+    let Some(words) = words(cmd) else {
         return true;
-    }
+    };
+    let Some(program) = words.iter().find(|word| !is_assignment(word.raw)) else {
+        return false;
+    };
     Command::new("sh")
         .arg("-c")
-        .arg(format!("command -v -- {program}"))
+        .arg(format!("command -v -- {}", program.raw))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -109,7 +161,7 @@ fn runnable(cmd: &str) -> bool {
 
 /// The release of the `less` that `cmd` runs, from `less --version`.
 fn less_release(cmd: &str) -> Option<u32> {
-    let out = Command::new(program(cmd))
+    let out = Command::new(program(cmd)?.text)
         .arg("--version")
         .stderr(Stdio::null())
         .output()
@@ -222,12 +274,42 @@ mod tests {
     }
 
     #[test]
+    fn words_split_as_sh_splits_them() {
+        let split =
+            |cmd| words(cmd).map(|ws| ws.into_iter().map(|w| (w.raw, w.text)).collect::<Vec<_>>());
+        assert_eq!(
+            split("LESS='-R -i'  \"a b\"\\ c d\\ e"),
+            Some(vec![
+                ("LESS='-R -i'", "LESS=-R -i".to_string()),
+                ("\"a b\"\\ c", "a b c".to_string()),
+                ("d\\ e", "d e".to_string()),
+            ])
+        );
+        // Inside double quotes a backslash quotes only `"`, `\`, `$` and a
+        // backtick.
+        assert_eq!(
+            split(r#""a\"b\x""#),
+            Some(vec![(r#""a\"b\x""#, r#"a"b\x"#.to_string())])
+        );
+        assert_eq!(split(""), Some(vec![]));
+        assert_eq!(split("'open"), None);
+        assert_eq!(split("\"open"), None);
+        assert_eq!(split("end\\"), None);
+    }
+
+    #[test]
     fn less_is_known_by_its_program_name() {
         assert!(is_less("less"));
         assert!(is_less("/usr/bin/less -i"));
         assert!(!is_less("lesspipe"));
         assert!(is_less("LESS=-i less"));
         assert!(!is_less("most less"));
+        // Read the way sh reads it: quotes and escapes are not the name.
+        assert!(is_less("LESS='-R -i' less"));
+        assert!(is_less("\"/usr/bin/less\" -i"));
+        assert!(is_less("'/opt/my tools/less'"));
+        assert!(is_less("le\\ss"));
+        assert!(!is_less("'less"));
     }
 
     #[test]
@@ -240,10 +322,10 @@ mod tests {
             "\"/bin/sh\"",
             "/bin/sh",
             "exec sh",
-            // Quoted or escaped, before the program or in it: left to sh.
-            "A='x' csvm-no-such-pager",
-            "\"csvm-no-such-pager\"",
-            "csvm\\-no-such-pager",
+            "\"/bin\"/sh",
+            "/bin/s\\h",
+            // A quote left open is sh's to report.
+            "\"/bin/sh",
         ] {
             assert!(runnable(can), "{can}");
         }
@@ -253,8 +335,13 @@ mod tests {
             "/csvm/no/such/pager",
             "~/csvm-no-such-pager",
             "$HOME/csvm-no-such-pager",
-            // A quote after the program does not hide a missing one.
+            // Quotes and escapes, before the program or in it, hide nothing.
             "csvm-no-such-pager 'x'",
+            "A='x y' csvm-no-such-pager",
+            "\"csvm-no-such-pager\"",
+            "csvm\\-no-such-pager",
+            // Quoted, a pattern names no file; sh would expand it unquoted.
+            "'/bin/s?'",
         ] {
             assert!(!runnable(cannot), "{cannot}");
         }
