@@ -37,8 +37,8 @@ fn series_hex(i: usize) -> String {
 /// default chart colour when there is no ramp. Unlike the terminal renderers
 /// this ignores `frame.color`: an SVG document always has colour.
 fn fill_at(ramp: Option<Ramp>, v: f64, lo: f64, hi: f64) -> String {
-    match ramp.and_then(|r| r.at(v, lo, hi).fg) {
-        Some(rgb) => rgb_hex(&rgb),
+    match ramp {
+        Some(r) => rgb_hex(&r.rgb_at(v, lo, hi)),
         None => series_hex(0),
     }
 }

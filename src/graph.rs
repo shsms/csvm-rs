@@ -8,7 +8,7 @@ use crate::chart::{
     BarData, ChartData, Frame, Glyphs, HeatData, HistData, SparkData, XyData, bar_value, hist_len,
     value_pos,
 };
-use crate::color::{Ramp, Rgb, Style};
+use crate::color::{Color, Ramp, Rgb, Style};
 use crate::field::format_num;
 
 /// Format `v` rounded to `step`'s precision (one digit finer than the step's
@@ -355,7 +355,7 @@ pub(crate) fn series_rgb(i: usize) -> Rgb {
 
 fn series_style(i: usize) -> Style {
     Style {
-        fg: Some(series_rgb(i)),
+        fg: Some(Color::Rgb(series_rgb(i))),
         ..Style::default()
     }
 }

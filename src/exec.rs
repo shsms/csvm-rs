@@ -3597,10 +3597,7 @@ mod tests {
         let input = "amount\n10\nNA\n30\n";
         let out = render_str("color red amount > 20 | fmt", input, true);
         let line = |needle: &str| out.lines().find(|l| l.contains(needle)).unwrap();
-        assert!(
-            line("30").contains("38;2;205;0;0"),
-            "30 should be red: {out:?}"
-        );
+        assert!(line("30").contains("\x1b[31m"), "30 should be red: {out:?}");
         assert!(!line("10").contains('\u{1b}'), "10 unpainted: {out:?}");
         assert!(!line("NA").contains('\u{1b}'), "NA unpainted: {out:?}");
     }
