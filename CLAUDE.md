@@ -98,11 +98,16 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `SortStmt::row_key` (`plan::auto_num`) before `SortStmt::compare` orders
   it, so both paths agree byte for byte.
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
-  also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage;
-  streams + stops early when there's no sort (`window_shape` /
-  `stream_window` in `exec.rs`); after a single `sort` it is a counter over
-  the merge output (`Window`), so the external sort still applies; else it
-  truncates in the materialized path. A
+  also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage.
+  Among the stages at the front of a plan that pass rows on one at a time
+  (transforms, stateful ones too, `tail +N`, `uniq`), it stops the reading
+  once full, wherever it sits: `RowChain` in `exec.rs` runs those stages
+  row by row as the input is read (`scan`), and
+  streams the rows out when nothing follows, else hands them to the rest of
+  the plan, which runs in memory over them (so `uniq id | head 19 | sort
+  qty` reads only up to its 19th distinct id). After a single `sort` it is
+  a counter over the merge output (`Window`, via `window_shape`), so the
+  external sort still applies; else it truncates in the materialized path. A
   *negative* count (`head -n -N`) keeps all but the last N — a separate
   `Stage::DropLast` on the blocking in-memory path. (Byte mode `-c` isn't
   supported.)

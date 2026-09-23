@@ -152,12 +152,19 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    // A plan of stages that pass rows on one at a time, with a `head` or
-    // `tail +N` among them, streams single-threaded and stops reading once a
-    // full `head` lets no more rows through.
+    // With a `head` or `tail +N` among the stages at the front that pass
+    // rows on one at a time, those run as one chain, single-threaded, and
+    // stop reading once a full `head` lets no more rows through. Stages
+    // after the chain see only the rows it let through, so they run over
+    // those in memory.
     let (mut chain, rest) = RowChain::front(&plan.stages);
-    if chain.has_window() && rest.is_empty() {
-        return stream_rows(&mut chain, opts.chunk_size, input, output);
+    if chain.has_window() {
+        if rest.is_empty() {
+            return stream_rows(&mut chain, opts.chunk_size, input, output);
+        }
+        let mut rows: Vec<OwnedRow> = Vec::new();
+        scan(&mut chain, opts.chunk_size, input, &mut rows)?;
+        return write_rows(output, &apply_stages_over_rows(rest, rows, opts)?);
     }
     // A stateful `add`/`select` (`prev()`/`rownum()`) is order-dependent: it
     // can't shard or stream chunk-parallel. Materialize and run the ordered
@@ -4417,5 +4424,39 @@ mod tests {
         // With the bug it tried to fill a whole 1 MB chunk first, so it would
         // block on a real stream; here that shows up as the read error.
         assert_eq!(run_paused("head 2").unwrap(), "id,val\n0,x\n1,x\n");
+    }
+
+    #[test]
+    fn a_head_bounds_what_a_blocking_stage_after_it_reads() {
+        assert_eq!(
+            run_paused("head 3 | sort id=nr").unwrap(),
+            "id,val\n2,x\n1,x\n0,x\n"
+        );
+        assert_eq!(
+            run_paused("select id != 1 | tail +2 | head 2 | sort id=nr | cols id").unwrap(),
+            "id\n3\n2\n"
+        );
+        // A stateful statement after the window runs over its rows.
+        assert_eq!(
+            run_paused("head 2 | add n = rownum() | sort id=nr").unwrap(),
+            "id,val,n\n1,x,2\n0,x,1\n"
+        );
+        // However far into the row-by-row stages the head is.
+        assert_eq!(
+            run_paused("select id != 0 | uniq val | head 1 | sort id").unwrap(),
+            "id,val\n1,x\n"
+        );
+        assert_eq!(
+            run_paused("add n = rownum() | select n > 1 | head 2 | sort id=nr").unwrap(),
+            "id,val,n\n2,x,3\n1,x,2\n"
+        );
+        // And with nothing blocking after it, rows stream out.
+        assert_eq!(
+            run_paused("uniq | head 2 | add n = rownum()").unwrap(),
+            "id,val,n\n0,x,1\n1,x,2\n"
+        );
+        // Without a head, a sort needs every row.
+        assert!(run_paused("tail +2 | sort id").is_err());
+        assert!(run_paused("sort id | head 2").is_err());
     }
 }
