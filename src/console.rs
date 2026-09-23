@@ -42,11 +42,17 @@ pub struct Console {
     pub columns: Option<usize>,
     /// The terminal's row count, when it is known (see [`term::rows`]).
     pub rows: Option<usize>,
+    /// stderr is a terminal.
+    pub stderr_terminal: bool,
+    /// The input is stdin, and stdin is a terminal: someone is typing it.
+    pub typed_input: bool,
     /// The pager to run, from `$CSVM_PAGER` and `$PAGER` (see
     /// [`pager::command`]); `None` when they turn paging off.
     pub pager_command: Option<String>,
     /// `--no-pager`.
     pub no_pager: bool,
+    /// `--no-progress`.
+    pub no_progress: bool,
 }
 
 impl Console {
@@ -62,11 +68,14 @@ impl Console {
             stdout: stdout_sink(),
             columns: term::columns(),
             rows: term::rows(),
+            stderr_terminal: io::stderr().is_terminal(),
+            typed_input: io::stdin().is_terminal(),
             pager_command: pager::command(
                 std::env::var("CSVM_PAGER").ok().as_deref(),
                 std::env::var("PAGER").ok().as_deref(),
             ),
             no_pager: false,
+            no_progress: false,
         }
     }
 
@@ -81,7 +90,9 @@ impl Console {
             } else {
                 env.stdout
             },
+            typed_input: env.typed_input && args.in_path().is_none(),
             no_pager: args.no_pager,
+            no_progress: args.no_progress,
             ..env
         }
     }
@@ -165,6 +176,20 @@ impl Console {
             links: self.links() && pager.is_none_or(Pager::shows_links),
         }
     }
+
+    /// Whether to draw the progress meter on stderr. It needs a terminal on
+    /// stderr that nothing else is drawing on while the run reads: nobody
+    /// typing the input into it, and stdout not writing rows to it (`buffered`
+    /// output waits for the run) nor feeding a program that may be showing
+    /// them there (a pipe into `less`).
+    pub fn meter(&self, buffered: bool) -> bool {
+        let quiet_stdout = match self.stdout {
+            Sink::Terminal => buffered,
+            Sink::File => true,
+            Sink::Pipe => false,
+        };
+        !self.no_progress && self.stderr_terminal && !self.dumb && !self.typed_input && quiet_stdout
+    }
 }
 
 /// Where stdout itself goes.
@@ -212,8 +237,11 @@ mod tests {
             stdout: Sink::Terminal,
             columns: Some(80),
             rows: Some(24),
+            stderr_terminal: true,
+            typed_input: false,
             pager_command: Some("less".into()),
             no_pager: false,
+            no_progress: false,
         }
     }
 
@@ -356,5 +384,35 @@ mod tests {
             ..terminal()
         };
         assert!(!plain.links());
+    }
+
+    #[test]
+    fn the_meter_draws_only_on_a_terminal_nothing_else_draws_on() {
+        // Rows to a file, or a table the run is still building: shown.
+        assert!(to(Sink::File).meter(false));
+        assert!(terminal().meter(true));
+        // Rows streaming to the terminal, or into a pipe: not shown.
+        assert!(!terminal().meter(false));
+        assert!(!to(Sink::Pipe).meter(true));
+        for quiet in [
+            Console {
+                typed_input: true,
+                ..to(Sink::File)
+            },
+            Console {
+                stderr_terminal: false,
+                ..to(Sink::File)
+            },
+            Console {
+                dumb: true,
+                ..to(Sink::File)
+            },
+            Console {
+                no_progress: true,
+                ..to(Sink::File)
+            },
+        ] {
+            assert!(!quiet.meter(true), "{quiet:?}");
+        }
     }
 }

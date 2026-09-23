@@ -49,6 +49,9 @@ options (--flag VALUE or --flag=VALUE):
       --no-pager       never page; by default a terminal's fmt table, chart, help
                        or --explain goes through $CSVM_PAGER, else $PAGER, else
                        less (either variable set to cat or empty turns it off)
+      --no-progress    never show the progress line a run past 1s draws on stderr
+                       (on a terminal, when output goes to a file or waits for
+                       the run, and the input is not typed in)
       --explain        print the compiled plan and exit
   -h, --help           show this help
   -V, --version        print version and exit";

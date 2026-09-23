@@ -550,7 +550,8 @@ lifetime, so there is one `apply` implementation.
 
 `csvm [-o/--output OUT] [-n/--threads N] [-f/--file FILE] [-t/--temp-dir DIR]
 [--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--no-pager]
-[--explain] [-V/--version] [SCRIPT] [INPUT]`. The script is the first positional; the input
+[--no-progress] [--explain] [-V/--version] [SCRIPT] [INPUT]`. The script is the
+first positional; the input
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
 is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the
 single positional is the input. At most one input is accepted (a second
@@ -571,7 +572,17 @@ terminal (not `TERM=dumb`), a `fmt` table, a `graph` chart, help and
 608, `--header=1` for a table at least as tall as the window
 (`Console::fills`) — never a shorter one, as `--header` turns `-F` off.
 Dropping the `Pager` waits for it; `--no-pager` or a pager of `cat` / empty
-turns it off.
+turns it off. A run past a second draws a progress line on stderr
+(`src/progress.rs`): `RunOpts.progress` is a shared byte count that the
+executor's file reader (`progress::Counted`) and the shard workers
+(`parse_counted`, per ~4 MiB piece, so the count follows the parsing rather
+than the up-front read) add to, and `main` counts a stdin stream itself; a
+`progress::Meter` thread redraws the line and clears it on drop.
+`Console::meter` turns it on when stderr is a terminal (not `TERM=dumb`) that
+nothing else draws on: stdout a file, or the terminal with buffered
+`fmt`/`color`/`graph` output — not a pipe (it may feed `less`) — and the input
+not typed at the terminal; `--no-progress` turns it off, and parquet shows
+none. The meter is dropped before the pager starts.
 Help lives in one registry
 (`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
 or alias) a command's forms + example, `csvm help TOPIC` the `operators`/

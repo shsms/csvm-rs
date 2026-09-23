@@ -26,7 +26,8 @@ builds the release binary and copies it to your XDG user-binaries directory
 
 ```
 csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
-     [--sort-buffer SIZE] [--color WHEN] [--no-pager] [--explain] [SCRIPT] [INPUT]
+     [--sort-buffer SIZE] [--color WHEN] [--no-pager] [--no-progress]
+     [--explain] [SCRIPT] [INPUT]
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
@@ -45,6 +46,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--header NAMES`   | input has no header row; `a,b,c` names the columns, `-` names them `c1, c2, …` |
 | `--color WHEN`     | `auto` (TTY only, not `TERM=dumb`), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE`. Gradients are 24-bit when `COLORTERM` is `truecolor`/`24bit`, else 256-colour |
 | `--no-pager`       | never page (see below)                                      |
+| `--no-progress`    | never show the progress line on stderr (see below)          |
 | `--explain`   | print the compiled plan and exit                            |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
@@ -64,6 +66,13 @@ colour on, a cell holding an `http://` or `https://` address is a clickable
 link (an OSC 8 hyperlink) in terminals that support them: only on the
 terminal, never into a file or a pipe, and through a pager only when it is
 `less` 581 or later, which passes them on.
+
+A run that takes more than a second shows how much input it has read on
+stderr — a percentage of a file, a byte count for stdin — and clears the line
+when it ends. It shows only when stderr is a terminal nothing else draws on
+meanwhile: output to a file, or a `fmt` table or chart still being built.
+Output into a pipe (which may be feeding `less`) or input typed at the terminal
+gets none, and `--no-progress` turns it off. Parquet input shows none.
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by

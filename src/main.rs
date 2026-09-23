@@ -6,7 +6,7 @@ use std::process;
 use csvm::cli::{self, Parsed};
 use csvm::console::Console;
 use csvm::plan::OutputFormat;
-use csvm::progress::{Counted, Progress};
+use csvm::progress::{Counted, Meter, Progress};
 use csvm::{exec, parse};
 
 fn main() {
@@ -104,7 +104,7 @@ fn run() -> Result<(), Failure> {
     };
     // Parse the pipe script into a plan here, once.
     let mut plan = parse::parse(&script).map_err(|e| e.to_string())?;
-    let opts = exec::RunOpts {
+    let mut opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,
         temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
@@ -136,10 +136,15 @@ fn run() -> Result<(), Failure> {
     // Aligning needs all rows (for column widths), colouring needs all rows (for
     // gradient ranges), and a graph draws from the whole output — so each of
     // these buffers the run first, then renders.
-    if plan.output == OutputFormat::Aligned
+    let buffered = plan.output == OutputFormat::Aligned
         || plan.graph.is_some()
-        || (color.is_some() && !plan.colors.is_empty())
-    {
+        || (color.is_some() && !plan.colors.is_empty());
+    // A slow run shows how far it has read on stderr, when nothing else is
+    // drawing on the terminal meanwhile.
+    if console.meter(buffered) {
+        opts.progress = Progress::counting();
+    }
+    if buffered {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
         // A table or a chart is read on screen, so a long one is paged. The
@@ -280,6 +285,9 @@ fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     Err("parquet input requires building csvm with --features parquet".to_string())
 }
 
+/// Run the plan over `source` into `output`. While it runs, a meter on stderr
+/// shows the input read so far when `opts.progress` counts it (never for
+/// parquet, whose reader counts nothing); the meter is gone when this returns.
 fn run_into<W: Write + Send>(
     source: &mut Source,
     plan: &csvm::plan::Plan,
@@ -287,13 +295,22 @@ fn run_into<W: Write + Send>(
     opts: &exec::RunOpts,
     output: &mut W,
 ) -> Result<(), csvm::error::Error> {
+    let meter = |total| {
+        opts.progress
+            .is_counting()
+            .then(|| Meter::start(opts.progress.clone(), total))
+    };
     match source {
         Source::File {
             path,
             data_start,
             file_len,
-        } => exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output),
+        } => {
+            let _meter = meter(Some(file_len.saturating_sub(*data_start)));
+            exec::run_file(plan, out_header, opts, path, *data_start, *file_len, output)
+        }
         Source::Stream(reader) => {
+            let _meter = meter(None);
             // A stream is read here, not by the executor, so count it here.
             let mut counted = BufReader::new(Counted::new(reader, opts.progress.clone()));
             exec::run(plan, out_header, opts, &mut counted, output)

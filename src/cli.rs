@@ -5,8 +5,8 @@
 //! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
-//! `--header`, `--color`, `--format` (csv | parquet), `--no-pager` and
-//! `--explain`.
+//! `--header`, `--color`, `--format` (csv | parquet), `--no-pager`,
+//! `--no-progress` and `--explain`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -29,6 +29,8 @@ pub struct Args {
     pub color: ColorWhen,
     /// `--no-pager`: write to the terminal directly, never through a pager.
     pub no_pager: bool,
+    /// `--no-progress`: never show the progress meter on stderr.
+    pub no_progress: bool,
     /// `--header`: the input has no header line; this names its columns.
     pub header: Option<Header>,
     /// `--format`: input format override. `None` auto-detects from the file
@@ -172,6 +174,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut sort_buffer = DEFAULT_SORT_BUFFER;
     let mut explain = false;
     let mut no_pager = false;
+    let mut no_progress = false;
     let mut color = ColorWhen::default();
     let mut script_file = None;
     let mut header = None;
@@ -236,6 +239,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             "--explain" => explain = true,
             "--no-pager" => no_pager = true,
+            "--no-progress" => no_progress = true,
             "--header" => header = Some(Header::parse(&value!())?),
             "--format" => {
                 let v = value!();
@@ -308,6 +312,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         explain,
         color,
         no_pager,
+        no_progress,
         header,
         format,
     })))
@@ -328,6 +333,8 @@ mod tests {
     #[test]
     fn no_pager_flag_reaches_runs_and_help() {
         assert!(!args(&["fmt"]).unwrap().no_pager);
+        assert!(!args(&["fmt"]).unwrap().no_progress);
+        assert!(args(&["--no-progress", "fmt"]).unwrap().no_progress);
         assert!(args(&["--no-pager", "fmt"]).unwrap().no_pager);
         let help = |parts: &[&str]| match parse(parts.iter().map(|s| s.to_string())) {
             Ok(Parsed::Help { topic, no_pager }) => (topic, no_pager),

@@ -3,7 +3,10 @@
 //! where `script` is not the util-linux one.
 
 mod common;
+#[path = "support/terminal.rs"]
+mod terminal;
 use common::temp_csv;
+use terminal::{have_script, script};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,20 +52,6 @@ impl Drop for FakeLess {
     }
 }
 
-/// Whether util-linux `script` is here to give csvm a terminal. CI must have
-/// it, so the tests that need it cannot all skip there unnoticed.
-fn have_script() -> bool {
-    let here = Command::new("script")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("util-linux"));
-    assert!(
-        here || std::env::var_os("CI").is_none(),
-        "the terminal tests need util-linux `script` on CI"
-    );
-    here
-}
-
 /// Run csvm with `args` on a terminal `rows` lines tall, with `CSVM_PAGER`
 /// set to `pager`; returns what reached the terminal.
 fn on_terminal(pager: &Path, rows: usize, args: &[&str]) -> String {
@@ -76,19 +65,13 @@ fn on_terminal_as(term: &str, pager: &Path, rows: usize, args: &[&str]) -> Strin
         .chain(args.iter().copied())
         .map(quote)
         .collect();
-    let script = format!("stty rows {rows} cols 80; {}", line.join(" "));
-    // `script` runs the line with $SHELL, which may not read sh syntax.
-    let out = Command::new("script")
-        .args(["-qec", &script, "/dev/null"])
-        .env("SHELL", "/bin/sh")
+    let shell = format!("stty rows {rows} cols 80; {}", line.join(" "));
+    let out = script(&shell)
         .env("CSVM_PAGER", pager)
         .env("TERM", term)
         .env_remove("LESS")
         .env_remove("LINES")
         .env_remove("COLUMNS")
-        .env_remove("NO_COLOR")
-        .env_remove("CLICOLOR_FORCE")
-        .env_remove("COLORTERM")
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stdout).replace('\r', "")
