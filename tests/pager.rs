@@ -170,6 +170,20 @@ fn explain_is_paged_even_with_an_output_file() {
 }
 
 #[test]
+fn a_paged_table_keeps_its_wide_cells_whole() {
+    if !have_script() {
+        return;
+    }
+    // Wider than the 80-column terminal: less scrolls it, so nothing is cut.
+    let wide = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    let data = temp_csv(&format!("name,note\nalpha,{wide}\n"));
+    let path = data.to_str().unwrap();
+    let fake = FakeLess::new("wide");
+    on_terminal(&fake.less(), 24, &["--color", "never", "fmt", path]);
+    assert!(fake.saved("input").unwrap().contains(wide));
+}
+
+#[test]
 fn help_goes_through_less_without_the_table_options() {
     if !have_script() {
         return;

@@ -257,6 +257,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   numeric are right-justified (digits line up); text columns are left-justified.
   With colour on, the header row is bold and an empty data cell shows a dim
   `∅` (`EMPTY_CELL`), layered over whatever the `color` rules paint there.
+  `exec::render` takes an `exec::Screen` (colour depth, terminal width, and
+  `fit`); with `fit` — a terminal and no pager, which would scroll sideways
+  instead — `fit_widths` cuts every text column wider than one shared cap
+  (the widest that fits, floor `MIN_FIT`) and `cut` ends a cut cell in `…`.
+  Numeric columns are never cut.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
   parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`

@@ -1655,8 +1655,13 @@ pub struct Screen {
     /// The depth colour is drawn at, or `None` with colour off.
     pub color: Option<Depth>,
     /// The terminal's column count when the output is shown in one (`None`
-    /// when stdout isn't a terminal): a chart's default width.
+    /// when stdout isn't a terminal): a chart's default width, and the width a
+    /// table is fitted to.
     pub width: Option<usize>,
+    /// Cut a `fmt` table's text columns so its lines fit `width`. For output
+    /// shown on the terminal as it is, not through a pager that scrolls a wide
+    /// table sideways.
+    pub fit: bool,
 }
 
 /// Render buffered output `bytes` to `output`, applying the plan's colour rules
@@ -1697,7 +1702,8 @@ pub fn render<W: Write>(
         None
     };
     if aligned {
-        align_and_write(&rows, styles.as_deref(), color, output)
+        let fit_to = screen.width.filter(|_| screen.fit);
+        align_and_write(&rows, styles.as_deref(), color, fit_to, output)
     } else {
         write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
@@ -1822,10 +1828,13 @@ const EMPTY_CELL: &str = "∅";
 /// unpadded. Padding is by visible width; the painted text carries the colour.
 /// With colour on (`color` is its depth) the header row is bold and an empty
 /// data cell shows [`EMPTY_CELL`], dimmed over whatever the rules paint there.
+/// With `fit_to`, text columns are cut so the lines fit that many columns
+/// (see [`fit_widths`]).
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
     color: Option<Depth>,
+    fit_to: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
     let marked = |ri: usize, field: &str| color.is_some() && ri > 0 && field.is_empty();
@@ -1861,6 +1870,9 @@ fn align_and_write<W: Write>(
             saw_number
         })
         .collect();
+    if let Some(width) = fit_to {
+        widths = fit_widths(&widths, &numeric, width);
+    }
 
     let mut line = String::new();
     for (ri, row) in rows.iter().enumerate() {
@@ -1870,8 +1882,11 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 line.push_str("  ");
             }
-            let text = if marked(ri, field) { EMPTY_CELL } else { field };
-            let pad = widths[i].saturating_sub(vis_width(text));
+            let text = cut(
+                if marked(ri, field) { EMPTY_CELL } else { field },
+                widths[i],
+            );
+            let pad = widths[i].saturating_sub(vis_width(&text));
             let painted: Cow<str> = match color {
                 Some(depth) => {
                     let mut style = style_at(styles, ri, i);
@@ -1880,9 +1895,9 @@ fn align_and_write<W: Write>(
                     } else if marked(ri, field) {
                         style = style.over(dim);
                     }
-                    style.paint(text, depth).into()
+                    style.paint(&text, depth).into()
                 }
-                None => text.into(),
+                None => text,
             };
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
@@ -1904,6 +1919,92 @@ fn align_and_write<W: Write>(
         output.write_all(line.as_bytes())?;
     }
     Ok(())
+}
+
+/// The narrowest a text column is cut to when fitting a table: past this a cut
+/// cell says too little to be worth it, so the lines are left to wrap instead.
+const MIN_FIT: usize = 8;
+
+/// Column `widths` cut down so a table's lines, two spaces between columns,
+/// fit `width`. Every text column wider than one cap is cut to it, the widest
+/// cap that fits, but never below [`MIN_FIT`]. Numeric columns keep their
+/// width: a number cut short reads as a different number.
+fn fit_widths(widths: &[usize], numeric: &[bool], width: usize) -> Vec<usize> {
+    let capped = |cap: usize| -> Vec<usize> {
+        widths
+            .iter()
+            .zip(numeric)
+            .map(|(&w, &num)| if num { w } else { w.min(cap) })
+            .collect()
+    };
+    let line = |cap: usize| capped(cap).iter().sum::<usize>() + 2 * widths.len().saturating_sub(1);
+    let widest = widths
+        .iter()
+        .zip(numeric)
+        .filter(|(_, num)| !**num)
+        .map(|(&w, _)| w)
+        .max()
+        .unwrap_or(0);
+    if line(widest) <= width {
+        return widths.to_vec();
+    }
+    // The widest cap in [MIN_FIT, widest) that fits; the line only grows with
+    // the cap, so a binary search finds it.
+    let (mut lo, mut hi) = (MIN_FIT, widest);
+    if line(lo) > width {
+        return capped(MIN_FIT);
+    }
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if line(mid) <= width {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    capped(lo)
+}
+
+/// `text` cut to at most `width` display columns, ending in `…` when anything
+/// was cut. The kept text is measured whole, the way the column's width was,
+/// since a glyph's width can depend on what follows it (an emoji's
+/// presentation selector); a glyph that would straddle the limit is left out.
+fn cut(text: &str, width: usize) -> Cow<'_, str> {
+    if vis_width(text) <= width {
+        return text.into();
+    }
+    // The longest prefix that leaves a column for the ellipsis, found by
+    // bisecting the char boundaries after doubling a byte limit to bound the
+    // search to about the part that is kept. A prefix nearly always grows
+    // wider as it grows; where it does not (a text presentation selector can
+    // narrow a glyph), the search may stop a little short, but it only ever
+    // ends on a prefix it measured and found to fit.
+    let fits = |end: usize| vis_width(&text[..end]) < width;
+    if !fits(0) {
+        return "…".into();
+    }
+    let mut limit = width;
+    while limit < text.len() && fits(text.floor_char_boundary(limit)) {
+        limit *= 2;
+    }
+    let limit = text.floor_char_boundary(limit.min(text.len()));
+    let ends: Vec<usize> = text[..limit]
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain([limit])
+        .collect();
+    // `ends[fit]` fits; nothing past `ends[short]` is known to.
+    let (mut fit, mut short) = (0, ends.len());
+    while short - fit > 1 {
+        let mid = fit + (short - fit) / 2;
+        if fits(ends[mid]) {
+            fit = mid;
+        } else {
+            short = mid;
+        }
+    }
+    let end = ends[fit];
+    format!("{}…", &text[..end]).into()
 }
 
 /// Write CSV rows with each cell painted by its style (for colouring plain,
@@ -2300,6 +2401,7 @@ mod tests {
         let screen = Screen {
             color: color.then_some(Depth::Truecolor),
             width: term_width,
+            fit: false,
         };
         render_on(script, input, &screen)
     }
@@ -3653,6 +3755,81 @@ mod tests {
         // A row rule paints the marker with the rest of the row, dimmed.
         let out = render_str("color red n > 1 | fmt", "a,n\n,2\n", true);
         assert!(out.contains("\x1b[2;31m∅\x1b[0m"), "{out:?}");
+    }
+
+    const LONG_NOTE: &str = "id,name,note\n1,alpha,a long piece of text here\n2,b,short\n";
+
+    /// A plain screen `width` columns wide that fits tables to it.
+    fn fitting(width: usize) -> Screen {
+        Screen {
+            color: None,
+            width: Some(width),
+            fit: true,
+        }
+    }
+
+    #[test]
+    fn fmt_cuts_text_columns_to_fit_the_terminal() {
+        // Every line fits 20 columns: the text columns share one cap, the
+        // widest that fits, and a cut cell ends in an ellipsis.
+        let out = render_on("fmt", LONG_NOTE, &fitting(20));
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "id  name   note",
+                " 1  alpha  a long p…",
+                " 2  b      short"
+            ]
+        );
+        // A table that already fits is left alone.
+        let whole = render_on("fmt", LONG_NOTE, &fitting(80));
+        assert!(whole.contains("a long piece of text here"), "{whole}");
+    }
+
+    #[test]
+    fn fmt_fitting_keeps_numbers_whole_and_text_readable() {
+        let input = "big,note\n123456789012,a long piece of text here\n";
+        let out = render_on("fmt", input, &fitting(10));
+        // Numbers are never cut, and no text column drops below the minimum,
+        // so a very narrow terminal still wraps rather than showing nothing.
+        assert!(out.contains("123456789012"), "{out}");
+        assert!(out.contains("a long …"), "{out}");
+    }
+
+    #[test]
+    fn fmt_fits_only_when_asked() {
+        let screen = Screen {
+            fit: false,
+            ..fitting(20)
+        };
+        let out = render_on("fmt", LONG_NOTE, &screen);
+        assert!(out.contains("a long piece of text here"), "{out}");
+    }
+
+    #[test]
+    fn cut_counts_display_columns() {
+        assert_eq!(cut("abcdef", 6), "abcdef");
+        assert_eq!(cut("abcdefg", 6), "abcde…");
+        // A wide glyph that would straddle the limit is left out whole.
+        assert_eq!(cut("袋袋袋袋袋", 6), "袋袋…");
+        assert_eq!(cut("abc", 1), "…");
+        // A long cell is cut the same, however far past the width it runs.
+        assert_eq!(cut(&"x".repeat(100_000), 10), format!("{}…", "x".repeat(9)));
+        // Glyphs whose width as a string is not the sum of their chars' (an
+        // emoji's presentation selector, a tab, a text selector that narrows
+        // a glyph) still fit, and are only cut when they have to be.
+        let narrowed = "⌚\u{fe0e}".repeat(10);
+        for text in [
+            "❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}❤\u{fe0f}",
+            "a\tb\tc\td\te\tf",
+            narrowed.as_str(),
+        ] {
+            let short = cut(text, 8);
+            assert!(vis_width(&short) <= 8, "{short:?}");
+            assert!(short.ends_with('…'), "{short:?}");
+            assert_eq!(cut(text, 80), text);
+        }
     }
 
     #[test]

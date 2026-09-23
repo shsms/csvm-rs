@@ -105,7 +105,8 @@ impl Console {
         }
     }
 
-    /// The terminal's width, when stdout is the terminal: a chart's default width.
+    /// The terminal's width, when stdout is the terminal: a chart's default
+    /// width, and the width a table is fitted to.
     pub fn width(&self) -> Option<usize> {
         self.columns.filter(|_| self.stdout == Sink::Terminal)
     }
@@ -144,11 +145,14 @@ impl Console {
         }
     }
 
-    /// What rendering needs to know about where its output is shown.
-    pub fn screen(&self) -> Screen {
+    /// What rendering needs to know about where its output is shown, through
+    /// `pager` when there is one: a paged table is not fitted, since the pager
+    /// scrolls it sideways.
+    pub fn screen(&self, pager: Option<&Pager>) -> Screen {
         Screen {
             color: self.color(),
             width: self.width(),
+            fit: pager.is_none(),
         }
     }
 }
@@ -318,5 +322,10 @@ mod tests {
             ..terminal()
         };
         assert!(!unknown.fills(b"a\nb\nc\n"));
+    }
+
+    #[test]
+    fn a_table_is_fitted_unless_a_pager_scrolls_it() {
+        assert!(terminal().screen(None).fit);
     }
 }

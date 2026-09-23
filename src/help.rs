@@ -440,7 +440,8 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         synopsis: &["fmt             align columns like `column -t` (takes no arguments)"],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
 the final output, so it composes after everything else. With colour on (see --color) the \
-header row is bold and an empty cell shows a dim ∅.",
+header row is bold and an empty cell shows a dim ∅. Shown on a terminal with no pager \
+(--no-pager), text columns are cut with … so each line fits the window; numbers are never cut.",
         examples: &["csvm 'stats | fmt' data.csv"],
     },
 ];

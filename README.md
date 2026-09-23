@@ -58,7 +58,8 @@ printed). A table gets `less -S`, so long lines scroll sideways instead of
 wrapping, and one taller than the window also `--header=1` (less 608 and
 later), so its header row stays on screen. `--no-pager`, or
 `CSVM_PAGER`/`PAGER` set to `cat` or empty, turns it off; so does
-`TERM=dumb`.
+`TERM=dumb`. A `fmt` table shown on the terminal with no pager is fitted to
+the window instead: text columns are cut with `…`, numbers never are.
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by

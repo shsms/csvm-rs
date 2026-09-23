@@ -145,12 +145,16 @@ fn run() -> Result<(), Failure> {
         // on a slow pipeline. A table prints a line for each line of the
         // run's output, so that says whether it fills the window.
         let table = plan.output == OutputFormat::Aligned;
-        if (table || plan.graph.is_some())
-            && let Some(p) = console.pager(table, table && console.fills(&buf))
-        {
+        let pager = if table || plan.graph.is_some() {
+            console.pager(table, table && console.fills(&buf))
+        } else {
+            None
+        };
+        let screen = console.screen(pager.as_ref());
+        if let Some(p) = pager {
             output = Box::new(p);
         }
-        exec::render(&buf, &plan, &console.screen(), &mut output)?;
+        exec::render(&buf, &plan, &screen, &mut output)?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }
