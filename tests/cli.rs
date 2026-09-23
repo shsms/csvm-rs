@@ -143,3 +143,36 @@ fn removed_spellings_fail_with_a_pointer() {
     assert!(!ok);
     assert!(err.contains("unknown option"), "{err}");
 }
+
+#[test]
+fn a_reader_that_stops_early_ends_the_run_quietly() {
+    let mut content = String::from("n,s\n");
+    for i in 0..100_000 {
+        content.push_str(&format!("{i},row{i}\n"));
+    }
+    let file = temp_csv(&content);
+    let path = file.to_str().unwrap();
+    for args in [
+        vec!["cols n", path],
+        vec!["-n", "4", "select n >= 0", path],
+        vec!["sort n=nr", path],
+        vec!["fmt", path],
+        vec!["color -g n", "--color", "always", path],
+        vec!["--help"],
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_csvm"))
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn csvm");
+        // Close the read end at once, like `head -0`: every write that
+        // outruns the pipe buffer then finds no reader.
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert!(out.status.success(), "{args:?}: {err}");
+        assert_eq!(err, "", "{args:?}");
+    }
+}

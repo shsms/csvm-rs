@@ -8,9 +8,47 @@ use csvm::plan::OutputFormat;
 use csvm::{exec, parse};
 
 fn main() {
-    if let Err(msg) = run() {
-        eprintln!("csvm: {msg}");
-        process::exit(1);
+    match run() {
+        Ok(()) | Err(Failure::Closed) => {}
+        Err(Failure::Message(msg)) => {
+            eprintln!("csvm: {msg}");
+            process::exit(1);
+        }
+    }
+}
+
+/// Why a run stopped short.
+enum Failure {
+    /// Report this on stderr and exit 1.
+    Message(String),
+    /// The output's reader stopped reading (`csvm … | head`). Nothing is
+    /// wrong with the run, so it ends quietly and successfully, the way
+    /// `cat` and `grep` do.
+    Closed,
+}
+
+impl From<String> for Failure {
+    fn from(msg: String) -> Self {
+        Failure::Message(msg)
+    }
+}
+
+impl From<csvm::error::Error> for Failure {
+    fn from(e: csvm::error::Error) -> Self {
+        match e {
+            csvm::error::Error::Io(e) => e.into(),
+            e => Failure::Message(e.to_string()),
+        }
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            Failure::Closed
+        } else {
+            Failure::Message(e.to_string())
+        }
     }
 }
 
@@ -29,23 +67,24 @@ enum Source {
     },
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), Failure> {
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Run(args)) => *args,
         Ok(Parsed::Help(topic)) => {
-            println!("{}", csvm::help::render(topic.as_deref())?);
+            let text = csvm::help::render(topic.as_deref())?;
+            writeln!(io::stdout(), "{text}")?;
             return Ok(());
         }
         Ok(Parsed::Version) => {
-            println!("csvm {}", csvm::VERSION);
+            writeln!(io::stdout(), "csvm {}", csvm::VERSION)?;
             return Ok(());
         }
         // On a usage error show the brief synopsis, not the whole manual.
         Err(e) => {
-            return Err(format!(
+            return Err(Failure::Message(format!(
                 "{e}\n\n{}\nrun `csvm --help` for options, `csvm help CMD` for a command",
                 csvm::help::usage_line()
-            ));
+            )));
         }
     };
 
@@ -66,11 +105,11 @@ fn run() -> Result<(), String> {
 
     let (mut source, header) = open_source(&args)?;
     // Joins need each right file's header to resolve; read them (IO) first.
-    exec::prepare_joins(&mut plan).map_err(|e| e.to_string())?;
-    let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
+    exec::prepare_joins(&mut plan)?;
+    let out_header = plan.resolve(&header)?;
 
     if args.explain {
-        print!("{}", exec::describe(&plan));
+        write!(io::stdout(), "{}", exec::describe(&plan))?;
         return Ok(());
     }
 
@@ -92,11 +131,11 @@ fn run() -> Result<(), String> {
     {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
-        exec::render(&buf, &plan, color_on, term_width, &mut output).map_err(|e| e.to_string())?;
+        exec::render(&buf, &plan, color_on, term_width, &mut output)?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }
-    output.flush().map_err(|e| e.to_string())?;
+    output.flush()?;
     Ok(())
 }
 
@@ -251,7 +290,7 @@ fn run_into<W: Write + Send>(
     out_header: &[String],
     opts: &exec::RunOpts,
     output: &mut W,
-) -> Result<(), String> {
+) -> Result<(), csvm::error::Error> {
     match source {
         Source::File {
             path,
@@ -262,7 +301,6 @@ fn run_into<W: Write + Send>(
         #[cfg(feature = "parquet")]
         Source::Parquet { path } => exec::run_parquet(plan, out_header, opts, path, output),
     }
-    .map_err(|e| e.to_string())
 }
 
 fn open_output(args: &cli::Args) -> Result<Box<dyn Write + Send>, String> {
