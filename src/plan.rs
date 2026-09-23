@@ -15,6 +15,7 @@ use crate::field::{Field, format_num};
 use crate::stats::STATS_SCHEMA;
 use regex::Regex;
 use std::cmp::Ordering;
+use std::ops::Range;
 
 /// A reference to a column: a name, resolved to a position.
 #[derive(Clone, Debug)]
@@ -889,6 +890,39 @@ pub struct Plan {
     pub colors: Vec<ColorRule>,
     /// A terminal chart to draw instead of emitting CSV (the `graph` sink).
     pub graph: Option<GraphSpec>,
+    /// Where in the script each part was written, for placing an error
+    /// [`Plan::resolve`] finds.
+    pub sources: Sources,
+}
+
+/// Where in the script the parts of a [`Plan`] were written: byte ranges of
+/// the script, the stage each part came from (a fragment's parts, the stage
+/// that called it). `None` where that is not known.
+#[derive(Clone, Debug, Default)]
+pub struct Sources {
+    /// Per stage: the span of each statement of a transform, or the one span
+    /// of any other stage.
+    pub stages: Vec<Vec<Option<Range<usize>>>>,
+    /// The span of each colour rule.
+    pub colors: Vec<Option<Range<usize>>>,
+    /// The span of the graph sink.
+    pub graph: Option<Range<usize>>,
+}
+
+impl Sources {
+    /// `e`, placed on part `part` of stage `stage` when its span is known.
+    fn place(&self, stage: usize, part: usize, e: Error) -> Error {
+        let span = self.stages.get(stage).and_then(|s| s.get(part)).cloned();
+        place_at(span.flatten(), e)
+    }
+}
+
+/// `e` placed on `span`, when there is one.
+fn place_at(span: Option<Range<usize>>, e: Error) -> Error {
+    match span {
+        Some(span) => e.at(span),
+        None => e,
+    }
 }
 
 /// A continuation key (appended after an item's own `on` clause) that fails to
@@ -1686,23 +1720,27 @@ impl Plan {
         // their mode from this, so a type follows the column however it is
         // spelled.
         let mut types: Vec<Option<ColType>> = vec![None; header.len()];
-        for stage in &mut self.stages {
+        let sources = &self.sources;
+        for (i, stage) in self.stages.iter_mut().enumerate() {
+            // Any other stage than a transform is one part.
+            let placed = |e| sources.place(i, 0, e);
             match stage {
                 Stage::Transform(stmts) => {
-                    for s in stmts {
-                        s.resolve(&mut header, &mut types)?;
+                    for (j, s) in stmts.iter_mut().enumerate() {
+                        s.resolve(&mut header, &mut types)
+                            .map_err(|e| sources.place(i, j, e))?;
                     }
                 }
-                Stage::Sort(s) => s.resolve(&header, &types)?,
+                Stage::Sort(s) => s.resolve(&header, &types).map_err(placed)?,
                 Stage::Head(_) | Stage::Tail(_) | Stage::DropLast(_) | Stage::Skip(_) => {} // no columns to resolve
                 Stage::Stats(s) => {
-                    s.resolve(&mut header)?;
+                    s.resolve(&mut header).map_err(placed)?;
                     types = STATS_TYPES.to_vec();
                 }
-                Stage::Uniq(u) => u.resolve(&header)?, // keeps the row shape
+                Stage::Uniq(u) => u.resolve(&header).map_err(placed)?, // keeps the row shape
                 Stage::Group(g) => {
                     let old = std::mem::take(&mut types);
-                    g.resolve(&mut header)?;
+                    g.resolve(&mut header).map_err(placed)?;
                     // A key keeps its column's type; count/sum/mean/stddev are
                     // numbers; min/max follow their column.
                     let aggs = g.aggs.iter().map(|a| match a.func {
@@ -1717,7 +1755,7 @@ impl Plan {
                         .collect();
                 }
                 Stage::Join(j) => {
-                    j.resolve(&mut header)?;
+                    j.resolve(&mut header).map_err(placed)?;
                     types.resize(header.len(), None); // left columns keep their types
                 }
             }
@@ -1728,26 +1766,30 @@ impl Plan {
         // (Row-level colour errors are already ignored in `compute_styles`.) Any
         // other failure is a real compile error and still aborts.
         let mut failed = None;
-        self.colors
-            .retain_mut(|rule| match rule.resolve(&header, &types) {
+        let mut rule_spans = self.sources.colors.iter();
+        self.colors.retain_mut(|rule| {
+            let span = rule_spans.next().cloned().flatten();
+            match rule.resolve(&header, &types) {
                 Ok(()) => true,
                 Err(Error::Column { .. } | Error::ColumnIndex { .. }) => false,
                 Err(e) => {
-                    failed.get_or_insert(e);
+                    failed.get_or_insert(place_at(span, e));
                     false
                 }
-            });
+            }
+        });
         if let Some(e) = failed {
             return Err(e);
         }
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
+            let placed = |e| place_at(self.sources.graph.clone(), e);
             for c in &mut g.cols {
-                c.resolve(&header)?;
+                c.resolve(&header).map_err(placed)?;
             }
             // The colour-by column is charted too, so it resolves the same way.
             if let Some(c) = &mut g.opts.color_by {
-                c.resolve(&header)?;
+                c.resolve(&header).map_err(placed)?;
             }
         }
         Ok(header)
@@ -1901,6 +1943,7 @@ mod tests {
             output: OutputFormat::Csv,
             colors: Vec::new(),
             graph: None,
+            sources: Sources::default(),
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -2044,6 +2087,7 @@ mod tests {
             output: OutputFormat::Csv,
             colors: Vec::new(),
             graph: None,
+            sources: Sources::default(),
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column { name, .. } if name == "nope"));

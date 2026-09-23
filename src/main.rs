@@ -114,8 +114,10 @@ fn run() -> Result<(), Failure> {
 
     let (mut source, header) = open_source(&args)?;
     // Joins need each right file's header to resolve; read them (IO) first.
-    exec::prepare_joins(&mut plan)?;
-    let out_header = plan.resolve(&header)?;
+    exec::prepare_joins(&mut plan).map_err(|e| script_error(&script, &e, &console))?;
+    let out_header = plan
+        .resolve(&header)
+        .map_err(|e| script_error(&script, &e, &console))?;
 
     if args.explain {
         // The plan goes to stdout even with -o, so it pages by stdout.
@@ -177,9 +179,8 @@ fn run() -> Result<(), Failure> {
     Ok(())
 }
 
-/// A script error's message and, when the parser placed it, the line of the
-/// script it is on with the place marked (in colour when the console colours
-/// errors).
+/// A script error's message and, when it has a place in the script, the line
+/// it is on with the place marked (in colour when the console colours errors).
 fn script_error(script: &str, e: &csvm::error::Error, console: &Console) -> String {
     let Some(span) = e.span() else {
         return e.to_string();

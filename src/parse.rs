@@ -23,8 +23,8 @@ use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
-    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Stage, StatsStmt,
-    Stmt, UniqStmt, ValExpr,
+    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Stage,
+    StatsStmt, Stmt, UniqStmt, ValExpr,
 };
 use std::ops::Range;
 
@@ -53,6 +53,7 @@ fn parse_stages(script: &str, fns: &FnTable, depth: usize, top: &str) -> Result<
         builder
             .parse_stage(stage)
             .map_err(|e| place_on(top, stage, e))?;
+        builder.written_at(offset_in(top, stage).map(|at| at..at + stage.len()));
     }
     if builder.items.is_empty()
         && builder.output == OutputFormat::Csv
@@ -250,6 +251,11 @@ struct Builder<'a> {
     colors: Vec<ColorRule>,
     /// A `graph` sink (plan metadata; the last command, terminates the pipe).
     graph: Option<GraphSpec>,
+    /// Where each item, colour rule and the graph were written in the script
+    /// (see [`Builder::written_at`]).
+    item_spans: Vec<Option<Range<usize>>>,
+    color_spans: Vec<Option<Range<usize>>>,
+    graph_span: Option<Range<usize>>,
 }
 
 impl<'a> Builder<'a> {
@@ -262,6 +268,20 @@ impl<'a> Builder<'a> {
             output: OutputFormat::Csv,
             colors: Vec::new(),
             graph: None,
+            item_spans: Vec::new(),
+            color_spans: Vec::new(),
+            graph_span: None,
+        }
+    }
+
+    /// Record `span` as where everything parsed since the last call was
+    /// written: the stage just parsed, and whatever a fragment it called
+    /// expanded to.
+    fn written_at(&mut self, span: Option<Range<usize>>) {
+        self.item_spans.resize(self.items.len(), span.clone());
+        self.color_spans.resize(self.colors.len(), span.clone());
+        if self.graph.is_some() && self.graph_span.is_none() {
+            self.graph_span = span;
         }
     }
 
@@ -269,35 +289,63 @@ impl<'a> Builder<'a> {
     /// `Transform`; every other item is already a stage of its own.
     fn take_plan(&mut self) -> Plan {
         let mut stages = Vec::new();
+        // In step with `stages`: the spans of each one's parts.
+        let mut spans: Vec<Vec<Option<Range<usize>>>> = Vec::new();
         let mut transform: Vec<Stmt> = Vec::new();
-        let flush = |transform: &mut Vec<Stmt>, stages: &mut Vec<Stage>| {
+        let mut transform_spans = Vec::new();
+        let flush = |transform: &mut Vec<Stmt>,
+                     transform_spans: &mut Vec<Option<Range<usize>>>,
+                     stages: &mut Vec<Stage>,
+                     spans: &mut Vec<Vec<Option<Range<usize>>>>| {
             if !transform.is_empty() {
                 stages.push(Stage::Transform(std::mem::take(transform)));
+                spans.push(std::mem::take(transform_spans));
             }
         };
-        for item in self.items.drain(..) {
-            match item {
-                Item::Stmt(s) => transform.push(s),
-                Item::Stage(Stage::Skip(n)) => {
-                    flush(&mut transform, &mut stages);
-                    push_window(&mut stages, n, None);
+        let item_spans = std::mem::take(&mut self.item_spans);
+        for (item, span) in self.items.drain(..).zip(item_spans) {
+            let stage = match item {
+                Item::Stmt(s) => {
+                    transform.push(s);
+                    transform_spans.push(span);
+                    continue;
                 }
-                Item::Stage(Stage::Head(n)) => {
-                    flush(&mut transform, &mut stages);
-                    push_window(&mut stages, 0, Some(n));
-                }
-                Item::Stage(stage) => {
-                    flush(&mut transform, &mut stages);
+                Item::Stage(stage) => stage,
+            };
+            flush(
+                &mut transform,
+                &mut transform_spans,
+                &mut stages,
+                &mut spans,
+            );
+            match stage {
+                // A window folds into the one before it, and resolves no
+                // columns, so it has no parts to place.
+                Stage::Skip(n) => push_window(&mut stages, n, None),
+                Stage::Head(n) => push_window(&mut stages, 0, Some(n)),
+                stage => {
                     stages.push(stage);
+                    spans.push(vec![span]);
                 }
             }
+            spans.resize_with(stages.len(), Vec::new);
         }
-        flush(&mut transform, &mut stages);
+        flush(
+            &mut transform,
+            &mut transform_spans,
+            &mut stages,
+            &mut spans,
+        );
         Plan {
             stages,
             output: self.output,
             colors: std::mem::take(&mut self.colors),
             graph: self.graph.take(),
+            sources: Sources {
+                stages: spans,
+                colors: std::mem::take(&mut self.color_spans),
+                graph: self.graph_span.take(),
+            },
         }
     }
 
@@ -1195,6 +1243,7 @@ fn identity_plan() -> Plan {
         output: OutputFormat::Csv,
         colors: Vec::new(),
         graph: None,
+        sources: Sources::default(),
     }
 }
 
@@ -2461,6 +2510,20 @@ mod tests {
             parse("select a >> 1").unwrap_err().to_string(),
             "expected a column, number, string, or function, found '>'"
         );
+    }
+
+    #[test]
+    fn resolve_errors_are_placed_on_their_stage() {
+        let header = ["a".to_string()];
+        let span = |script: &str| {
+            let mut plan = parse(script).unwrap();
+            plan.resolve(&header).unwrap_err().span()
+        };
+        assert_eq!(span("cols a | select b > 1"), Some(9..21));
+        assert_eq!(span("cols a | sort 5=n"), Some(9..17));
+        assert_eq!(span("graph hist zz"), Some(0..13));
+        // A fragment's statements were written at its call.
+        assert_eq!(span("fn f(x) { select x > 1 }\nf(zz)"), Some(25..30));
     }
 
     #[test]

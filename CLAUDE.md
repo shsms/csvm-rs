@@ -408,8 +408,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   on its stage. Text that is not a slice of the script
   (a fragment's expansion) falls back to the calling stage. `Error::At`
   displays as the bare message; `main` adds `error::excerpt`, the script
-  line with `^` markers (bold red when stderr takes colour). Resolve-time
-  errors (an unknown column) are not placed yet.
+  line with `^` markers (bold red when stderr takes colour). Errors found
+  at resolve time are placed too: the parser records where each part of the
+  plan was written (`plan::Sources`, per stage and statement, a fragment's
+  parts at its call), and `Plan::resolve` places an error on its part.
 
 ## Implicit conversions (there are no conversion commands)
 

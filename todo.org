@@ -26,10 +26,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   alloc per 64 KiB. Hoist a caller-owned buffer through the serial loops.
 
 ** TODO Interface simplifications
-- Script errors found at resolve time (an unknown column, a join key) are
-  not placed in the script the way compile errors are (=Error::At=): a
-  =ColRef= keeps its name but not where it was written. Carrying a span on
-  the refs would let =main= mark the column with =^= too.
 - The =join= item grammar has a documented ambiguity: a keyless file after an
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a

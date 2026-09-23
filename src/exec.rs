@@ -2758,10 +2758,9 @@ mod tests {
 
     #[test]
     fn missing_column_is_an_error() {
-        assert!(matches!(
-            run_str("cols nope", INPUT),
-            Err(Error::Column { .. })
-        ));
+        // Placed in the script, it is still an unknown column underneath.
+        let e = run_str("cols nope", INPUT).unwrap_err();
+        assert!(matches!(e.unplaced(), Error::Column { .. }), "{e:?}");
     }
 
     #[test]
