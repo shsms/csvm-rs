@@ -180,6 +180,7 @@ impl Console {
             // Asking a pager costs a run of `less --version`, so only when
             // links are on.
             links: self.links() && pager.is_none_or(Pager::shows_links),
+            stripe: None,
         }
     }
 

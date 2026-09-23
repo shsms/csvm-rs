@@ -117,6 +117,22 @@ fn rgb_name(c: Rgb) -> String {
     }
 }
 
+/// A background a little off `bg`, for every other row of a table: 18 steps
+/// a channel lighter on a dark background, darker on a light one. That is
+/// enough for the 256-colour palette to tell a grey or near-grey background
+/// from its stripe; a strongly coloured one may map both to one entry.
+pub fn stripe(bg: Rgb) -> Rgb {
+    let luma = 0.2126 * f64::from(bg.0) + 0.7152 * f64::from(bg.1) + 0.0722 * f64::from(bg.2);
+    let shift = |c: u8| {
+        if luma < 128.0 {
+            c.saturating_add(18)
+        } else {
+            c.saturating_sub(18)
+        }
+    };
+    Rgb(shift(bg.0), shift(bg.1), shift(bg.2))
+}
+
 /// How many colours the terminal can show, which decides how an RGB colour is
 /// written: exactly, or as the nearest entry of the 256-colour palette.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,8 +252,17 @@ impl Style {
     /// Wrap `text` in SGR escapes for this style at `depth` (returns it
     /// unchanged when the style is empty, so no stray resets are emitted).
     pub fn paint(&self, text: &str, depth: Depth) -> String {
+        match self.start(depth) {
+            Some(start) => format!("{start}{text}\x1b[0m"),
+            None => text.to_string(),
+        }
+    }
+
+    /// The SGR escape that turns this style on at `depth` (`\x1b[0m` turns it
+    /// off), or `None` when the style is empty.
+    pub fn start(&self, depth: Depth) -> Option<String> {
         if self.is_empty() {
-            return text.to_string();
+            return None;
         }
         let mut codes: Vec<String> = Vec::new();
         if self.bold {
@@ -255,7 +280,7 @@ impl Style {
         if let Some(bg) = self.bg {
             codes.push(bg.sgr(true, depth));
         }
-        format!("\x1b[{}m{text}\x1b[0m", codes.join(";"))
+        Some(format!("\x1b[{}m", codes.join(";")))
     }
 }
 
@@ -433,6 +458,22 @@ mod tests {
             s.paint("x", Depth::Ansi256),
             "\x1b[38;5;196;48;5;16mx\x1b[0m"
         );
+    }
+
+    #[test]
+    fn a_stripe_is_a_little_off_the_background() {
+        assert_eq!(stripe(Rgb(0, 0, 0)), Rgb(18, 18, 18));
+        assert_eq!(stripe(Rgb(255, 255, 255)), Rgb(237, 237, 237));
+        assert_eq!(stripe(Rgb(0, 43, 54)), Rgb(18, 61, 72)); // a dark blue
+        // The 256-colour palette still shows it as a different entry.
+        for bg in [
+            Rgb(0, 0, 0),
+            Rgb(30, 30, 30),
+            Rgb(40, 40, 40),
+            Rgb(255, 255, 255),
+        ] {
+            assert_ne!(ansi256(stripe(bg)), ansi256(bg), "{bg:?}");
+        }
     }
 
     #[test]

@@ -18,7 +18,7 @@ use crossbeam_channel::bounded;
 use memchr::memchr;
 
 use crate::chart;
-use crate::color::{Depth, Style};
+use crate::color::{Color, Depth, Rgb, Style};
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
@@ -1720,6 +1720,9 @@ pub struct Screen {
     /// Make a `fmt` table's web addresses clickable (OSC 8 hyperlinks), for a
     /// terminal, or a pager, that shows them as links and not as escapes.
     pub links: bool,
+    /// The background every other data row of a `fmt` table is shaded with,
+    /// or `None` for no stripes.
+    pub stripe: Option<Rgb>,
 }
 
 /// Render buffered output `bytes` to `output`, applying the plan's colour rules
@@ -1887,7 +1890,9 @@ const EMPTY_CELL: &str = "∅";
 /// [`EMPTY_CELL`], dimmed over whatever the rules paint there. When the screen
 /// fits tables, text columns are cut so the lines fit its width (see
 /// [`fit_widths`]); when it shows links, a web address links to itself, whole
-/// even when its text is cut.
+/// even when its text is cut. With a stripe, every other data row is shaded
+/// with it from its first cell to the table's right edge, under whatever the
+/// rules paint there.
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
@@ -1912,6 +1917,16 @@ fn align_and_write<W: Write>(
     let dim = Style {
         dim: true,
         ..Style::default()
+    };
+    // The first data row and every other one after it.
+    let shade = |ri: usize| {
+        let bg = screen
+            .stripe
+            .filter(|_| color.is_some() && !ri.is_multiple_of(2));
+        Style {
+            bg: bg.map(Color::Rgb),
+            ..Style::default()
+        }
     };
 
     // Right-justify a column when every data cell reads as a number (blanks
@@ -1939,9 +1954,11 @@ fn align_and_write<W: Write>(
         // Where the last cell with something in it ends: the line stops
         // there, so empty cells at its end leave no padding behind.
         let mut end = 0;
+        let shade = shade(ri);
+        let shade_start = color.and_then(|depth| shade.start(depth));
         for (i, field) in row.iter().enumerate() {
             if i > 0 {
-                line.push_str("  ");
+                push_gap(&mut line, 2, shade_start.as_deref());
             }
             let text = cut(
                 if marked(ri, field) { EMPTY_CELL } else { field },
@@ -1951,7 +1968,7 @@ fn align_and_write<W: Write>(
             let has_content = !text.is_empty();
             let painted: Cow<str> = match color {
                 Some(depth) => {
-                    let mut style = style_at(styles, ri, i);
+                    let mut style = shade.over(style_at(styles, ri, i));
                     if ri == 0 {
                         style = style.over(bold);
                     } else if marked(ri, field) {
@@ -1966,10 +1983,9 @@ fn align_and_write<W: Write>(
             } else {
                 painted
             };
-            let padding = " ".repeat(pad);
             if numeric[i] {
                 // Right-justify: pad on the left.
-                line.push_str(&padding);
+                push_gap(&mut line, pad, shade_start.as_deref());
                 line.push_str(&painted);
             } else {
                 line.push_str(&painted);
@@ -1979,14 +1995,36 @@ fn align_and_write<W: Write>(
             }
             if !numeric[i] {
                 // Left-justify: pad on the right.
-                line.push_str(&padding);
+                push_gap(&mut line, pad, shade_start.as_deref());
             }
         }
-        line.truncate(end);
+        if shade.is_empty() {
+            line.truncate(end);
+        } else {
+            // A short row's missing cells, blank, so the band still reaches
+            // the table's edge.
+            let missing: usize = widths[row.len()..].iter().map(|w| w + 2).sum();
+            push_gap(&mut line, missing, shade_start.as_deref());
+        }
         line.push('\n');
         output.write_all(line.as_bytes())?;
     }
     Ok(())
+}
+
+/// Push `n` spaces between or around cells onto `line`, shaded with the
+/// row's `shade` escape when it has one.
+fn push_gap(line: &mut String, n: usize, shade: Option<&str>) {
+    if n == 0 {
+        return;
+    }
+    if let Some(start) = shade {
+        line.push_str(start);
+    }
+    line.extend(std::iter::repeat_n(' ', n));
+    if shade.is_some() {
+        line.push_str("\x1b[0m");
+    }
 }
 
 /// Whether a cell is a web address a terminal can open: `http://` or
@@ -2488,6 +2526,7 @@ mod tests {
             width: term_width,
             fit: false,
             links: false,
+            stripe: None,
         };
         render_on(script, input, &screen)
     }
@@ -3893,7 +3932,53 @@ mod tests {
             width: Some(width),
             fit: true,
             links: false,
+            stripe: None,
         }
+    }
+
+    #[test]
+    fn fmt_shades_every_other_data_row_to_the_tables_edge() {
+        let screen = Screen {
+            color: Some(Depth::Truecolor),
+            stripe: Some(Rgb(24, 24, 24)),
+            ..fitting(80)
+        };
+        let shaded = |s: &str| format!("\x1b[48;2;24;24;24m{s}\x1b[0m");
+        let input = "name,n\nzz,1\nyy,20\n,3\n";
+        let out = render_on("color red name == 'zz' | fmt", input, &screen);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "\x1b[1mname\x1b[0m   \x1b[1mn\x1b[0m");
+        // A rule's colour is drawn over the stripe, and the gaps are shaded
+        // too, so the stripe runs unbroken.
+        let red = |s: &str| format!("\x1b[31;48;2;24;24;24m{s}\x1b[0m");
+        assert_eq!(
+            lines[1],
+            [red("zz"), shaded("  "), shaded("  "), shaded(" "), red("1")].concat()
+        );
+        assert_eq!(lines[2], "yy    20");
+        assert_eq!(
+            lines[3],
+            [
+                "\x1b[2;48;2;24;24;24m∅\x1b[0m".to_string(),
+                shaded("   "),
+                shaded("  "),
+                shaded(" "),
+                shaded("3"),
+            ]
+            .concat()
+        );
+        // No colour, no stripes.
+        let plain = Screen {
+            color: None,
+            ..screen
+        };
+        assert!(!render_on("fmt", input, &plain).contains('\x1b'));
+        // A cell that fills its column leaves no empty shaded gap behind.
+        let full = render_on("fmt", "a,b\nx,1\n", &screen);
+        assert_eq!(
+            full.lines().nth(1).unwrap(),
+            [shaded("x"), shaded("  "), shaded("1")].concat()
+        );
     }
 
     #[test]
