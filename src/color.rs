@@ -13,31 +13,93 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
-/// The terminal's base colours: the 8 ANSI colours and grey (bright black),
-/// each with the RGB a gradient between them interpolates through. A base
-/// colour is painted with its own SGR code, so it shows in the shade the
-/// terminal's theme gives it; the RGB is only the stand-in for arithmetic.
-const BASE: [(&str, Rgb); 9] = [
-    ("black", Rgb(0, 0, 0)),
-    ("red", Rgb(205, 0, 0)),
-    ("green", Rgb(0, 205, 0)),
-    ("yellow", Rgb(205, 205, 0)),
-    ("blue", Rgb(0, 0, 238)),
-    ("magenta", Rgb(205, 0, 205)),
-    ("cyan", Rgb(0, 205, 205)),
-    ("white", Rgb(229, 229, 229)),
-    ("gray", Rgb(127, 127, 127)),
-];
+/// One of the terminal's base colours: the eight ANSI colours and grey (bright
+/// black). It is painted with its own SGR code, so it shows in the shade the
+/// terminal's theme gives it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Base {
+    Black,
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    White,
+    Gray,
+}
 
-/// The index into [`BASE`] for a colour name (`grey` spells `gray` too).
-fn base_index(name: &str) -> Option<usize> {
-    let name = if name == "grey" { "gray" } else { name };
-    BASE.iter().position(|(n, _)| *n == name)
+impl Base {
+    /// Every base colour, in the order of the terminal's colours 0 to 8.
+    pub(crate) const ALL: [Base; 9] = [
+        Base::Black,
+        Base::Red,
+        Base::Green,
+        Base::Yellow,
+        Base::Blue,
+        Base::Magenta,
+        Base::Cyan,
+        Base::White,
+        Base::Gray,
+    ];
+
+    /// The base colour `name` names (`grey` spells `gray` too).
+    pub fn named(name: &str) -> Option<Base> {
+        let name = if name == "grey" { "gray" } else { name };
+        Base::ALL.into_iter().find(|base| base.name() == name)
+    }
+
+    /// Its name in a colour spec.
+    pub fn name(self) -> &'static str {
+        match self {
+            Base::Black => "black",
+            Base::Red => "red",
+            Base::Green => "green",
+            Base::Yellow => "yellow",
+            Base::Blue => "blue",
+            Base::Magenta => "magenta",
+            Base::Cyan => "cyan",
+            Base::White => "white",
+            Base::Gray => "gray",
+        }
+    }
+
+    /// The RGB a gradient between base colours goes through: xterm's shade,
+    /// a stand-in for arithmetic, since the terminal's own is not known.
+    pub fn rgb(self) -> Rgb {
+        match self {
+            Base::Black => Rgb(0, 0, 0),
+            Base::Red => Rgb(205, 0, 0),
+            Base::Green => Rgb(0, 205, 0),
+            Base::Yellow => Rgb(205, 205, 0),
+            Base::Blue => Rgb(0, 0, 238),
+            Base::Magenta => Rgb(205, 0, 205),
+            Base::Cyan => Rgb(0, 205, 205),
+            Base::White => Rgb(229, 229, 229),
+            Base::Gray => Rgb(127, 127, 127),
+        }
+    }
+
+    /// Its SGR code less the foreground's 30 or the background's 40: grey is
+    /// bright black, whose codes are 90 and 100.
+    fn code(self) -> u8 {
+        match self {
+            Base::Black => 0,
+            Base::Red => 1,
+            Base::Green => 2,
+            Base::Yellow => 3,
+            Base::Blue => 4,
+            Base::Magenta => 5,
+            Base::Cyan => 6,
+            Base::White => 7,
+            Base::Gray => 60,
+        }
+    }
 }
 
 /// A base colour's name as RGB, for a gradient's ends.
 fn named(name: &str) -> Option<Rgb> {
-    base_index(name).map(|i| BASE[i].1)
+    Base::named(name).map(Base::rgb)
 }
 
 /// `c` as a `#rrggbb` literal — the hex form SVG and CSS want.
@@ -49,8 +111,8 @@ pub fn rgb_hex(c: &Rgb) -> String {
 /// named colours (e.g. a value interpolated along a ramp). Inverse of [`named`];
 /// used for the terse `--explain` rendering.
 fn rgb_name(c: Rgb) -> String {
-    match BASE.iter().find(|(_, rgb)| *rgb == c) {
-        Some((name, _)) => (*name).into(),
+    match Base::ALL.into_iter().find(|base| base.rgb() == c) {
+        Some(base) => base.name().into(),
         None => rgb_hex(&c),
     }
 }
@@ -84,10 +146,8 @@ impl Depth {
 /// A colour as the terminal is asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
-    /// One of the terminal's base colours, by its index into the table of
-    /// them (black, red, …, gray), drawn in the shade the terminal's theme
-    /// gives it.
-    Base(u8),
+    /// One of the terminal's base colours, drawn in its theme's shade.
+    Base(Base),
     /// An exact colour: a point along a ramp, or a chart's series colour.
     Rgb(Rgb),
 }
@@ -97,9 +157,7 @@ impl Color {
     /// background, at `depth`.
     fn sgr(self, bg: bool, depth: Depth) -> String {
         match self {
-            // Grey is bright black, which has its own code range (90/100).
-            Color::Base(8) => (if bg { "100" } else { "90" }).into(),
-            Color::Base(i) => format!("{}", u32::from(i) + if bg { 40 } else { 30 }),
+            Color::Base(base) => (base.code() + if bg { 40 } else { 30 }).to_string(),
             Color::Rgb(c) => {
                 let lead = if bg { 48 } else { 38 };
                 match depth {
@@ -114,7 +172,7 @@ impl Color {
 impl fmt::Display for Color {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Color::Base(i) => write!(f, "{}", BASE[usize::from(*i)].0),
+            Color::Base(base) => write!(f, "{}", base.name()),
             Color::Rgb(c) => write!(f, "{}", rgb_name(*c)),
         }
     }
@@ -233,8 +291,8 @@ impl fmt::Display for Style {
 /// base colour, so it paints in the terminal theme's shade of it.
 pub fn parse_style(spec: &str) -> Result<Style, String> {
     let base = |name: &str| {
-        base_index(name)
-            .map(|i| Color::Base(i as u8))
+        Base::named(name)
+            .map(Color::Base)
             .ok_or_else(|| format!("unknown colour '{name}'"))
     };
     let mut style = Style::default();
@@ -328,7 +386,7 @@ mod tests {
 
     /// A base colour by name, as a parsed spec holds it.
     fn base(name: &str) -> Option<Color> {
-        base_index(name).map(|i| Color::Base(i as u8))
+        Base::named(name).map(Color::Base)
     }
 
     /// A base colour's stand-in RGB, as a ramp paints it.

@@ -42,9 +42,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   parameter on =run_file= would make the choice explicit at each call, but
   =run_file= is already at clippy's argument limit; bundling the input's
   path and byte range into one value would make room.
-- =Color::Base(u8)= accepts any index, though only 0-8 name a base colour
-  (=parse_style= builds it through =base_index=, so none reaches it today).
-  A small enum of the nine colours would let the compiler rule out a tenth.
 - Sharded =stats= / =group= reduce in =-n= ranges, so the documented
   low-order-digit float drift of =sum=/=mean=/=stddev= (hundreds of ULP on a
   few hundred thousand rows) is now the default behaviour (threads default
