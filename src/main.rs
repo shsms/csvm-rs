@@ -115,7 +115,8 @@ fn run() -> Result<(), Failure> {
     }
 
     let console = Console::read(&args);
-    let color_on = console.color();
+    // Colour, when on, is drawn at the depth the terminal announces.
+    let color = console.color();
     // The graph sink's default width.
     let term_width = console.width();
     let mut output = open_output(&args)?;
@@ -124,11 +125,11 @@ fn run() -> Result<(), Failure> {
     // these buffers the run first, then renders.
     if plan.output == OutputFormat::Aligned
         || plan.graph.is_some()
-        || (color_on && !plan.colors.is_empty())
+        || (color.is_some() && !plan.colors.is_empty())
     {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
-        exec::render(&buf, &plan, color_on, term_width, &mut output)?;
+        exec::render(&buf, &plan, color, term_width, &mut output)?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
     }

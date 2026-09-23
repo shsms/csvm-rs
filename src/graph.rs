@@ -8,7 +8,7 @@ use crate::chart::{
     BarData, ChartData, Frame, Glyphs, HeatData, HistData, SparkData, XyData, bar_value, hist_len,
     value_pos,
 };
-use crate::color::{Color, Ramp, Rgb, Style};
+use crate::color::{Color, Depth, Ramp, Rgb, Style};
 use crate::field::format_num;
 
 /// Format `v` rounded to `step`'s precision (one digit finer than the step's
@@ -89,9 +89,16 @@ fn paint(frame: &Frame, v: f64, lo: f64, hi: f64, text: &str) -> String {
 /// [`paint`] with the ramp given outright, for the one caller that has a ramp
 /// the frame does not: `-c/--color-by` colours with no `-r` on the command
 /// line (see [`render_xy`]).
-fn paint_with(ramp: Option<Ramp>, color: bool, v: f64, lo: f64, hi: f64, text: &str) -> String {
+fn paint_with(
+    ramp: Option<Ramp>,
+    color: Option<Depth>,
+    v: f64,
+    lo: f64,
+    hi: f64,
+    text: &str,
+) -> String {
     match (ramp, color) {
-        (Some(r), true) if !text.is_empty() => r.at(v, lo, hi).paint(text),
+        (Some(r), Some(depth)) if !text.is_empty() => r.at(v, lo, hi).paint(text, depth),
         _ => text.to_string(),
     }
 }
@@ -208,10 +215,10 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
             // against, so a colour is a position on the axis. Several: the
             // series palette says which column a bar belongs to. A row a log
             // axis cannot place has no bar to paint either way.
-            let drawn = match at {
-                Some(_) if multi && frame.color => series_style(i).paint(&drawn),
-                Some(at) => paint(frame, at, lo, hi, &drawn),
-                None => drawn,
+            let drawn = match (at, frame.color) {
+                (Some(_), Some(depth)) if multi => series_style(i).paint(&drawn, depth),
+                (Some(at), _) => paint(frame, at, lo, hi, &drawn),
+                (None, _) => drawn,
             };
             // The label heads its group; the rows below it line up under a gap.
             let label = if i == 0 { row.0.as_str() } else { "" };
@@ -235,13 +242,13 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
 /// The `● name` legend line of a multi-series chart: one entry per series,
 /// painted in that series' colour. Colour is what tells the series apart, so
 /// with it off the markers go too and only the names are listed.
-fn legend_line(names: &[String], glyphs: &Glyphs, color: bool) -> String {
+fn legend_line(names: &[String], glyphs: &Glyphs, color: Option<Depth>) -> String {
     let entries: Vec<String> = names
         .iter()
         .enumerate()
         .map(|(i, n)| {
-            if color {
-                series_style(i).paint(&format!("{} {n}", glyphs.legend))
+            if let Some(depth) = color {
+                series_style(i).paint(&format!("{} {n}", glyphs.legend), depth)
             } else {
                 n.clone()
             }
@@ -714,8 +721,8 @@ fn render_xy(frame: &Frame, xy: &XyData) -> String {
     // stays plain. Only a single series is painted this way, and only with a
     // ramp and terminal colour to paint it, so the grid is built only when it
     // will show — it is one allocation the size of the canvas.
-    let cell: Option<(Vec<Option<f64>>, f64, f64)> =
-        (colors && !multi && ramp.is_some()).then(|| {
+    let cell: Option<(Vec<Option<f64>>, f64, f64)> = (colors.is_some() && !multi && ramp.is_some())
+        .then(|| {
             let mut vals: Vec<Option<f64>> = vec![None; wcells * hcells];
             // The busiest cell is the density ramp's high end; one point is its
             // low end, so an empty grid still spans 1..=1.
@@ -777,8 +784,10 @@ fn render_xy(frame: &Frame, xy: &XyData) -> String {
                 Some((si, c)) => {
                     let idx = cy * wcells + cx;
                     let ch = (frame.glyphs.braille)(c.bits[idx]).to_string();
-                    if colors && multi {
-                        out.push_str(&series_style(si).paint(&ch));
+                    if let Some(depth) = colors
+                        && multi
+                    {
+                        out.push_str(&series_style(si).paint(&ch, depth));
                     } else if let Some((vals, lo, hi)) = &cell {
                         // Only a cell holding a data point has a colour value —
                         // a colour-by one or a density count. A cell lit by a
@@ -865,10 +874,10 @@ fn render_heat(frame: &Frame, h: &HeatData) -> String {
         out.push_str(&format!("{label:>gutter$} {}", frame.glyphs.axis_tick));
         for col in 0..h.cols {
             let count = h.counts[row * h.cols + col];
-            if frame.color && count > 0 {
+            if frame.color.is_some() && count > 0 {
                 let cell = frame.glyphs.full.to_string();
                 let at = hist_len(count, frame.log);
-                out.push_str(&paint_with(Some(ramp), true, at, clo, chi, &cell));
+                out.push_str(&paint_with(Some(ramp), frame.color, at, clo, chi, &cell));
             } else {
                 out.push(frame.glyphs.shades[shade_level(count, max, frame.log)]);
             }
@@ -919,14 +928,14 @@ mod tests {
         // The span of -1e308..1e308 overflows an f64, so edges worked out
         // from `hi - lo` printed as NaN and inf down the left of the chart.
         let h = HistData::build(&[-1e308, 0.0, 1e308], Some(4), None).unwrap();
-        let s = render_hist(&Frame::new("v".to_string(), 80, 15, false), &h);
+        let s = render_hist(&Frame::new("v".to_string(), 80, 15, None), &h);
         assert!(!s.contains("NaN") && !s.contains("inf"), "{s}");
     }
 
     #[test]
     fn render_reports_skipped_and_summary() {
         let h = HistData::build(&[1.0, 2.0, 3.0], Some(2), None).unwrap();
-        let mut f = Frame::new("amount".to_string(), 40, 15, false);
+        let mut f = Frame::new("amount".to_string(), 40, 15, None);
         f.notes.push("skipped 2 non-numeric".to_string());
         let s = render_hist(&f, &h);
         assert!(s.starts_with("amount\n"));
@@ -939,7 +948,7 @@ mod tests {
     #[test]
     fn bars_anchor_positive_at_left_edge() {
         let s = render_bars(
-            &Frame::new("v".to_string(), 30, 15, false),
+            &Frame::new("v".to_string(), 30, 15, None),
             &one_series(&[("a", 2.0), ("b", 4.0)]),
         );
         assert!(s.starts_with("v\n"));
@@ -952,7 +961,7 @@ mod tests {
     #[test]
     fn bars_diverge_around_zero_for_negatives() {
         let s = render_bars(
-            &Frame::new("d".to_string(), 40, 15, false),
+            &Frame::new("d".to_string(), 40, 15, None),
             &one_series(&[("pos", 5.0), ("neg", -5.0)]),
         );
         let pos = s.lines().find(|l| l.contains("pos")).unwrap();
@@ -966,7 +975,7 @@ mod tests {
     fn bars_clamp_to_an_explicit_axis_but_print_the_real_value() {
         let mut b = one_series(&[("a", 1.0), ("b", 9.0)]);
         b.axis = Some((0.0, 2.0));
-        let s = render_bars(&Frame::new("v".to_string(), 40, 15, false), &b);
+        let s = render_bars(&Frame::new("v".to_string(), 40, 15, None), &b);
         // The drawn field of a row: between the axis rule and the printed value.
         let field = |name: &str| {
             let line = s.lines().find(|l| l.contains(name)).unwrap();
@@ -987,7 +996,7 @@ mod tests {
 
     #[test]
     fn bars_report_skipped_and_truncated() {
-        let mut f = Frame::new("v".to_string(), 30, 15, false);
+        let mut f = Frame::new("v".to_string(), 30, 15, None);
         f.notes.push("+2 more not shown".to_string());
         f.notes.push("skipped 3 non-numeric".to_string());
         let s = render_bars(&f, &one_series(&[("a", 1.0)]));
@@ -998,7 +1007,7 @@ mod tests {
     #[test]
     fn spark_is_one_line_scaled_to_width() {
         let s = render_spark(
-            &Frame::new("v".to_string(), 4, 15, false),
+            &Frame::new("v".to_string(), 4, 15, None),
             &SparkData {
                 name: "v".to_string(),
                 values: vec![1.0, 2.0, 3.0, 4.0],
@@ -1017,7 +1026,7 @@ mod tests {
     fn spark_downsamples_long_series() {
         let vals: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let s = render_spark(
-            &Frame::new("v".to_string(), 10, 15, false),
+            &Frame::new("v".to_string(), 10, 15, None),
             &SparkData {
                 name: "v".to_string(),
                 values: crate::chart::bucket(&vals, 10),
@@ -1042,7 +1051,7 @@ mod tests {
     #[test]
     fn render_xy_frames_a_scatter() {
         let s = render_xy(
-            &Frame::new("y vs x".to_string(), 10, 4, false),
+            &Frame::new("y vs x".to_string(), 10, 4, None),
             &xy_data(
                 &["y"],
                 &[&[(0.0, 0.0), (1.0, 1.0), (2.0, 2.0)]],
@@ -1063,7 +1072,7 @@ mod tests {
         // Row-index fallback: positions are 1,2,3 but the axis shows real ends.
         let ends = XAxis::Ends("2024-01-01".to_string(), "2024-01-03".to_string());
         let s = render_xy(
-            &Frame::new("y vs t".to_string(), 40, 4, false),
+            &Frame::new("y vs t".to_string(), 40, 4, None),
             &xy_data(&["y"], &[&[(1.0, 0.0), (2.0, 1.0), (3.0, 2.0)]], ends, true),
         );
         assert!(s.contains("2024-01-01") && s.contains("2024-01-03"), "{s}");
@@ -1074,7 +1083,7 @@ mod tests {
         // Counts 0, 1, 2 and 4 over a busiest cell of 4: an empty cell is
         // blank and the rest climb the five shades.
         let h = heat_data(vec![0, 1, 2, 4]);
-        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, false), &h);
+        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, None), &h);
         assert!(s.starts_with("y vs x\n"), "{s}");
         let rows: Vec<&str> = s.lines().filter(|l| l.contains('┤')).collect();
         assert_eq!(rows.len(), 2, "{s}");
@@ -1092,11 +1101,11 @@ mod tests {
         // the shades must give it the lightest non-empty one — the same chart
         // with and without colour.
         let h = heat_data(vec![0, 1, 1, 1]);
-        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, false), &h);
+        let s = render_heat(&Frame::new("y vs x".to_string(), 12, 2, None), &h);
         let rows: Vec<&str> = s.lines().filter(|l| l.contains('┤')).collect();
         assert!(rows[0].ends_with("░░"), "{s}");
         assert!(rows[1].ends_with(" ░"), "{s}");
-        let mut f = Frame::new("y vs x".to_string(), 12, 2, true);
+        let mut f = Frame::new("y vs x".to_string(), 12, 2, Some(Depth::Truecolor));
         f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let colored = render_heat(&f, &heat_data(vec![0, 1, 1, 1]));
         assert_eq!(
@@ -1108,7 +1117,7 @@ mod tests {
 
     #[test]
     fn render_heat_paints_the_ramp_when_colour_is_on() {
-        let mut f = Frame::new("y vs x".to_string(), 12, 2, true);
+        let mut f = Frame::new("y vs x".to_string(), 12, 2, Some(Depth::Truecolor));
         f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let s = render_heat(&f, &heat_data(vec![0, 1, 2, 4]));
         // One painted glyph per non-empty cell; the lightest is the ramp's low
@@ -1161,7 +1170,7 @@ mod tests {
         // A wide numeric axis over 0..100 should graduate beyond just the ends.
         let pts: Vec<(f64, f64)> = (0..=100).map(|i| (i as f64, i as f64)).collect();
         let s = render_xy(
-            &Frame::new("y vs x".to_string(), 80, 6, false),
+            &Frame::new("y vs x".to_string(), 80, 6, None),
             &xy_data(&["y"], &[&pts], XAxis::Numeric, false),
         );
         // More than the two ends (0 and 100) — an intermediate tick near 50.
@@ -1170,7 +1179,7 @@ mod tests {
 
     #[test]
     fn render_xy_empty_is_loud() {
-        let mut f = Frame::new("y vs x".to_string(), 80, 15, false);
+        let mut f = Frame::new("y vs x".to_string(), 80, 15, None);
         f.notes.push("skipped 5 non-numeric".to_string());
         let s = render(
             &f,
@@ -1184,7 +1193,7 @@ mod tests {
     fn render_xy_paints_one_series_by_density_then_by_colour_by() {
         let blue = "\x1b[38;2;0;0;238m";
         let red = "\x1b[38;2;205;0;0m";
-        let mut f = Frame::new("y vs x".to_string(), 12, 4, true);
+        let mut f = Frame::new("y vs x".to_string(), 12, 4, Some(Depth::Truecolor));
         f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let row = |x: f64, y: f64, c: Option<f64>| XyRow {
             xcell: format_num(x),
@@ -1234,7 +1243,7 @@ mod tests {
     fn render_xy_density_leaves_the_line_between_points_plain() {
         // A `line` chart's connecting segments light cells that hold no data
         // point; density counts points, so those cells stay unpainted.
-        let mut f = Frame::new("y vs x".to_string(), 24, 4, true);
+        let mut f = Frame::new("y vs x".to_string(), 24, 4, Some(Depth::Truecolor));
         f.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let s = render_xy(
             &f,
@@ -1247,7 +1256,7 @@ mod tests {
     #[test]
     fn render_xy_multi_series_adds_a_legend_when_coloured() {
         let s = render_xy(
-            &Frame::new("t".to_string(), 8, 4, true),
+            &Frame::new("t".to_string(), 8, 4, Some(Depth::Truecolor)),
             &xy_data(
                 &["a", "b"],
                 &[&[(0.0, 0.0)], &[(0.0, 1.0)]],
@@ -1269,7 +1278,10 @@ mod tests {
             ],
             None,
         );
-        let s = render_bars(&Frame::new("t".to_string(), 40, 15, true), &b);
+        let s = render_bars(
+            &Frame::new("t".to_string(), 40, 15, Some(Depth::Truecolor)),
+            &b,
+        );
         let rows: Vec<&str> = s.lines().filter(|l| l.contains('│')).collect();
         assert_eq!(rows.len(), 4, "{s}");
         // The label prints on the first series' row and is blank on the rest.
@@ -1301,7 +1313,7 @@ mod tests {
             values: vec![1.0, 10.0, 100.0],
             range: None,
         };
-        let mut frame = Frame::new("v".to_string(), 8, 4, false);
+        let mut frame = Frame::new("v".to_string(), 8, 4, None);
         let line = |f: &Frame| render_spark(f, &s).lines().nth(1).unwrap().to_string();
         let lin = line(&frame);
         frame.log = true;

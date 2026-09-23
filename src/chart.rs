@@ -3,7 +3,7 @@
 //! buffered output; `graph.rs` draws the result in the terminal and `svg.rs`
 //! as SVG.
 
-use crate::color::Ramp;
+use crate::color::{Depth, Ramp};
 use crate::csv;
 use crate::field::Field;
 use crate::graph::XAxis;
@@ -144,8 +144,8 @@ pub struct Frame {
     pub height: usize,
     pub glyphs: Glyphs,
     pub ramp: Option<Ramp>,
-    /// ANSI colour is on.
-    pub color: bool,
+    /// The depth ANSI colour is drawn at, or `None` with colour off.
+    pub color: Option<Depth>,
     /// The value axis is on a log10 scale.
     pub log: bool,
     /// Dropped-data notes, e.g. "skipped 3 non-numeric".
@@ -155,7 +155,7 @@ pub struct Frame {
 impl Frame {
     /// A frame with the given title and size, drawn in the terminal with the
     /// Unicode glyphs and no labels, ramp, log scale or notes.
-    pub fn new(title: String, width: usize, height: usize, color: bool) -> Self {
+    pub fn new(title: String, width: usize, height: usize, color: Option<Depth>) -> Self {
         Frame {
             dest: Dest::Terminal,
             title,
@@ -935,7 +935,7 @@ pub fn default_title(g: &GraphSpec) -> String {
 /// come out differently depending on where they were run. The notes are the
 /// one part left blank — they are what the collector could not use, so they
 /// are filled in once the data is in.
-pub fn frame(g: &GraphSpec, term_width: Option<usize>, color: bool) -> Frame {
+pub fn frame(g: &GraphSpec, term_width: Option<usize>, color: Option<Depth>) -> Frame {
     let title = g.opts.title.clone().unwrap_or_else(|| default_title(g));
     let dest = match (g.opts.data, g.opts.svg) {
         (true, _) => Dest::Data,
@@ -1276,7 +1276,7 @@ mod tests {
 
     #[test]
     fn frame_notes_render_as_a_tail_and_a_line() {
-        let mut f = Frame::new("t".into(), 80, 15, false);
+        let mut f = Frame::new("t".into(), 80, 15, None);
         assert_eq!(f.notes_tail(), "");
         f.notes.push("skipped 2 non-numeric".into());
         f.notes.push("+1 more not shown".into());

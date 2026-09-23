@@ -472,6 +472,9 @@ The combine / bg / attribute forms above are for the PREDICATE rules — \
 `color COLOUR EXPR` and `color -c COL COLOUR EXPR`. A GRADIENT (`color -g COL \
 lo:hi`) is narrower: lo and hi are two plain colour names (no +, bg, or \
 attributes) and it colours the foreground only; the ramp defaults to green:red.\n\n\
+A named colour in a predicate rule is the terminal's own, so it follows your theme. \
+Gradients are exact colours: 24-bit when COLORTERM is truecolor or 24bit, else the \
+nearest of the 256-colour palette (set COLORTERM=truecolor to force 24-bit).\n\n\
 Emission is gated by --color auto|always|never (auto = only when stdout is a TTY); \
 NO_COLOR and CLICOLOR_FORCE are honoured under auto.",
     },

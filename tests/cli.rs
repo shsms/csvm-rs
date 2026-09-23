@@ -9,13 +9,29 @@ use std::process::{Command, Stdio};
 
 /// Run the binary with `args`, feeding `stdin`; returns (exit ok, stdout, stderr).
 fn csvm(args: &[&str], stdin: &str) -> (bool, String, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_csvm"))
+    csvm_env(args, stdin, &[])
+}
+
+/// [`csvm`], with environment variables set (`Some`) or removed (`None`). The
+/// colour variables of the caller's environment are removed first, so they
+/// cannot colour the output.
+fn csvm_env(args: &[&str], stdin: &str, env: &[(&str, Option<&str>)]) -> (bool, String, String) {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_csvm"));
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn csvm");
+        .env_remove("CLICOLOR_FORCE")
+        .env_remove("NO_COLOR")
+        .env_remove("COLORTERM");
+    for (name, value) in env {
+        match value {
+            Some(v) => command.env(name, v),
+            None => command.env_remove(name),
+        };
+    }
+    let mut child = command.spawn().expect("spawn csvm");
     // A script that fails to parse exits before reading stdin, so the write
     // can find the pipe already closed.
     if let Err(e) = child.stdin.take().unwrap().write_all(stdin.as_bytes()) {
@@ -175,4 +191,19 @@ fn a_reader_that_stops_early_ends_the_run_quietly() {
         assert!(out.status.success(), "{args:?}: {err}");
         assert_eq!(err, "", "{args:?}");
     }
+}
+
+#[test]
+fn gradients_are_24_bit_only_where_colorterm_says_so() {
+    let run = |colorterm: Option<&str>| {
+        let env = [("CLICOLOR_FORCE", Some("1")), ("COLORTERM", colorterm)];
+        let (ok, out, err) = csvm_env(&["color -g n"], "n\n1\n5\n", &env);
+        assert!(ok, "{err}");
+        out
+    };
+    let palette = run(None);
+    assert!(palette.contains("\x1b[38;5;"), "{palette:?}");
+    assert!(!palette.contains("\x1b[38;2;"), "{palette:?}");
+    let exact = run(Some("truecolor"));
+    assert!(exact.contains("\x1b[38;2;"), "{exact:?}");
 }

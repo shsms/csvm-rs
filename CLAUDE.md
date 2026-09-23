@@ -214,8 +214,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   with the shared ramp/bounds). Predicate rules reuse the `select` expression parser; rules
   resolve against the *output* header and render in `exec::render`, which pads by
   *visible* width so ANSI escapes don't break alignment. Gradients reuse
-  `ColStats::num_range` for default bounds. Colours are truecolour SGR
-  (`src/color.rs`); `--color auto|always|never` gates emission (auto = TTY).
+  `ColStats::num_range` for default bounds. Colours are SGR escapes
+  (`src/color.rs`): a named colour in a predicate rule is the terminal's own
+  base colour (`31`, `44`, `90`, …, so it follows the theme), while a ramp's
+  points and a chart's series colours are exact RGB, written as 24-bit colour
+  when `$COLORTERM` is `truecolor`/`24bit` and as the nearest 256-colour
+  palette entry otherwise (`color::Depth`, picked by `console::Console`).
+  `--color auto|always|never` gates emission (auto = TTY).
 - **`rename old=new …`** is a header-only change (resolve renames the header;
   `apply` is a no-op).
 - **`add NAME = EXPR`** appends a computed column (`Stmt::Add`), or replaces `NAME`

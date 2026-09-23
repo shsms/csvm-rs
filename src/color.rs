@@ -3,8 +3,9 @@
 //! [`Style`] is a foreground/background/attribute set parsed from a spec like
 //! `bold+bg:red`; [`Ramp`] is a two-colour gradient (`green:red`) that maps a
 //! value within a range to an interpolated colour. Both render to ANSI SGR
-//! escapes. This module is presentation-only — *what* to colour is the caller's
-//! decision (see `plan::ColorRule`).
+//! escapes at a [`Depth`]: 24-bit where the terminal says it has it, the
+//! 256-colour palette otherwise. This module is presentation-only — *what* to
+//! colour is the caller's decision (see `plan::ColorRule`).
 
 use std::fmt;
 
@@ -54,6 +55,32 @@ fn rgb_name(c: Rgb) -> String {
     }
 }
 
+/// How many colours the terminal can show, which decides how an RGB colour is
+/// written: exactly, or as the nearest entry of the 256-colour palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Depth {
+    /// The xterm 256-colour palette (`38;5;N`), which nearly every terminal
+    /// has.
+    Ansi256,
+    /// 24-bit colour (`38;2;R;G;B`).
+    Truecolor,
+}
+
+impl Depth {
+    /// The depth `$COLORTERM` announces: `truecolor` or `24bit` is 24-bit
+    /// colour, anything else (or nothing) the 256-colour palette. Terminals
+    /// with 24-bit colour set the variable, and one without it shows 24-bit
+    /// escapes wrongly or not at all, so the palette is the safe default.
+    pub fn from_colorterm(colorterm: Option<&str>) -> Depth {
+        match colorterm {
+            Some(v) if v.eq_ignore_ascii_case("truecolor") || v.eq_ignore_ascii_case("24bit") => {
+                Depth::Truecolor
+            }
+            _ => Depth::Ansi256,
+        }
+    }
+}
+
 /// A colour as the terminal is asked for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Color {
@@ -67,15 +94,18 @@ pub enum Color {
 
 impl Color {
     /// The SGR parameters for this colour, as a foreground (`bg` false) or a
-    /// background.
-    fn sgr(self, bg: bool) -> String {
+    /// background, at `depth`.
+    fn sgr(self, bg: bool, depth: Depth) -> String {
         match self {
             // Grey is bright black, which has its own code range (90/100).
             Color::Base(8) => (if bg { "100" } else { "90" }).into(),
             Color::Base(i) => format!("{}", u32::from(i) + if bg { 40 } else { 30 }),
             Color::Rgb(c) => {
                 let lead = if bg { 48 } else { 38 };
-                format!("{lead};2;{};{};{}", c.0, c.1, c.2)
+                match depth {
+                    Depth::Truecolor => format!("{lead};2;{};{};{}", c.0, c.1, c.2),
+                    Depth::Ansi256 => format!("{lead};5;{}", ansi256(c)),
+                }
             }
         }
     }
@@ -87,6 +117,34 @@ impl fmt::Display for Color {
             Color::Base(i) => write!(f, "{}", BASE[usize::from(*i)].0),
             Color::Rgb(c) => write!(f, "{}", rgb_name(*c)),
         }
+    }
+}
+
+/// The 256-colour palette entry nearest to `c`: the closer of the 6×6×6 colour
+/// cube (entries 16–231) and the 24-step grey ramp (232–255). The 16 entries
+/// below the cube are left out; terminals theme them, so what they show is not
+/// known.
+fn ansi256(c: Rgb) -> u8 {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    let dist = |a: Rgb, b: Rgb| {
+        let d = |x: u8, y: u8| (i32::from(x) - i32::from(y)).pow(2);
+        d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
+    };
+    let level = |v: u8| {
+        (0..LEVELS.len())
+            .min_by_key(|&i| (i32::from(LEVELS[i]) - i32::from(v)).abs())
+            .unwrap()
+    };
+    let (r, g, b) = (level(c.0), level(c.1), level(c.2));
+    let cube = Rgb(LEVELS[r], LEVELS[g], LEVELS[b]);
+    // Grey step i is the level 8 + 10i.
+    let mean = (u32::from(c.0) + u32::from(c.1) + u32::from(c.2)) / 3;
+    let step = ((mean.saturating_sub(3)) / 10).min(23) as u8;
+    let grey = 8 + 10 * step;
+    if dist(c, Rgb(grey, grey, grey)) < dist(c, cube) {
+        232 + step
+    } else {
+        16 + 36 * r as u8 + 6 * g as u8 + b as u8
     }
 }
 
@@ -117,9 +175,9 @@ impl Style {
         }
     }
 
-    /// Wrap `text` in SGR escapes for this style (returns it unchanged when the
-    /// style is empty, so no stray resets are emitted).
-    pub fn paint(&self, text: &str) -> String {
+    /// Wrap `text` in SGR escapes for this style at `depth` (returns it
+    /// unchanged when the style is empty, so no stray resets are emitted).
+    pub fn paint(&self, text: &str, depth: Depth) -> String {
         if self.is_empty() {
             return text.to_string();
         }
@@ -134,10 +192,10 @@ impl Style {
             codes.push("4".into());
         }
         if let Some(fg) = self.fg {
-            codes.push(fg.sgr(false));
+            codes.push(fg.sgr(false, depth));
         }
         if let Some(bg) = self.bg {
-            codes.push(bg.sgr(true));
+            codes.push(bg.sgr(true, depth));
         }
         format!("\x1b[{}m{text}\x1b[0m", codes.join(";"))
     }
@@ -283,31 +341,64 @@ mod tests {
         let s = parse_style("bold+red").unwrap();
         assert!(s.bold);
         assert_eq!(s.fg, base("red"));
-        let painted = s.paint("hi");
+        let painted = s.paint("hi", Depth::Truecolor);
         assert!(painted.starts_with("\x1b["));
         assert!(painted.ends_with("\x1b[0m"));
         assert!(painted.contains("hi"));
         // An empty style adds no escapes.
-        assert_eq!(Style::default().paint("x"), "x");
+        assert_eq!(Style::default().paint("x", Depth::Truecolor), "x");
     }
 
     #[test]
-    fn base_colours_use_the_terminal_codes() {
-        let s = parse_style("red+bg:blue").unwrap();
-        assert_eq!(s.paint("x"), "\x1b[31;44mx\x1b[0m");
-        // Grey is bright black, from the 90/100 range.
-        let s = parse_style("grey+bg:gray").unwrap();
-        assert_eq!(s.paint("x"), "\x1b[90;100mx\x1b[0m");
+    fn base_colours_use_the_terminal_codes_at_any_depth() {
+        for depth in [Depth::Truecolor, Depth::Ansi256] {
+            let s = parse_style("red+bg:blue").unwrap();
+            assert_eq!(s.paint("x", depth), "\x1b[31;44mx\x1b[0m");
+            // Grey is bright black, from the 90/100 range.
+            let s = parse_style("grey+bg:gray").unwrap();
+            assert_eq!(s.paint("x", depth), "\x1b[90;100mx\x1b[0m");
+        }
     }
 
     #[test]
-    fn exact_colours_are_24_bit() {
+    fn exact_colours_follow_the_depth() {
         let s = Style {
             fg: Some(Color::Rgb(Rgb(255, 0, 0))),
             bg: Some(Color::Rgb(Rgb(0, 0, 0))),
             ..Style::default()
         };
-        assert_eq!(s.paint("x"), "\x1b[38;2;255;0;0;48;2;0;0;0mx\x1b[0m");
+        assert_eq!(
+            s.paint("x", Depth::Truecolor),
+            "\x1b[38;2;255;0;0;48;2;0;0;0mx\x1b[0m"
+        );
+        assert_eq!(
+            s.paint("x", Depth::Ansi256),
+            "\x1b[38;5;196;48;5;16mx\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn ansi256_picks_the_nearest_cube_or_grey_entry() {
+        assert_eq!(ansi256(Rgb(0, 0, 0)), 16);
+        assert_eq!(ansi256(Rgb(255, 255, 255)), 231);
+        assert_eq!(ansi256(Rgb(255, 0, 0)), 196);
+        assert_eq!(ansi256(Rgb(0, 205, 0)), 16 + 6 * 4); // green, level 215
+        // A mid grey sits on the grey ramp, not the cube's coarse 95/135 steps.
+        assert_eq!(ansi256(Rgb(128, 128, 128)), 232 + 12);
+        assert_eq!(ansi256(Rgb(8, 8, 8)), 232);
+        assert_eq!(ansi256(Rgb(238, 238, 238)), 255);
+        // A colour off the grey axis stays in the cube.
+        assert_eq!(ansi256(Rgb(0x4f, 0xc3, 0xf7)), 16 + 36 + 6 * 3 + 5);
+    }
+
+    #[test]
+    fn colorterm_names_the_depth() {
+        assert_eq!(Depth::from_colorterm(Some("truecolor")), Depth::Truecolor);
+        assert_eq!(Depth::from_colorterm(Some("24bit")), Depth::Truecolor);
+        assert_eq!(Depth::from_colorterm(Some("TrueColor")), Depth::Truecolor);
+        assert_eq!(Depth::from_colorterm(Some("")), Depth::Ansi256);
+        assert_eq!(Depth::from_colorterm(Some("yes")), Depth::Ansi256);
+        assert_eq!(Depth::from_colorterm(None), Depth::Ansi256);
     }
 
     #[test]

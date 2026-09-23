@@ -3,6 +3,7 @@
 //! method on it, so it can be tested without a terminal.
 
 use crate::cli::{Args, ColorWhen};
+use crate::color::Depth;
 use crate::term;
 use std::io::{self, IsTerminal};
 
@@ -29,6 +30,8 @@ pub struct Console {
     pub no_color: bool,
     /// `CLICOLOR_FORCE` is set and not `0`.
     pub force_color: bool,
+    /// The depth `$COLORTERM` announces (see [`Depth::from_colorterm`]).
+    pub depth: Depth,
     /// Where stdout goes.
     pub stdout: Sink,
     /// The terminal's column count, when it is known (see [`term::columns`]).
@@ -43,6 +46,7 @@ impl Console {
             color: args.color,
             no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             force_color: std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0"),
+            depth: Depth::from_colorterm(std::env::var("COLORTERM").ok().as_deref()),
             stdout: if args.out_path().is_some() {
                 Sink::File
             } else {
@@ -52,9 +56,10 @@ impl Console {
         }
     }
 
-    /// Whether stdout is coloured.
-    pub fn color(&self) -> bool {
+    /// The depth colour is drawn at on stdout, or `None` with colour off.
+    pub fn color(&self) -> Option<Depth> {
         self.colors(self.stdout == Sink::Terminal)
+            .then_some(self.depth)
     }
 
     /// Whether to colour a stream: an explicit `--color always`/`never` wins.
@@ -116,6 +121,7 @@ mod tests {
             color: ColorWhen::Auto,
             no_color: false,
             force_color: false,
+            depth: Depth::Ansi256,
             stdout: Sink::Terminal,
             columns: Some(80),
         }
@@ -131,22 +137,22 @@ mod tests {
 
     #[test]
     fn colour_follows_the_flag_then_the_variables_then_the_terminal() {
-        let on = |c: Console| c.color().then_some(());
-        assert_eq!(on(terminal()), Some(()));
+        let on = |c: Console| c.color();
+        assert_eq!(on(terminal()), Some(Depth::Ansi256));
         assert_eq!(on(to(Sink::File)), None);
         assert_eq!(
             on(Console {
                 color: ColorWhen::Always,
                 ..to(Sink::File)
             }),
-            Some(())
+            Some(Depth::Ansi256)
         );
         assert_eq!(
             on(Console {
                 force_color: true,
                 ..to(Sink::File)
             }),
-            Some(())
+            Some(Depth::Ansi256)
         );
         assert_eq!(
             on(Console {
@@ -170,5 +176,15 @@ mod tests {
         assert_eq!(terminal().width(), Some(80));
         assert_eq!(to(Sink::File).width(), None);
         assert_eq!(to(Sink::Pipe).width(), None);
+    }
+
+    #[test]
+    fn colour_is_drawn_at_the_announced_depth() {
+        let truecolor = Console {
+            depth: Depth::Truecolor,
+            ..terminal()
+        };
+        assert_eq!(truecolor.color(), Some(Depth::Truecolor));
+        assert_eq!(terminal().color(), Some(Depth::Ansi256));
     }
 }

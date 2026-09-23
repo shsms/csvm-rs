@@ -17,7 +17,7 @@ use crossbeam_channel::bounded;
 use memchr::memchr;
 
 use crate::chart;
-use crate::color::Style;
+use crate::color::{Depth, Style};
 use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
@@ -1657,7 +1657,7 @@ fn write_rows<W: Write>(output: &mut W, rows: &[OwnedRow]) -> Result<(), Error> 
 pub fn render<W: Write>(
     bytes: &[u8],
     plan: &Plan,
-    color: bool,
+    color: Option<Depth>,
     term_width: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
@@ -1667,7 +1667,8 @@ pub fn render<W: Write>(
         return render_graph(bytes, g, color, term_width, output);
     }
     let aligned = plan.output == OutputFormat::Aligned;
-    let want_color = color && !plan.colors.is_empty();
+    let depth = color.unwrap_or(Depth::Truecolor);
+    let want_color = color.is_some() && !plan.colors.is_empty();
     if !aligned && !want_color {
         // Nothing to do but copy the bytes through (the caller only buffers when
         // there is something to render, so this is just a safety net).
@@ -1687,9 +1688,9 @@ pub fn render<W: Write>(
         None
     };
     if aligned {
-        align_and_write(&rows, styles.as_deref(), output)
+        align_and_write(&rows, styles.as_deref(), depth, output)
     } else {
-        write_csv_colored(&rows, styles.as_deref(), output)
+        write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
 }
 
@@ -1703,7 +1704,7 @@ pub fn render<W: Write>(
 fn render_graph<W: Write>(
     bytes: &[u8],
     g: &GraphSpec,
-    color: bool,
+    color: Option<Depth>,
     term_width: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
@@ -1809,6 +1810,7 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
+    depth: Depth,
     output: &mut W,
 ) -> Result<(), Error> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
@@ -1844,7 +1846,7 @@ fn align_and_write<W: Write>(
                 line.push_str("  ");
             }
             let pad = widths[i].saturating_sub(vis_width(field));
-            let painted = style_at(styles, ri, i).paint(field);
+            let painted = style_at(styles, ri, i).paint(field, depth);
             if numeric[i] {
                 // Right-justify: pad on the left (so never a trailing space).
                 for _ in 0..pad {
@@ -1872,6 +1874,7 @@ fn align_and_write<W: Write>(
 fn write_csv_colored<W: Write>(
     rows: &[Vec<String>],
     styles: Option<&[Vec<Style>]>,
+    depth: Depth,
     output: &mut W,
 ) -> Result<(), Error> {
     let mut line = String::new();
@@ -1882,7 +1885,7 @@ fn write_csv_colored<W: Write>(
                 line.push(',');
             }
             let encoded = csv::encode_field(cell);
-            line.push_str(&style_at(styles, ri, i).paint(&encoded));
+            line.push_str(&style_at(styles, ri, i).paint(&encoded, depth));
         }
         line.push('\n');
         output.write_all(line.as_bytes())?;
@@ -2270,6 +2273,7 @@ mod tests {
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
         let mut out = Vec::new();
+        let color = color.then_some(Depth::Truecolor);
         render(&buf, &plan, color, term_width, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }

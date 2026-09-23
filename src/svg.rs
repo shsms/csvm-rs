@@ -458,12 +458,13 @@ mod tests {
     use super::*;
     use crate::chart::AxisRange;
     use crate::chart::fixtures::{bar_data, heat_data, one_series, xy_data};
+    use crate::color::Depth;
 
     /// A frame with the given title and nothing else set: an SVG is a fixed
     /// size, so only the title, the captions, the ramp, the log axis and the
     /// notes reach the emitters.
     fn frame_for(title: &str) -> Frame {
-        Frame::new(title.to_string(), 80, 15, true)
+        Frame::new(title.to_string(), 80, 15, Some(Depth::Truecolor))
     }
 
     /// A histogram of `counts` over `[lo, hi]`.
@@ -593,7 +594,7 @@ mod tests {
 
     #[test]
     fn ramp_fills_hist_bars_by_count() {
-        let mut frame = Frame::new("h".into(), 80, 15, true);
+        let mut frame = Frame::new("h".into(), 80, 15, Some(Depth::Truecolor));
         frame.ramp = Some(crate::color::parse_ramp("blue:red").unwrap());
         let s = render(&frame, &ChartData::Hist(Some(hist_data(0.0, 1.0, &[0, 4]))));
         assert!(
