@@ -440,13 +440,18 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         name: "fmt",
         aliases: &[],
         summary: "whitespace-align the table",
-        synopsis: &["fmt             align columns like `column -t` (takes no arguments)"],
+        synopsis: &[
+            "fmt             align columns like `column -t`",
+            "fmt -s          …and shade every other row (--stripes)",
+        ],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
 the final output, so it composes after everything else. With colour on (see --color) the \
 header row is bold and an empty cell shows a dim ∅. Shown on a terminal with no pager \
 (--no-pager), text columns are cut with … so each line fits the window; numbers are never cut. \
 With colour on, a cell holding an http:// or https:// address is a link the terminal can \
-open (only on the terminal, and through a pager only when it is less 581 or later).",
+open (only on the terminal, and through a pager only when it is less 581 or later). With -s, \
+on a terminal with colour, the first data row and every other one after it are shaded a \
+little off the terminal's background (asked of the terminal, else read from $COLORFGBG).",
         examples: &["csvm 'stats | fmt' data.csv"],
     },
 ];

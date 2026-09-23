@@ -1041,10 +1041,12 @@ impl<'a> Builder<'a> {
     }
 
     fn parse_fmt(&mut self, rest: &str) -> Result<(), Error> {
-        if !rest.trim().is_empty() {
-            return Err(err("fmt takes no arguments"));
-        }
-        self.output = OutputFormat::Aligned;
+        let stripes = match rest.trim() {
+            "" => false,
+            "-s" | "--stripes" => true,
+            other => return Err(err(format!("fmt takes only -s (--stripes), not {other:?}"))),
+        };
+        self.output = OutputFormat::Aligned { stripes };
         Ok(())
     }
 
@@ -3539,12 +3541,21 @@ mod tests {
         );
 
         let plan = parse("sort a | fmt").unwrap();
-        assert_eq!(plan.output, OutputFormat::Aligned);
+        assert_eq!(plan.output, OutputFormat::Aligned { stripes: false });
         // fmt is not a stage.
         assert!(plan.stages.iter().all(|s| !matches!(s, Stage::Head(_))));
 
         // fmt alone (no transforms) is valid — align the input.
-        assert_eq!(parse("fmt").unwrap().output, OutputFormat::Aligned);
+        assert_eq!(
+            parse("fmt").unwrap().output,
+            OutputFormat::Aligned { stripes: false }
+        );
+        for striped in ["fmt -s", "fmt --stripes"] {
+            assert_eq!(
+                parse(striped).unwrap().output,
+                OutputFormat::Aligned { stripes: true }
+            );
+        }
     }
 
     #[test]
@@ -3656,7 +3667,8 @@ mod tests {
         assert!(parse(r#"select "a > 0""#).is_err());
         assert!(parse("head abc").is_err()); // head needs a number
         assert!(parse("rename old").is_err()); // rename needs old=new
-        assert!(parse("fmt x").is_err()); // fmt takes no args
+        assert!(parse("fmt x").is_err()); // fmt takes only -s
+        assert!(parse("fmt -s -s").is_err());
         assert!(parse("join r.csv").is_err()); // missing `on KEYS`
         assert!(parse("join on sku").is_err()); // missing file
         assert!(parse("join r.csv on").is_err()); // empty key list
@@ -3978,7 +3990,7 @@ mod tests {
         };
         assert!(matches!(stmts[0], Stmt::Select(_)));
         assert!(matches!(&stmts[1], Stmt::Add(a) if a.name == "b"));
-        assert_eq!(plan.output, OutputFormat::Aligned);
+        assert_eq!(plan.output, OutputFormat::Aligned { stripes: false });
 
         // A newline inside a `join (…)` group doesn't split the outer pipeline.
         let plan = parse("rename value=a\njoin (\n rename value=b\n) r.csv on key\nfmt").unwrap();

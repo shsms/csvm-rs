@@ -30,6 +30,7 @@ pub fn script(shell: &str) -> Command {
         // Colour variables in the caller's environment would colour the output.
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR_FORCE")
-        .env_remove("COLORTERM");
+        .env_remove("COLORTERM")
+        .env_remove("COLORFGBG");
     command
 }

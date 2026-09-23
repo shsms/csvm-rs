@@ -1741,7 +1741,7 @@ pub fn render<W: Write>(
     if let Some(g) = &plan.graph {
         return render_graph(bytes, g, color, screen.width, output);
     }
-    let aligned = plan.output == OutputFormat::Aligned;
+    let aligned = matches!(plan.output, OutputFormat::Aligned { .. });
     let depth = color.unwrap_or(Depth::Truecolor);
     let want_color = color.is_some() && !plan.colors.is_empty();
     if !aligned && !want_color {
@@ -1763,7 +1763,14 @@ pub fn render<W: Write>(
         None
     };
     if aligned {
-        align_and_write(&rows, styles.as_deref(), screen, output)
+        // Only a table that asked for stripes (`fmt -s`) gets them.
+        let screen = Screen {
+            stripe: screen
+                .stripe
+                .filter(|_| plan.output == OutputFormat::Aligned { stripes: true }),
+            ..*screen
+        };
+        align_and_write(&rows, styles.as_deref(), &screen, output)
     } else {
         write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
@@ -2256,8 +2263,10 @@ pub fn describe(plan: &Plan) -> String {
             }
         }
     }
-    if plan.output == OutputFormat::Aligned {
-        out.push_str("output: aligned\n");
+    match plan.output {
+        OutputFormat::Csv => {}
+        OutputFormat::Aligned { stripes: false } => out.push_str("output: aligned\n"),
+        OutputFormat::Aligned { stripes: true } => out.push_str("output: aligned, striped\n"),
     }
     for rule in &plan.colors {
         out.push_str(&describe_color(rule));
@@ -3945,7 +3954,7 @@ mod tests {
         };
         let shaded = |s: &str| format!("\x1b[48;2;24;24;24m{s}\x1b[0m");
         let input = "name,n\nzz,1\nyy,20\n,3\n";
-        let out = render_on("color red name == 'zz' | fmt", input, &screen);
+        let out = render_on("color red name == 'zz' | fmt -s", input, &screen);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "\x1b[1mname\x1b[0m   \x1b[1mn\x1b[0m");
         // A rule's colour is drawn over the stripe, and the gaps are shaded
@@ -3972,13 +3981,24 @@ mod tests {
             color: None,
             ..screen
         };
-        assert!(!render_on("fmt", input, &plain).contains('\x1b'));
+        assert!(!render_on("fmt -s", input, &plain).contains('\x1b'));
+        // A plain fmt asked for no stripes.
+        assert!(!render_on("fmt", input, &screen).contains("48;"));
         // A cell that fills its column leaves no empty shaded gap behind.
-        let full = render_on("fmt", "a,b\nx,1\n", &screen);
+        let full = render_on("fmt -s", "a,b\nx,1\n", &screen);
         assert_eq!(
             full.lines().nth(1).unwrap(),
             [shaded("x"), shaded("  "), shaded("1")].concat()
         );
+        // A shaded row keeps the padding after its last text cell, and a
+        // short row is shaded blank through its missing cells.
+        let text = render_on("fmt -s", "a,note\nx,hi\ny,long\nz\n", &screen);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            [shaded("x"), shaded("  "), shaded("hi"), shaded("  ")].concat()
+        );
+        assert_eq!(lines[3], [shaded("z"), shaded("      ")].concat());
     }
 
     #[test]

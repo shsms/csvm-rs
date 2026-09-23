@@ -3,7 +3,7 @@
 //! method on it, so it can be tested without a terminal.
 
 use crate::cli::{Args, ColorWhen};
-use crate::color::Depth;
+use crate::color::{self, Depth, Rgb};
 use crate::exec::Screen;
 use crate::pager::{self, Pager};
 use crate::term;
@@ -166,13 +166,39 @@ impl Console {
     /// colour, and only a terminal opens it, so it needs colour on and stdout
     /// the terminal.
     pub fn links(&self) -> bool {
+        self.color_on_terminal()
+    }
+
+    /// The shade for a striped table's rows (`fmt -s`): a little off the
+    /// background of the terminal stdout is on, asked of that terminal (see
+    /// [`term::background`]). `None` when stripes cannot show here (colour
+    /// off, stdout not the terminal, `TERM=dumb`), or the background is not
+    /// known.
+    pub fn stripe(&self) -> Option<Rgb> {
+        if !self.stripes() {
+            return None;
+        }
+        term::background().map(color::stripe)
+    }
+
+    /// Whether a table's rows can be striped. The shade is a colour worked
+    /// out from the background of the terminal stdout is on, so it needs
+    /// colour on and stdout that terminal, one that is asked what its
+    /// background is (not `TERM=dumb`).
+    fn stripes(&self) -> bool {
+        self.color_on_terminal() && !self.dumb
+    }
+
+    /// Whether colour is on and stdout is the terminal.
+    fn color_on_terminal(&self) -> bool {
         self.color().is_some() && self.stdout == Sink::Terminal
     }
 
     /// What rendering needs to know about where its output is shown, through
     /// `pager` when there is one: a paged table is not fitted, since the pager
     /// scrolls it sideways, and links only reach a pager that shows them.
-    pub fn screen(&self, pager: Option<&Pager>) -> Screen {
+    /// `stripe` is the shade for a striped table (see [`Console::stripe`]).
+    pub fn screen(&self, pager: Option<&Pager>, stripe: Option<Rgb>) -> Screen {
         Screen {
             color: self.color(),
             width: self.width(),
@@ -180,7 +206,7 @@ impl Console {
             // Asking a pager costs a run of `less --version`, so only when
             // links are on.
             links: self.links() && pager.is_none_or(Pager::shows_links),
-            stripe: None,
+            stripe,
         }
     }
 
@@ -371,13 +397,13 @@ mod tests {
 
     #[test]
     fn a_table_is_fitted_unless_a_pager_scrolls_it() {
-        assert!(terminal().screen(None).fit);
+        assert!(terminal().screen(None, None).fit);
     }
 
     #[test]
     fn links_need_colour_and_the_terminal() {
         assert!(terminal().links());
-        assert!(terminal().screen(None).links);
+        assert!(terminal().screen(None, None).links);
         // Forced colour into a file or a pipe writes no links.
         for stdout in [Sink::File, Sink::Pipe] {
             let forced = Console {
@@ -391,6 +417,28 @@ mod tests {
             ..terminal()
         };
         assert!(!plain.links());
+    }
+
+    #[test]
+    fn stripes_need_colour_and_the_terminal() {
+        assert!(terminal().stripes());
+        for plain in [
+            Console {
+                color: ColorWhen::Never,
+                ..terminal()
+            },
+            Console {
+                color: ColorWhen::Always,
+                dumb: true,
+                ..terminal()
+            },
+            Console {
+                color: ColorWhen::Always,
+                ..to(Sink::File)
+            },
+        ] {
+            assert!(!plain.stripes(), "{plain:?}");
+        }
     }
 
     #[test]

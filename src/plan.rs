@@ -753,7 +753,10 @@ pub enum OutputFormat {
     #[default]
     Csv,
     /// Whitespace-aligned columns, like `column -t` (set by the `fmt` command).
-    Aligned,
+    Aligned {
+        /// `fmt -s`: shade every other data row on a terminal.
+        stripes: bool,
+    },
 }
 
 /// What a predicate colour rule paints.

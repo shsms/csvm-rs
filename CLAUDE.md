@@ -266,6 +266,17 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Pager::shows_links` — `less` 581+), a cell that
   `is_web_address` (`http(s)://`, no spaces or control characters) is wrapped
   in an OSC 8 hyperlink to its whole text, even when the shown text is cut.
+  `fmt -s` (`--stripes`, `OutputFormat::Aligned { stripes }`) shades the
+  first data row and every other one after it with `Screen.stripe`, from
+  the first cell to the table's edge (through a short row's missing cells
+  too), under the rules' colours. `main` gets the shade from
+  `Console::stripe` (colour on and stdout the terminal, not `TERM=dumb`)
+  before a pager starts: it asks `term::background` (OSC 11 to the
+  terminal stdout is on, then DA1, whose reply ends the wait early; at most
+  a second, and not with keys typed ahead, from a background job or of a
+  terminal that is not the process's own; else `$COLORFGBG`), and
+  `color::stripe` moves it 18 steps a channel lighter on a dark background,
+  darker on a light one.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
   parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`

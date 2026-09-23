@@ -67,6 +67,12 @@ link (an OSC 8 hyperlink) in terminals that support them: only on the
 terminal, never into a file or a pipe, and through a pager only when it is
 `less` 581 or later, which passes them on.
 
+`fmt -s` (`--stripes`) shades the first data row of a table and every other one
+after it, with colour on the terminal: a little lighter than the terminal's
+background on a dark one and a little darker on a light one. csvm asks the
+terminal for its background (OSC 11) and, when it does not answer, reads
+`$COLORFGBG`; knowing neither, it draws no stripes.
+
 A run that takes more than a second shows how much input it has read on
 stderr — a percentage of a file, a byte count for stdin — and clears the line
 when it ends. It shows only when stderr is a terminal nothing else draws on
@@ -110,7 +116,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
-| `fmt`              | whitespace-aligned table (`column -t`); numbers right-justified; in colour, a bold header and a dim `∅` for an empty cell |
+| `fmt [-s]`         | whitespace-aligned table (`column -t`); numbers right-justified; in colour, a bold header and a dim `∅` for an empty cell; `-s` stripes the rows |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL V[,V2…]` | one horizontal bar per row and value column (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
