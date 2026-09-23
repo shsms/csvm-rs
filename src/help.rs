@@ -46,6 +46,9 @@ options (--flag VALUE or --flag=VALUE):
       --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;
                        also caps sort workers at SZ / 2M)
       --color WHEN     auto (a TTY, not TERM=dumb) | always | never
+      --no-pager       never page; by default a terminal's fmt table, chart, help
+                       or --explain goes through $CSVM_PAGER, else $PAGER, else
+                       less (either variable set to cat or empty turns it off)
       --explain        print the compiled plan and exit
   -h, --help           show this help
   -V, --version        print version and exit";

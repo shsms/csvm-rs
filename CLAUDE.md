@@ -538,8 +538,8 @@ lifetime, so there is one `apply` implementation.
 ## CLI
 
 `csvm [-o/--output OUT] [-n/--threads N] [-f/--file FILE] [-t/--temp-dir DIR]
-[--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--explain]
-[-V/--version] [SCRIPT] [INPUT]`. The script is the first positional; the input
+[--chunk-size SIZE] [--sort-buffer SIZE] [--color WHEN] [--no-pager]
+[--explain] [-V/--version] [SCRIPT] [INPUT]`. The script is the first positional; the input
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
 is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the
 single positional is the input. At most one input is accepted (a second
@@ -552,7 +552,15 @@ stdin it reads the line and chains it back). It applies to the main input only:
 a `join` right file always carries its own header. `--color` honors
 `NO_COLOR`/`CLICOLOR_FORCE` under `auto`. How output is shown is decided in
 the library, not in `main`: `main` reads a `console::Console` (the flags, the
-variables, and what stdout goes to, a `console::Sink`) and asks it.
+variables, and what stdout goes to, a `console::Sink`) and asks it. On a
+terminal (not `TERM=dumb`), a `fmt` table, a `graph` chart, help and
+`--explain` are paged (`src/pager.rs`, when `Console::pages`):
+`$CSVM_PAGER`, else `$PAGER`, else `less`, run through `sh -c` like git, with
+`LESS=FRX` when unset; `less` also gets `-S` for a table and, from release
+608, `--header=1` for a table at least as tall as the window
+(`Console::fills`) — never a shorter one, as `--header` turns `-F` off.
+Dropping the `Pager` waits for it; `--no-pager` or a pager of `cat` / empty
+turns it off.
 Help lives in one registry
 (`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
 or alias) a command's forms + example, `csvm help TOPIC` the `operators`/

@@ -26,7 +26,7 @@ builds the release binary and copies it to your XDG user-binaries directory
 
 ```
 csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
-     [--sort-buffer SIZE] [--color WHEN] [--explain] [SCRIPT] [INPUT]
+     [--sort-buffer SIZE] [--color WHEN] [--no-pager] [--explain] [SCRIPT] [INPUT]
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
@@ -44,11 +44,21 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--sort-buffer SIZE`| in-memory budget before `sort` spills; `K`/`M`/`G` ok (default 256 MiB) |
 | `--header NAMES`   | input has no header row; `a,b,c` names the columns, `-` names them `c1, c2, …` |
 | `--color WHEN`     | `auto` (TTY only, not `TERM=dumb`), `always`, `never`; honors `NO_COLOR`/`CLICOLOR_FORCE`. Gradients are 24-bit when `COLORTERM` is `truecolor`/`24bit`, else 256-colour |
+| `--no-pager`       | never page (see below)                                      |
 | `--explain`   | print the compiled plan and exit                            |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
 
 Long options also accept the `--flag=value` form (e.g. `--color=always`).
+
+On a terminal, a `fmt` table, a `graph` chart, help and `--explain` go through
+a pager, like git's: `$CSVM_PAGER`, else `$PAGER`, else `less` (with
+`LESS=FRX` when `LESS` is unset, so output that fits on one screen is just
+printed). A table gets `less -S`, so long lines scroll sideways instead of
+wrapping, and one taller than the window also `--header=1` (less 608 and
+later), so its header row stays on screen. `--no-pager`, or
+`CSVM_PAGER`/`PAGER` set to `cat` or empty, turns it off; so does
+`TERM=dumb`.
 
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by

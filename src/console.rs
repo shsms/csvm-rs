@@ -4,8 +4,9 @@
 
 use crate::cli::{Args, ColorWhen};
 use crate::color::Depth;
+use crate::pager::{self, Pager};
 use crate::term;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 
 /// Where stdout goes, as far as the way output is shown cares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,24 +39,49 @@ pub struct Console {
     pub stdout: Sink,
     /// The terminal's column count, when it is known (see [`term::columns`]).
     pub columns: Option<usize>,
+    /// The terminal's row count, when it is known (see [`term::rows`]).
+    pub rows: Option<usize>,
+    /// The pager to run, from `$CSVM_PAGER` and `$PAGER` (see
+    /// [`pager::command`]); `None` when they turn paging off.
+    pub pager_command: Option<String>,
+    /// `--no-pager`.
+    pub no_pager: bool,
 }
 
 impl Console {
-    /// The facts for a run of `args`: its flags, the environment, and what
-    /// stdout is connected to.
-    pub fn read(args: &Args) -> Console {
+    /// The facts for a run with no flags: the environment, and what stdin,
+    /// stdout and stderr are connected to.
+    pub fn read_env() -> Console {
         Console {
-            color: args.color,
+            color: ColorWhen::Auto,
             no_color: std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()),
             force_color: std::env::var_os("CLICOLOR_FORCE").is_some_and(|v| v != "0"),
             depth: Depth::from_colorterm(std::env::var("COLORTERM").ok().as_deref()),
             dumb: std::env::var_os("TERM").is_some_and(|t| t == "dumb"),
+            stdout: stdout_sink(),
+            columns: term::columns(),
+            rows: term::rows(),
+            pager_command: pager::command(
+                std::env::var("CSVM_PAGER").ok().as_deref(),
+                std::env::var("PAGER").ok().as_deref(),
+            ),
+            no_pager: false,
+        }
+    }
+
+    /// The facts for a run of `args`: [`Console::read_env`], with its flags,
+    /// its output file and its input file.
+    pub fn read(args: &Args) -> Console {
+        let env = Console::read_env();
+        Console {
+            color: args.color,
             stdout: if args.out_path().is_some() {
                 Sink::File
             } else {
-                stdout_sink()
+                env.stdout
             },
-            columns: term::columns(),
+            no_pager: args.no_pager,
+            ..env
         }
     }
 
@@ -81,6 +107,40 @@ impl Console {
     /// The terminal's width, when stdout is the terminal: a chart's default width.
     pub fn width(&self) -> Option<usize> {
         self.columns.filter(|_| self.stdout == Sink::Terminal)
+    }
+
+    /// Whether output shown on the terminal goes through a pager.
+    pub fn pages(&self) -> bool {
+        self.stdout == Sink::Terminal
+            && !self.dumb
+            && !self.no_pager
+            && self.pager_command.is_some()
+    }
+
+    /// Whether `output`, one line on screen per line of it, has as many lines
+    /// as the window, so a pager would scroll it.
+    pub fn fills(&self, output: &[u8]) -> bool {
+        self.rows
+            .is_some_and(|rows| memchr::memchr_iter(b'\n', output).nth(rows - 1).is_some())
+    }
+
+    /// The pager for output shown on the terminal, when [`Console::pages`];
+    /// `table` asks for the options a wide table wants, and `tall` says it
+    /// fills the window. `None` means write to stdout directly.
+    pub fn pager(&self, table: bool, tall: bool) -> Option<Pager> {
+        if !self.pages() {
+            return None;
+        }
+        Pager::start(self.pager_command.as_deref()?, table, tall)
+    }
+
+    /// Stdout for help and `--explain` text: through the pager when there is
+    /// one.
+    pub fn paged_stdout(&self) -> Box<dyn Write> {
+        match self.pager(false, false) {
+            Some(p) => Box::new(p),
+            None => Box::new(io::stdout()),
+        }
     }
 }
 
@@ -128,6 +188,9 @@ mod tests {
             dumb: false,
             stdout: Sink::Terminal,
             columns: Some(80),
+            rows: Some(24),
+            pager_command: Some("less".into()),
+            no_pager: false,
         }
     }
 
@@ -207,5 +270,44 @@ mod tests {
             .color(),
             Some(Depth::Ansi256)
         );
+    }
+
+    #[test]
+    fn only_a_terminal_that_is_not_dumb_is_paged() {
+        assert!(terminal().pages());
+        for quiet in [
+            Console {
+                no_pager: true,
+                ..terminal()
+            },
+            Console {
+                pager_command: None,
+                ..terminal()
+            },
+            Console {
+                dumb: true,
+                ..terminal()
+            },
+            to(Sink::File),
+            to(Sink::Pipe),
+        ] {
+            assert!(!quiet.pages(), "{quiet:?}");
+        }
+    }
+
+    #[test]
+    fn output_fills_the_window_from_as_many_lines_as_it_has_rows() {
+        let three = Console {
+            rows: Some(3),
+            ..terminal()
+        };
+        // Two lines leave a row for the pager's prompt; three do not.
+        assert!(!three.fills(b"a\nb\n"));
+        assert!(three.fills(b"a\nb\nc\n"));
+        let unknown = Console {
+            rows: None,
+            ..terminal()
+        };
+        assert!(!unknown.fills(b"a\nb\nc\n"));
     }
 }

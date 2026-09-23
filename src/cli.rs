@@ -5,7 +5,8 @@
 //! stdin, and a bare `-` is also stdin. At most one input is accepted. Options:
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
-//! `--header`, `--color`, `--format` (csv | parquet), and `--explain`.
+//! `--header`, `--color`, `--format` (csv | parquet), `--no-pager` and
+//! `--explain`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -26,6 +27,8 @@ pub struct Args {
     pub sort_buffer: usize,
     pub explain: bool,
     pub color: ColorWhen,
+    /// `--no-pager`: write to the terminal directly, never through a pager.
+    pub no_pager: bool,
     /// `--header`: the input has no header line; this names its columns.
     pub header: Option<Header>,
     /// `--format`: input format override. `None` auto-detects from the file
@@ -147,10 +150,14 @@ fn parse_size(s: &str, what: &str) -> Result<i64, String> {
 }
 
 /// Outcome of parsing: run with `Args`, or print help / version and exit. `Help`
-/// carries an optional topic (`csvm help CMD`); `None` is the overview.
+/// carries an optional topic (`csvm help CMD`; `None` is the overview) and
+/// whether `--no-pager` was given anywhere on the line.
 pub enum Parsed {
     Run(Box<Args>),
-    Help(Option<String>),
+    Help {
+        topic: Option<String>,
+        no_pager: bool,
+    },
     Version,
 }
 
@@ -164,6 +171,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut chunk_size = DEFAULT_CHUNK_SIZE;
     let mut sort_buffer = DEFAULT_SORT_BUFFER;
     let mut explain = false;
+    let mut no_pager = false;
     let mut color = ColorWhen::default();
     let mut script_file = None;
     let mut header = None;
@@ -190,7 +198,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             };
         }
         match arg.as_str() {
-            "-h" | "--help" => return Ok(Parsed::Help(None)),
+            "-h" | "--help" => {
+                // The rest of the line is not parsed, but a `--no-pager`
+                // after the `--help` still counts.
+                no_pager |= it.any(|a| a == "--no-pager");
+                return Ok(Parsed::Help {
+                    topic: None,
+                    no_pager,
+                });
+            }
             "-V" | "--version" => return Ok(Parsed::Version),
             "-o" | "--output" => out_file = Some(value!()),
             "-n" | "--threads" => {
@@ -219,6 +235,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--explain" => explain = true,
+            "--no-pager" => no_pager = true,
             "--header" => header = Some(Header::parse(&value!())?),
             "--format" => {
                 let v = value!();
@@ -250,7 +267,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         if positionals.len() > 2 {
             return Err("usage: csvm help [COMMAND|TOPIC]".to_string());
         }
-        return Ok(Parsed::Help(positionals.into_iter().nth(1)));
+        return Ok(Parsed::Help {
+            topic: positionals.into_iter().nth(1),
+            no_pager,
+        });
     }
 
     // Positionals are `SCRIPT [INPUT]` (awk-style): the script is the first
@@ -287,6 +307,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         sort_buffer,
         explain,
         color,
+        no_pager,
         header,
         format,
     })))
@@ -299,9 +320,26 @@ mod tests {
     fn args(parts: &[&str]) -> Result<Args, String> {
         match parse(parts.iter().map(|s| s.to_string()))? {
             Parsed::Run(a) => Ok(*a),
-            Parsed::Help(_) => Err("help".into()),
+            Parsed::Help { .. } => Err("help".into()),
             Parsed::Version => Err("version".into()),
         }
+    }
+
+    #[test]
+    fn no_pager_flag_reaches_runs_and_help() {
+        assert!(!args(&["fmt"]).unwrap().no_pager);
+        assert!(args(&["--no-pager", "fmt"]).unwrap().no_pager);
+        let help = |parts: &[&str]| match parse(parts.iter().map(|s| s.to_string())) {
+            Ok(Parsed::Help { topic, no_pager }) => (topic, no_pager),
+            _ => panic!("{parts:?} is not help"),
+        };
+        assert_eq!(help(&["--help"]), (None, false));
+        assert_eq!(help(&["--no-pager", "-h"]), (None, true));
+        assert_eq!(help(&["--help", "--no-pager"]), (None, true));
+        assert_eq!(
+            help(&["help", "fmt", "--no-pager"]),
+            (Some("fmt".into()), true)
+        );
     }
 
     #[test]

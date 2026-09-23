@@ -71,9 +71,15 @@ enum Source {
 fn run() -> Result<(), Failure> {
     let args = match cli::parse(std::env::args().skip(1)) {
         Ok(Parsed::Run(args)) => *args,
-        Ok(Parsed::Help(topic)) => {
+        Ok(Parsed::Help { topic, no_pager }) => {
             let text = csvm::help::render(topic.as_deref())?;
-            writeln!(io::stdout(), "{text}")?;
+            let console = Console {
+                no_pager,
+                ..Console::read_env()
+            };
+            let mut out = console.paged_stdout();
+            writeln!(out, "{text}")?;
+            out.flush()?;
             return Ok(());
         }
         Ok(Parsed::Version) => {
@@ -109,12 +115,19 @@ fn run() -> Result<(), Failure> {
     exec::prepare_joins(&mut plan)?;
     let out_header = plan.resolve(&header)?;
 
+    let console = Console::read(&args);
     if args.explain {
-        write!(io::stdout(), "{}", exec::describe(&plan))?;
+        // The plan goes to stdout even with -o, so it pages by stdout.
+        let explain = Console {
+            no_pager: args.no_pager,
+            ..Console::read_env()
+        };
+        let mut out = explain.paged_stdout();
+        write!(out, "{}", exec::describe(&plan))?;
+        out.flush()?;
         return Ok(());
     }
 
-    let console = Console::read(&args);
     // Colour, when on, is drawn at the depth the terminal announces.
     let color = console.color();
     // The graph sink's default width.
@@ -129,6 +142,16 @@ fn run() -> Result<(), Failure> {
     {
         let mut buf: Vec<u8> = Vec::new();
         run_into(&mut source, &plan, &out_header, &opts, &mut buf)?;
+        // A table or a chart is read on screen, so a long one is paged. The
+        // pager starts only now, with the run done, so it never sits waiting
+        // on a slow pipeline. A table prints a line for each line of the
+        // run's output, so that says whether it fills the window.
+        let table = plan.output == OutputFormat::Aligned;
+        if (table || plan.graph.is_some())
+            && let Some(p) = console.pager(table, table && console.fills(&buf))
+        {
+            output = Box::new(p);
+        }
         exec::render(&buf, &plan, color, term_width, &mut output)?;
     } else {
         run_into(&mut source, &plan, &out_header, &opts, &mut output)?;
