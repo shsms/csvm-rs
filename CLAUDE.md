@@ -74,8 +74,8 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   (`Cmp` holds two `ValExpr`s; leaf operands take allocation-free fast paths,
   compound ones outlined `#[inline(never)]` fallbacks). `=~`/`!~` and
   the affixes still take a plain column on the left. A `select` reading
-  `prev()`/`rownum()` is stateful and routes to the ordered in-memory path,
-  like a stateful `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
+  `prev()`/`rownum()` is stateful and runs its rows in order, like a stateful
+  `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
   `color` predicates reject stateful expressions at parse time (they render
   post-run, where a rule whose column is missing from the output, by name or
   by position, is silently dropped; any other resolve error in a rule still
@@ -110,17 +110,18 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `head`, via the shared `parse_count`). Blocking — it can't stream/stop
   early, so any plan with `tail N` takes the in-memory path (`Stage::Tail`,
   applied as a drain in `apply_stages_over_rows`). **`tail +N`** (`-n +N`) is
-  coreutils' "from row N on": a `Stage::Skip(N-1)` that streams through the
-  same window path as `head` (`[pre | skip | head | post]`), so `tail +N |
-  head M` stops early, and counts over the merge output after a `sort` like
-  `head`; elsewhere it drains in the materialized path. Adjacent `head` /
+  coreutils' "from row N on": a `Stage::Skip(N-1)` that streams like `head`
+  (a `RowChain` step), so `tail +N | head M` stops early, and counts over
+  the merge output after a `sort` like `head`; elsewhere it drains in the
+  materialized path. Adjacent `head` /
   `tail +N` stages fold into one window when the plan is built
   (`push_window` in `parse.rs`: `skip a | head l | skip b` is `skip a+b |
   head l-b`), so `head 5 | tail +2` streams too.
 - **`uniq [cols]`** drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
-  pre-sort is needed; blocking, so it uses the in-memory path. The dedup key is
-  the CSV-encoded cells (`dedup_rows` in `exec.rs`, a `HashSet`).
+  pre-sort is needed. Among the stages at the front with a `head` or `tail
+  +N` it runs row by row in `RowChain`, else it uses the in-memory path. The
+  dedup key is the CSV-encoded cells (`uniq_key` in `exec.rs`, a `HashSet`).
 - **`stats [cols]`** reduces the input to one summary row per column
   (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
   column. A blocking, *reducing* stage: it streams the input through per-column
@@ -243,10 +244,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   sibling recursive-descent parser (`ExprParser::parse_value`). `eval` takes an
   `EvalCtx { prev_row, rownum }` and returns an owned `Field`. A pure `add` is
   per-row and **shardable** (rides every path); an `add` reading `prev`/`rownum`
-  is `is_stateful()` and routes to the **in-memory ordered path** (the guard
-  `plan_has_stateful_expr` in `exec::run_body`/`run_file`, mirroring the
-  `tail`/`uniq`/`join` fallback), so its output is `-n`-independent. The new
-  column carries the expression's **static type** (numeric / text / untyped,
+  is `is_stateful()` and runs its rows in order, so its output is
+  `-n`-independent: row by row in `RowChain` (`Stateful`) when a `head` or
+  `tail +N` among the stages at the front streams the plan, where rows before
+  a failing one are written first as in any stream, else on the **in-memory
+  ordered path** (the guard `plan_has_stateful_expr` in
+  `exec::run_body`/`run_file`, mirroring the `tail`/`uniq`/`join` fallback).
+  The new column carries the expression's **static type** (numeric / text /
+  untyped,
   `ValExpr::static_type` — including a type inherited from a typed column or
   a `?:` whose branches agree; `num(x)` is numeric and `str(x)` text, so
   `add c = num(c)` is how a column is pinned), so later comparisons against it
@@ -541,12 +546,12 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
-  (`head`, `tail +N`, and a lone transform: the window paths through
-  `stream_window`, a lone transform with `-n>1` through
-  `stream_transform_parallel`) read via `next_chunk_available` (a single `read`
-  completed to a line boundary) and flush output per chunk, so a slow or
-  unbounded stream emits promptly instead of stalling until a 1 MB buffer fills
-  (which made `head` hang and `select` withhold output). `sort` and the
+  (`head`, `tail +N` and a lone transform through `RowChain`'s `scan`, a
+  lone transform with `-n>1` through `stream_transform_parallel`) read via
+  `next_chunk_available` (a single `read` completed to a line boundary) and
+  flush output per chunk, so a slow or unbounded stream emits promptly
+  instead of stalling until a 1 MB buffer fills (which made `head` hang and
+  `select` withhold output). `sort` and the
   in-memory fallback still fill large chunks via `next_chunk` (they must read
   all input before emitting, so batching wins there).
 - `sort` is a blocking stage handled by a **parallel external merge sort**

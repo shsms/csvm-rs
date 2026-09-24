@@ -152,16 +152,18 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
+    // A plan of stages that pass rows on one at a time, with a `head` or
+    // `tail +N` among them, streams single-threaded and stops reading once a
+    // full `head` lets no more rows through.
+    let (mut chain, rest) = RowChain::front(&plan.stages);
+    if chain.has_window() && rest.is_empty() {
+        return stream_rows(&mut chain, opts.chunk_size, input, output);
+    }
     // A stateful `add`/`select` (`prev()`/`rownum()`) is order-dependent: it
     // can't shard or stream chunk-parallel. Materialize and run the ordered
     // in-memory path (the same fallback `tail`/`uniq`/`join` use).
     if plan_has_stateful_expr(plan) {
         return run_staged_in_memory(plan, opts, input, output);
-    }
-    // A `tail +N` / `head` window with no sort streams single-threaded and
-    // stops early.
-    if let Some((pre, window, post)) = window_shape(&plan.stages) {
-        return stream_window(pre, window, post, opts.chunk_size, input, output);
     }
     // `stats` reduces the stream to a tiny profile; stream the input through it
     // (O(columns) memory) and run any following stages over that profile.
@@ -178,9 +180,7 @@ fn run_body<R: BufRead, W: Write + Send>(
         [Stage::Transform(stmts)] if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
         }
-        [Stage::Transform(stmts)] => {
-            stream_window(stmts, Window::ALL, &[], opts.chunk_size, input, output)
-        }
+        [Stage::Transform(_)] => stream_rows(&mut chain, opts.chunk_size, input, output),
         _ => run_staged(plan, opts, input, output),
     }
 }
@@ -248,6 +248,39 @@ fn window_shape(stages: &[Stage]) -> Option<(&[Stmt], Window, &[Stmt])> {
     Some((pre, window, post))
 }
 
+/// A stage that passes rows on one at a time, with what it keeps between
+/// rows.
+enum RowStep<'p> {
+    /// Statements, and their state when one of them is stateful.
+    Transform(&'p [Stmt], Option<Stateful>),
+    /// `head` or `tail +N`.
+    Window(Window),
+    /// `uniq`: its key columns, the keys seen so far, and the current row's
+    /// key.
+    Uniq(&'p [usize], HashSet<String>, String),
+}
+
+impl RowStep<'_> {
+    /// Run `row` through the step: `false` when it stops there.
+    fn pass<'a>(
+        &mut self,
+        row: &mut Vec<Field<'a>>,
+        scratch: &mut Vec<Field<'a>>,
+    ) -> Result<bool, Error> {
+        match self {
+            RowStep::Transform(stmts, None) => {
+                apply_stmts(stmts, row, scratch, &EvalCtx::default())
+            }
+            RowStep::Transform(stmts, Some(state)) => state.apply(stmts, row, scratch),
+            RowStep::Window(window) => Ok(window.admit()),
+            RowStep::Uniq(positions, seen, key) => {
+                uniq_key(key, row, positions);
+                Ok(first_seen(seen, key))
+            }
+        }
+    }
+}
+
 /// What a stage holding a stateful statement (`prev()`/`rownum()`) keeps
 /// between rows, which it must see in input order.
 struct Stateful {
@@ -304,41 +337,139 @@ impl Stateful {
     }
 }
 
-/// Stream `[pre | window | post]` single-threaded, offering the rows that
-/// survive `pre` to the window and stopping once it is full. Reads only as
-/// much input as it needs (via [`next_chunk_available`]) so it emits and
-/// stops promptly on a stream rather than blocking for a full chunk.
-fn stream_window<R: BufRead, W: Write>(
-    pre: &[Stmt],
-    mut window: Window,
-    post: &[Stmt],
+/// The stages at the front of a plan that pass rows on one at a time, run
+/// together over the input.
+struct RowChain<'p> {
+    steps: Vec<RowStep<'p>>,
+}
+
+impl<'p> RowChain<'p> {
+    /// The chain of the stages at the front of `stages` that pass rows on
+    /// one at a time, and the stages after them.
+    fn front(stages: &'p [Stage]) -> (RowChain<'p>, &'p [Stage]) {
+        let mut steps = Vec::new();
+        for (i, stage) in stages.iter().enumerate() {
+            steps.push(match stage {
+                Stage::Transform(stmts) => RowStep::Transform(
+                    stmts,
+                    stmts
+                        .iter()
+                        .any(Stmt::is_stateful)
+                        .then(|| Stateful::new(stmts)),
+                ),
+                Stage::Skip(n) => RowStep::Window(Window::new(*n, usize::MAX)),
+                Stage::Head(n) => RowStep::Window(Window::new(0, *n)),
+                Stage::Uniq(u) => RowStep::Uniq(&u.positions, HashSet::new(), String::new()),
+                Stage::Sort(_)
+                | Stage::Tail(_)
+                | Stage::DropLast(_)
+                | Stage::Stats(_)
+                | Stage::Group(_)
+                | Stage::Join(_) => return (RowChain { steps }, &stages[i..]),
+            });
+        }
+        (RowChain { steps }, &[])
+    }
+
+    /// Whether the chain holds a `head` or `tail +N`.
+    fn has_window(&self) -> bool {
+        self.steps.iter().any(|s| matches!(s, RowStep::Window(_)))
+    }
+
+    /// Whether a full `head` lets no more rows through.
+    fn done(&self) -> bool {
+        self.steps
+            .iter()
+            .any(|s| matches!(s, RowStep::Window(w) if w.done()))
+    }
+
+    /// Run `row` through every step: `false` when it stops at one.
+    fn pass<'a>(
+        &mut self,
+        row: &mut Vec<Field<'a>>,
+        scratch: &mut Vec<Field<'a>>,
+    ) -> Result<bool, Error> {
+        for step in &mut self.steps {
+            if !step.pass(row, scratch)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Where [`scan`] puts the rows that make it through.
+trait RowSink {
+    fn row(&mut self, row: &[Field<'_>]);
+    /// The end of a chunk of input.
+    fn chunk_end(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
+/// Rows written to `output` as CSV lines, flushed after each chunk so a slow
+/// stream's rows do not wait for the next one.
+struct LinesTo<'w, W> {
+    buf: String,
+    output: &'w mut W,
+}
+
+impl<W: Write> RowSink for LinesTo<'_, W> {
+    fn row(&mut self, row: &[Field<'_>]) {
+        csv::write_row(&mut self.buf, row);
+    }
+
+    fn chunk_end(&mut self) -> Result<(), Error> {
+        self.output.write_all(self.buf.as_bytes())?;
+        self.output.flush()?;
+        self.buf.clear();
+        Ok(())
+    }
+}
+
+impl RowSink for Vec<OwnedRow> {
+    fn row(&mut self, row: &[Field<'_>]) {
+        self.push(owned_row(row));
+    }
+}
+
+/// [`scan`] `chain` over `input`, writing the rows that make it through to
+/// `output`.
+fn stream_rows<R: BufRead, W: Write>(
+    chain: &mut RowChain,
     chunk_size: usize,
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    let mut out_buf = String::new();
-    while !window.done() {
+    let mut lines = LinesTo {
+        buf: String::new(),
+        output,
+    };
+    scan(chain, chunk_size, input, &mut lines)
+}
+
+/// Run `input`'s rows through `chain` single-threaded, handing the ones that
+/// make it through to `sink`, and stop once the chain is done. Reads only as
+/// much input as it needs (via [`next_chunk_available`]) so it stops
+/// promptly on a stream rather than blocking for a full chunk.
+fn scan<R: BufRead>(
+    chain: &mut RowChain,
+    chunk_size: usize,
+    input: &mut R,
+    sink: &mut impl RowSink,
+) -> Result<(), Error> {
+    while !chain.done() {
         let Some(chunk) = next_chunk_available(input, chunk_size)? else {
             break;
         };
-        out_buf.clear();
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
         csv::parse_chunk(&chunk, |row| {
-            if err.is_some() || window.done() {
+            if err.is_some() || chain.done() {
                 return;
             }
-            match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
-                Ok(true) => {
-                    if !window.admit() {
-                        return;
-                    }
-                    match apply_stmts(post, row, &mut scratch, &EvalCtx::default()) {
-                        Ok(true) => csv::write_row(&mut out_buf, row),
-                        Ok(false) => {}
-                        Err(e) => err = Some(e),
-                    }
-                }
+            match chain.pass(row, &mut scratch) {
+                Ok(true) => sink.row(row),
                 Ok(false) => {}
                 Err(e) => err = Some(e),
             }
@@ -346,8 +477,7 @@ fn stream_window<R: BufRead, W: Write>(
         if let Some(e) = err {
             return Err(e);
         }
-        output.write_all(out_buf.as_bytes())?;
-        output.flush()?; // don't let a live/slow stream's output sit in the BufWriter
+        sink.chunk_end()?;
     }
     Ok(())
 }
@@ -2735,9 +2865,12 @@ mod tests {
             }
             fn consume(&mut self, _: usize) {}
         }
-        let mut out = Vec::new();
-        stream_window(&[], Window::new(4, 0), &[], 64, &mut Unreadable, &mut out).unwrap();
-        assert!(out.is_empty());
+        let mut chain = RowChain {
+            steps: vec![RowStep::Window(Window::new(4, 0))],
+        };
+        let mut rows: Vec<OwnedRow> = Vec::new();
+        scan(&mut chain, 64, &mut Unreadable, &mut rows).unwrap();
+        assert!(rows.is_empty());
     }
 
     #[test]
@@ -4235,14 +4368,12 @@ mod tests {
         out
     }
 
-    #[test]
-    fn head_stops_early_without_reading_to_eof() {
-        // A reader that yields the header and a few rows, then *errors* instead
-        // of signaling EOF — standing in for a stream that has produced some
-        // rows but has not ended (an interactive pipe, `tail -f`, etc.). `head`
-        // must emit its N rows and stop *before* demanding more input. With the
-        // bug it tried to fill a whole 1 MB chunk first, so it would block on a
-        // real stream; here that shows up as the read error propagating.
+    /// A reader that yields the header and five rows, one per read, then
+    /// *errors* instead of signaling EOF — standing in for a stream that has
+    /// produced some rows but has not ended (an interactive pipe, `tail -f`,
+    /// etc.), or for a file too big to read to its end. Returns what `script`
+    /// writes over it, or the read error if the run asks for more.
+    fn run_paused(script: &str) -> Result<String, Error> {
         use std::collections::VecDeque;
 
         struct PausingReader(VecDeque<Vec<u8>>);
@@ -4266,7 +4397,7 @@ mod tests {
         }
         let mut reader = io::BufReader::new(PausingReader(chunks));
 
-        let mut plan = parse("head 2").unwrap();
+        let mut plan = parse(script).unwrap();
         let header = read_header(&mut reader).unwrap();
         let out_header = plan.resolve(&header).unwrap();
         let opts = RunOpts {
@@ -4276,7 +4407,15 @@ mod tests {
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
         };
         let mut out = Vec::new();
-        run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "id,val\n0,x\n1,x\n");
+        run(&plan, &out_header, &opts, &mut reader, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn head_stops_early_without_reading_to_eof() {
+        // `head` must emit its N rows and stop *before* demanding more input.
+        // With the bug it tried to fill a whole 1 MB chunk first, so it would
+        // block on a real stream; here that shows up as the read error.
+        assert_eq!(run_paused("head 2").unwrap(), "id,val\n0,x\n1,x\n");
     }
 }
