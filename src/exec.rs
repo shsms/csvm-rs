@@ -2201,7 +2201,7 @@ fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts)
     }
     for row in rows.iter_mut().skip(1) {
         for (cell, _) in row.iter_mut().zip(numeric).filter(|(_, n)| **n) {
-            if let Some(short) = field::table_num(cell, table.decimals) {
+            if let Some(short) = field::table_num(cell, table.decimals, false) {
                 *cell = short;
             }
         }

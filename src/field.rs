@@ -179,11 +179,16 @@ pub fn format_num_into(n: f64, buf: &mut String) {
 /// (`2.675` to two decimals shows `2.68`); any other number rounds as its
 /// float does (`2.675e0` shows `2.67`).
 /// A cell with an exponent stays as written unless rounding changes
-/// its value: `1e5` stays, `1e-7` shows `0`. A cell that is not a finite
-/// number shows as written.
-pub fn table_num(cell: &str, decimals: Option<u8>) -> Option<String> {
+/// its value: `1e5` stays, `1e-7` shows `0`. With `human`, a number whose
+/// absolute value is 1000 or more once rounded takes a suffix instead:
+/// `1234567` shows `1.23M`, and one too big for E shows an exponent,
+/// `1.23e300`. A cell that is not a finite number shows as written.
+pub fn table_num(cell: &str, decimals: Option<u8>, human: bool) -> Option<String> {
     let n = Field::Str(cell).num_opt().filter(|n| n.is_finite())?;
     let text = cell.trim();
+    if human && rounds_to_1000_or_more(text, n, decimals) {
+        return Some(human_num(text, n));
+    }
     let decimals = usize::from(decimals?);
     let exponent = text.contains(['e', 'E']);
     let written_decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
@@ -287,6 +292,21 @@ impl Decimal {
     }
 }
 
+/// Whether the absolute value of `text`, whose value is `n`, is 1000 or more
+/// once rounded to `decimals` (`None` keeps every digit).
+fn rounds_to_1000_or_more(text: &str, n: f64, decimals: Option<u8>) -> bool {
+    if n.abs() >= 1000.0 {
+        return true;
+    }
+    // Rounding moves a number by half a unit at most, so only one from 999.5
+    // up can round up to 1000.
+    n.abs() >= 999.5
+        && decimals.is_some_and(|d| {
+            let rounded = round_cell(text, n, d.into());
+            rounded.parse::<f64>().is_ok_and(|r| r.abs() >= 1000.0)
+        })
+}
+
 /// `n` to at most `decimals` decimals, its trailing zeros dropped, and `0`
 /// for a number that rounds to zero from either side. When the shortest text
 /// that reads back as `n` fits, it is the answer, so no digit past the
@@ -303,6 +323,58 @@ fn round_num(n: f64, decimals: usize) -> String {
         s.remove(0);
     }
     s
+}
+
+/// `text`, whose value is `n` and whose absolute value is 1000 or more once
+/// rounded, to three significant digits with a k, M, G, T, P or E suffix for
+/// each power of 1000. A number too big for E shows three significant digits
+/// and an exponent: `1.23e300`.
+fn human_num(text: &str, n: f64) -> String {
+    const SUFFIXES: [char; 6] = ['k', 'M', 'G', 'T', 'P', 'E'];
+    let sign = if n < 0.0 { "-" } else { "" };
+    let (mut out, exponent) = three_digits(text, n);
+    let power = exponent.div_euclid(3);
+    let suffix = usize::try_from(power - 1)
+        .ok()
+        .and_then(|i| SUFFIXES.get(i));
+    let Some(suffix) = suffix else {
+        out.insert(1, '.');
+        trim_decimals(&mut out);
+        return format!("{sign}{out}e{exponent}");
+    };
+    // `123` with its point after the first, second or third digit.
+    out.insert(1 + exponent.rem_euclid(3) as usize, '.');
+    trim_decimals(&mut out);
+    format!("{sign}{out}{suffix}")
+}
+
+/// The absolute value of `text`, whose value is `n`, to three significant
+/// digits: the digits, and the power of ten of the first. A plain decimal
+/// rounds on its own digits, a half away from zero (see [`Decimal`]);
+/// anything else rounds through `n`.
+fn three_digits(text: &str, n: f64) -> (String, i32) {
+    if let Some(mut d) = Decimal::parse(text)
+        && let Some(first) = d.digits.iter().position(|&b| b != b'0')
+    {
+        d.round_at(first + 3);
+        let first = d.digits.iter().position(|&b| b != b'0').unwrap_or(0);
+        let mut digits: String = d
+            .digits
+            .iter()
+            .skip(first)
+            .take(3)
+            .map(|&b| char::from(b))
+            .collect();
+        while digits.len() < 3 {
+            digits.push('0');
+        }
+        let exponent = d.point as i32 - 1 - first as i32;
+        return (digits, exponent);
+    }
+    let s = format!("{:.2e}", n.abs());
+    let (mantissa, exponent) = s.split_once('e').expect("`{:e}` writes an `e`");
+    let exponent = exponent.parse().expect("`{:e}` writes a whole exponent");
+    (mantissa.replace('.', ""), exponent)
 }
 
 /// Drop the zeros at the end of a number's decimals, and then its decimal
@@ -353,7 +425,7 @@ mod tests {
 
     #[test]
     fn table_num_rounds_long_decimals_only() {
-        let six = |c| table_num(c, Some(6));
+        let six = |c| table_num(c, Some(6), false);
         assert_eq!(six("3.14159265358979").as_deref(), Some("3.141593"));
         assert_eq!(six("1234567.891").as_deref(), None);
         assert_eq!(six("0.000012345678").as_deref(), Some("0.000012"));
@@ -371,7 +443,7 @@ mod tests {
         assert_eq!(six("2.50000000").as_deref(), Some("2.5"));
         assert_eq!(six("0.10000000000000001").as_deref(), Some("0.1"));
         // No digit past the float's precision shows.
-        let p = |c, d| table_num(c, Some(d));
+        let p = |c, d| table_num(c, Some(d), false);
         assert_eq!(p("0.100000000000000000", 17).as_deref(), Some("0.1"));
         assert_eq!(p("1234567.10000000000", 10).as_deref(), Some("1234567.1"));
         // A half rounds away from zero, on the cell's own digits.
@@ -392,10 +464,54 @@ mod tests {
             assert_eq!(six(text), None, "{text}");
         }
         // No decimal point to trim at: whole numbers keep their zeros.
-        assert_eq!(table_num("1234.5", Some(0)).as_deref(), Some("1235"));
-        assert_eq!(table_num("100.4", Some(0)).as_deref(), Some("100"));
-        assert_eq!(table_num("3.14159", Some(2)).as_deref(), Some("3.14"));
-        assert_eq!(table_num("3.14159265358979", None), None);
+        assert_eq!(table_num("1234.5", Some(0), false).as_deref(), Some("1235"));
+        assert_eq!(table_num("100.4", Some(0), false).as_deref(), Some("100"));
+        assert_eq!(
+            table_num("3.14159", Some(2), false).as_deref(),
+            Some("3.14")
+        );
+        assert_eq!(table_num("3.14159265358979", None, false), None);
+    }
+
+    #[test]
+    fn table_num_human_suffixes() {
+        let human = |c| table_num(c, Some(6), true);
+        assert_eq!(human("1000").as_deref(), Some("1k"));
+        assert_eq!(human("1234").as_deref(), Some("1.23k"));
+        assert_eq!(human("12345").as_deref(), Some("12.3k"));
+        assert_eq!(human("123456").as_deref(), Some("123k"));
+        assert_eq!(human("1234567").as_deref(), Some("1.23M"));
+        assert_eq!(human("-9876543210").as_deref(), Some("-9.88G"));
+        assert_eq!(human("1.5e12").as_deref(), Some("1.5T"));
+        assert_eq!(human("2e15").as_deref(), Some("2P"));
+        assert_eq!(human("3e18").as_deref(), Some("3E"));
+        // Too big for E: an exponent.
+        assert_eq!(human("4e21").as_deref(), Some("4e21"));
+        assert_eq!(human("9.996e20").as_deref(), Some("1e21"));
+        assert_eq!(human("1e300").as_deref(), Some("1e300"));
+        assert_eq!(human("1.2345e300").as_deref(), Some("1.23e300"));
+        assert_eq!(human("-1.2345e300").as_deref(), Some("-1.23e300"));
+        // Rounding up to the next suffix, and to a fourth digit.
+        assert_eq!(human("999600").as_deref(), Some("1M"));
+        assert_eq!(human("-999999").as_deref(), Some("-1M"));
+        assert_eq!(human("9996").as_deref(), Some("10k"));
+        assert_eq!(human("9995").as_deref(), Some("10k"));
+        // A half rounds away from zero here too.
+        assert_eq!(human("1245").as_deref(), Some("1.25k"));
+        assert_eq!(human("-1245").as_deref(), Some("-1.25k"));
+        assert_eq!(human("1245000000000000").as_deref(), Some("1.25P"));
+        assert_eq!(human("99960").as_deref(), Some("100k"));
+        // Rounded first: a number that shows as 1000 takes a suffix.
+        assert_eq!(human("999.9999999").as_deref(), Some("1k"));
+        assert_eq!(human("-999.9999999").as_deref(), Some("-1k"));
+        assert_eq!(table_num("999.6", Some(0), true).as_deref(), Some("1k"));
+        assert_eq!(table_num("999.5", Some(0), true).as_deref(), Some("1k"));
+        assert_eq!(table_num("999.9999999", None, true), None);
+        // Below 1000 the decimals rule applies.
+        assert_eq!(human("999.5"), None);
+        assert_eq!(human("0.00123456789").as_deref(), Some("0.001235"));
+        assert_eq!(table_num("1234", None, true).as_deref(), Some("1.23k"));
+        assert_eq!(table_num("0.00123456789", None, true), None);
     }
 
     #[test]
