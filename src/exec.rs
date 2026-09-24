@@ -1793,37 +1793,69 @@ fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>,
 /// matching N right rows yields N rows); unmatched rows are padded with empty
 /// cells for left/right/full as appropriate.
 fn join_rows(j: &JoinStmt, left: Vec<OwnedRow>, opts: &RunOpts) -> Result<Vec<OwnedRow>, Error> {
-    let right = materialize_join_right(j, opts)?;
-    let mut table: HashMap<String, Vec<usize>> = HashMap::new();
+    let table = JoinTable::build(j, opts)?;
     let mut key = String::new();
-    for (ri, row) in right.iter().enumerate() {
-        encode_key(&mut key, row, &j.right_key_pos);
-        table.entry(std::mem::take(&mut key)).or_default().push(ri);
-    }
-
-    let mut matched = vec![false; right.len()];
+    let mut matched = vec![false; table.right.len()];
     let mut out: Vec<OwnedRow> = Vec::new();
     for lrow in &left {
-        encode_key(&mut key, lrow, &j.left_key_pos);
-        match table.get(&key) {
-            Some(idxs) => {
-                for &ri in idxs {
-                    matched[ri] = true;
-                    out.push(combine(j, lrow, Some(&right[ri])));
-                }
+        table.join(j, lrow, &mut key, |matched_at, joined| {
+            if let Some(ri) = matched_at {
+                matched[ri] = true;
             }
-            None if j.join_type.keeps_left_unmatched() => out.push(combine(j, lrow, None)),
-            None => {}
-        }
+            out.push(joined);
+            Ok(())
+        })?;
     }
     if j.join_type.keeps_right_unmatched() {
         for (ri, &m) in matched.iter().enumerate() {
             if !m {
-                out.push(combine_right_only(j, &right[ri]));
+                out.push(combine_right_only(j, &table.right[ri]));
             }
         }
     }
     Ok(out)
+}
+
+/// A join's right side, run through its sub-plan, with its rows indexed by
+/// key.
+struct JoinTable {
+    right: Vec<OwnedRow>,
+    /// Each key's right rows, in file order.
+    index: HashMap<String, Vec<usize>>,
+}
+
+impl JoinTable {
+    fn build(j: &JoinStmt, opts: &RunOpts) -> Result<JoinTable, Error> {
+        let right = materialize_join_right(j, opts)?;
+        let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut key = String::new();
+        for (ri, row) in right.iter().enumerate() {
+            encode_key(&mut key, row, &j.right_key_pos);
+            index.entry(std::mem::take(&mut key)).or_default().push(ri);
+        }
+        Ok(JoinTable { right, index })
+    }
+
+    /// Hand `out` each row left row `row` joins into, with the matching
+    /// right row's index: one per match, or for a left join the row with
+    /// the right side empty when nothing matches (`key` is scratch).
+    fn join<'a>(
+        &self,
+        j: &JoinStmt,
+        row: &[Field<'a>],
+        key: &mut String,
+        mut out: impl FnMut(Option<usize>, Vec<Field<'a>>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        encode_key(key, row, &j.left_key_pos);
+        let matches = self.index.get(key.as_str()).map_or(&[][..], Vec::as_slice);
+        for &ri in matches {
+            out(Some(ri), combine(j, row, Some(&self.right[ri])))?;
+        }
+        if matches.is_empty() && j.join_type.keeps_left_unmatched() {
+            out(None, combine(j, row, None))?;
+        }
+        Ok(())
+    }
 }
 
 /// Build a CSV-encoded key from `positions` of `row` into `key` (a missing
@@ -1836,8 +1868,12 @@ fn encode_key(key: &mut String, row: &[Field], positions: &[usize]) {
 
 /// A joined output row: the left columns, then the right's emitted columns
 /// (empty cells when `rrow` is `None`, i.e. an unmatched left row).
-fn combine(j: &JoinStmt, lrow: &[Field<'static>], rrow: Option<&[Field<'static>]>) -> OwnedRow {
-    let mut out: OwnedRow = Vec::with_capacity(j.left_ncols + j.right_emit_pos.len());
+fn combine<'a>(
+    j: &JoinStmt,
+    lrow: &[Field<'a>],
+    rrow: Option<&[Field<'static>]>,
+) -> Vec<Field<'a>> {
+    let mut out = Vec::with_capacity(j.left_ncols + j.right_emit_pos.len());
     for i in 0..j.left_ncols {
         out.push(lrow.get(i).cloned().unwrap_or(Field::Str("")));
     }
