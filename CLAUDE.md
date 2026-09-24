@@ -124,8 +124,9 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   head l-b`), so `head 5 | tail +2` streams too.
 - **`uniq [cols]`** drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
-  pre-sort is needed. Among the stages at the front with a `head` or `tail
-  +N` it runs row by row in `RowChain`, else it uses the in-memory path. The
+  pre-sort is needed. Among the stages at the front it runs row by row in
+  `RowChain` (`RowChain::in_order`), streaming when nothing blocking follows
+  (O(distinct keys) memory); after a blocking stage it runs in memory. The
   dedup key is the CSV-encoded cells (`uniq_key` in `exec.rs`, a `HashSet`).
 - **`stats [cols]`** reduces the input to one summary row per column
   (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
@@ -250,10 +251,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `EvalCtx { prev_row, rownum }` and returns an owned `Field`. A pure `add` is
   per-row and **shardable** (rides every path); an `add` reading `prev`/`rownum`
   is `is_stateful()` and runs its rows in order, so its output is
-  `-n`-independent: row by row in `RowChain` (`Stateful`) when a `head` or
-  `tail +N` among the stages at the front streams the plan, where rows before
-  a failing one are written first as in any stream, else on the **in-memory
-  ordered path** (the guard `plan_has_stateful_expr` in
+  `-n`-independent: row by row in `RowChain` (`Stateful`) when it is among
+  the stages at the front, streaming when nothing blocking follows (rows
+  before a failing one are written first, as in any stream), else on the
+  **in-memory ordered path** (the guard `plan_has_stateful_expr` in
   `exec::run_body`/`run_file`, mirroring the `tail`/`uniq`/`join` fallback).
   The new column carries the expression's **static type** (numeric / text /
   untyped,
@@ -534,8 +535,9 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   concatenate in file order — the parquet mirror of CSV's `run_sharded` (~3.2× on
   4 cores; a single-row-group file can't shard). Anything else materializes:
   the stages at the front that pass rows on one at a time run through
-  `RowChain` as the batches decode, so a full `head` among them stops the
-  decoding, and the rest runs on the staged in-memory path.
+  `RowChain` as the batches decode (`decode_through`), so a full `head`
+  among them stops the decoding; their rows stream out when nothing
+  follows, else the rest runs on the staged in-memory path.
 - Follow-ups (`todo.org`): column/row-group projection push-down (only decode the
   columns the plan touches), more column types (temporal/decimal/dictionary), and
   parquet *output* (the `Sink` half). `gen_parquet` (feature-gated example) writes
@@ -552,9 +554,11 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
-  (`head`, `tail +N` and a lone transform through `RowChain`'s `scan`, a
-  lone transform with `-n>1` through `stream_transform_parallel`) read via
-  `next_chunk_available` (a single `read` completed to a line boundary) and
+  (`head`, `tail +N`, `uniq`, a stateful statement and a lone transform
+  through `RowChain`'s `scan`, a lone transform with `-n>1` through
+  `stream_transform_parallel`) read via `next_chunk_available` (a single
+  `read` completed to a line boundary, into a `ChunkSpace` kept from chunk
+  to chunk) and
   flush output per chunk, so a slow or unbounded stream emits promptly
   instead of stalling until a 1 MB buffer fills (which made `head` hang and
   `select` withhold output). `sort` and the

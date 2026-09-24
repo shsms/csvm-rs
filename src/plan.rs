@@ -1217,7 +1217,7 @@ impl BoolExpr {
     }
 
     /// Whether the expression reads cross-row state (`prev()`/`rownum()`) via a
-    /// comparison operand, which routes the plan to the ordered in-memory path.
+    /// comparison operand, so it must see the rows in order.
     pub fn is_stateful(&self) -> bool {
         match self {
             BoolExpr::And(es) | BoolExpr::Or(es) => es.iter().any(BoolExpr::is_stateful),
@@ -1230,7 +1230,8 @@ impl BoolExpr {
 
 /// Per-row context for the stateful leaves of a value expression (`prev()`,
 /// `rownum()`). [`Default`] is empty — a pure expression never reads it, so the
-/// streaming/sharded paths pass the default; the in-memory ordered path fills it.
+/// streaming/sharded paths pass the default; the paths that run a stateful
+/// statement in order fill it.
 #[derive(Default)]
 pub struct EvalCtx<'a> {
     /// The previous row (`None` on the first row, where `prev()` reads the
@@ -1595,8 +1596,8 @@ impl Stmt {
     }
 
     /// Whether this statement reads cross-row state (a stateful `add` or a
-    /// `select` comparing against `prev()`/`rownum()`), which routes the plan
-    /// to the in-memory ordered execution path.
+    /// `select` comparing against `prev()`/`rownum()`), so it must see the
+    /// rows in order.
     pub fn is_stateful(&self) -> bool {
         match self {
             Stmt::Add(a) => a.stateful,

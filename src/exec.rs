@@ -177,13 +177,13 @@ fn run_body<R: BufRead, W: Write + Send>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    // With a `head` or `tail +N` among the stages at the front that pass
-    // rows on one at a time, those run as one chain, single-threaded, and
-    // stop reading once a full `head` lets no more rows through. Stages
-    // after the chain see only the rows it let through, so they run over
-    // those in memory.
+    // The stages at the front that pass rows on one at a time run as one
+    // chain, single-threaded, when one of them must see the rows in order
+    // (see `RowChain::in_order`): rows stream out when nothing follows, and
+    // a full `head` stops the reading. Stages after the chain see only the
+    // rows it let through, so they run over those in memory.
     let (mut chain, rest) = RowChain::front(&plan.stages);
-    if chain.has_window() {
+    if chain.in_order() {
         if rest.is_empty() {
             return stream_rows(&mut chain, opts.chunk_size, input, output);
         }
@@ -403,9 +403,14 @@ impl<'p> RowChain<'p> {
         (RowChain { steps }, &[])
     }
 
-    /// Whether the chain holds a `head` or `tail +N`.
-    fn has_window(&self) -> bool {
-        self.steps.iter().any(|s| matches!(s, RowStep::Window(_)))
+    /// Whether the chain holds a step that must see the rows one at a time
+    /// and in order: a `head` or `tail +N`, a `uniq`, or a stateful
+    /// statement.
+    fn in_order(&self) -> bool {
+        self.steps.iter().any(|step| match step {
+            RowStep::Transform(_, state) => state.is_some(),
+            RowStep::Window(_) | RowStep::Uniq(..) => true,
+        })
     }
 
     /// Whether a full `head` lets no more rows through.
@@ -433,6 +438,11 @@ impl<'p> RowChain<'p> {
 /// Where [`scan`] puts the rows that make it through.
 trait RowSink {
     fn row(&mut self, row: &[Field<'_>]);
+    /// [`RowSink::row`] for a row already owned, which a sink may keep.
+    #[cfg(feature = "parquet")]
+    fn take_row(&mut self, row: OwnedRow) {
+        self.row(&row);
+    }
     /// The end of a chunk of input.
     fn chunk_end(&mut self) -> Result<(), Error> {
         Ok(())
@@ -462,6 +472,11 @@ impl<W: Write> RowSink for LinesTo<'_, W> {
 impl RowSink for Vec<OwnedRow> {
     fn row(&mut self, row: &[Field<'_>]) {
         self.push(owned_row(row));
+    }
+
+    #[cfg(feature = "parquet")]
+    fn take_row(&mut self, row: OwnedRow) {
+        self.push(row);
     }
 }
 
@@ -1003,12 +1018,32 @@ pub fn run_parquet<W: Write + Send>(
         return Ok(());
     }
 
-    // Otherwise materialize the rows, then run the stages in order. The
-    // stages at the front that pass rows on one at a time run as they are
-    // read, so a full `head` among them stops the reading.
+    // Otherwise the stages at the front that pass rows on one at a time run
+    // as the batches decode, so a full `head` among them stops the decoding;
+    // their rows stream out when nothing follows, else the rest runs over
+    // them in memory.
     let mut reader = crate::parquet::ParquetReader::open(path, progress)?;
     let (mut chain, rest) = RowChain::front(&plan.stages);
+    if rest.is_empty() {
+        let mut lines = LinesTo {
+            buf: String::new(),
+            output,
+        };
+        return decode_through(&mut chain, &mut reader, &mut lines);
+    }
     let mut rows: Vec<OwnedRow> = Vec::new();
+    decode_through(&mut chain, &mut reader, &mut rows)?;
+    write_rows(output, &apply_stages_over_rows(rest, rows, opts)?)
+}
+
+/// Decode `reader`'s batches through `chain` into `sink`, a batch a chunk,
+/// until the chain is done.
+#[cfg(feature = "parquet")]
+fn decode_through(
+    chain: &mut RowChain,
+    reader: &mut crate::parquet::ParquetReader,
+    sink: &mut impl RowSink,
+) -> Result<(), Error> {
     let mut scratch: Vec<Field> = Vec::new();
     while !chain.done()
         && let Some(batch) = reader.next_batch()
@@ -1018,12 +1053,12 @@ pub fn run_parquet<W: Write + Send>(
                 break;
             }
             if chain.pass(&mut row, &mut scratch)? {
-                rows.push(row);
+                sink.take_row(row);
             }
         }
+        sink.chunk_end()?;
     }
-    let rows = apply_stages_over_rows(rest, rows, opts)?;
-    write_rows(output, &rows)
+    Ok(())
 }
 
 /// Sharded parquet transform: partition the file's row groups into contiguous
@@ -4422,6 +4457,20 @@ mod tests {
     /// etc.), or for a file too big to read to its end. Returns what `script`
     /// writes over it, or the read error if the run asks for more.
     fn run_paused(script: &str) -> Result<String, Error> {
+        let mut out = Vec::new();
+        run_paused_into(script, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// What `script` has written over the [`run_paused`] reader when the
+    /// run asks for more than the reader has yet.
+    fn written_by_pause(script: &str) -> String {
+        let mut out = Vec::new();
+        assert!(run_paused_into(script, &mut out).is_err(), "{script}");
+        String::from_utf8(out).unwrap()
+    }
+
+    fn run_paused_into(script: &str, out: &mut Vec<u8>) -> Result<(), Error> {
         use std::collections::VecDeque;
 
         struct PausingReader(VecDeque<Vec<u8>>);
@@ -4454,9 +4503,23 @@ mod tests {
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
         };
-        let mut out = Vec::new();
-        run(&plan, &out_header, &opts, &mut reader, &mut out)?;
-        Ok(String::from_utf8(out).unwrap())
+        run(&plan, &out_header, &opts, &mut reader, out)
+    }
+
+    #[test]
+    fn a_stage_that_needs_rows_in_order_streams_them() {
+        // The rows before the pause are out, not held back for the end.
+        assert_eq!(written_by_pause("uniq val"), "id,val\n0,x\n");
+        assert_eq!(
+            written_by_pause("add n = rownum() | select n > 3"),
+            "id,val,n\n3,x,4\n4,x,5\n"
+        );
+        assert_eq!(
+            written_by_pause("select id != prev(id) | cols id"),
+            "id\n1\n2\n3\n4\n"
+        );
+        // A blocking stage after them still waits for every row.
+        assert_eq!(written_by_pause("uniq val | sort id"), "id,val\n");
     }
 
     #[test]
