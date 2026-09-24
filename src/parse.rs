@@ -24,7 +24,7 @@ use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
     OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Stage,
-    StatsStmt, Stmt, UniqStmt, ValExpr, Written,
+    StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
 use std::ops::Range;
 
@@ -1045,7 +1045,7 @@ impl<'a> Builder<'a> {
             "-s" | "--stripes" => true,
             other => return Err(err(format!("fmt takes only -s (--stripes), not {other:?}"))),
         };
-        self.output = OutputFormat::Aligned { stripes };
+        self.output = OutputFormat::Aligned(TableOpts { stripes });
         Ok(())
     }
 
@@ -3600,19 +3600,19 @@ mod tests {
         );
 
         let plan = parse("sort a | fmt").unwrap();
-        assert_eq!(plan.output, OutputFormat::Aligned { stripes: false });
+        assert_eq!(plan.output, OutputFormat::Aligned(TableOpts::default()));
         // fmt is not a stage.
         assert!(plan.stages.iter().all(|s| !matches!(s, Stage::Head(_))));
 
         // fmt alone (no transforms) is valid — align the input.
         assert_eq!(
             parse("fmt").unwrap().output,
-            OutputFormat::Aligned { stripes: false }
+            OutputFormat::Aligned(TableOpts::default())
         );
         for striped in ["fmt -s", "fmt --stripes"] {
             assert_eq!(
                 parse(striped).unwrap().output,
-                OutputFormat::Aligned { stripes: true }
+                OutputFormat::Aligned(TableOpts { stripes: true })
             );
         }
     }
@@ -4049,7 +4049,7 @@ mod tests {
         };
         assert!(matches!(stmts[0], Stmt::Select(_)));
         assert!(matches!(&stmts[1], Stmt::Add(a) if a.name == "b"));
-        assert_eq!(plan.output, OutputFormat::Aligned { stripes: false });
+        assert_eq!(plan.output, OutputFormat::Aligned(TableOpts::default()));
 
         // A newline inside a `join (…)` group doesn't split the outer pipeline.
         let plan = parse("rename value=a\njoin (\n rename value=b\n) r.csv on key\nfmt").unwrap();

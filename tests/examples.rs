@@ -48,7 +48,7 @@ fn run_with_header(
     exec::run(&plan, &out_header, &opts, &mut reader, &mut out).map_err(|e| e.to_string())?;
     // `fmt` aligns the final output and `graph` draws it (main does this;
     // mirror it here). Colour off.
-    if matches!(plan.output, csvm::plan::OutputFormat::Aligned { .. }) || plan.graph.is_some() {
+    if matches!(plan.output, csvm::plan::OutputFormat::Aligned(_)) || plan.graph.is_some() {
         let mut aligned = Vec::new();
         exec::render(&out, &plan, &exec::Screen::default(), &mut aligned)
             .map_err(|e| e.to_string())?;

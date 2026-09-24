@@ -2025,7 +2025,7 @@ pub fn render<W: Write>(
     if let Some(g) = &plan.graph {
         return render_graph(bytes, g, color, screen.width, output);
     }
-    let aligned = matches!(plan.output, OutputFormat::Aligned { .. });
+    let aligned = matches!(plan.output, OutputFormat::Aligned(_));
     let depth = color.unwrap_or(Depth::Truecolor);
     let want_color = color.is_some() && !plan.colors.is_empty();
     if !aligned && !want_color {
@@ -2046,18 +2046,17 @@ pub fn render<W: Write>(
     } else {
         None
     };
-    if aligned {
-        // Only a table that asked for stripes (`fmt -s`) gets them.
-        let screen = Screen {
-            stripe: screen
-                .stripe
-                .filter(|_| plan.output == OutputFormat::Aligned { stripes: true }),
-            ..*screen
-        };
-        let numeric = numeric_columns(&rows);
-        align_and_write(&rows, &numeric, styles.as_deref(), &screen, output)
-    } else {
-        write_csv_colored(&rows, styles.as_deref(), depth, output)
+    match plan.output {
+        OutputFormat::Aligned(table) => {
+            let numeric = numeric_columns(&rows);
+            // Only a table that asked for stripes (`fmt -s`) gets them.
+            let screen = Screen {
+                stripe: screen.stripe.filter(|_| table.stripes),
+                ..*screen
+            };
+            align_and_write(&rows, &numeric, styles.as_deref(), &screen, output)
+        }
+        OutputFormat::Csv => write_csv_colored(&rows, styles.as_deref(), depth, output),
     }
 }
 
@@ -2555,8 +2554,13 @@ pub fn describe(plan: &Plan) -> String {
     }
     match plan.output {
         OutputFormat::Csv => {}
-        OutputFormat::Aligned { stripes: false } => out.push_str("output: aligned\n"),
-        OutputFormat::Aligned { stripes: true } => out.push_str("output: aligned, striped\n"),
+        OutputFormat::Aligned(table) => {
+            out.push_str("output: aligned");
+            if table.stripes {
+                out.push_str(", striped");
+            }
+            out.push('\n');
+        }
     }
     for rule in &plan.colors {
         out.push_str(&describe_color(rule));

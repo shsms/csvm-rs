@@ -293,7 +293,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Pager::shows_links` — `less` 581+), a cell that
   `is_web_address` (`http(s)://`, no spaces or control characters) is wrapped
   in an OSC 8 hyperlink to its whole text, even when the shown text is cut.
-  `fmt -s` (`--stripes`, `OutputFormat::Aligned { stripes }`) shades the
+  `fmt -s` (`--stripes`, `TableOpts.stripes`) shades the
   first data row and every other one after it with `Screen.stripe`, from
   the first cell to the table's edge (through a short row's missing cells
   too), under the rules' colours. `main` gets the shade from

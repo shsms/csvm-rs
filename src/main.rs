@@ -138,7 +138,7 @@ fn run() -> Result<(), Failure> {
     // Aligning needs all rows (for column widths), colouring needs all rows (for
     // gradient ranges), and a graph draws from the whole output — so each of
     // these buffers the run first, then renders.
-    let buffered = matches!(plan.output, OutputFormat::Aligned { .. })
+    let buffered = matches!(plan.output, OutputFormat::Aligned(_))
         || plan.graph.is_some()
         || (color.is_some() && !plan.colors.is_empty());
     // A slow run shows how far it has read on stderr, when nothing else is
@@ -155,10 +155,10 @@ fn run() -> Result<(), Failure> {
         // pager starts only now, with the run done, so it never sits waiting
         // on a slow pipeline. A table prints a line for each line of the
         // run's output, so that says whether it fills the window.
-        let table = matches!(plan.output, OutputFormat::Aligned { .. });
+        let table = matches!(plan.output, OutputFormat::Aligned(_));
         // Asked of the terminal before a pager takes it over, and while no
         // other thread runs (see `term::background`).
-        let stripe = if plan.output == (OutputFormat::Aligned { stripes: true }) {
+        let stripe = if matches!(plan.output, OutputFormat::Aligned(t) if t.stripes) {
             console.stripe()
         } else {
             None
