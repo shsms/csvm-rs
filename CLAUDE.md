@@ -140,14 +140,19 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   but are skipped from the aggregates (still counted as non-empty) so they don't
   poison sum/mean/stddev; `select`/`sort`/`num()` still accept them. `ColStats`
   is deliberately presentation-free so `fmt`'s value-colouring can reuse it.
-  Over a **seekable file with `-n>1`** (the default, since `-n` is the core
-  count), `stats` shards: each worker builds a partial `ColStats` over its
-  byte range and `ColStats::merge` (Welford parallel combine) folds them.
-  Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may differ from
-  the `-n1` result in their low-order digits (the parallel reduction sums in
-  a different order, and the gap grows with the row count), so pass `-n 1`
-  for bit-reproducible float aggregates. stdin / `-n1` use the single-pass
-  streaming path.
+  Over a **seekable file** `stats` shards, at any `-n`: `over_shards` cuts
+  the file into shards of `RunOpts::shard_bytes` (8 MiB,
+  `DEFAULT_SHARD_BYTES`), which up to `-n` workers take in turn (worker
+  `k` the shards `k`, `k + workers`, …), each building a partial `ColStats`
+  from its range read a piece at a time (`parse_range`), and
+  `ColStats::merge` (Welford parallel combine) folds them in file order as
+  they come; a worker waits with its partial until the fold takes it, so
+  about one partial a worker is held at once. The shards follow the
+  file's size, not `-n`, so the output is the same at every `-n`, float
+  digits included. Counts/`min`/`max` also match one pass over the rows;
+  floating `sum`/`mean`/`stddev` may differ from one pass (stdin's
+  single-pass streaming path) in their last digits, as the partials add up
+  in a different order.
 - **`agg [NAME=]FN(col),… [by COLS]`** reduces to one row per distinct key —
   the per-key sibling of `stats` (which reduces globally). `by COLS` gives the
   keys; without it `agg` emits a single global row. The whole argument is
@@ -168,14 +173,17 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   in `exec.rs` folds rows into a `HashMap<key, GroupAcc>` keeping first-seen
   order, reusing one `ColStats` (`stats.rs`) per distinct aggregated column —
   O(groups × aggregated-cols) memory. Like `stats` it has streaming and sharded
-  fast paths (`group_shape` gates both): stdin / `-n1` **stream** the input
-  through one `Grouper` (`run_group_streaming`), and a **seekable file with
-  `-n>1`** shards — each worker builds a partial `Grouper` over its byte range
-  and `Grouper::merge` folds them in file order (so first-seen group order is
-  preserved). Counts/`min`/`max` are exact; floating `sum`/`mean`/`stddev` may
-  differ from `-n1` in their low-order digits (parallel reduction order), the
-  same caveat as sharded `stats`. An `agg` combined with a `sort` (or another blocking stage)
-  still takes the in-memory path.
+  fast paths (`group_shape` gates both): stdin **streams** the input through
+  one `Grouper` (`run_group_streaming`), and a **seekable file** shards —
+  each shard builds a partial `Grouper` and `Grouper::merge` folds them in
+  file order (so first-seen group order is preserved; the merge reuses the
+  shard's encoded keys). With an aggregate that adds floats
+  (`AggFunc::adds_floats`: `sum`/`mean`/`stddev`) the shards are the size-based
+  ones of `stats`, at any `-n` but at most `MAX_FLOAT_AGG_SHARDS` (16), so the
+  digits do not follow `-n`; without one they cannot change the result, and
+  as each shard costs a partial group per key, a file shards one range per
+  worker, or streams at `-n 1`. An `agg` combined with a `sort` (or another
+  blocking stage) still takes the in-memory path.
 - **`join [FLAGS] ITEM[, ITEM…]`** (`ITEM := [(SUBPIPELINE)] FILE [on KEYS]`)
   merges one or more right-side CSVs in by key. Items are separated by
   top-level commas (`split_top_commas` — protects quoted and parenthesized
@@ -260,9 +268,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   is `is_stateful()` and runs its rows in order, so its output is
   `-n`-independent: row by row in `RowChain` (`Stateful`) when it is among
   the stages at the front, or after a single `sort`, streaming when nothing
-  blocking follows (rows before a failing one are written first, as in any
-  stream), else on the **in-memory ordered path**; it never shards
-  (`plan_has_stateful_expr` in `exec::run_file`).
+  blocking follows (the rows of the chunks before a failing row are written
+  first, as in any stream), else on the **in-memory ordered path**; it never
+  shards (`run_file`, `stats_shape` and `group_shape` check
+  `Stmt::is_stateful`).
   The new column carries the expression's **static type** (numeric / text /
   untyped,
   `ValExpr::static_type` — including a type inherited from a typed column or
@@ -570,7 +579,7 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   `tblock`s: statements before a sort form one stage, the sort is its own stage,
   statements after form another).
 - No-sort plans over a **seekable file** with `-n>1` are **sharded**: each
-  worker reads its own line-aligned byte range (no central reader/channel),
+  worker reads its own line-aligned byte range (no central reader),
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
@@ -643,10 +652,10 @@ turns it off. A run past a second draws a progress line on stderr
 read (bytes, or rows of a parquet input: `progress::Unit`) that
 `run_file` takes with its `exec::InputFile` (the path and data range), and
 that its file reader (`progress::Counted`) and the shard workers
-(`parse_counted`, per ~4 MiB piece, so the count follows the parsing rather
-than the up-front read) add to. `main` passes its counter in and counts a
-stdin stream itself; a join's right file runs with one that counts nothing.
-A `progress::Meter` thread redraws the line and clears it on drop.
+(`parse_range`, per ~4 MiB piece once parsed) add to. `main` passes
+its counter in and counts a stdin stream itself; a join's right file runs
+with one that counts nothing. A `progress::Meter` thread redraws the line
+and clears it on drop.
 `Console::meter` turns it on when stderr is a terminal (not `TERM=dumb`) that
 nothing else draws on: stdout a file, or the terminal with buffered
 `fmt`/`color`/`graph` output — not a pipe (it may feed `less`) — and the input
@@ -661,8 +670,8 @@ or alias) a command's forms + example, `csvm help TOPIC` the `operators`/
 `parse::COMMANDS` so the help can't drift (the overview's command list is
 generated from it). Usage errors show only the brief synopsis. Defaults:
 stdin/stdout, threads = the core count (`available_parallelism`, capped at
-1024 like any `-n`; `-n 1` is the explicit serial run, and the one that makes
-sharded `stats`/`group` float aggregates bit-reproducible),
+1024 like any `-n`; `-n 1` is the explicit serial run; a file's `stats` and
+`agg` come out the same at every `-n`),
 chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)

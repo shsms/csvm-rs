@@ -110,6 +110,7 @@ fn run() -> Result<(), Failure> {
         threads: args.threads,
         temp_dir: args.temp_dir.clone().unwrap_or_else(std::env::temp_dir),
         sort_buffer: args.sort_buffer,
+        shard_bytes: exec::DEFAULT_SHARD_BYTES,
     };
 
     let (mut source, header) = open_source(&args)?;

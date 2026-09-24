@@ -54,6 +54,7 @@ fn run_opts() -> RunOpts {
         threads: 1,
         temp_dir: std::env::temp_dir(),
         sort_buffer: 256 << 20,
+        shard_bytes: csvm::exec::DEFAULT_SHARD_BYTES,
     }
 }
 

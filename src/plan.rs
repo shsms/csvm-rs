@@ -396,6 +396,15 @@ pub enum AggFunc {
 }
 
 impl AggFunc {
+    /// Whether it adds floats up, so its last digits follow the order the
+    /// rows come in.
+    pub fn adds_floats(self) -> bool {
+        match self {
+            AggFunc::Sum | AggFunc::Mean | AggFunc::Stddev => true,
+            AggFunc::Count | AggFunc::CountDistinct | AggFunc::Min | AggFunc::Max => false,
+        }
+    }
+
     /// The verb as written, for the default output-column name and `--explain`.
     pub fn name(self) -> &'static str {
         match self {

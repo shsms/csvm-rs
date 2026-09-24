@@ -53,7 +53,19 @@ pub struct RunOpts {
     pub threads: usize,
     pub temp_dir: PathBuf,
     pub sort_buffer: usize,
+    /// The bytes of a file each shard of a sharded `stats` or `agg` covers
+    /// (see [`DEFAULT_SHARD_BYTES`]).
+    pub shard_bytes: u64,
 }
+
+/// A sharded reduction's shard size unless told otherwise. Shards follow the
+/// file's size, not the worker count, so a float sum comes out the same
+/// whatever `-n` is.
+pub const DEFAULT_SHARD_BYTES: u64 = 8 << 20;
+
+/// The most shards a file's `agg` takes when it adds floats (see
+/// [`run_file`]).
+const MAX_FLOAT_AGG_SHARDS: usize = 16;
 
 /// A seekable input file: its path, and where its data lies, from
 /// `data_start` (past the header line, if it has one) to its `len`.
@@ -561,9 +573,10 @@ fn scan<R: BufRead>(
 }
 
 /// If the plan has exactly one `stats` stage with nothing blocking before it (an
-/// optional leading transform only), return the pre-stats statements, the stats
-/// stage, and the stages that follow it. Anything else (a sort/head before
-/// stats, or multiple stats) returns `None` and takes the in-memory path.
+/// optional leading transform only, with no stateful statement), return the
+/// pre-stats statements, the stats stage, and the stages that follow it.
+/// Anything else (a sort/head before stats, or multiple stats) returns `None`
+/// and takes another path.
 fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
     let idxs: Vec<usize> = plan
         .stages
@@ -575,7 +588,7 @@ fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
     let [si] = idxs[..] else { return None };
     let pre: &[Stmt] = match &plan.stages[..si] {
         [] => &[],
-        [Stage::Transform(stmts)] => stmts,
+        [Stage::Transform(stmts)] if !stmts.iter().any(Stmt::is_stateful) => stmts,
         _ => return None,
     };
     let Stage::Stats(stats) = &plan.stages[si] else {
@@ -584,10 +597,11 @@ fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
     Some((pre, stats, &plan.stages[si + 1..]))
 }
 
-/// If the plan has exactly one `group` stage with nothing blocking before it (an
-/// optional leading transform only), return the pre-group statements, the group
-/// stage, and the stages that follow it — the `group … | agg …` mirror of
-/// [`stats_shape`], enabling the streaming and sharded reduce paths.
+/// If the plan has exactly one `group` stage with nothing blocking before it
+/// (an optional leading transform only, with no stateful statement), return
+/// the pre-group statements, the group stage, and the stages that follow it —
+/// the `group … | agg …` mirror of [`stats_shape`], enabling the streaming
+/// and sharded reduce paths.
 fn group_shape(plan: &Plan) -> Option<(&[Stmt], &GroupStmt, &[Stage])> {
     let idxs: Vec<usize> = plan
         .stages
@@ -599,7 +613,7 @@ fn group_shape(plan: &Plan) -> Option<(&[Stmt], &GroupStmt, &[Stage])> {
     let [gi] = idxs[..] else { return None };
     let pre: &[Stmt] = match &plan.stages[..gi] {
         [] => &[],
-        [Stage::Transform(stmts)] => stmts,
+        [Stage::Transform(stmts)] if !stmts.iter().any(Stmt::is_stateful) => stmts,
         _ => return None,
     };
     let Stage::Group(g) = &plan.stages[gi] else {
@@ -857,10 +871,13 @@ impl<'a> Grouper<'a> {
     /// the ~1-ULP `sum`/`mean`/`stddev` drift any parallel reduction has, since
     /// the float combine sums in a different order — like sharded `stats`).
     fn merge(&mut self, other: Grouper<'a>) {
-        for acc in other.groups {
-            self.keybuf.clear();
-            csv::write_row(&mut self.keybuf, &acc.key);
-            match self.index.get(&self.keybuf) {
+        // The other side's encoded keys, by group, taken from its index.
+        let mut keys: Vec<String> = vec![String::new(); other.groups.len()];
+        for (key, i) in other.index {
+            keys[i] = key;
+        }
+        for (acc, key) in other.groups.into_iter().zip(keys) {
+            match self.index.get(&key) {
                 Some(&i) => {
                     let dst = &mut self.groups[i];
                     dst.rows += acc.rows;
@@ -873,7 +890,7 @@ impl<'a> Grouper<'a> {
                 }
                 None => {
                     let i = self.groups.len();
-                    self.index.insert(self.keybuf.clone(), i);
+                    self.index.insert(key, i);
                     self.groups.push(acc);
                 }
             }
@@ -956,9 +973,10 @@ pub fn read_header_from_path(path: &Path) -> Result<(Vec<String>, u64, u64), Err
 }
 
 /// Run a plan over a seekable file. A lone transform stage with `threads > 1`
-/// is **sharded**: each worker reads its own byte range, with no central reader
-/// or channel. Everything else falls back to the reader-based path. The bytes
-/// of `input` consumed are counted into `progress`.
+/// is **sharded**: each worker reads its own byte range, with no central
+/// reader. So are `stats` and `agg` (see below). Everything else falls back
+/// to the reader-based path. The bytes of `input` consumed are counted into
+/// `progress`.
 pub fn run_file<W: Write + Send>(
     plan: &Plan,
     out_header: &[String],
@@ -969,36 +987,48 @@ pub fn run_file<W: Write + Send>(
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
-    // A stateful statement must see the rows in order: skip the sharded fast
-    // paths and let the reader path run it (see `run_body`).
-    let stateful = plan_has_stateful_expr(plan);
-
+    // A stateful statement must see the rows in order, so it never shards:
+    // the reader path runs it (see `run_body`).
     if let [Stage::Transform(stmts)] = plan.stages.as_slice()
         && opts.threads > 1
-        && !stateful
+        && !stmts.iter().any(Stmt::is_stateful)
     {
         return run_sharded(stmts, input, opts.threads, progress, output);
     }
 
-    // `stats` reduces associatively, so shard it over the file too.
-    if opts.threads > 1
-        && !stateful
-        && let Some((pre, stats, post)) = stats_shape(plan)
-    {
-        let merged = run_stats_sharded(pre, &stats.positions, input, opts.threads, progress)?;
+    // Shards of `opts.shard_bytes`: they follow the file, not `-n`, so a sum
+    // over them comes out the same at every `-n`.
+    let size_shards = input
+        .len
+        .saturating_sub(input.data_start)
+        .div_ceil(opts.shard_bytes.max(1)) as usize;
+
+    // `stats` reduces associatively, so shard it over the file too, even at
+    // `-n 1`.
+    if let Some((pre, stats, post)) = stats_shape(plan) {
+        let merged = run_stats_sharded(pre, &stats.positions, input, opts, size_shards, progress)?;
         let rows = apply_stages_over_rows(post, profile_rows(stats, &merged), opts)?;
         return write_rows(output, &rows);
     }
 
-    // `group … | agg …` reduces per key associatively, so shard it over the file
-    // too — the per-key mirror of the `stats` branch above.
-    if opts.threads > 1
-        && !stateful
-        && let Some((pre, g, post)) = group_shape(plan)
-    {
-        let grouper = run_group_sharded(pre, g, input, opts.threads, progress)?;
-        let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
-        return write_rows(output, &rows);
+    // `group … | agg …` reduces per key associatively, so shard it over the
+    // file too — the per-key mirror of the `stats` branch above. Each shard
+    // costs a partial group per key, so an aggregate that adds floats takes
+    // at most `MAX_FLOAT_AGG_SHARDS` of them, and one that does not, where the
+    // shards cannot change the result, takes one per worker, or at `-n 1`
+    // streams.
+    if let Some((pre, g, post)) = group_shape(plan) {
+        let adds_floats = g.aggs.iter().any(|a| a.func.adds_floats());
+        if opts.threads > 1 || adds_floats {
+            let shards = if adds_floats {
+                size_shards.min(MAX_FLOAT_AGG_SHARDS)
+            } else {
+                opts.threads
+            };
+            let grouper = run_group_sharded(pre, g, input, opts, shards, progress)?;
+            let rows = apply_stages_over_rows(post, grouper.into_rows(), opts)?;
+            return write_rows(output, &rows);
+        }
     }
 
     let mut file = File::open(input.path)?;
@@ -1276,9 +1306,8 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
 }
 
 /// Sharded transform: split the file's data region into `threads` line-aligned
-/// byte ranges and process each on its own thread (no central reader, no
-/// channel). Shard outputs are concatenated in file order, preserving row
-/// order.
+/// byte ranges and process each on its own thread (no central reader).
+/// Shard outputs are written in file order, preserving row order.
 fn run_sharded<W: Write>(
     stmts: &[Stmt],
     input: InputFile,
@@ -1286,30 +1315,14 @@ fn run_sharded<W: Write>(
     progress: &Progress,
     output: &mut W,
 ) -> Result<(), Error> {
-    let ranges = shard_ranges(input, threads)?;
     let path = input.path;
-    if ranges.is_empty() {
-        return Ok(()); // header only, no data rows
-    }
-    let results: Vec<Result<String, Error>> = thread::scope(|scope| {
-        let handles: Vec<_> = ranges
-            .into_iter()
-            .map(|(start, end)| {
-                scope.spawn(move || process_range(stmts, path, start, end, progress))
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(Error::Other("shard worker panicked".into())))
-            })
-            .collect()
-    });
-    for result in results {
-        output.write_all(result?.as_bytes())?;
-    }
-    Ok(())
+    over_shards(
+        input,
+        threads,
+        threads,
+        |start, end| process_range(stmts, path, start, end, progress),
+        |out| Ok(output.write_all(out.as_bytes())?),
+    )
 }
 
 /// Divide `input`'s data into up to `n` contiguous ranges, each starting and
@@ -1364,32 +1377,9 @@ fn snap_to_newline(file: &mut File, pos: u64, file_len: u64) -> Result<u64, Erro
     }
 }
 
-/// How much of a shard's range is parsed between two additions to the run's
-/// [`Progress`].
+/// How much of a shard's range is read and parsed at a time, and counted
+/// into the run's [`Progress`] once parsed.
 const PROGRESS_PIECE: usize = 4 << 20;
-
-/// [`csv::parse_chunk`] over `text` a piece of about [`PROGRESS_PIECE`] bytes
-/// at a time, each ending at a line break, counting each piece into `progress`
-/// once its rows are done. A shard reads its whole range up front, so the
-/// counting has to follow the parsing for the meter to move with the work.
-/// No row spans a line, so the rows are the ones a single call would give.
-fn parse_counted<'a>(
-    text: &'a str,
-    progress: &Progress,
-    mut on_row: impl FnMut(&mut Vec<Field<'a>>),
-) {
-    let mut rest = text;
-    while !rest.is_empty() {
-        let cut = match rest.as_bytes().get(PROGRESS_PIECE..) {
-            Some(tail) => memchr(b'\n', tail).map_or(rest.len(), |i| PROGRESS_PIECE + i + 1),
-            None => rest.len(),
-        };
-        let (piece, tail) = rest.split_at(cut);
-        csv::parse_chunk(piece, &mut on_row);
-        progress.add(piece.len() as u64);
-        rest = tail;
-    }
-}
 
 /// Read one shard's byte range, parse it, apply the statements, and return the
 /// serialized survivors.
@@ -1400,29 +1390,56 @@ fn process_range(
     end: u64,
     progress: &Progress,
 ) -> Result<String, Error> {
+    let mut out = String::new();
+    parse_range(path, start, end, progress, |row, scratch| {
+        if apply_stmts(stmts, row, scratch, &EvalCtx::default())? {
+            csv::write_row(&mut out, row);
+        }
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Parse bytes `start..end` of `path` a piece of about [`PROGRESS_PIECE`] at
+/// a time, read into one buffer, handing `on_row` each row and a scratch row
+/// for the statements, and counting each piece into `progress` once its rows
+/// are done. The range starts and ends on a line boundary. The first error
+/// `on_row` returns stops the reading.
+fn parse_range(
+    path: &Path,
+    start: u64,
+    end: u64,
+    progress: &Progress,
+    mut on_row: impl for<'r> FnMut(&mut Vec<Field<'r>>, &mut Vec<Field<'r>>) -> Result<(), Error>,
+) -> Result<(), Error> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity((end - start) as usize);
-    file.take(end - start).read_to_end(&mut bytes)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-
-    let mut out = String::with_capacity(bytes.len() / 2 + 64);
-    let mut scratch: Vec<Field> = Vec::new();
-    let mut err: Option<Error> = None;
-    parse_counted(text, progress, |row| {
-        if err.is_some() {
-            return;
+    let mut reader = BufReader::new(file.take(end - start));
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        (&mut reader)
+            .take(PROGRESS_PIECE as u64)
+            .read_to_end(&mut buf)?;
+        if buf.is_empty() {
+            return Ok(());
         }
-        match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
-            Ok(true) => csv::write_row(&mut out, row),
-            Ok(false) => {}
-            Err(e) => err = Some(e),
+        if buf.len() == PROGRESS_PIECE {
+            reader.read_until(b'\n', &mut buf)?;
         }
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(out),
+        let piece = std::str::from_utf8(&buf)
+            .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
+        let mut scratch = Vec::new();
+        let mut err = None;
+        csv::parse_chunk(piece, |row| {
+            if err.is_none() {
+                err = on_row(row, &mut scratch).err();
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        progress.add(piece.len() as u64);
     }
 }
 
@@ -1437,75 +1454,98 @@ fn stats_over_range(
     end: u64,
     progress: &Progress,
 ) -> Result<Vec<ColStats>, Error> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity((end - start) as usize);
-    file.take(end - start).read_to_end(&mut bytes)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-
     let mut accs: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
-    let mut scratch: Vec<Field> = Vec::new();
-    let mut err: Option<Error> = None;
-    parse_counted(text, progress, |row| {
-        if err.is_some() {
-            return;
+    parse_range(path, start, end, progress, |row, scratch| {
+        if apply_stmts(pre, row, scratch, &EvalCtx::default())? {
+            accumulate(&mut accs, positions, row);
         }
-        match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
-            Ok(true) => accumulate(&mut accs, positions, row),
-            Ok(false) => {}
-            Err(e) => err = Some(e),
+        Ok(())
+    })?;
+    Ok(accs)
+}
+
+/// Run `work` over `input` cut into `shards` line-aligned ranges, on up to
+/// `threads` workers, handing each result to `fold` in file order. Worker `k`
+/// takes shards `k`, `k + workers`, … and waits with each result until
+/// `fold` takes it, so a worker holds one result at a time, and the others
+/// read on while `fold` runs. The first error, in file order, stops the run;
+/// so does a panic in `work`, as an error where panics unwind (the release
+/// build aborts on one).
+fn over_shards<T: Send>(
+    input: InputFile,
+    threads: usize,
+    shards: usize,
+    work: impl Fn(u64, u64) -> Result<T, Error> + Sync,
+    mut fold: impl FnMut(T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let ranges = shard_ranges(input, shards.max(1))?;
+    let workers = threads.clamp(1, ranges.len().max(1));
+    let panicked = || Error::Other("shard worker panicked".into());
+    thread::scope(|scope| {
+        let results: Vec<_> = (0..workers)
+            .map(|k| {
+                let (done_tx, done_rx) = bounded(0);
+                let (ranges, work) = (&ranges, &work);
+                scope.spawn(move || {
+                    for &(start, end) in ranges.iter().skip(k).step_by(workers) {
+                        let part = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            work(start, end)
+                        }))
+                        .unwrap_or_else(|_| Err(panicked()));
+                        // Closed once `fold` stopped: stop too.
+                        if done_tx.send(part).is_err() {
+                            return;
+                        }
+                    }
+                });
+                done_rx
+            })
+            .collect();
+        for i in 0..ranges.len() {
+            fold(results[i % workers].recv().map_err(|_| panicked())??)?;
         }
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(accs),
-    }
+        Ok(())
+    })
 }
 
 /// Sharded `stats` over a seekable file: each shard computes partial `ColStats`
-/// over its line-aligned byte range, then the partials merge. Returns the merged
-/// per-column accumulators; the caller renders the profile and runs any
-/// post-stats stages. The reduce mirror of [`run_sharded`].
+/// over its line-aligned byte range, then the partials merge in file order.
+/// Returns the merged per-column accumulators; the caller renders the profile
+/// and runs any post-stats stages. The reduce mirror of [`run_sharded`].
 ///
-/// Counts, `min`, and `max` are order-independent and so identical to the
-/// single-threaded result; floating `sum`/`mean`/`stddev` may differ by ~1 ULP,
-/// since a sharded (pairwise) reduction sums in a different order — inherent to
-/// any parallel reduction.
+/// The shards depend on the file alone ([`over_shards`]), so the result is
+/// the same at any `-n`. Counts, `min` and `max` also match one pass over the
+/// rows; floating `sum`/`mean`/`stddev` may differ from one pass (stdin's) in
+/// their last digits, as the partials add up in a different order.
 fn run_stats_sharded(
     pre: &[Stmt],
     positions: &[usize],
     input: InputFile,
-    threads: usize,
+    opts: &RunOpts,
+    shards: usize,
     progress: &Progress,
 ) -> Result<Vec<ColStats>, Error> {
-    let mut merged: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
-    let ranges = shard_ranges(input, threads)?;
     let path = input.path;
-    if !ranges.is_empty() {
-        let partials: Vec<Result<Vec<ColStats>, Error>> = thread::scope(|scope| {
-            let handles: Vec<_> = ranges
-                .into_iter()
-                .map(|(start, end)| {
-                    scope
-                        .spawn(move || stats_over_range(pre, positions, path, start, end, progress))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(Error::Other("stats shard worker panicked".into())))
-                })
-                .collect()
-        });
-        for part in partials {
-            for (m, p) in merged.iter_mut().zip(&part?) {
-                m.merge(p);
+    // Merged into the first shard's, so one shard is exactly one pass.
+    let mut merged: Option<Vec<ColStats>> = None;
+    over_shards(
+        input,
+        opts.threads,
+        shards,
+        |start, end| stats_over_range(pre, positions, path, start, end, progress),
+        |part| {
+            match &mut merged {
+                Some(merged) => {
+                    for (m, p) in merged.iter_mut().zip(&part) {
+                        m.merge(p);
+                    }
+                }
+                None => merged = Some(part),
             }
-        }
-    }
-    Ok(merged)
+            Ok(())
+        },
+    )?;
+    Ok(merged.unwrap_or_else(|| positions.iter().map(|_| ColStats::new()).collect()))
 }
 
 /// Accumulate a partial [`Grouper`] over one shard's byte range, applying the
@@ -1521,69 +1561,45 @@ fn group_over_range<'a>(
     end: u64,
     progress: &Progress,
 ) -> Result<Grouper<'a>, Error> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut bytes = Vec::with_capacity((end - start) as usize);
-    file.take(end - start).read_to_end(&mut bytes)?;
-    let text = std::str::from_utf8(&bytes)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-
     let mut grouper = Grouper::new(g);
-    let mut scratch: Vec<Field> = Vec::new();
-    let mut err: Option<Error> = None;
-    parse_counted(text, progress, |row| {
-        if err.is_some() {
-            return;
+    parse_range(path, start, end, progress, |row, scratch| {
+        if apply_stmts(pre, row, scratch, &EvalCtx::default())? {
+            grouper.update(row);
         }
-        match apply_stmts(pre, row, &mut scratch, &EvalCtx::default()) {
-            Ok(true) => grouper.update(row),
-            Ok(false) => {}
-            Err(e) => err = Some(e),
-        }
-    });
-    match err {
-        Some(e) => Err(e),
-        None => Ok(grouper),
-    }
+        Ok(())
+    })?;
+    Ok(grouper)
 }
 
 /// Sharded `group … | agg …` over a seekable file: each shard builds a partial
 /// [`Grouper`] over its line-aligned byte range, then the partials merge in file
 /// order (preserving first-seen group order). Returns the merged `Grouper`; the
 /// caller emits its rows and runs any post-group stages. The reduce mirror of
-/// [`run_sharded`], like [`run_stats_sharded`] — same exact counts/min/max and
-/// ~1-ULP `sum`/`mean`/`stddev` caveat.
+/// [`run_sharded`], like [`run_stats_sharded`], and the same at any `-n`.
 fn run_group_sharded<'a>(
     pre: &[Stmt],
     g: &'a GroupStmt,
     input: InputFile,
-    threads: usize,
+    opts: &RunOpts,
+    shards: usize,
     progress: &Progress,
 ) -> Result<Grouper<'a>, Error> {
-    let mut merged = Grouper::new(g);
-    let ranges = shard_ranges(input, threads)?;
     let path = input.path;
-    if !ranges.is_empty() {
-        let partials: Vec<Result<Grouper, Error>> = thread::scope(|scope| {
-            let handles: Vec<_> = ranges
-                .into_iter()
-                .map(|(start, end)| {
-                    scope.spawn(move || group_over_range(pre, g, path, start, end, progress))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| Err(Error::Other("group shard worker panicked".into())))
-                })
-                .collect()
-        });
-        for part in partials {
-            merged.merge(part?);
-        }
-    }
-    Ok(merged)
+    let mut merged: Option<Grouper> = None;
+    over_shards(
+        input,
+        opts.threads,
+        shards,
+        |start, end| group_over_range(pre, g, path, start, end, progress),
+        |part| {
+            match &mut merged {
+                Some(merged) => merged.merge(part),
+                None => merged = Some(part),
+            }
+            Ok(())
+        },
+    )?;
+    Ok(merged.unwrap_or_else(|| Grouper::new(g)))
 }
 
 /// Run a plan that contains a `sort`. The common case — exactly one sort —
@@ -1671,16 +1687,6 @@ fn run_staged<R: BufRead, W: Write>(
     chain.finish()?;
     output.write_all(&out_buf)?;
     Ok(())
-}
-
-/// Whether any transform stage holds a stateful statement — an `add` or
-/// `select` reading `prev()`/`rownum()` — which is order-dependent and so
-/// can't shard or stream chunk-parallel.
-fn plan_has_stateful_expr(plan: &Plan) -> bool {
-    plan.stages.iter().any(|s| match s {
-        Stage::Transform(stmts) => stmts.iter().any(Stmt::is_stateful),
-        _ => false,
-    })
 }
 
 /// Materialize all rows, run each stage in turn, then serialize. The fallback
@@ -2765,6 +2771,7 @@ mod tests {
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            shard_bytes: DEFAULT_SHARD_BYTES,
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2783,6 +2790,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: 1, // spill after every row
+            shard_bytes: DEFAULT_SHARD_BYTES,
         };
         run(&plan, &out_header, &opts, &mut reader, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
@@ -2823,6 +2831,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            shard_bytes: DEFAULT_SHARD_BYTES,
         };
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
@@ -3007,6 +3016,7 @@ mod tests {
                 threads: 4,
                 temp_dir: std::env::temp_dir(),
                 sort_buffer: 1,
+                shard_bytes: DEFAULT_SHARD_BYTES,
             };
             let mut out = Vec::new();
             run(&plan, &out_header, &opts, &mut reader, &mut out).unwrap();
@@ -3383,18 +3393,138 @@ mod tests {
         assert_eq!(lines[2], "f,0");
     }
 
+    #[test]
+    fn over_shards_folds_in_file_order_and_turns_a_panic_into_an_error() {
+        let path =
+            std::env::temp_dir().join(format!("csvm-over-shards-{}.csv", std::process::id()));
+        let text: String = (0..100).map(|i| format!("{i}\n")).collect();
+        std::fs::write(&path, &text).unwrap();
+        let input = InputFile {
+            path: &path,
+            data_start: 0,
+            len: text.len() as u64,
+        };
+        // More shards than workers, so each worker takes several.
+        let mut starts = Vec::new();
+        over_shards(
+            input,
+            3,
+            10,
+            |start, _| Ok(start),
+            |start| {
+                starts.push(start);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(starts.len(), 10);
+        assert!(starts.is_sorted(), "{starts:?}");
+        // A shard that panics ends the run with an error, not a hang.
+        let err = over_shards(
+            input,
+            3,
+            10,
+            |start, _| if start > 0 { panic!("shard") } else { Ok(()) },
+            |()| Ok(()),
+        );
+        assert!(
+            err.as_ref()
+                .is_err_and(|e| e.to_string().contains("panicked")),
+            "{err:?}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn sharded_sums_do_not_depend_on_the_thread_count() {
+        // Sums whose last digits depend on the order they are added in: the
+        // shards follow the file's size, so every `-n` adds them the same.
+        let mut csv = String::from("v,k\n");
+        for i in 0..3000u32 {
+            let v = f64::from(i).sqrt() * 1e6 + 0.1;
+            csv.push_str(&format!("{v},{}\n", i % 5));
+        }
+        let path = std::env::temp_dir().join(format!("csvm-shard-sums-{}.csv", std::process::id()));
+        std::fs::write(&path, &csv).unwrap();
+        for script in ["stats v", "agg sum(v),mean(v),stddev(v) by k"] {
+            let serial = run_file_with(script, &path, 1, Progress::default());
+            for threads in [2, 3, 8] {
+                let parallel = run_file_with(script, &path, threads, Progress::default());
+                assert_eq!(parallel, serial, "{script} -n {threads}");
+                // A stateful statement after them does not change that.
+                let after = format!("{script} | add r = rownum() | cols -v r");
+                let parallel = run_file_with(&after, &path, threads, Progress::default());
+                assert_eq!(parallel, serial, "{after} -n {threads}");
+            }
+        }
+        // One before them sees every row in order.
+        for threads in [1, 3] {
+            let out = run_file_with(
+                "add r = rownum() | stats r",
+                &path,
+                threads,
+                Progress::default(),
+            );
+            assert!(out.contains("r,3000,0,1,3000,"), "{out}");
+            let script = "add r = rownum() | agg max(r) by k";
+            let out = run_file_with(script, &path, threads, Progress::default());
+            assert!(out.ends_with("4,3000\n"), "{out}");
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_bad_row_in_a_shard_fails_the_run_with_the_first_one() {
+        let mut csv = String::from("x,k\n");
+        for i in 0..3000 {
+            let x = match i {
+                100 => "A".to_string(),
+                2500 => "C".to_string(),
+                _ => i.to_string(),
+            };
+            csv.push_str(&format!("{x},{}\n", i % 5));
+        }
+        let path = std::env::temp_dir().join(format!("csvm-bad-row-{}.csv", std::process::id()));
+        std::fs::write(&path, &csv).unwrap();
+        for script in [
+            "add y = x + 1",
+            "select x > 5 | stats",
+            "add y = x * 2 | agg count(y) by k",
+        ] {
+            for threads in [1, 2, 8] {
+                let err = try_run_file_with(script, &path, threads, Progress::default());
+                assert!(
+                    err.as_ref().is_err_and(|e| e.to_string().contains("'A'")),
+                    "{script} -n {threads}: {err:?}"
+                );
+            }
+        }
+        std::fs::remove_file(&path).ok();
+    }
+
     /// The output of `script` run over the file at `path` with `threads`
     /// workers, counting what it reads into `progress`.
     fn run_file_with(script: &str, path: &Path, threads: usize, progress: Progress) -> String {
-        let mut plan = parse(script).unwrap();
-        prepare_joins(&mut plan).unwrap();
-        let (header, data_start, file_len) = read_header_from_path(path).unwrap();
-        let out_header = plan.resolve(&header).unwrap();
+        try_run_file_with(script, path, threads, progress).unwrap()
+    }
+
+    /// [`run_file_with`], keeping its error.
+    fn try_run_file_with(
+        script: &str,
+        path: &Path,
+        threads: usize,
+        progress: Progress,
+    ) -> Result<String, Error> {
+        let mut plan = parse(script)?;
+        prepare_joins(&mut plan)?;
+        let (header, data_start, file_len) = read_header_from_path(path)?;
+        let out_header = plan.resolve(&header)?;
         let opts = RunOpts {
             chunk_size: 256,
             threads,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            shard_bytes: 64, // many shards, even for a small file
         };
         let mut out = Vec::new();
         run_file(
@@ -3408,9 +3538,8 @@ mod tests {
             },
             &progress,
             &mut out,
-        )
-        .unwrap();
-        String::from_utf8(out).unwrap()
+        )?;
+        Ok(String::from_utf8(out).unwrap())
     }
 
     /// The bytes a run of `script` over the file at `path` with `threads`
@@ -4368,28 +4497,39 @@ mod tests {
     }
 
     #[test]
-    fn parse_counted_gives_every_row_and_counts_every_byte() {
-        // A bit over two pieces, so it is parsed in three.
-        let line = "12345,some text\n";
-        let text = line.repeat(2 * PROGRESS_PIECE / line.len() + 100);
+    fn parse_range_reads_a_range_in_pieces_and_counts_every_byte() {
+        // A header, then a bit over two pieces of rows, which do not end on
+        // a piece's edge.
+        let line = "12345,some text!\n";
+        let text = format!("h\n{}", line.repeat(2 * PROGRESS_PIECE / line.len() + 100));
+        let path =
+            std::env::temp_dir().join(format!("csvm-parse-range-{}.csv", std::process::id()));
+        std::fs::write(&path, &text).unwrap();
         let progress = Progress::counting();
         let (mut rows, mut counted_midway) = (0usize, Vec::new());
-        parse_counted(&text, &progress, |row| {
+        parse_range(&path, 2, text.len() as u64, &progress, |row, _| {
             assert_eq!(row.len(), 2);
             rows += 1;
             counted_midway.push(progress.get());
-        });
-        assert_eq!(rows, text.lines().count());
-        assert_eq!(progress.get(), text.len() as u64);
-        // The count moved while rows were still coming, a piece at a time.
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(rows, text.lines().count() - 1);
+        assert_eq!(progress.get(), text.len() as u64 - 2);
+        // Each piece is counted once its rows are done.
+        assert_eq!(counted_midway[0], 0);
         counted_midway.dedup();
         assert_eq!(counted_midway.len(), 3, "{counted_midway:?}");
-        // Text with no trailing newline keeps its last row.
-        let mut last = Vec::new();
-        parse_counted("a,b\nc,d", &Progress::default(), |row| {
-            last = row.iter().map(|f| f.as_str().into_owned()).collect()
+        // The first error stops the reading, within its piece.
+        let progress = Progress::counting();
+        let mut rows = 0;
+        let err = parse_range(&path, 2, text.len() as u64, &progress, |_, _| {
+            rows += 1;
+            Err(Error::Other("stop".into()))
         });
-        assert_eq!(last, ["c", "d"]);
+        assert!(err.is_err_and(|e| e.to_string() == "stop"));
+        assert_eq!((rows, progress.get()), (1, 0));
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
@@ -4533,6 +4673,7 @@ mod tests {
             threads: 1,
             temp_dir: std::env::temp_dir(),
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            shard_bytes: DEFAULT_SHARD_BYTES,
         };
         run(&plan, &out_header, &opts, &mut reader, out)
     }

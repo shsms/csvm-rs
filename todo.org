@@ -22,13 +22,6 @@ git history; this file is the "what next / what was decided" scratchpad.
   distinct item separator, removes the trap.
 
 ** TODO Correctness / edges
-- Sharded =stats= / =group= reduce in =-n= ranges, so the documented
-  low-order-digit float drift of =sum=/=mean=/=stddev= (hundreds of ULP on a
-  few hundred thousand rows) is now the default behaviour (threads default
-  to the core count since 2026-09-05) and can differ between machines; =-n
-  1= is the reproducible run. Decoupling the
-  shard count from the worker count (=shard_ranges= picking a count from
-  file size) would make the output thread-count independent.
 - sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
   spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
   A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
