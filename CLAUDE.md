@@ -584,7 +584,8 @@ terminal (not `TERM=dumb`), a `fmt` table, a `graph` chart, help and
 (`Console::fills`) — never a shorter one, as `--header` turns `-F` off.
 Dropping the `Pager` waits for it; `--no-pager` or a pager of `cat` / empty
 turns it off. A run past a second draws a progress line on stderr
-(`src/progress.rs`): a `progress::Progress` is a shared byte count that
+(`src/progress.rs`): a `progress::Progress` is a shared count of the input
+read (bytes, or rows of a parquet input: `progress::Unit`) that
 `run_file` takes with its `exec::InputFile` (the path and data range), and
 that its file reader (`progress::Counted`) and the shard workers
 (`parse_counted`, per ~4 MiB piece, so the count follows the parsing rather

@@ -12,8 +12,9 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// A count of input bytes consumed so far. The default counts nothing, so a
-/// run with no meter pays one branch per read.
+/// A count of the input consumed so far, in the [`Unit`] its reader counts.
+/// The default counts nothing, so a run with no meter pays one branch per
+/// read.
 #[derive(Clone, Debug, Default)]
 pub struct Progress(Option<Arc<AtomicU64>>);
 
@@ -28,14 +29,14 @@ impl Progress {
         self.0.is_some()
     }
 
-    /// Count `n` more bytes.
+    /// Count `n` more of the input.
     pub fn add(&self, n: u64) {
         if let Some(count) = &self.0 {
             count.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    /// The bytes counted so far.
+    /// The count so far.
     pub fn get(&self) -> u64 {
         self.0.as_ref().map_or(0, |c| c.load(Ordering::Relaxed))
     }
@@ -79,19 +80,33 @@ fn bytes(n: u64) -> String {
 
 /// The meter's line: how much of the input is read (a percentage of `total`
 /// when it is known, as for a file) and how long the run has taken.
-fn status(read: u64, total: Option<u64>, elapsed: Duration) -> String {
+fn status(read: u64, total: Option<u64>, unit: Unit, elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
+    let amount = |n: u64| match unit {
+        Unit::Bytes => bytes(n),
+        Unit::Rows => format!("{n} rows"),
+    };
     match total {
         Some(total) if total > 0 => {
             let pct = (read.min(total) as f64 / total as f64 * 100.0).floor();
-            format!(
-                "csvm: {pct:.0}% · {} of {} · {secs:.1}s",
-                bytes(read.min(total)),
-                bytes(total)
-            )
+            let of = match unit {
+                // "5 of 10 rows", not "5 rows of 10 rows".
+                Unit::Bytes => format!("{} of {}", bytes(read.min(total)), bytes(total)),
+                Unit::Rows => format!("{} of {total} rows", read.min(total)),
+            };
+            format!("csvm: {pct:.0}% · {of} · {secs:.1}s")
         }
-        _ => format!("csvm: {} read · {secs:.1}s", bytes(read)),
+        _ => format!("csvm: {} read · {secs:.1}s", amount(read)),
     }
+}
+
+/// What a [`Progress`] counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    /// Bytes of a CSV input.
+    Bytes,
+    /// Rows of a parquet input, which is read in decoded batches.
+    Rows,
 }
 
 /// A line on stderr showing a run's [`Progress`], redrawn in place until the
@@ -110,16 +125,16 @@ impl Meter {
     /// How often the line is redrawn.
     const TICK: Duration = Duration::from_millis(200);
 
-    /// Start showing `progress` out of `total` bytes (`None` when the input's
-    /// size is not known, as for stdin).
-    pub fn start(progress: Progress, total: Option<u64>) -> Meter {
+    /// Start showing `progress` out of `total` (`None` when the input's size
+    /// is not known, as for stdin), counted in `unit`.
+    pub fn start(progress: Progress, total: Option<u64>, unit: Unit) -> Meter {
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = thread::spawn(move || {
             let began = Instant::now();
             let mut wait = Meter::DELAY;
             let mut drawn = false;
             while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(wait) {
-                let line = status(progress.get(), total, began.elapsed());
+                let line = status(progress.get(), total, unit, began.elapsed());
                 // A failed write to stderr has nowhere to be reported.
                 let _ = write!(io::stderr(), "\r\x1b[K{line}");
                 drawn = true;
@@ -188,18 +203,32 @@ mod tests {
     #[test]
     fn status_shows_a_share_of_a_known_size() {
         let t = Duration::from_millis(3140);
+        let bytes = Unit::Bytes;
         assert_eq!(
-            status(512 << 20, Some(1 << 30), t),
+            status(512 << 20, Some(1 << 30), bytes, t),
             "csvm: 50% · 512.0 MiB of 1.0 GiB · 3.1s"
         );
         // A count past the size (a file grown mid-run) stays at 100%.
-        assert_eq!(status(20, Some(10), t), "csvm: 100% · 10 B of 10 B · 3.1s");
-        assert_eq!(status(2048, None, t), "csvm: 2.0 KiB read · 3.1s");
+        assert_eq!(
+            status(20, Some(10), bytes, t),
+            "csvm: 100% · 10 B of 10 B · 3.1s"
+        );
+        assert_eq!(status(2048, None, bytes, t), "csvm: 2.0 KiB read · 3.1s");
+    }
+
+    #[test]
+    fn status_counts_rows_for_rows() {
+        let t = Duration::from_millis(3140);
+        assert_eq!(
+            status(1200, Some(4800), Unit::Rows, t),
+            "csvm: 25% · 1200 of 4800 rows · 3.1s"
+        );
+        assert_eq!(status(7, None, Unit::Rows, t), "csvm: 7 rows read · 3.1s");
     }
 
     #[test]
     fn a_quick_meter_draws_nothing() {
-        let mut meter = Meter::start(Progress::counting(), Some(10));
+        let mut meter = Meter::start(Progress::counting(), Some(10), Unit::Bytes);
         assert!(!meter.finish());
     }
 }

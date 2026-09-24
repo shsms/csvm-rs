@@ -6,7 +6,7 @@ use std::process;
 use csvm::cli::{self, Parsed};
 use csvm::console::Console;
 use csvm::plan::OutputFormat;
-use csvm::progress::{Counted, Meter, Progress};
+use csvm::progress::{Counted, Meter, Progress, Unit};
 use csvm::{exec, parse};
 
 fn main() {
@@ -318,10 +318,10 @@ fn run_into<W: Write + Send>(
     progress: &Progress,
     output: &mut W,
 ) -> Result<(), csvm::error::Error> {
-    let meter = |total| {
+    let meter = |total, unit| {
         progress
             .is_counting()
-            .then(|| Meter::start(progress.clone(), total))
+            .then(|| Meter::start(progress.clone(), total, unit))
     };
     match source {
         Source::File {
@@ -329,7 +329,7 @@ fn run_into<W: Write + Send>(
             data_start,
             file_len,
         } => {
-            let _meter = meter(Some(file_len.saturating_sub(*data_start)));
+            let _meter = meter(Some(file_len.saturating_sub(*data_start)), Unit::Bytes);
             let input = exec::InputFile {
                 path,
                 data_start: *data_start,
@@ -338,7 +338,7 @@ fn run_into<W: Write + Send>(
             exec::run_file(plan, out_header, opts, input, progress, output)
         }
         Source::Stream(reader) => {
-            let _meter = meter(None);
+            let _meter = meter(None, Unit::Bytes);
             // A stream is read here, not by the executor, so count it here.
             let mut counted = BufReader::new(Counted::new(reader, progress.clone()));
             exec::run(plan, out_header, opts, &mut counted, output)
