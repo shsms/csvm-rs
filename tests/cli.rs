@@ -227,3 +227,34 @@ fn a_script_error_shows_where_it_is() {
          cols a | select a >> 1\n                     ^\n"
     );
 }
+
+#[test]
+fn an_unknown_column_is_marked_where_it_is_named() {
+    let (ok, _, err) = csvm(&["cols a | select bogus > 1"], "a\n1\n");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "csvm: column not found: bogus — have: a\n  \
+         cols a | select bogus > 1\n                  ^^^^^\n"
+    );
+    // In a join's sub-pipeline, against the right file's header.
+    let right = temp_csv("k,w\n1,x\n");
+    let script = format!("join (select zz > 1) {} on k", right.display());
+    let (ok, _, err) = csvm(&[&script], "k\n1\n");
+    assert!(!ok);
+    assert!(
+        err.ends_with(&format!("  {script}\n{}^^\n", " ".repeat(2 + 13))),
+        "{err}"
+    );
+    // A missing join key, not the same letters in the file's path.
+    let zz = std::env::temp_dir().join(format!("csvm_zz_{}.csv", std::process::id()));
+    std::fs::write(&zz, "zz\n1\n").unwrap();
+    let script = format!("join {} on zz", zz.display());
+    let (ok, _, err) = csvm(&[&script], "k\n1\n");
+    std::fs::remove_file(&zz).unwrap();
+    assert!(!ok);
+    assert!(
+        err.ends_with(&format!("  {script}\n{}^^\n", " ".repeat(script.len()))),
+        "{err}"
+    );
+}

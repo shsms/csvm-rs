@@ -24,7 +24,7 @@ use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
     OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Stage,
-    StatsStmt, Stmt, UniqStmt, ValExpr,
+    StatsStmt, Stmt, UniqStmt, ValExpr, Written,
 };
 use std::ops::Range;
 
@@ -253,9 +253,12 @@ struct Builder<'a> {
     graph: Option<GraphSpec>,
     /// Where each item, colour rule and the graph were written in the script
     /// (see [`Builder::written_at`]).
-    item_spans: Vec<Option<Range<usize>>>,
-    color_spans: Vec<Option<Range<usize>>>,
-    graph_span: Option<Range<usize>>,
+    item_written: Vec<Written>,
+    color_written: Vec<Written>,
+    graph_written: Option<Written>,
+    /// The columns read since the last [`Builder::written_at`], and where
+    /// each is written (see [`Builder::read_column`]).
+    columns: Vec<(String, Range<usize>)>,
 }
 
 impl<'a> Builder<'a> {
@@ -268,55 +271,98 @@ impl<'a> Builder<'a> {
             output: OutputFormat::Csv,
             colors: Vec::new(),
             graph: None,
-            item_spans: Vec::new(),
-            color_spans: Vec::new(),
-            graph_span: None,
+            item_written: Vec::new(),
+            color_written: Vec::new(),
+            graph_written: None,
+            columns: Vec::new(),
         }
     }
 
     /// Record `span` as where everything parsed since the last call was
     /// written: the stage just parsed, and whatever a fragment it called
-    /// expanded to.
+    /// expanded to; with the columns read meanwhile.
     fn written_at(&mut self, span: Option<Range<usize>>) {
-        self.item_spans.resize(self.items.len(), span.clone());
-        self.color_spans.resize(self.colors.len(), span.clone());
-        if self.graph.is_some() && self.graph_span.is_none() {
-            self.graph_span = span;
+        let written = Written {
+            span,
+            columns: std::mem::take(&mut self.columns),
+        };
+        self.item_written
+            .resize_with(self.items.len(), || written.clone());
+        self.color_written
+            .resize_with(self.colors.len(), || written.clone());
+        if self.graph.is_some() && self.graph_written.is_none() {
+            self.graph_written = Some(written);
         }
+    }
+
+    /// Note that the part being parsed reads column `name`, written at `at`
+    /// of `src`. Dropped when `src` is not a slice of the script, as for a
+    /// fragment's expansion.
+    fn read_column(&mut self, name: &str, src: &str, at: Range<usize>) {
+        if let Some(base) = offset_in(self.script, src) {
+            self.columns
+                .push((name.to_string(), base + at.start..base + at.end));
+        }
+    }
+
+    /// [`Builder::read_column`] for `name`, read from the item at `item` of
+    /// `src`: where it is written there, from byte `from` of the item's text
+    /// in `src` on, else the whole item.
+    fn read_column_in(&mut self, name: &str, src: &str, item: Range<usize>, from: usize) {
+        let found = src
+            .get(item.clone())
+            .and_then(|text| text.get(from..))
+            .and_then(|rest| rest.find(name));
+        let at = match found {
+            Some(i) => item.start + from + i..item.start + from + i + name.len(),
+            None => item,
+        };
+        self.read_column(name, src, at);
+    }
+
+    /// The column list `s` (see [`split_list`]), each column noted as read.
+    fn column_list(&mut self, s: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, at) in split_items(s, false, false).0 {
+            self.read_column(&name, s, at);
+            names.push(name);
+        }
+        names
     }
 
     /// Group the flat item list into stages: runs of statements become a
     /// `Transform`; every other item is already a stage of its own.
     fn take_plan(&mut self) -> Plan {
         let mut stages = Vec::new();
-        // In step with `stages`: the spans of each one's parts.
-        let mut spans: Vec<Vec<Option<Range<usize>>>> = Vec::new();
+        // In step with `stages`: where each one's parts were written.
+        let mut written: Vec<Vec<Written>> = Vec::new();
         let mut transform: Vec<Stmt> = Vec::new();
-        let mut transform_spans = Vec::new();
+        let mut transform_written = Vec::new();
         let flush = |transform: &mut Vec<Stmt>,
-                     transform_spans: &mut Vec<Option<Range<usize>>>,
+                     transform_written: &mut Vec<Written>,
                      stages: &mut Vec<Stage>,
-                     spans: &mut Vec<Vec<Option<Range<usize>>>>| {
+                     written: &mut Vec<Vec<Written>>| {
             if !transform.is_empty() {
                 stages.push(Stage::Transform(std::mem::take(transform)));
-                spans.push(std::mem::take(transform_spans));
+                written.push(std::mem::take(transform_written));
             }
         };
-        let item_spans = std::mem::take(&mut self.item_spans);
-        for (item, span) in self.items.drain(..).zip(item_spans) {
+        let item_written = std::mem::take(&mut self.item_written);
+        debug_assert_eq!(self.items.len(), item_written.len());
+        for (item, part) in self.items.drain(..).zip(item_written) {
             let stage = match item {
                 Item::Stmt(s) => {
                     transform.push(s);
-                    transform_spans.push(span);
+                    transform_written.push(part);
                     continue;
                 }
                 Item::Stage(stage) => stage,
             };
             flush(
                 &mut transform,
-                &mut transform_spans,
+                &mut transform_written,
                 &mut stages,
-                &mut spans,
+                &mut written,
             );
             match stage {
                 // A window folds into the one before it, and resolves no
@@ -325,16 +371,16 @@ impl<'a> Builder<'a> {
                 Stage::Head(n) => push_window(&mut stages, 0, Some(n)),
                 stage => {
                     stages.push(stage);
-                    spans.push(vec![span]);
+                    written.push(vec![part]);
                 }
             }
-            spans.resize_with(stages.len(), Vec::new);
+            written.resize_with(stages.len(), Vec::new);
         }
         flush(
             &mut transform,
-            &mut transform_spans,
+            &mut transform_written,
             &mut stages,
-            &mut spans,
+            &mut written,
         );
         Plan {
             stages,
@@ -342,9 +388,9 @@ impl<'a> Builder<'a> {
             colors: std::mem::take(&mut self.colors),
             graph: self.graph.take(),
             sources: Sources {
-                stages: spans,
-                colors: std::mem::take(&mut self.color_spans),
-                graph: self.graph_span.take(),
+                stages: written,
+                colors: std::mem::take(&mut self.color_written),
+                graph: self.graph_written.take().unwrap_or_default(),
             },
         }
     }
@@ -439,7 +485,7 @@ impl<'a> Builder<'a> {
     /// `parse`. An error is placed on the part the parser names, else on the
     /// token it stopped at, or on the token the lexer was reading.
     fn parse_expr<T>(
-        &self,
+        &mut self,
         src: &str,
         parse: impl FnOnce(&mut ExprParser) -> Result<T, Error>,
     ) -> Result<T, Error> {
@@ -450,8 +496,13 @@ impl<'a> Builder<'a> {
             end: src.len(),
             pos: 0,
             fail_span: None,
+            columns: Vec::new(),
         };
-        parse(&mut parser).map_err(|e| self.place_in(src, parser.error_span(), e))
+        let parsed = parse(&mut parser).map_err(|e| self.place_in(src, parser.error_span(), e))?;
+        for (name, at) in parser.columns {
+            self.read_column(&name, src, at);
+        }
+        Ok(parsed)
     }
 
     /// `e`, from the expression `src`, placed on the byte range `at` of it.
@@ -540,8 +591,9 @@ impl<'a> Builder<'a> {
     /// by the whole row, or by the named key columns. Global (not adjacent), so
     /// no pre-sort is required.
     fn parse_uniq(&mut self, rest: &str) -> Result<(), Error> {
+        let cols = self.column_list(rest);
         self.items.push(Item::Stage(Stage::Uniq(UniqStmt {
-            cols: split_list(rest),
+            cols,
             positions: Vec::new(),
         })));
         Ok(())
@@ -609,7 +661,7 @@ impl<'a> Builder<'a> {
                 && !has_bare_word(frag, "on")
                 && let Some(prev) = stmts.last_mut().filter(|j| !j.keys.is_empty())
             {
-                parse_join_keys(frag, &mut prev.keys)?;
+                self.parse_join_keys(frag, &mut prev.keys)?;
                 continue;
             }
 
@@ -644,7 +696,7 @@ impl<'a> Builder<'a> {
                 if kw != "on" {
                     return Err(err("join expects `on KEY[,KEY...]` after the file"));
                 }
-                parse_join_keys(key_str, &mut keys)?;
+                self.parse_join_keys(key_str, &mut keys)?;
                 if keys.is_empty() {
                     return Err(err("join `on` expects at least one key column"));
                 }
@@ -692,12 +744,32 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// Parse `KEY[,KEY...]` specs (`name` or `lname=rname`) onto `keys`.
+    fn parse_join_keys(
+        &mut self,
+        spec_list: &str,
+        keys: &mut Vec<(String, String)>,
+    ) -> Result<(), Error> {
+        for (spec, at) in split_items(spec_list, false, false).0 {
+            let (l, r) = match spec.split_once('=') {
+                None => (spec.as_str(), spec.as_str()),
+                Some((l, r)) if !l.is_empty() && !r.is_empty() => (l, r),
+                Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
+            };
+            // Only the left key is looked up in the stream this part reads.
+            self.read_column_in(l, spec_list, at, 0);
+            keys.push((l.to_string(), r.to_string()));
+        }
+        Ok(())
+    }
+
     /// `stats [cols]` profiles the named columns (or all of them, if none are
     /// named): a blocking stage that reduces the input to one summary row per
     /// column.
     fn parse_stats(&mut self, rest: &str) -> Result<(), Error> {
+        let cols = self.column_list(rest);
         self.items.push(Item::Stage(Stage::Stats(StatsStmt {
-            cols: split_list(rest),
+            cols,
             positions: Vec::new(),
         })));
         Ok(())
@@ -714,10 +786,23 @@ impl<'a> Builder<'a> {
             Some(at) => (&items[..at], &items[at + 1..]),
             None => (&items[..], &[][..]),
         };
-        let aggs = specs
-            .iter()
-            .map(|(t, _)| parse_agg_spec(t))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut aggs = Vec::new();
+        for (spec, at) in specs {
+            let agg = parse_agg_spec(spec)?;
+            if let Some(col) = &agg.col {
+                // The column is inside the call's parentheses, after any
+                // `NAME=` (which may hold a `(` too), as parse_agg_spec reads it.
+                let from = rest.get(at.clone()).map_or(0, |t| {
+                    let call = split_name_eq(t)
+                        .ok()
+                        .and_then(|(_, _, spec)| spec)
+                        .unwrap_or(t);
+                    t.len() - call.len() + call.find('(').unwrap_or(0)
+                });
+                self.read_column_in(col, rest, at.clone(), from);
+            }
+            aggs.push(agg);
+        }
         if aggs.is_empty() {
             return Err(err(
                 "agg expects at least one aggregate, e.g. agg sum(amount)",
@@ -726,7 +811,14 @@ impl<'a> Builder<'a> {
         if by_at.is_some() && keys.is_empty() {
             return Err(err("agg: `by` expects at least one key column"));
         }
-        let keys: Vec<String> = keys.iter().map(|(k, _)| unquote(k).to_string()).collect();
+        let keys: Vec<String> = keys
+            .iter()
+            .map(|(k, at)| {
+                let key = unquote(k);
+                self.read_column_in(key, rest, at.clone(), 0);
+                key.to_string()
+            })
+            .collect();
         self.items.push(Item::Stage(Stage::Group(GroupStmt {
             keys,
             key_positions: Vec::new(),
@@ -757,7 +849,7 @@ impl<'a> Builder<'a> {
             }
         };
         let mut opts = GraphOpts::default();
-        let mut positional = String::new();
+        let mut cols = Vec::new();
         let mut s = rest.trim();
         while !s.is_empty() {
             let (word, after) = split_first_word(s);
@@ -813,6 +905,9 @@ impl<'a> Builder<'a> {
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-c", "--color-by"]) {
                 let (val, tail) = v?;
+                // The value follows the flag's name, after a space or `=`.
+                let from = word.find('=').map_or(word.len(), |eq| eq + 1);
+                self.read_column_in(&val, s, 0..s.len() - tail.len(), from);
                 opts.color_by = Some(ColRef::new(val));
                 s = tail.trim_start();
             } else if let Some(v) = flag_value(word, after, &["-y", "--yrange"]) {
@@ -822,10 +917,7 @@ impl<'a> Builder<'a> {
             } else if word.starts_with('-') && word != "-" {
                 return Err(err(format!("graph: unknown flag `{word}`")));
             } else {
-                if !positional.is_empty() {
-                    positional.push(' ');
-                }
-                positional.push_str(word);
+                cols.extend(self.column_list(word));
                 s = after;
             }
         }
@@ -833,7 +925,6 @@ impl<'a> Builder<'a> {
         if opts.data && opts.svg {
             return Err(err("graph: -D/--data and -S/--svg are exclusive"));
         }
-        let cols = split_list(&positional);
         check_graph_arity(kind, kind_word, cols.len())?;
         check_graph_flags(kind, kind_word, &opts, cols.len())?;
         self.graph = Some(GraphSpec {
@@ -932,9 +1023,10 @@ impl<'a> Builder<'a> {
 
     fn parse_rename(&mut self, rest: &str) -> Result<(), Error> {
         let mut pairs = Vec::new();
-        for spec in split_list(rest) {
+        for (spec, at) in split_items(rest, false, false).0 {
             match spec.split_once('=') {
                 Some((from, to)) if !from.is_empty() && !to.is_empty() => {
+                    self.read_column_in(from, rest, at, 0);
                     pairs.push((from.to_string(), to.to_string()));
                 }
                 _ => return Err(err(format!("rename expects old=new pairs, got '{spec}'"))),
@@ -961,7 +1053,7 @@ impl<'a> Builder<'a> {
             Some(r) => (true, r.trim_start()),
             None => (false, rest),
         };
-        let names = split_list(list);
+        let names = self.column_list(list);
         if names.is_empty() {
             return Err(err("cols expects at least one column"));
         }
@@ -1024,15 +1116,16 @@ impl<'a> Builder<'a> {
 
     fn parse_sort(&mut self, rest: &str) -> Result<(), Error> {
         let mut keys = Vec::new();
-        for spec in split_list(rest) {
+        for (spec, at) in split_items(rest, false, false).0 {
             // `col=flags`.
             let (name, flags) = match spec.split_once('=') {
                 Some((n, f)) => (n.to_string(), f),
-                None => (spec, ""),
+                None => (spec.clone(), ""),
             };
             if name.is_empty() {
                 return Err(err("sort spec is missing a column name"));
             }
+            self.read_column_in(&name, rest, at, 0);
             let mut key = SortKey {
                 mode: SortMode::Auto,
                 name,
@@ -1498,20 +1591,6 @@ fn has_bare_word(s: &str, word: &str) -> bool {
         rest = after.trim_start();
     }
     false
-}
-
-/// Parse `KEY[,KEY...]` specs (`name` or `lname=rname`) onto `keys`.
-fn parse_join_keys(spec_list: &str, keys: &mut Vec<(String, String)>) -> Result<(), Error> {
-    for spec in split_list(spec_list) {
-        match spec.split_once('=') {
-            None => keys.push((spec.clone(), spec)),
-            Some((l, r)) if !l.is_empty() && !r.is_empty() => {
-                keys.push((l.to_string(), r.to_string()));
-            }
-            Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
-        }
-    }
-    Ok(())
 }
 
 /// True when the separator `c` sits next to an unquoted `=` and so does not
@@ -2089,6 +2168,9 @@ struct ExprParser {
     /// Where the error being returned is, when that is not the token at the
     /// cursor: a part already read past, such as a call to its `)`.
     fail_span: Option<Range<usize>>,
+    /// Each column the expression reads, with the byte range it is written
+    /// at.
+    columns: Vec<(String, Range<usize>)>,
 }
 
 /// A parsed subexpression that is either a boolean or a value. The unified
@@ -2428,6 +2510,8 @@ impl ExprParser {
                 if self.eat("(") {
                     self.parse_call(&name)
                 } else {
+                    self.columns
+                        .push((name.clone(), self.spans[self.pos - 1].clone()));
                     Ok(ValExpr::Col(ColRef::new(name)))
                 }
             }
@@ -2543,11 +2627,56 @@ mod tests {
             let mut plan = parse(script).unwrap();
             plan.resolve(&header).unwrap_err().span()
         };
-        assert_eq!(span("cols a | select b > 1"), Some(9..21));
-        assert_eq!(span("cols a | sort 5=n"), Some(9..17));
-        assert_eq!(span("graph hist zz"), Some(0..13));
+        // An error that is not about a column is placed on its part.
+        assert_eq!(span("cols a | select num(a) > 'x'"), Some(9..28));
+        assert_eq!(span("color red num(a) > 'x'"), Some(0..22));
+        // A column error, in each kind of stage, on where it is named.
+        assert_eq!(span("cols a | select b > 1"), Some(16..17));
+        assert_eq!(span("cols a | sort 5=n"), Some(14..15));
+        assert_eq!(span("cols a | uniq zz"), Some(14..16));
+        assert_eq!(span("cols a | stats zz"), Some(15..17));
+        assert_eq!(span("cols a | agg sum(zz)"), Some(17..19));
+        assert_eq!(span("graph hist zz"), Some(11..13));
         // A fragment's statements were written at its call.
         assert_eq!(span("fn f(x) { select x > 1 }\nf(zz)"), Some(25..30));
+    }
+
+    #[test]
+    fn a_column_error_is_placed_where_the_script_names_it() {
+        let place = |header: &[&str], script: &str| {
+            let header: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+            let mut plan = parse(script).unwrap();
+            plan.resolve(&header).unwrap_err().span().unwrap()
+        };
+        let mark = |header: &[&str], script: &str| script[place(header, script)].to_string();
+        let a = ["a"];
+        assert_eq!(mark(&a, "cols a | select b > 1"), "b");
+        // The first time the part names it.
+        assert_eq!(place(&a, "cols a | select zz > 1 && zz < 5"), 16..18);
+        // A column, not a string literal or a number that reads the same.
+        assert_eq!(mark(&a, "cols a | select a == 'b' || b > 1"), "b");
+        assert_eq!(mark(&a, "cols a | select 3 < `3`"), "`3`");
+        // Not the name of the column an `add` or `agg` makes.
+        assert_eq!(place(&a, "cols a | add zz = zz + 1"), 18..20);
+        assert_eq!(place(&a, "cols a | agg zz=sum(zz)"), 20..22);
+        assert_eq!(place(&a, "cols a | agg t = sum(u)"), 21..22);
+        assert_eq!(place(&a, "cols a | agg `s(`=sum(s)"), 22..23);
+        assert_eq!(place(&a, "cols a | agg sum(`a(b`)"), 18..21);
+        // A whole item of a list, not part of a longer name.
+        assert_eq!(mark(&["a", "x-zz"], "cols x-zz, zz"), "zz");
+        assert_eq!(mark(&a, "cols a | sort 5=n"), "5");
+        assert_eq!(mark(&a, "cols a | agg count by zz"), "zz");
+        assert_eq!(mark(&a, "rename zz=b"), "zz");
+        assert_eq!(mark(&a, "graph line a zz"), "zz");
+        assert_eq!(mark(&a, "graph scatter a a -c zz"), "zz");
+        assert_eq!(mark(&a, "graph scatter a a --color-by=c"), "c");
+        // A join's left key, not the letters of its file's path; a right key
+        // is in the right file, so it marks the whole join.
+        assert_eq!(mark(&a, "join zz.csv on zz"), "zz");
+        assert_eq!(place(&a, "join zz.csv on zz"), 15..17);
+        assert_eq!(mark(&a, "join f.csv on a=zz"), "join f.csv on a=zz");
+        // A fragment's expansion is not in the script: its call is the place.
+        assert_eq!(mark(&a, "fn f(x) { select x > 1 }\nf(zz)"), "f(zz)");
     }
 
     #[test]

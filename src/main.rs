@@ -180,7 +180,8 @@ fn run() -> Result<(), Failure> {
 }
 
 /// A script error's message and, when it has a place in the script, the line
-/// it is on with the place marked (in colour when the console colours errors).
+/// it is on with the place marked (in colour when the console colours errors):
+/// for an unknown column, where the column is named.
 fn script_error(script: &str, e: &csvm::error::Error, console: &Console) -> String {
     let Some(span) = e.span() else {
         return e.to_string();

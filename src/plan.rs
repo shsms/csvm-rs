@@ -622,33 +622,45 @@ pub struct JoinStmt {
 }
 
 impl JoinStmt {
-    /// Resolve key columns against the left header (threaded in) and the
-    /// (already-set) right header, then reshape `header` to the joined schema.
+    /// Resolve the left key columns against `header`, the stream's.
+    fn resolve_left_keys(&mut self, header: &[String]) -> Result<(), Error> {
+        self.left_ncols = header.len();
+        self.left_key_pos = self.key_positions(header, |(l, _)| l)?;
+        Ok(())
+    }
+
+    /// Where one side's keys (`side` picks it from a pair) are in `header`.
+    /// A key past the item's own `on` gets [`join_key_err`]'s hint.
+    fn key_positions(
+        &self,
+        header: &[String],
+        side: fn(&(String, String)) -> &String,
+    ) -> Result<Vec<usize>, Error> {
+        self.keys
+            .iter()
+            .enumerate()
+            .map(|(i, key)| {
+                resolve_col(side(key), header).map_err(|e| {
+                    if i < self.own_keys {
+                        e
+                    } else {
+                        join_key_err(e)
+                    }
+                })
+            })
+            .collect()
+    }
+
+    /// After [`JoinStmt::resolve_left_keys`], resolve the right key columns
+    /// against the (already-set) right header, then reshape `header` to the
+    /// joined schema.
     ///
     /// Columns whose names appear on *both* sides (the left header and the right's
     /// emitted columns) are disambiguated: the left clashing column gets
     /// `lsuffix` (none by default), the right one `rsuffix` (`_r` by default).
     /// Non-clashing names are left untouched.
     fn resolve(&mut self, header: &mut Vec<String>) -> Result<(), Error> {
-        self.left_ncols = header.len();
-        let own = self.own_keys;
-        self.left_key_pos = self
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(i, (l, _))| {
-                resolve_col(l, header).map_err(|e| if i < own { e } else { join_key_err(e) })
-            })
-            .collect::<Result<_, _>>()?;
-        self.right_key_pos = self
-            .keys
-            .iter()
-            .enumerate()
-            .map(|(i, (_, r))| {
-                resolve_col(r, &self.right_header)
-                    .map_err(|e| if i < own { e } else { join_key_err(e) })
-            })
-            .collect::<Result<_, _>>()?;
+        self.right_key_pos = self.key_positions(&self.right_header, |(_, r)| r)?;
         // Emit every right column except the (redundant) key columns, in order.
         self.right_emit_pos = (0..self.right_header.len())
             .filter(|i| !self.right_key_pos.contains(i))
@@ -895,33 +907,68 @@ pub struct Plan {
     pub sources: Sources,
 }
 
-/// Where in the script the parts of a [`Plan`] were written: byte ranges of
-/// the script, the stage each part came from (a fragment's parts, the stage
-/// that called it). `None` where that is not known.
+/// Where in the script the parts of a [`Plan`] were written (a fragment's
+/// parts, at the stage that called it).
 #[derive(Clone, Debug, Default)]
 pub struct Sources {
-    /// Per stage: the span of each statement of a transform, or the one span
-    /// of any other stage.
-    pub stages: Vec<Vec<Option<Range<usize>>>>,
-    /// The span of each colour rule.
-    pub colors: Vec<Option<Range<usize>>>,
-    /// The span of the graph sink.
-    pub graph: Option<Range<usize>>,
+    /// Per stage: each statement of a transform, or the one part of any
+    /// other stage.
+    pub stages: Vec<Vec<Written>>,
+    /// Each colour rule.
+    pub colors: Vec<Written>,
+    /// The graph sink.
+    pub graph: Written,
 }
 
 impl Sources {
-    /// `e`, placed on part `part` of stage `stage` when its span is known.
+    /// `e`, placed by part `part` of stage `stage` (see [`Written::place`]).
     fn place(&self, stage: usize, part: usize, e: Error) -> Error {
-        let span = self.stages.get(stage).and_then(|s| s.get(part)).cloned();
-        place_at(span.flatten(), e)
+        match self.stages.get(stage).and_then(|s| s.get(part)) {
+            Some(written) => written.place(e),
+            None => e,
+        }
+    }
+
+    /// `e`, placed on the whole of stage `stage`, a stage of one part.
+    fn place_on_part(&self, stage: usize, e: Error) -> Error {
+        match self.stages.get(stage).and_then(|s| s.first()) {
+            Some(written) => written.place_whole(e),
+            None => e,
+        }
     }
 }
 
-/// `e` placed on `span`, when there is one.
-fn place_at(span: Option<Range<usize>>, e: Error) -> Error {
-    match span {
-        Some(span) => e.at(span),
-        None => e,
+/// Where one part of a plan was written.
+#[derive(Clone, Debug, Default)]
+pub struct Written {
+    /// The part's byte range of the script, when known.
+    pub span: Option<Range<usize>>,
+    /// Each column the part reads, as the parser read it, with the byte
+    /// range of the script it is written at.
+    pub columns: Vec<(String, Range<usize>)>,
+}
+
+impl Written {
+    /// `e` placed where it comes from: a column that is not there where the
+    /// part first names it, anything else on the whole part.
+    pub fn place(&self, e: Error) -> Error {
+        let name = match &e {
+            Error::Column { name, .. } => Some(name),
+            Error::ColumnIndex { index, .. } => Some(index),
+            _ => None,
+        };
+        match name.and_then(|name| self.columns.iter().find(|(read, _)| read == name)) {
+            Some((_, at)) => e.at(at.clone()),
+            None => self.place_whole(e),
+        }
+    }
+
+    /// `e` placed on the whole part, when its span is known.
+    fn place_whole(&self, e: Error) -> Error {
+        match &self.span {
+            Some(span) => e.at(span.clone()),
+            None => e,
+        }
     }
 }
 
@@ -1755,7 +1802,11 @@ impl Plan {
                         .collect();
                 }
                 Stage::Join(j) => {
-                    j.resolve(&mut header).map_err(placed)?;
+                    j.resolve_left_keys(&header).map_err(placed)?;
+                    // The part names only its left keys, so an error from the
+                    // right file's side goes on the whole part.
+                    j.resolve(&mut header)
+                        .map_err(|e| sources.place_on_part(i, e))?;
                     types.resize(header.len(), None); // left columns keep their types
                 }
             }
@@ -1766,24 +1817,30 @@ impl Plan {
         // (Row-level colour errors are already ignored in `compute_styles`.) Any
         // other failure is a real compile error and still aborts.
         let mut failed = None;
-        let mut rule_spans = self.sources.colors.iter();
+        // A dropped rule's place goes with it, so the rest stay in step.
+        let mut written = std::mem::take(&mut self.sources.colors).into_iter();
+        let mut kept = Vec::new();
         self.colors.retain_mut(|rule| {
-            let span = rule_spans.next().cloned().flatten();
+            let rule_written = written.next().unwrap_or_default();
             match rule.resolve(&header, &types) {
-                Ok(()) => true,
+                Ok(()) => {
+                    kept.push(rule_written);
+                    true
+                }
                 Err(Error::Column { .. } | Error::ColumnIndex { .. }) => false,
                 Err(e) => {
-                    failed.get_or_insert(place_at(span, e));
+                    failed.get_or_insert(rule_written.place(e));
                     false
                 }
             }
         });
+        self.sources.colors = kept;
         if let Some(e) = failed {
             return Err(e);
         }
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
-            let placed = |e| place_at(self.sources.graph.clone(), e);
+            let placed = |e| self.sources.graph.place(e);
             for c in &mut g.cols {
                 c.resolve(&header).map_err(placed)?;
             }

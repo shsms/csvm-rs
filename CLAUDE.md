@@ -410,8 +410,13 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   displays as the bare message; `main` adds `error::excerpt`, the script
   line with `^` markers (bold red when stderr takes colour). Errors found
   at resolve time are placed too: the parser records where each part of the
-  plan was written (`plan::Sources`, per stage and statement, a fragment's
-  parts at its call), and `Plan::resolve` places an error on its part.
+  plan was written (`plan::Sources` of `plan::Written`, per stage and
+  statement, a fragment's parts at its call), with every column the part
+  reads and where it is written (`Builder::read_column`: expression
+  identifiers, list items, sort/rename/agg names, join left keys, graph
+  columns and `-c`). `Written::place` puts an unknown column on the first
+  place the part names it, any other error on the whole part; a join's
+  right key, looked up in the right file, goes on the whole join.
 
 ## Implicit conversions (there are no conversion commands)
 
