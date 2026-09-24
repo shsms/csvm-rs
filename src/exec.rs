@@ -179,11 +179,11 @@ fn run_body<R: BufRead, W: Write + Send>(
 ) -> Result<(), Error> {
     // The stages at the front that pass rows on one at a time run as one
     // chain, single-threaded, when one of them must see the rows in order
-    // (see `RowChain::in_order`): rows stream out when nothing follows, and
+    // (see `RowChain::preferred`): rows stream out when nothing follows, and
     // a full `head` stops the reading. Stages after the chain see only the
     // rows it let through, so they run over those in memory.
-    let (mut chain, rest) = RowChain::front(&plan.stages);
-    if chain.in_order() {
+    let (mut chain, rest) = RowChain::front(&plan.stages, opts);
+    if chain.preferred() {
         if rest.is_empty() {
             return stream_rows(&mut chain, opts.chunk_size, input, output);
         }
@@ -290,26 +290,67 @@ enum RowStep<'p> {
     /// `uniq`: its key columns, the keys seen so far, and the current row's
     /// key.
     Uniq(&'p [usize], HashSet<String>, String),
+    /// An inner or left `join`.
+    Join(Box<JoinStep<'p>>),
 }
 
-impl RowStep<'_> {
-    /// Run `row` through the step: `false` when it stops there.
-    fn pass<'a>(
-        &mut self,
-        row: &mut Vec<Field<'a>>,
-        scratch: &mut Vec<Field<'a>>,
-    ) -> Result<bool, Error> {
-        match self {
-            RowStep::Transform(stmts, None) => {
-                apply_stmts(stmts, row, scratch, &EvalCtx::default())
-            }
-            RowStep::Transform(stmts, Some(state)) => state.apply(stmts, row, scratch),
-            RowStep::Window(window) => Ok(window.admit()),
-            RowStep::Uniq(positions, seen, key) => {
-                uniq_key(key, row, positions);
-                Ok(first_seen(seen, key))
-            }
+/// Run `row` through `steps`, handing `emit` each row that comes out of the
+/// last (a join may make it several).
+fn pass_through<'a, F: FnMut(&mut Vec<Field<'a>>)>(
+    steps: &mut [RowStep],
+    row: &mut Vec<Field<'a>>,
+    scratch: &mut Vec<Field<'a>>,
+    emit: &mut F,
+) -> Result<(), Error> {
+    let Some((step, rest)) = steps.split_first_mut() else {
+        emit(row);
+        return Ok(());
+    };
+    let kept = match step {
+        RowStep::Transform(stmts, None) => apply_stmts(stmts, row, scratch, &EvalCtx::default())?,
+        RowStep::Transform(stmts, Some(state)) => state.apply(stmts, row, scratch)?,
+        RowStep::Window(window) => window.admit(),
+        RowStep::Uniq(positions, seen, key) => {
+            uniq_key(key, row, positions);
+            first_seen(seen, key)
         }
+        RowStep::Join(join) => {
+            return join.probe(row, |joined| pass_through(rest, joined, scratch, emit));
+        }
+    };
+    if kept {
+        pass_through(rest, row, scratch, emit)
+    } else {
+        Ok(())
+    }
+}
+
+/// An inner or left join run a row at a time: each left row is probed
+/// against the right file's table, built when the first row comes (or by
+/// [`RowChain::finish`] when none does).
+struct JoinStep<'p> {
+    stmt: &'p JoinStmt,
+    opts: &'p RunOpts,
+    table: Option<JoinTable>,
+    /// The current row's key.
+    key: String,
+}
+
+impl JoinStep<'_> {
+    /// Hand `then` each row left row `row` joins into (see
+    /// [`JoinTable::join`]).
+    fn probe<'a>(
+        &mut self,
+        row: &[Field<'a>],
+        mut then: impl FnMut(&mut Vec<Field<'a>>) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let table = match &mut self.table {
+            Some(table) => table,
+            table @ None => table.insert(JoinTable::build(self.stmt, self.opts)?),
+        };
+        table.join(self.stmt, row, &mut self.key, |_, mut joined| {
+            then(&mut joined)
+        })
     }
 }
 
@@ -378,7 +419,7 @@ struct RowChain<'p> {
 impl<'p> RowChain<'p> {
     /// The chain of the stages at the front of `stages` that pass rows on
     /// one at a time, and the stages after them.
-    fn front(stages: &'p [Stage]) -> (RowChain<'p>, &'p [Stage]) {
+    fn front(stages: &'p [Stage], opts: &'p RunOpts) -> (RowChain<'p>, &'p [Stage]) {
         let mut steps = Vec::new();
         for (i, stage) in stages.iter().enumerate() {
             steps.push(match stage {
@@ -392,24 +433,35 @@ impl<'p> RowChain<'p> {
                 Stage::Skip(n) => RowStep::Window(Window::new(*n, usize::MAX)),
                 Stage::Head(n) => RowStep::Window(Window::new(0, *n)),
                 Stage::Uniq(u) => RowStep::Uniq(&u.positions, HashSet::new(), String::new()),
+                // Those add the right side's unmatched rows after every left
+                // one.
+                Stage::Join(j) if j.join_type.keeps_right_unmatched() => {
+                    return (RowChain { steps }, &stages[i..]);
+                }
+                Stage::Join(j) => RowStep::Join(Box::new(JoinStep {
+                    stmt: j,
+                    opts,
+                    table: None,
+                    key: String::new(),
+                })),
                 Stage::Sort(_)
                 | Stage::Tail(_)
                 | Stage::DropLast(_)
                 | Stage::Stats(_)
-                | Stage::Group(_)
-                | Stage::Join(_) => return (RowChain { steps }, &stages[i..]),
+                | Stage::Group(_) => return (RowChain { steps }, &stages[i..]),
             });
         }
         (RowChain { steps }, &[])
     }
 
-    /// Whether the chain holds a step that must see the rows one at a time
-    /// and in order: a `head` or `tail +N`, a `uniq`, or a stateful
-    /// statement.
-    fn in_order(&self) -> bool {
+    /// Whether the chain is the way to run its stages: it holds more than
+    /// stateless statements (which other paths run in parallel), namely a
+    /// step that must see the rows one at a time and in order (a `head` or
+    /// `tail +N`, a `uniq`, a stateful statement), or a join.
+    fn preferred(&self) -> bool {
         self.steps.iter().any(|step| match step {
             RowStep::Transform(_, state) => state.is_some(),
-            RowStep::Window(_) | RowStep::Uniq(..) => true,
+            RowStep::Window(_) | RowStep::Uniq(..) | RowStep::Join(_) => true,
         })
     }
 
@@ -420,18 +472,28 @@ impl<'p> RowChain<'p> {
             .any(|s| matches!(s, RowStep::Window(w) if w.done()))
     }
 
-    /// Run `row` through every step: `false` when it stops at one.
+    /// Run `row` through every step, handing `emit` each row that comes out
+    /// of the last (a join may make it several).
     fn pass<'a>(
         &mut self,
         row: &mut Vec<Field<'a>>,
         scratch: &mut Vec<Field<'a>>,
-    ) -> Result<bool, Error> {
+        mut emit: impl FnMut(&mut Vec<Field<'a>>),
+    ) -> Result<(), Error> {
+        pass_through(&mut self.steps, row, scratch, &mut emit)
+    }
+
+    /// Build the table of every join no row reached, so an error on its
+    /// right side is reported even when no left row comes.
+    fn finish(&mut self) -> Result<(), Error> {
         for step in &mut self.steps {
-            if !step.pass(row, scratch)? {
-                return Ok(false);
+            if let RowStep::Join(join) = step
+                && join.table.is_none()
+            {
+                join.table = Some(JoinTable::build(join.stmt, join.opts)?);
             }
         }
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -516,10 +578,8 @@ fn scan<R: BufRead>(
             if err.is_some() || chain.done() {
                 return;
             }
-            match chain.pass(row, &mut scratch) {
-                Ok(true) => sink.row(row),
-                Ok(false) => {}
-                Err(e) => err = Some(e),
+            if let Err(e) = chain.pass(row, &mut scratch, |row| sink.row(row)) {
+                err = Some(e);
             }
         });
         if let Some(e) = err {
@@ -527,7 +587,7 @@ fn scan<R: BufRead>(
         }
         sink.chunk_end()?;
     }
-    Ok(())
+    chain.finish()
 }
 
 /// If the plan has exactly one `stats` stage with nothing blocking before it (an
@@ -1023,7 +1083,7 @@ pub fn run_parquet<W: Write + Send>(
     // their rows stream out when nothing follows, else the rest runs over
     // them in memory.
     let mut reader = crate::parquet::ParquetReader::open(path, progress)?;
-    let (mut chain, rest) = RowChain::front(&plan.stages);
+    let (mut chain, rest) = RowChain::front(&plan.stages, opts);
     if rest.is_empty() {
         let mut lines = LinesTo {
             buf: String::new(),
@@ -1052,13 +1112,13 @@ fn decode_through(
             if chain.done() {
                 break;
             }
-            if chain.pass(&mut row, &mut scratch)? {
-                sink.take_row(row);
-            }
+            chain.pass(&mut row, &mut scratch, |row| {
+                sink.take_row(std::mem::take(row));
+            })?;
         }
         sink.chunk_end()?;
     }
-    Ok(())
+    chain.finish()
 }
 
 /// Sharded parquet transform: partition the file's row groups into contiguous
@@ -2755,6 +2815,7 @@ mod tests {
 
     fn run_with(script: &str, input: &str, threads: usize, chunk: usize) -> Result<String, Error> {
         let mut plan = parse(script)?;
+        prepare_joins(&mut plan)?;
         let mut reader = io::BufReader::new(input.as_bytes());
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
@@ -4531,6 +4592,7 @@ mod tests {
         let mut reader = io::BufReader::new(PausingReader(chunks));
 
         let mut plan = parse(script).unwrap();
+        prepare_joins(&mut plan).unwrap();
         let header = read_header(&mut reader).unwrap();
         let out_header = plan.resolve(&header).unwrap();
         let opts = RunOpts {
@@ -4540,6 +4602,51 @@ mod tests {
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
         };
         run(&plan, &out_header, &opts, &mut reader, out)
+    }
+
+    #[test]
+    fn a_head_after_an_inner_or_left_join_stops_the_reading() {
+        let right =
+            std::env::temp_dir().join(format!("csvm-join-chain-{}.csv", std::process::id()));
+        // Two matches for 0, one for 1, none for the others.
+        std::fs::write(&right, "id,w\n0,a\n0,b\n1,c\n").unwrap();
+        let right = right.display();
+        assert_eq!(
+            run_paused(&format!("join {right} on id | head 3")).unwrap(),
+            "id,val,w\n0,x,a\n0,x,b\n1,x,c\n"
+        );
+        assert_eq!(
+            run_paused(&format!("join -l {right} on id | head 4")).unwrap(),
+            "id,val,w\n0,x,a\n0,x,b\n1,x,c\n2,x,\n"
+        );
+        // Without a head the rows still stream.
+        assert_eq!(
+            written_by_pause(&format!("join {right} on id")),
+            "id,val,w\n0,x,a\n0,x,b\n1,x,c\n"
+        );
+        // A right join adds the right side's unmatched rows after every left
+        // one, so it reads to the end.
+        assert!(run_paused(&format!("join -r {right} on id | head 1")).is_err());
+        std::fs::remove_file(format!("{right}")).unwrap();
+    }
+
+    #[test]
+    fn a_joins_right_side_fails_even_with_no_left_rows() {
+        let right =
+            std::env::temp_dir().join(format!("csvm-join-empty-{}.csv", std::process::id()));
+        std::fs::write(&right, "id,w\n1,x\n").unwrap();
+        let right = right.display();
+        for script in [
+            format!("join (add w = num(w)) {right} on id"),
+            format!("sort id | join (add w = num(w)) {right} on id"),
+        ] {
+            let err = run_str(&script, "id\n");
+            assert!(
+                err.as_ref().is_err_and(|e| e.to_string().contains("'x'")),
+                "{script}: {err:?}"
+            );
+        }
+        std::fs::remove_file(format!("{right}")).unwrap();
     }
 
     #[test]

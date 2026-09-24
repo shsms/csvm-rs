@@ -20,11 +20,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 - Numbers print rounded to six decimals, so =add v = 1e-7= prints =0=
   while =--explain= shows =0.0000001=. That is the output formatter, not
   the lexer, but exponent literals make it easy to hit.
-- A =head= after a =join= still reads the whole input: =join= is not a
-  =RowChain= step (=exec.rs=), so the chain ends before it. An inner or left
-  join passes each left row on as it probes the right side's table, so it
-  could be one once that table is built up front; a right or full join adds
-  the unmatched right rows at the end, so it stays blocking.
 
 ** TODO Interface simplifications
 - The =join= item grammar has a documented ambiguity: a keyless file after an

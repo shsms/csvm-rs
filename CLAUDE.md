@@ -100,17 +100,16 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage.
   Among the stages at the front of a plan that pass rows on one at a time
-  (transforms, stateful ones too, `tail +N`, `uniq`), it stops the reading
-  once full, wherever it sits: `RowChain` in `exec.rs` runs those stages
-  row by row as the input is read (`scan`; for parquet, per batch), and
-  streams the rows out when nothing follows, else hands them to the rest of
-  the plan, which runs in memory over them (so `uniq id | head 19 | sort
-  qty` reads only up to its 19th distinct id). After a single `sort` it is
-  a counter over the merge output (`Window`, via `window_shape`), so the
-  external sort still applies; else it truncates in the materialized path. A
-  *negative* count (`head -n -N`) keeps all but the last N — a separate
-  `Stage::DropLast` on the blocking in-memory path. (Byte mode `-c` isn't
-  supported.)
+  (transforms, stateful ones too, `tail +N`, `uniq`, an inner or left `join`),
+  it stops the reading once full, wherever it sits: `RowChain` in `exec.rs` runs
+  those stages row by row as the input is read (`scan`; for parquet, per batch),
+  and streams the rows out when nothing follows, else hands them to the rest of
+  the plan, which runs in memory over them (so `uniq id | head 19 | sort qty`
+  reads only up to its 19th distinct id). After a single `sort` it is a counter
+  over the merge output (`Window`, via `window_shape`), so the external sort
+  still applies; else it truncates in the materialized path. A *negative* count
+  (`head -n -N`) keeps all but the last N — a separate `Stage::DropLast` on the
+  blocking in-memory path. (Byte mode `-c` isn't supported.)
 - **`tail [N]`** keeps the last N rows (default 10; same count spellings as
   `head`, via the shared `parse_count`). Blocking — it can't stream/stop
   early, so any plan with `tail N` takes the in-memory path (`Stage::Tail`,
@@ -201,8 +200,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   *clashing* names are touched). `exec::prepare_joins` reads each right file's
   header and resolves its sub-plan *before* the pure `Plan::resolve` (which needs
   the right header to compute the joined schema); `main` calls it between parse
-  and resolve. Any plan with a `join` takes the in-memory path (`Stage::Join` in
-  `apply_stages_over_rows`). The right side must be a file (never stdin). Paren
+  and resolve. An inner or left join among the stages at the front runs as a
+  `RowChain` step (`JoinStep`): the right side's `JoinTable` is built when
+  the first left row comes (`RowChain::finish` builds it when none does, so
+  a right-side error still shows), and each left row is probed as it is read, so
+  its rows stream and a `head` after it stops the reading. A right or full
+  join adds the right side's unmatched rows after every left one, so it
+  runs in memory (`join_rows`, over the same `JoinTable`), as does any join
+  after a blocking stage. The right side must be a file (never stdin). Paren
   groups make `split_stages` paren-aware so the sub-pipeline's `|` doesn't split
   the outer pipeline.
 - **`fn NAME(PARAM, …) { STAGES }`** defines a pipeline fragment in the script

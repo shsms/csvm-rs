@@ -522,4 +522,30 @@ mod tests {
         }
         std::fs::remove_file(&path).ok();
     }
+
+    #[test]
+    fn a_joins_right_side_fails_even_with_no_left_rows() {
+        let path = write_n("empty-join", 0);
+        let right = std::env::temp_dir().join(format!("csvm-pq-join-{}.csv", std::process::id()));
+        std::fs::write(&right, "id,w\n1,x\n").unwrap();
+        let script = format!("join (add w = num(w)) {} on id", right.display());
+        let opts = crate::exec::RunOpts {
+            chunk_size: 1 << 20,
+            threads: 1,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: 1 << 20,
+        };
+        let mut plan = crate::parse::parse(&script).unwrap();
+        crate::exec::prepare_joins(&mut plan).unwrap();
+        let out_header = plan.resolve(&read_header(&path).unwrap()).unwrap();
+        let progress = Progress::default();
+        let err =
+            crate::exec::run_parquet(&plan, &out_header, &opts, &path, &progress, &mut Vec::new());
+        assert!(
+            err.as_ref().is_err_and(|e| e.to_string().contains("'x'")),
+            "{err:?}"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&right).ok();
+    }
 }
