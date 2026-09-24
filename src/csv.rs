@@ -123,7 +123,12 @@ fn make_quoted(inner: &str, escaped: bool) -> Field<'_> {
 /// only when it contains a delimiter, quote, or newline; `"` is escaped as `""`.
 /// Numbers are formatted and never need quoting.
 pub fn write_row(buf: &mut String, row: &[Field]) {
-    for (i, f) in row.iter().enumerate() {
+    write_cells(buf, row);
+}
+
+/// [`write_row`] over any sequence of cells.
+pub fn write_cells<'f, 'a: 'f>(buf: &mut String, cells: impl IntoIterator<Item = &'f Field<'a>>) {
+    for (i, f) in cells.into_iter().enumerate() {
         if i > 0 {
             buf.push(',');
         }

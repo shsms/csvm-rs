@@ -248,6 +248,62 @@ fn window_shape(stages: &[Stage]) -> Option<(&[Stmt], Window, &[Stmt])> {
     Some((pre, window, post))
 }
 
+/// What a stage holding a stateful statement (`prev()`/`rownum()`) keeps
+/// between rows, which it must see in input order.
+struct Stateful {
+    /// Rows seen so far.
+    rownum: u64,
+    /// Whether the statement at each index is stateful.
+    stateful: Vec<bool>,
+    /// The row before the current one as the statement at each index saw
+    /// it (see [`Stateful::apply`]).
+    prev_rows: Vec<Option<OwnedRow>>,
+}
+
+impl Stateful {
+    fn new(stmts: &[Stmt]) -> Stateful {
+        Stateful {
+            rownum: 0,
+            stateful: stmts.iter().map(Stmt::is_stateful).collect(),
+            prev_rows: vec![None; stmts.len()],
+        }
+    }
+
+    /// Apply `stmts` to the next row. `prev(C)` resolves C's position
+    /// against the header *as that statement sees it* — after any earlier
+    /// `cols`/`rename`/`add` in the same stage, but before any later one. So
+    /// the previous row is kept as each stateful statement saw it. `prev`
+    /// thus tracks the previous row that reached that statement
+    /// (independent of a later `select`), and `rownum` counts every
+    /// entering row, 1-based.
+    fn apply<'a>(
+        &mut self,
+        stmts: &[Stmt],
+        row: &mut Vec<Field<'a>>,
+        scratch: &mut Vec<Field<'a>>,
+    ) -> Result<bool, Error> {
+        self.rownum += 1;
+        for (k, stmt) in stmts.iter().enumerate() {
+            let survived = if self.stateful[k] {
+                let seen = owned_row(row);
+                let ctx = EvalCtx {
+                    prev_row: self.prev_rows[k].as_deref(),
+                    rownum: self.rownum,
+                };
+                let survived = stmt.apply(row, scratch, &ctx)?;
+                self.prev_rows[k] = Some(seen);
+                survived
+            } else {
+                stmt.apply(row, scratch, &EvalCtx::default())?
+            };
+            if !survived {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Stream `[pre | window | post]` single-threaded, offering the rows that
 /// survive `pre` to the window and stopping once it is full. Reads only as
 /// much input as it needs (via [`next_chunk_available`]) so it emits and
@@ -1434,41 +1490,9 @@ fn apply_stages_over_rows(
                 let mut kept = Vec::with_capacity(rows.len());
                 let mut scratch: Vec<Field> = Vec::new();
                 if stmts.iter().any(Stmt::is_stateful) {
-                    // A stateful `add` (`prev()`/`rownum()`) needs rows in input
-                    // order with the previous row available. `prev(C)` resolves
-                    // C's position against the header *as that add sees it* —
-                    // after any earlier `cols`/`rename`/`add` in the same stage,
-                    // but before any later one. So the previous row must be
-                    // snapshotted at each stateful add's own point in the stage;
-                    // `prev_rows[k]` holds it for the add at statement index `k`.
-                    // `prev` thus tracks the previous row that reached that add
-                    // (independent of a later `select`), and `rownum` counts
-                    // every entering row, 1-based.
-                    let mut prev_rows: Vec<Option<OwnedRow>> = vec![None; stmts.len()];
-                    for (i, row) in rows.drain(..).enumerate() {
-                        let mut row = row;
-                        let mut keep = true;
-                        for (k, stmt) in stmts.iter().enumerate() {
-                            let survived = if stmt.is_stateful() {
-                                let snapshot = row.clone(); // this add's input layout
-                                let r = {
-                                    let ctx = EvalCtx {
-                                        prev_row: prev_rows[k].as_deref(),
-                                        rownum: i as u64 + 1,
-                                    };
-                                    stmt.apply(&mut row, &mut scratch, &ctx)?
-                                };
-                                prev_rows[k] = Some(snapshot); // for the next row
-                                r
-                            } else {
-                                stmt.apply(&mut row, &mut scratch, &EvalCtx::default())?
-                            };
-                            if !survived {
-                                keep = false;
-                                break;
-                            }
-                        }
-                        if keep {
+                    let mut state = Stateful::new(stmts);
+                    for mut row in rows.drain(..) {
+                        if state.apply(stmts, &mut row, &mut scratch)? {
                             kept.push(row);
                         }
                     }
@@ -1546,7 +1570,7 @@ fn materialize_join_right(j: &JoinStmt, opts: &RunOpts) -> Result<Vec<OwnedRow>,
         .map_err(|e| Error::Other(format!("join right side is not valid UTF-8: {e}")))?;
     let mut rows: Vec<OwnedRow> = Vec::new();
     csv::parse_chunk(text, |row| {
-        rows.push(row.iter().map(|f| f.clone().into_owned()).collect());
+        rows.push(owned_row(row));
     });
     Ok(rows)
 }
@@ -1559,16 +1583,15 @@ fn join_rows(j: &JoinStmt, left: Vec<OwnedRow>, opts: &RunOpts) -> Result<Vec<Ow
     let right = materialize_join_right(j, opts)?;
     let mut table: HashMap<String, Vec<usize>> = HashMap::new();
     let mut key = String::new();
-    let mut sel: Vec<Field<'static>> = Vec::new();
     for (ri, row) in right.iter().enumerate() {
-        encode_key(&mut key, &mut sel, row, &j.right_key_pos);
+        encode_key(&mut key, row, &j.right_key_pos);
         table.entry(std::mem::take(&mut key)).or_default().push(ri);
     }
 
     let mut matched = vec![false; right.len()];
     let mut out: Vec<OwnedRow> = Vec::new();
     for lrow in &left {
-        encode_key(&mut key, &mut sel, lrow, &j.left_key_pos);
+        encode_key(&mut key, lrow, &j.left_key_pos);
         match table.get(&key) {
             Some(idxs) => {
                 for &ri in idxs {
@@ -1590,22 +1613,12 @@ fn join_rows(j: &JoinStmt, left: Vec<OwnedRow>, opts: &RunOpts) -> Result<Vec<Ow
     Ok(out)
 }
 
-/// Build a CSV-encoded key from `positions` of `row` into `key` (reusing `sel`
-/// as scratch), so commas/quotes in cells can't collide between keys.
-fn encode_key(
-    key: &mut String,
-    sel: &mut Vec<Field<'static>>,
-    row: &[Field<'static>],
-    positions: &[usize],
-) {
+/// Build a CSV-encoded key from `positions` of `row` into `key` (a missing
+/// cell reads as empty), so commas/quotes in cells can't collide between keys.
+fn encode_key(key: &mut String, row: &[Field], positions: &[usize]) {
+    const BLANK: Field = Field::Str("");
     key.clear();
-    sel.clear();
-    sel.extend(
-        positions
-            .iter()
-            .map(|&p| row.get(p).cloned().unwrap_or(Field::Str(""))),
-    );
-    csv::write_row(key, sel);
+    csv::write_cells(key, positions.iter().map(|&p| row.get(p).unwrap_or(&BLANK)));
 }
 
 /// A joined output row: the left columns, then the right's emitted columns
@@ -1645,22 +1658,31 @@ fn combine_right_only(j: &JoinStmt, rrow: &[Field<'static>]) -> OwnedRow {
 fn dedup_rows(rows: &mut Vec<OwnedRow>, positions: &[usize]) {
     let mut seen: HashSet<String> = HashSet::new();
     let mut key = String::new();
-    let mut sel: Vec<Field> = Vec::new();
     rows.retain(|row| {
-        key.clear();
-        if positions.is_empty() {
-            csv::write_row(&mut key, row);
-        } else {
-            sel.clear();
-            sel.extend(
-                positions
-                    .iter()
-                    .map(|&p| row.get(p).cloned().unwrap_or(Field::Str(""))),
-            );
-            csv::write_row(&mut key, &sel);
-        }
-        seen.insert(std::mem::take(&mut key))
+        uniq_key(&mut key, row, positions);
+        first_seen(&mut seen, &key)
     });
+}
+
+/// Set `key` to what `uniq` tells rows apart by: the CSV-encoded cells at
+/// `positions`, or the whole row when there are none.
+fn uniq_key(key: &mut String, row: &[Field], positions: &[usize]) {
+    if positions.is_empty() {
+        key.clear();
+        csv::write_row(key, row);
+    } else {
+        encode_key(key, row, positions);
+    }
+}
+
+/// Whether `key` is new to `seen`, adding it if so.
+fn first_seen(seen: &mut HashSet<String>, key: &str) -> bool {
+    !seen.contains(key) && seen.insert(key.to_owned())
+}
+
+/// `row` with every cell owned, to outlive the chunk it was read from.
+fn owned_row(row: &[Field]) -> OwnedRow {
+    row.iter().map(|f| f.clone().into_owned()).collect()
 }
 
 /// Read all input rows as owned values.
@@ -1668,7 +1690,7 @@ fn materialize<R: BufRead>(chunk_size: usize, input: &mut R) -> Result<Vec<Owned
     let mut rows: Vec<OwnedRow> = Vec::new();
     while let Some(chunk) = next_chunk(input, chunk_size)? {
         csv::parse_chunk(&chunk, |row| {
-            rows.push(row.iter().map(|f| f.clone().into_owned()).collect());
+            rows.push(owned_row(row));
         });
     }
     Ok(rows)
