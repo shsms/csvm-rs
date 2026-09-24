@@ -9,6 +9,7 @@ use pty::{Terminal, csvm};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 /// A directory holding a fake `less`: it answers `--version` like less 668 and
 /// otherwise saves its options, `$LESS` and its input next to itself.
@@ -187,4 +188,112 @@ fn the_pager_stays_out_of_what_it_should_not_page() {
     );
     assert!(std::fs::read_to_string(&out).unwrap().contains("alpha"));
     assert_eq!(fake.saved("args"), None);
+}
+
+/// Whether the real `less` is here, for the tests that page through it. It
+/// must be on CI, so those tests cannot all skip there unnoticed.
+fn have_less() -> bool {
+    let here = Command::new("less")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(
+        here || std::env::var_os("CI").is_none(),
+        "the pager tests need less on CI"
+    );
+    here
+}
+
+/// A table taller than the 24-line terminal: a header, then `r1` to `rN`.
+fn tall_table(rows: usize) -> common::TempCsv {
+    let body: String = (1..=rows).map(|i| format!("r{i},{i}\n")).collect();
+    temp_csv(&format!("head_row,n\n{body}"))
+}
+
+/// Run `csvm --color never fmt` over `data`, paged by the real `less`.
+fn paged(data: &Path) -> Terminal {
+    let args = ["--color", "never", "fmt", data.to_str().unwrap()];
+    Terminal::shell(&format!("exec {}", csvm(&args)), &[])
+}
+
+#[test]
+fn ctrl_c_goes_to_less_and_q_ends_the_run() {
+    if !have_less() {
+        return;
+    }
+    let data = tall_table(60);
+    let mut term = paged(&data);
+    term.wait_for("r10");
+    // less takes Ctrl-C (it stops a search); csvm keeps waiting for it.
+    term.send(b"\x03");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(term.running(), "Ctrl-C ended csvm under less");
+    term.send(b"q");
+    assert!(term.finish().success());
+    assert!(term.cooked());
+}
+
+#[test]
+fn quitting_less_before_the_end_ends_the_run_quietly() {
+    if !have_less() {
+        return;
+    }
+    // Far more than a pipe holds, so csvm is still writing when less quits.
+    let data = tall_table(20_000);
+    let mut term = paged(&data);
+    term.wait_for("r10");
+    term.send(b"q");
+    assert!(term.finish().success());
+    let shown = term.text();
+    assert!(!shown.contains("csvm:"), "{shown:?}");
+}
+
+#[test]
+fn a_table_that_fits_is_just_printed() {
+    if !have_less() {
+        return;
+    }
+    let data = temp_csv("head_row,n\nr1,1\nr2,2\n");
+    let mut term = paged(&data);
+    // No key is pressed: less prints it and quits by itself.
+    assert!(term.finish().success());
+    let shown = term.text();
+    for line in ["head_row  n", "r1        1", "r2        2"] {
+        assert!(shown.contains(line), "{shown:?}");
+    }
+}
+
+#[test]
+fn a_tall_table_keeps_its_header_on_screen_where_less_can() {
+    if !have_less() {
+        return;
+    }
+    // From release 608 less can pin the header, and csvm asks it to.
+    let release = Command::new("less").arg("--version").output().unwrap();
+    let release: u32 = String::from_utf8_lossy(&release.stdout)
+        .split_whitespace()
+        .nth(1)
+        // Its leading digits, as csvm reads it (`661x`, `581.2`).
+        .and_then(|word| {
+            word.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .expect("less's release");
+    let data = tall_table(60);
+    let mut term = paged(&data);
+    term.wait_for("r10");
+    let first_page = term.shown().len();
+    // To the end, which the first page did not show.
+    term.send(b"G");
+    term.wait_for("r60");
+    let end_page = term.text_since(first_page);
+    assert_eq!(
+        end_page.contains("head_row"),
+        release >= 608,
+        "less {release}: {end_page:?}"
+    );
+    term.send(b"q");
+    assert!(term.finish().success());
 }

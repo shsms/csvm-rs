@@ -130,6 +130,11 @@ impl Terminal {
         self.keys.flush().expect("the terminal takes input");
     }
 
+    /// Whether the program is still running.
+    pub fn running(&mut self) -> bool {
+        self.child.try_wait().expect("a child to wait on").is_none()
+    }
+
     /// Wait for the program to end, and for everything it drew; panics after
     /// [`PATIENCE`].
     pub fn finish(&mut self) -> ExitStatus {
