@@ -72,7 +72,8 @@ stderr — a percentage of a file, a byte count for stdin — and clears the lin
 when it ends. It shows only when stderr is a terminal nothing else draws on
 meanwhile: output to a file, or a `fmt` table or chart still being built.
 Output into a pipe (which may be feeding `less`) or input typed at the terminal
-gets none, and `--no-progress` turns it off. Parquet input shows none.
+gets none, and `--no-progress` turns it off. For Parquet input it counts rows,
+out of the total the file's footer gives.
 
 A script error shows the line it is on with the place marked:
 

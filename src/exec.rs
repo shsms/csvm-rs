@@ -755,6 +755,7 @@ pub fn run_parquet<W: Write + Send>(
     out_header: &[String],
     opts: &RunOpts,
     path: &Path,
+    progress: &Progress,
     output: &mut W,
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
@@ -765,9 +766,9 @@ pub fn run_parquet<W: Write + Send>(
         && !stmts.iter().any(Stmt::is_stateful)
     {
         if opts.threads > 1 {
-            return run_parquet_sharded(stmts, opts.threads, path, output);
+            return run_parquet_sharded(stmts, opts.threads, path, progress, output);
         }
-        let mut reader = crate::parquet::ParquetReader::open(path)?;
+        let mut reader = crate::parquet::ParquetReader::open(path, progress)?;
         let mut out_buf = String::new();
         let mut scratch: Vec<Field> = Vec::new();
         while let Some(batch) = reader.next_batch() {
@@ -783,7 +784,7 @@ pub fn run_parquet<W: Write + Send>(
     }
 
     // Otherwise materialize all rows, then run the stages in order.
-    let mut reader = crate::parquet::ParquetReader::open(path)?;
+    let mut reader = crate::parquet::ParquetReader::open(path, progress)?;
     let mut rows: Vec<OwnedRow> = Vec::new();
     while let Some(batch) = reader.next_batch() {
         rows.extend(batch?);
@@ -801,6 +802,7 @@ fn run_parquet_sharded<W: Write>(
     stmts: &[Stmt],
     threads: usize,
     path: &Path,
+    progress: &Progress,
     output: &mut W,
 ) -> Result<(), Error> {
     let n = crate::parquet::num_row_groups(path)?;
@@ -811,7 +813,7 @@ fn run_parquet_sharded<W: Write>(
     let results: Vec<Result<String, Error>> = thread::scope(|scope| {
         let handles: Vec<_> = blocks
             .into_iter()
-            .map(|rgs| scope.spawn(move || process_row_groups(stmts, path, rgs)))
+            .map(|rgs| scope.spawn(move || process_row_groups(stmts, path, rgs, progress)))
             .collect();
         handles
             .into_iter()
@@ -829,8 +831,13 @@ fn run_parquet_sharded<W: Write>(
 
 /// Decode one worker's row groups, apply the statements, return serialized rows.
 #[cfg(feature = "parquet")]
-fn process_row_groups(stmts: &[Stmt], path: &Path, rgs: Vec<usize>) -> Result<String, Error> {
-    let mut reader = crate::parquet::ParquetReader::open_row_groups(path, rgs)?;
+fn process_row_groups(
+    stmts: &[Stmt],
+    path: &Path,
+    rgs: Vec<usize>,
+    progress: &Progress,
+) -> Result<String, Error> {
+    let mut reader = crate::parquet::ParquetReader::open_row_groups(path, rgs, progress)?;
     let mut out = String::new();
     let mut scratch: Vec<Field> = Vec::new();
     while let Some(batch) = reader.next_batch() {

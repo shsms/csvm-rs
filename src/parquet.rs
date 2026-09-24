@@ -26,6 +26,7 @@ use parquet::arrow::arrow_reader::{ParquetRecordBatchReader, ParquetRecordBatchR
 
 use crate::error::Error;
 use crate::field::Field;
+use crate::progress::Progress;
 
 /// How many rows the arrow reader decodes per `RecordBatch`. Bounds the
 /// streaming path's working memory and makes batching deterministic.
@@ -35,6 +36,8 @@ const BATCH_ROWS: usize = 8192;
 /// it into owned rows.
 pub struct ParquetReader {
     inner: ParquetRecordBatchReader,
+    /// Where the rows handed out are counted.
+    progress: Progress,
 }
 
 fn open_builder(path: &Path) -> Result<ParquetRecordBatchReaderBuilder<File>, Error> {
@@ -50,6 +53,13 @@ pub fn read_header(path: &Path) -> Result<Vec<String>, Error> {
     let schema = builder.schema();
     validate_schema(schema)?;
     Ok(schema.fields().iter().map(|f| f.name().clone()).collect())
+}
+
+/// Number of rows in the file, from its footer: what a parquet run's
+/// [`Progress`] counts up to.
+pub fn num_rows(path: &Path) -> Result<u64, Error> {
+    let rows = open_builder(path)?.metadata().file_metadata().num_rows();
+    Ok(u64::try_from(rows).unwrap_or(0))
 }
 
 /// Number of row groups in the file — the unit of read parallelism, mirroring
@@ -94,18 +104,28 @@ fn supported(dt: &DataType) -> bool {
 }
 
 impl ParquetReader {
-    pub fn open(path: &Path) -> Result<ParquetReader, Error> {
-        Self::build(path, None)
+    /// A reader of the whole file, counting the rows it hands out into
+    /// `progress`.
+    pub fn open(path: &Path, progress: &Progress) -> Result<ParquetReader, Error> {
+        Self::build(path, None, progress)
     }
 
     /// Open a reader restricted to `row_groups` (a subset of the file's groups),
     /// for sharded reads — each worker decodes a disjoint block. Indices must be
     /// ascending and in range; arrow yields the groups in the order given.
-    pub fn open_row_groups(path: &Path, row_groups: Vec<usize>) -> Result<ParquetReader, Error> {
-        Self::build(path, Some(row_groups))
+    pub fn open_row_groups(
+        path: &Path,
+        row_groups: Vec<usize>,
+        progress: &Progress,
+    ) -> Result<ParquetReader, Error> {
+        Self::build(path, Some(row_groups), progress)
     }
 
-    fn build(path: &Path, row_groups: Option<Vec<usize>>) -> Result<ParquetReader, Error> {
+    fn build(
+        path: &Path,
+        row_groups: Option<Vec<usize>>,
+        progress: &Progress,
+    ) -> Result<ParquetReader, Error> {
         let mut builder = open_builder(path)?;
         validate_schema(builder.schema())?;
         if let Some(rgs) = row_groups {
@@ -115,17 +135,22 @@ impl ParquetReader {
             .with_batch_size(BATCH_ROWS)
             .build()
             .map_err(|e| Error::Other(format!("cannot read parquet '{}': {e}", path.display())))?;
-        Ok(ParquetReader { inner })
+        Ok(ParquetReader {
+            inner,
+            progress: progress.clone(),
+        })
     }
 
     /// Pull the next batch as owned rows, or `None` at end of file.
     pub fn next_batch(&mut self) -> Option<Result<Vec<Vec<Field<'static>>>, Error>> {
         let batch = self.inner.next()?;
-        Some(
-            batch
-                .map_err(|e| Error::Other(format!("parquet read error: {e}")))
-                .and_then(|b| batch_to_rows(&b)),
-        )
+        let rows = batch
+            .map_err(|e| Error::Other(format!("parquet read error: {e}")))
+            .and_then(|b| batch_to_rows(&b));
+        if let Ok(rows) = &rows {
+            self.progress.add(rows.len() as u64);
+        }
+        Some(rows)
     }
 }
 
@@ -276,6 +301,16 @@ mod tests {
     }
 
     fn run_script_n(path: &std::path::Path, script: &str, threads: usize) -> String {
+        run_counted(path, script, threads, &Progress::default())
+    }
+
+    /// [`run_script_n`], counting the rows read into `progress`.
+    fn run_counted(
+        path: &std::path::Path,
+        script: &str,
+        threads: usize,
+        progress: &Progress,
+    ) -> String {
         let opts = crate::exec::RunOpts {
             chunk_size: 1 << 20,
             threads,
@@ -286,7 +321,7 @@ mod tests {
         let header = read_header(path).unwrap();
         let out_header = plan.resolve(&header).unwrap();
         let mut buf = Vec::new();
-        crate::exec::run_parquet(&plan, &out_header, &opts, path, &mut buf).unwrap();
+        crate::exec::run_parquet(&plan, &out_header, &opts, path, progress, &mut buf).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -304,7 +339,7 @@ mod tests {
             ["id", "name", "amount", "flag"]
         );
 
-        let mut reader = ParquetReader::open(&path).unwrap();
+        let mut reader = ParquetReader::open(&path, &Progress::default()).unwrap();
         let rows = reader.next_batch().unwrap().unwrap();
         // Numeric columns decode to Field::Num; a null is the empty string;
         // booleans render t/f.
@@ -364,7 +399,15 @@ mod tests {
             let header = read_header(&path).unwrap();
             let out_header = plan.resolve(&header).unwrap();
             let mut buf = Vec::new();
-            crate::exec::run_parquet(&plan, &out_header, &opts, &path, &mut buf).unwrap();
+            crate::exec::run_parquet(
+                &plan,
+                &out_header,
+                &opts,
+                &path,
+                &Progress::default(),
+                &mut buf,
+            )
+            .unwrap();
             String::from_utf8(buf).unwrap()
         };
         // Streaming transform: numeric compare needs no cast (typed input).
@@ -398,6 +441,23 @@ mod tests {
             run_script(&path, "agg count, max(id)"),
             "count,id_max\n20000,19999\n"
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_run_counts_every_row_it_reads() {
+        let path = write_n("count", 1500);
+        assert_eq!(num_rows(&path).unwrap(), 1500);
+        // Serial and sharded (several row groups), streamed and materialized.
+        for (script, threads) in [
+            ("select id >= 0", 1),
+            ("select id >= 0", 4),
+            ("sort id=nr", 1),
+        ] {
+            let progress = Progress::counting();
+            run_counted(&path, script, threads, &progress);
+            assert_eq!(progress.get(), 1500, "{script} -n {threads}");
+        }
         std::fs::remove_file(&path).ok();
     }
 
@@ -444,7 +504,7 @@ mod tests {
         assert_eq!(read_header(&path).unwrap(), ["id", "amount"]);
         // No data rows: the streaming path writes just the header.
         assert_eq!(run_script(&path, "select id >= 0"), "id,amount\n");
-        let mut reader = ParquetReader::open(&path).unwrap();
+        let mut reader = ParquetReader::open(&path, &Progress::default()).unwrap();
         // Arrow may emit zero batches, or batches that are all empty.
         while let Some(batch) = reader.next_batch() {
             assert!(batch.unwrap().is_empty());

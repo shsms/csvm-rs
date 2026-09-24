@@ -595,8 +595,10 @@ A `progress::Meter` thread redraws the line and clears it on drop.
 `Console::meter` turns it on when stderr is a terminal (not `TERM=dumb`) that
 nothing else draws on: stdout a file, or the terminal with buffered
 `fmt`/`color`/`graph` output — not a pipe (it may feed `less`) — and the input
-not typed at the terminal; `--no-progress` turns it off, and parquet shows
-none. The meter is dropped before the pager starts.
+not typed at the terminal; `--no-progress` turns it off. A parquet input is
+counted in rows (`progress::Unit`): `ParquetReader` adds each batch it hands
+out, against the footer's `parquet::num_rows`. The meter is dropped before
+the pager starts.
 Help lives in one registry
 (`src/help.rs`): `--help`/`csvm help` print the overview, `csvm help CMD` (name
 or alias) a command's forms + example, `csvm help TOPIC` the `operators`/

@@ -307,9 +307,9 @@ fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
 }
 
 /// Run the plan over `source` into `output`, counting the input read into
-/// `progress`. While it runs, a meter on stderr shows the count when
-/// `progress` keeps one (never for parquet, whose reader counts nothing); the
-/// meter is gone when this returns.
+/// `progress`: bytes of a CSV input, rows of a parquet one. While it runs, a
+/// meter on stderr shows the count when `progress` keeps one; the meter is
+/// gone when this returns.
 fn run_into<W: Write + Send>(
     source: &mut Source,
     plan: &csvm::plan::Plan,
@@ -344,7 +344,15 @@ fn run_into<W: Write + Send>(
             exec::run(plan, out_header, opts, &mut counted, output)
         }
         #[cfg(feature = "parquet")]
-        Source::Parquet { path } => exec::run_parquet(plan, out_header, opts, path, output),
+        Source::Parquet { path } => {
+            // The footer's row count, read only for a meter to show.
+            let total = progress
+                .is_counting()
+                .then(|| csvm::parquet::num_rows(path))
+                .transpose()?;
+            let _meter = meter(total, Unit::Rows);
+            exec::run_parquet(plan, out_header, opts, path, progress, output)
+        }
     }
 }
 
