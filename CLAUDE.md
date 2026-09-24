@@ -105,9 +105,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   those stages row by row as the input is read (`scan`; for parquet, per batch),
   and streams the rows out when nothing follows, else hands them to the rest of
   the plan, which runs in memory over them (so `uniq id | head 19 | sort qty`
-  reads only up to its 19th distinct id). After a single `sort` it is a counter
-  over the merge output (`Window`, via `window_shape`), so the external sort
-  still applies; else it truncates in the materialized path. A *negative* count
+  reads only up to its 19th distinct id). After a single `sort` the stages
+  that pass rows on one at a time are a chain over the merge output, so the
+  external sort still applies and a full `head` stops the merge; else it
+  truncates in the materialized path. A *negative* count
   (`head -n -N`) keeps all but the last N — a separate `Stage::DropLast` on the
   blocking in-memory path. (Byte mode `-c` isn't supported.)
 - **`tail [N]`** keeps the last N rows (default 10; same count spellings as
@@ -123,9 +124,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   head l-b`), so `head 5 | tail +2` streams too.
 - **`uniq [cols]`** drops duplicate rows keeping the first, by
   the whole row or the named key columns. Global (not Unix-adjacent), so no
-  pre-sort is needed. Among the stages at the front it runs row by row in
-  `RowChain` (`RowChain::in_order`), streaming when nothing blocking follows
-  (O(distinct keys) memory); after a blocking stage it runs in memory. The
+  pre-sort is needed. Among the stages at the front, or after a single
+  `sort`, it runs row by row in `RowChain` (see `RowChain::preferred`),
+  streaming when nothing blocking follows (O(distinct keys) memory); after
+  any other blocking stage it runs in memory. The
   dedup key is the CSV-encoded cells (`uniq_key` in `exec.rs`, a `HashSet`).
 - **`stats [cols]`** reduces the input to one summary row per column
   (`field,count,empty,min,max,sum,mean,stddev`); an empty list profiles every
@@ -257,10 +259,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   per-row and **shardable** (rides every path); an `add` reading `prev`/`rownum`
   is `is_stateful()` and runs its rows in order, so its output is
   `-n`-independent: row by row in `RowChain` (`Stateful`) when it is among
-  the stages at the front, streaming when nothing blocking follows (rows
-  before a failing one are written first, as in any stream), else on the
-  **in-memory ordered path** (the guard `plan_has_stateful_expr` in
-  `exec::run_body`/`run_file`, mirroring the `tail`/`uniq`/`join` fallback).
+  the stages at the front, or after a single `sort`, streaming when nothing
+  blocking follows (rows before a failing one are written first, as in any
+  stream), else on the **in-memory ordered path**; it never shards
+  (`plan_has_stateful_expr` in `exec::run_file`).
   The new column carries the expression's **static type** (numeric / text /
   untyped,
   `ValExpr::static_type` — including a type inherited from a typed column or
@@ -581,12 +583,14 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   A single-threaded binary-heap k-way merge then picks the smallest key and
   emits the row's already-serialized bytes via a callback — no per-field
   allocation, no re-serialization on output. A block is a contiguous input
-  range, so its sequence number keeps the merge stable. Trailing transforms
-  and a trailing `head`/`tail +N` window run on the merge output row by row
-  (the `Window` counter in `run_staged`; `apply_post_to_line` when transforms
-  wrap the window); anything else after the sort materializes. The row's
-  serialized form is the `LineFormat`: the output CSV line when nothing runs
-  after the sort, else the typed cell codec (`encode_row` / `decode_row`),
+  range, so its sequence number keeps the merge stable. The stages after
+  the sort that pass rows on one at a time (statements, stateful ones too,
+  windows, `uniq`, an inner or left `join`) run on the merge output as a
+  `RowChain` in `run_staged`, and a full `head` stops the merge; anything
+  else after the sort materializes. The row's serialized form is the
+  `LineFormat`: the output CSV line when only windows follow the sort
+  (`RowChain::only_windows`), else the typed cell codec (`encode_row` /
+  `decode_row`),
   which keeps a `Field::Num` exact for the statements after the sort instead
   of handing them its six-decimal output text.
 

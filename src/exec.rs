@@ -191,12 +191,6 @@ fn run_body<R: BufRead, W: Write + Send>(
         scan(&mut chain, opts.chunk_size, input, &mut rows)?;
         return write_rows(output, &apply_stages_over_rows(rest, rows, opts)?);
     }
-    // A stateful `add`/`select` (`prev()`/`rownum()`) is order-dependent: it
-    // can't shard or stream chunk-parallel. Materialize and run the ordered
-    // in-memory path (the same fallback `tail`/`uniq`/`join` use).
-    if plan_has_stateful_expr(plan) {
-        return run_staged_in_memory(plan, opts, input, output);
-    }
     // `stats` reduces the stream to a tiny profile; stream the input through it
     // (O(columns) memory) and run any following stages over that profile.
     if let Some((pre, stats, post)) = stats_shape(plan) {
@@ -218,7 +212,6 @@ fn run_body<R: BufRead, W: Write + Send>(
 }
 
 /// A row window: drop the first `skip` rows, then pass the next `limit`.
-#[derive(Clone, Copy)]
 struct Window {
     skip: usize,
     limit: usize,
@@ -227,10 +220,7 @@ struct Window {
 }
 
 impl Window {
-    /// Every row.
-    const ALL: Window = Window::new(0, usize::MAX);
-
-    const fn new(skip: usize, limit: usize) -> Self {
+    fn new(skip: usize, limit: usize) -> Self {
         Window {
             skip,
             limit,
@@ -250,34 +240,6 @@ impl Window {
     fn done(&self) -> bool {
         self.limit == 0 || self.seen >= self.skip.saturating_add(self.limit)
     }
-}
-
-/// If `stages` is `[Transform?, Skip?, Head?, Transform?]` with at least one
-/// of the window stages, return the pre-window statements, the window, and
-/// the post-window statements.
-fn window_shape(stages: &[Stage]) -> Option<(&[Stmt], Window, &[Stmt])> {
-    let (pre, rest) = match stages {
-        [Stage::Transform(p), rest @ ..] => (p.as_slice(), rest),
-        rest => (&[][..], rest),
-    };
-    let (skip, rest) = match rest {
-        [Stage::Skip(n), rest @ ..] => (Some(*n), rest),
-        rest => (None, rest),
-    };
-    let (limit, rest) = match rest {
-        [Stage::Head(n), rest @ ..] => (Some(*n), rest),
-        rest => (None, rest),
-    };
-    let post = match rest {
-        [] => &[][..],
-        [Stage::Transform(p)] => p.as_slice(),
-        _ => return None,
-    };
-    if skip.is_none() && limit.is_none() {
-        return None; // no window stage: a lone transform has its own paths
-    }
-    let window = Window::new(skip.unwrap_or(0), limit.unwrap_or(usize::MAX));
-    Some((pre, window, post))
 }
 
 /// A stage that passes rows on one at a time, with what it keeps between
@@ -410,8 +372,8 @@ impl Stateful {
     }
 }
 
-/// The stages at the front of a plan that pass rows on one at a time, run
-/// together over the input.
+/// The stages at the front of a plan, or after its single `sort`, that pass
+/// rows on one at a time, run together over the input or the sort's merge.
 struct RowChain<'p> {
     steps: Vec<RowStep<'p>>,
 }
@@ -462,6 +424,14 @@ impl<'p> RowChain<'p> {
         self.steps.iter().any(|step| match step {
             RowStep::Transform(_, state) => state.is_some(),
             RowStep::Window(_) | RowStep::Uniq(..) | RowStep::Join(_) => true,
+        })
+    }
+
+    /// Whether every step is a window, which does not read the rows.
+    fn only_windows(&self) -> bool {
+        self.steps.iter().all(|step| match step {
+            RowStep::Window(_) => true,
+            RowStep::Transform(..) | RowStep::Uniq(..) | RowStep::Join(_) => false,
         })
     }
 
@@ -999,8 +969,8 @@ pub fn run_file<W: Write + Send>(
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
-    // A stateful `add` forces the ordered in-memory path (see `run_body`); skip
-    // all sharded fast paths and let the reader path route it there.
+    // A stateful statement must see the rows in order: skip the sharded fast
+    // paths and let the reader path run it (see `run_body`).
     let stateful = plan_has_stateful_expr(plan);
 
     if let [Stage::Transform(stmts)] = plan.stages.as_slice()
@@ -1627,10 +1597,9 @@ fn run_staged<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<(), Error> {
-    // The streaming sort path handles `[Transform?, Sort, Transform?]`, or a
-    // window (`Skip`/`Head` with transforms around it) after the sort, which
-    // is a counter over the merge output; anything else materializes and
-    // runs stage by stage.
+    // The external sort handles `[Transform?, Sort, …]` where the stages
+    // after the sort pass rows on one at a time: they run as a chain over
+    // the merge output. Anything else materializes and runs stage by stage.
     let (pre, rest) = match plan.stages.as_slice() {
         [Stage::Transform(p), rest @ ..] => (p.as_slice(), rest),
         rest => (&[][..], rest),
@@ -1638,21 +1607,17 @@ fn run_staged<R: BufRead, W: Write>(
     let [Stage::Sort(sort), tail @ ..] = rest else {
         return run_staged_in_memory(plan, opts, input, output);
     };
-    let (post, mut window, post2) = match tail {
-        [] => (&[][..], Window::ALL, &[][..]),
-        [Stage::Transform(p)] => (p.as_slice(), Window::ALL, &[][..]),
-        tail => match window_shape(tail) {
-            Some(shape) => shape,
-            None => return run_staged_in_memory(plan, opts, input, output),
-        },
-    };
+    let (mut chain, after) = RowChain::front(tail, opts);
+    if !after.is_empty() {
+        return run_staged_in_memory(plan, opts, input, output);
+    }
 
     // Feed raw input blocks to the sorter; its workers parse, apply the
-    // pre-sort statements, and sort each block in parallel. With nothing to
-    // run after the sort the workers serialize the output line itself;
-    // otherwise typed cells, so a number reaches the post-sort statements
-    // with its full value.
-    let format = if post.is_empty() && post2.is_empty() {
+    // pre-sort statements, and sort each block in parallel. When all that
+    // follows the sort is windows, which do not read the rows, the workers
+    // serialize the output line itself; otherwise typed cells, so a number
+    // reaches the stages after the sort with its full value.
+    let format = if chain.only_windows() {
         LineFormat::Csv
     } else {
         LineFormat::Typed
@@ -1670,59 +1635,41 @@ fn run_staged<R: BufRead, W: Write>(
         sorter.push_block(block);
     }
 
-    // The merge hands us the workers' serialized rows. With no post-sort
-    // statements they are output lines and go straight out; otherwise we
-    // decode each, apply, and serialize. A full window stops the merge.
+    // The merge hands us the workers' serialized rows, which run through
+    // the chain: output lines go straight out; typed ones are decoded, and
+    // serialized again as they come out. A full window stops the merge.
     let mut out_buf: Vec<u8> = Vec::new();
     let mut row_buf = String::new();
     sorter.finish()?.for_each_line(|line| {
         match format {
             LineFormat::Csv => {
-                if window.admit() {
+                chain.pass(&mut Vec::new(), &mut Vec::new(), |_| {
                     out_buf.extend_from_slice(line);
-                }
+                })?;
             }
             LineFormat::Typed => {
-                apply_post_to_line(post, &mut window, post2, line, &mut row_buf, &mut out_buf)?;
+                let mut row = sort::decode_row(line)?;
+                // The row borrows the line, so its scratch lives as long.
+                let mut line_scratch = Vec::new();
+                chain.pass(&mut row, &mut line_scratch, |row| {
+                    row_buf.clear();
+                    csv::write_row(&mut row_buf, row);
+                    out_buf.extend_from_slice(row_buf.as_bytes());
+                })?;
             }
         }
         if out_buf.len() >= 1 << 16 {
             output.write_all(&out_buf)?;
             out_buf.clear();
         }
-        Ok(if window.done() {
+        Ok(if chain.done() {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         })
     })?;
+    chain.finish()?;
     output.write_all(&out_buf)?;
-    Ok(())
-}
-
-/// Decode one merged typed row, apply `[post | window | post2]`, and append
-/// the serialized survivor to `out` (`row_buf` is the reused serialization
-/// buffer). Only used when a `sort` has trailing transforms; the pure-sort
-/// and bare-window paths write line bytes directly.
-fn apply_post_to_line(
-    post: &[Stmt],
-    window: &mut Window,
-    post2: &[Stmt],
-    line: &[u8],
-    row_buf: &mut String,
-    out: &mut Vec<u8>,
-) -> Result<(), Error> {
-    let mut row = sort::decode_row(line)?;
-    let mut scratch: Vec<Field> = Vec::new();
-    let ctx = EvalCtx::default();
-    let kept = apply_stmts(post, &mut row, &mut scratch, &ctx)?
-        && window.admit()
-        && apply_stmts(post2, &mut row, &mut scratch, &ctx)?;
-    if kept {
-        row_buf.clear();
-        csv::write_row(row_buf, &row);
-        out.extend_from_slice(row_buf.as_bytes());
-    }
     Ok(())
 }
 
@@ -3054,28 +3001,6 @@ mod tests {
     }
 
     #[test]
-    fn window_shape_covers_skip_head_and_a_bare_skip() {
-        let shape = |script: &str| {
-            let mut plan = crate::parse::parse(script).unwrap();
-            plan.resolve(&["id".to_string()]).unwrap();
-            window_shape(&plan.stages)
-                .map(|(pre, w, post)| (pre.len(), w.skip, w.limit, post.len()))
-        };
-        assert_eq!(shape("tail +3 | head 2"), Some((0, 2, 2, 0)));
-        // The reverse order folds at parse time, so it streams too.
-        assert_eq!(shape("head 5 | tail +2"), Some((0, 1, 4, 0)));
-        assert_eq!(
-            shape("select id > 1 | head 2 | cols id"),
-            Some((1, 0, 2, 1))
-        );
-        // `tail +1` is a no-op window; it still streams rather than materializing.
-        assert_eq!(shape("tail +1"), Some((0, 0, usize::MAX, 0)));
-        // A lone transform has its own paths; a window after a sort does not stream.
-        assert_eq!(shape("cols id"), None);
-        assert_eq!(shape("sort id | head 2"), None);
-    }
-
-    #[test]
     fn sort_streams_a_trailing_window() {
         // A skip/head after the sort is a counter over the merge output, so the
         // external sort still applies; with a 1-byte budget every run spills.
@@ -3110,6 +3035,16 @@ mod tests {
         assert_eq!(
             run("sort countZ=nr | tail +2 | head 0"),
             "id,fieldA,countZ\n"
+        );
+        // Any stages that pass rows on one at a time run over the merge.
+        assert_eq!(run("sort countZ=nr | uniq fieldA | cols id"), "id\n4\n2\n");
+        assert_eq!(
+            run("sort countZ=nr | add n = rownum() | cols id,n"),
+            "id,n\n4,1\n1,2\n2,3\n3,4\n"
+        );
+        assert_eq!(
+            run("sort countZ=nr | uniq fieldA | head 1 | cols id"),
+            "id\n4\n"
         );
     }
 
