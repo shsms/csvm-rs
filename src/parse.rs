@@ -832,21 +832,12 @@ impl<'a> Builder<'a> {
     /// emitting CSV, so it must be the last command. `hist COL`, `spark COL`,
     /// `bar LABEL VALUE`, `scatter X Y`, `line X Y`, `heatmap X Y`.
     fn parse_graph(&mut self, rest: &str) -> Result<(), Error> {
-        let (kind_word, rest) = split_first_word(rest.trim());
-        let kind = match kind_word {
-            "hist" | "histogram" => GraphKind::Hist,
-            "bar" => GraphKind::Bar,
-            "spark" | "sparkline" => GraphKind::Spark,
-            "scatter" => GraphKind::Scatter,
-            "line" => GraphKind::Line,
-            "heatmap" | "heat" => GraphKind::Heatmap,
-            "" => return Err(err("graph expects a chart type, e.g. graph hist amount")),
-            other => {
-                return Err(err(format!(
-                    "graph: unknown chart type `{other}` \
-                     (try: hist, bar, spark, scatter, line, heatmap)"
-                )));
-            }
+        // Without a chart type the first word is a column, and the columns
+        // choose the chart (see `default_graph_kind`).
+        let (kind_word, after_kind) = split_first_word(rest.trim());
+        let (named, rest) = match graph_kind(kind_word) {
+            Some(kind) => (Some(kind), after_kind),
+            None => (None, rest.trim()),
         };
         let mut opts = GraphOpts::default();
         let mut cols = Vec::new();
@@ -925,10 +916,18 @@ impl<'a> Builder<'a> {
         if opts.data && opts.svg {
             return Err(err("graph: -D/--data and -S/--svg are exclusive"));
         }
+        let (kind, kind_word) = match named {
+            Some(kind) => (kind, kind_word),
+            None => {
+                let kind = default_graph_kind(cols.len())?;
+                (kind, kind.name())
+            }
+        };
         check_graph_arity(kind, kind_word, cols.len())?;
         check_graph_flags(kind, kind_word, &opts, cols.len())?;
         self.graph = Some(GraphSpec {
             kind,
+            kind_named: named.is_some(),
             cols: cols.into_iter().map(ColRef::new).collect(),
             opts,
         });
@@ -1743,6 +1742,32 @@ fn subst_params(body: &str, params: &[String], args: &[&str]) -> String {
         }
     }
     out
+}
+
+/// The chart type `word` names, if any.
+fn graph_kind(word: &str) -> Option<GraphKind> {
+    match word {
+        "hist" | "histogram" => Some(GraphKind::Hist),
+        "bar" => Some(GraphKind::Bar),
+        "spark" | "sparkline" => Some(GraphKind::Spark),
+        "scatter" => Some(GraphKind::Scatter),
+        "line" => Some(GraphKind::Line),
+        "heatmap" | "heat" => Some(GraphKind::Heatmap),
+        _ => None,
+    }
+}
+
+/// The chart for `ncols` columns given without a type: one column's
+/// distribution, else a line of the others against the first.
+fn default_graph_kind(ncols: usize) -> Result<GraphKind, Error> {
+    match ncols {
+        0 => Err(err(format!(
+            "graph expects columns, e.g. graph date price, or a chart type first: {}",
+            GraphKind::name_list()
+        ))),
+        1 => Ok(GraphKind::Hist),
+        2.. => Ok(GraphKind::Line),
+    }
 }
 
 /// Validate the column count for a chart type: hist/spark take one, bar takes
@@ -3252,11 +3277,45 @@ mod tests {
     #[test]
     fn graph_must_be_last_and_well_formed() {
         assert!(parse("graph hist x | sort x").is_err()); // nothing may follow a sink
-        assert!(parse("graph").is_err()); // missing chart type
-        assert!(parse("graph pie x").is_err()); // unknown chart type
+        assert!(parse("graph").is_err()); // no columns
         assert!(parse("graph hist a b").is_err()); // hist takes exactly one column
         assert!(parse("graph hist x --bins 0").is_err()); // bins must be positive
         assert!(parse("graph hist x --frob 1").is_err()); // unknown flag
+    }
+
+    #[test]
+    fn graph_without_a_type_is_chosen_by_its_columns() {
+        let kind = |script: &str| {
+            let g = parse(script).unwrap().graph.unwrap();
+            (g.kind, g.kind_named, g.cols.len())
+        };
+        assert_eq!(kind("graph date price"), (GraphKind::Line, false, 2));
+        assert_eq!(kind("graph date a,b -t T"), (GraphKind::Line, false, 3));
+        assert_eq!(kind("graph price"), (GraphKind::Hist, false, 1));
+        assert_eq!(kind("graph line date price"), (GraphKind::Line, true, 2));
+        // A column named like a chart type is backticked.
+        assert_eq!(kind("graph `hist` b"), (GraphKind::Line, false, 2));
+        // The type's own flags still apply: a histogram takes no -y.
+        assert!(parse("graph price -y 0:1").is_err());
+        // A mistyped type reads as a column, which resolve points out.
+        let header = ["x".to_string(), "price".to_string()];
+        let script = "graph scater x price";
+        let e = parse(script).unwrap().resolve(&header).unwrap_err();
+        assert!(e.to_string().contains("`graph scatter …`"), "{e}");
+        assert_eq!(e.span().map(|s| &script[s]), Some("scater"));
+        // Not close to one: the kinds are listed.
+        let e = parse("graph chart x")
+            .unwrap()
+            .resolve(&header)
+            .unwrap_err();
+        assert!(
+            e.to_string()
+                .ends_with("hist, bar, spark, scatter, line, heatmap)"),
+            "{e}"
+        );
+        // No columns: the kinds are listed.
+        let e = parse("graph").unwrap_err().to_string();
+        assert!(e.contains("or a chart type first: hist, bar"), "{e}");
     }
 
     #[test]

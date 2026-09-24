@@ -297,9 +297,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   darker on a light one.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
-  parser rejects anything after it). Plan metadata (`Plan.graph`, `GraphSpec`
-  in `plan.rs`), not a stage — like `fmt`/`color` it renders in `exec::render`
-  from the buffered output, reusing the whole executor upstream. The **data
+  parser rejects anything after it). Without a `KIND` the first word is a
+  column and the columns choose (`default_graph_kind`): `graph X Y…` is a
+  line chart, `graph COL` a histogram, a bare `graph` an error listing the
+  kinds; `GraphSpec.kind_named` says which, so resolve can suggest a kind
+  for a first column that looks like a mistyped one. Plan metadata
+  (`Plan.graph`, `GraphSpec` in `plan.rs`), not a stage — like
+  `fmt`/`color` it renders in `exec::render` from the buffered output,
+  reusing the whole executor upstream. The **data
   model is `src/chart.rs`**: `chart::frame` builds the `Frame` (title, labels,
   size, `Glyphs`, ramp, colour/log flags, and the `Dest` — `Terminal`, `Svg` or
   `Data` — worked out once from the flags, so what follows the terminal, what

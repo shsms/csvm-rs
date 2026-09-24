@@ -122,6 +122,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
 | `graph scatter X Y` / `line X Y` | braille scatter/line plot, multi-series (sink) |
 | `graph heatmap X Y` | 2-D histogram on a grid, each cell shaded by its point count (sink) |
+| `graph X Y[,Y2…]` / `graph COL` | with no chart type: a line chart, or one column's histogram (sink) |
 
 `graph` flags: size — `-W/--width N`, `-H/--height N`, `-s/--scale F`,
 `-A/--ascii`; axes — `-x/--xrange lo:hi`, `-y/--yrange lo:hi`, `-l/--log`,

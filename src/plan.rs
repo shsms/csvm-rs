@@ -820,6 +820,35 @@ pub enum GraphKind {
     Heatmap,
 }
 
+impl GraphKind {
+    /// Every chart type.
+    pub const ALL: [GraphKind; 6] = [
+        GraphKind::Hist,
+        GraphKind::Bar,
+        GraphKind::Spark,
+        GraphKind::Scatter,
+        GraphKind::Line,
+        GraphKind::Heatmap,
+    ];
+
+    /// Every chart type's name, comma-separated, for a message.
+    pub fn name_list() -> String {
+        GraphKind::ALL.map(GraphKind::name).join(", ")
+    }
+
+    /// Its name in a script.
+    pub fn name(self) -> &'static str {
+        match self {
+            GraphKind::Hist => "hist",
+            GraphKind::Bar => "bar",
+            GraphKind::Spark => "spark",
+            GraphKind::Scatter => "scatter",
+            GraphKind::Line => "line",
+            GraphKind::Heatmap => "heatmap",
+        }
+    }
+}
+
 /// Presentation options shared across chart kinds.
 #[derive(Clone, Debug)]
 pub struct GraphOpts {
@@ -892,6 +921,8 @@ impl Default for GraphOpts {
 #[derive(Clone, Debug)]
 pub struct GraphSpec {
     pub kind: GraphKind,
+    /// The script named the chart type; else the columns chose it.
+    pub kind_named: bool,
     pub cols: Vec<ColRef>,
     pub opts: GraphOpts,
 }
@@ -1845,8 +1876,25 @@ impl Plan {
         // The graph sink draws from the final columns; resolve its references too.
         if let Some(g) = &mut self.graph {
             let placed = |e| self.sources.graph.place(e);
-            for c in &mut g.cols {
-                c.resolve(&header).map_err(placed)?;
+            for (i, c) in g.cols.iter_mut().enumerate() {
+                c.resolve(&header).map_err(|e| {
+                    let e = placed(e);
+                    if i > 0 || g.kind_named {
+                        return e;
+                    }
+                    // With no chart type named, the first column may be a
+                    // mistyped one.
+                    let names = GraphKind::ALL.map(GraphKind::name);
+                    let hint = match crate::error::did_you_mean(&c.name, &names) {
+                        Some(kind) => format!("or, for the chart type, `graph {kind} …`?"),
+                        None => format!("or a chart type first: {}", GraphKind::name_list()),
+                    };
+                    let hinted = Error::Other(format!("{} ({hint})", e.unplaced()));
+                    match e.span() {
+                        Some(span) => hinted.at(span),
+                        None => hinted,
+                    }
+                })?;
             }
             // The colour-by column is charted too, so it resolves the same way.
             if let Some(c) = &mut g.opts.color_by {

@@ -302,6 +302,7 @@ by their output text (like a `by` key); sum/mean/stddev are blank for a non-nume
             "graph scatter X Y[,Y2…]     points on a braille canvas",
             "graph line X Y[,Y2…]        connected points (multi-series)",
             "graph heatmap X Y           2-D histogram, shaded by count",
+            "graph X Y[,Y2…]  graph COL  no type: a line chart, or a histogram of one column",
             "  size:   -W/--width N  -H/--height N  -s/--scale F  -A/--ascii",
             "  axes:   -x/--xrange lo:hi  -y/--yrange lo:hi  -l/--log  --xlabel T  --ylabel T",
             "  other:  -b/--bins N  -t/--title T  -r/--ramp lo:hi  -c/--color-by COL",

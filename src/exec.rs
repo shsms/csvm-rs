@@ -23,9 +23,9 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::Field;
 use crate::plan::{
-    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphKind, GraphOpts,
-    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
-    ValExpr, apply_stmts,
+    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphOpts, GraphSpec,
+    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
+    apply_stmts,
 };
 use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
@@ -2550,14 +2550,7 @@ pub fn describe(plan: &Plan) -> String {
         out.push_str(&describe_color(rule));
     }
     if let Some(g) = &plan.graph {
-        let kind = match g.kind {
-            GraphKind::Hist => "hist",
-            GraphKind::Bar => "bar",
-            GraphKind::Spark => "spark",
-            GraphKind::Scatter => "scatter",
-            GraphKind::Line => "line",
-            GraphKind::Heatmap => "heatmap",
-        };
+        let kind = g.kind.name();
         let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
         out.push_str(&format!("graph: {kind} {cols:?}"));
         out.push_str(&describe_graph_opts(&g.opts));

@@ -14,9 +14,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
-- =graph= without a kind: make =graph X Y= draw a line chart, since
-  choosing a kind is the hard part of using =graph=. Needs a rule for
-  =graph COL= (hist?) and for a bare =graph= (error with the kinds).
 - Numbers print rounded to six decimals, so =add v = 1e-7= prints =0=
   while =--explain= shows =0.0000001=. That is the output formatter, not
   the lexer, but exponent literals make it easy to hit.
