@@ -773,6 +773,10 @@ pub struct TableOpts {
     /// The most decimals a number in a numeric column shows (`fmt -p N`,
     /// six by default), or `None` for every digit (`fmt -f`).
     pub decimals: Option<u8>,
+    /// `fmt -h`: a number whose absolute value is 1000 or more once rounded
+    /// shows three significant digits and a k, M, G, T, P or E suffix, or an
+    /// exponent when it is too big for E.
+    pub human: bool,
 }
 
 impl Default for TableOpts {
@@ -780,6 +784,7 @@ impl Default for TableOpts {
         TableOpts {
             stripes: false,
             decimals: Some(6),
+            human: false,
         }
     }
 }

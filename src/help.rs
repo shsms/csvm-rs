@@ -446,6 +446,7 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
             "fmt -s          …and shade every other row (--stripes)",
             "fmt -p N        show at most N decimals, not 6 (--precision)",
             "fmt -f          show every digit of a number (--full)",
+            "fmt -h          show 1234567 as 1.23M (--human)",
         ],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
 the final output, so it composes after everything else. With colour on (see --color) the \
@@ -460,10 +461,12 @@ most that many, its trailing zeros dropped; one with no more shows as written, a
 one with an exponent, like 1e5, unless rounding changes it (1e-7 shows 0). A half \
 rounds away from zero in a number with no exponent and up to 15 significant digits (zeros \
 at the end not counted); any other rounds as its float does (with -p 2, 2.675 shows 2.68 \
-but 2.675e0 shows 2.67).",
+but 2.675e0 shows 2.67). With -h, a number whose absolute value is 1000 or more once \
+rounded shows 3 significant digits and a k, M, G, T, P or E suffix, for powers of 1000 \
+(past E, an exponent: 1.23e300). Flags combine, as in fmt -s -h; -f and -p don't.",
         examples: &[
             "csvm 'stats | fmt' data.csv",
-            "csvm 'stats | fmt -p 2' data.csv",
+            "csvm 'stats | fmt -h -p 2' data.csv",
         ],
     },
 ];

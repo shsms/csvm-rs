@@ -2196,12 +2196,12 @@ fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
 /// Rewrite the data cells of the `numeric` columns as `table` shows them (see
 /// [`field::table_num`]).
 fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts) {
-    if table.decimals.is_none() {
+    if table.decimals.is_none() && !table.human {
         return;
     }
     for row in rows.iter_mut().skip(1) {
         for (cell, _) in row.iter_mut().zip(numeric).filter(|(_, n)| **n) {
-            if let Some(short) = field::table_num(cell, table.decimals, false) {
+            if let Some(short) = field::table_num(cell, table.decimals, table.human) {
                 *cell = short;
             }
         }
@@ -2578,6 +2578,9 @@ pub fn describe(plan: &Plan) -> String {
             match table.decimals {
                 Some(n) => out.push_str(&format!(", up to {n} decimals")),
                 None => out.push_str(", every digit"),
+            }
+            if table.human {
+                out.push_str(", k/M/G/T/P/E suffixes");
             }
             out.push('\n');
         }
@@ -3151,6 +3154,7 @@ mod tests {
         assert!(d("fmt").contains("output: aligned, up to 6 decimals\n"));
         assert!(d("fmt -s -p 2").contains("output: aligned, striped, up to 2 decimals\n"));
         assert!(d("fmt -f").contains("output: aligned, every digit\n"));
+        assert!(d("fmt -h").contains("output: aligned, up to 6 decimals, k/M/G/T/P/E suffixes\n"));
     }
 
     #[test]
@@ -4356,6 +4360,15 @@ mod tests {
             render_str("fmt -f", input, false).lines().nth(1),
             Some("3.14159265  2.718281828  v1.23456789")
         );
+        // A suffixed number is still right-justified.
+        let human: Vec<String> = render_str("fmt -h", "n\n1234567.5\n2.5\n", false)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(human, ["    n", "1.23M", "  2.5"]);
+        // A colour gradient reads the numbers as they were: 1.5k is painted.
+        let painted = render_str("color -g n | fmt -h", "n\n1000\n1500\n2000\n", true);
+        assert!(painted.contains("m1.5k\x1b[0m"), "{painted:?}");
     }
 
     #[test]

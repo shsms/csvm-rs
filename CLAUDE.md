@@ -319,6 +319,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   decimals keeps its own spelling (`2.50`), and so does a cell with an
   exponent that rounding leaves at the same value (`1e5`, but `1e-7` shows
   `0`).
+  `-h` (`human`) shows a number whose absolute value is 1000 or more once
+  rounded to three significant digits (a half rounding as above)
+  with a k/M/G/T/P/E suffix (powers of 1000), and one too big for E with an
+  exponent (`1.23e300`).
   Colour rules are computed on the cells as they were. `-f` and `-p` are
   exclusive, and each flag is taken once.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns

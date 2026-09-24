@@ -1039,7 +1039,7 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// `fmt [-s] [-f | -p N]`: align the output as a table.
+    /// `fmt [-s] [-f | -p N] [-h]`: align the output as a table.
     fn parse_fmt(&mut self, rest: &str) -> Result<(), Error> {
         let mut table = TableOpts::default();
         let (mut saw_full, mut saw_precision) = (false, false);
@@ -1063,9 +1063,11 @@ impl<'a> Builder<'a> {
                         table.decimals = None;
                         &mut saw_full
                     }
+                    "-h" | "--human" => &mut table.human,
                     other => {
                         return Err(err(format!(
-                            "fmt takes -s (--stripes), -f (--full) and -p N (--precision), not {other:?}"
+                            "fmt takes -s (--stripes), -f (--full), -p N (--precision) and \
+                             -h (--human), not {other:?}"
                         )));
                     }
                 }
@@ -3686,11 +3688,23 @@ mod tests {
                 }
             );
         }
+        for human in ["fmt -h", "fmt --human"] {
+            assert_eq!(table(human), TableOpts { human: true, ..six });
+        }
         assert_eq!(
-            table("fmt -s -p 0"),
+            table("fmt -h -s -p 0"),
             TableOpts {
                 stripes: true,
                 decimals: Some(0),
+                human: true
+            }
+        );
+        assert_eq!(
+            table("fmt -f -h"),
+            TableOpts {
+                decimals: None,
+                human: true,
+                ..six
             }
         );
 
@@ -3705,7 +3719,7 @@ mod tests {
         assert!(msg("fmt -p 2 -p=3").contains("fmt takes -p only once"));
         assert!(msg("fmt -p x").contains("\"x\""));
         assert!(msg("fmt -p -1").contains("\"-1\""));
-        assert!(msg("fmt -x").contains("-p N (--precision), not \"-x\""));
+        assert!(msg("fmt -x").contains("-h (--human), not \"-x\""));
     }
 
     #[test]
