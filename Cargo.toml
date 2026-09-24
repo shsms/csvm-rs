@@ -47,6 +47,8 @@ libc = "0.2"
 csv = "1"
 # Statistics-driven benchmark harness (see benches/).
 criterion = "0.5"
+# A pty the terminal tests play the terminal on (tests/support/pty.rs).
+portable-pty = "0.9"
 
 [profile.release]
 lto = true

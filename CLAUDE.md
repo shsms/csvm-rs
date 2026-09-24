@@ -689,3 +689,8 @@ good.
   `cargo test`, a release build, and `cargo bench --no-run` on every push and PR.
 - `src/lib.rs` holds the library; `src/main.rs` is a thin CLI shim so internals
   are unit-testable.
+- What csvm does only on a terminal (the pager, the progress line, the
+  background question behind `fmt -s`) is tested end to end on a pty the
+  test plays: `tests/support/pty.rs` runs a `sh -c` line with the pty as its
+  controlling terminal, records what it draws, and lets the test type keys,
+  answer the terminal's questions and read its mode afterwards.
