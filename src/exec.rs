@@ -21,11 +21,11 @@ use crate::chart;
 use crate::color::{Color, Depth, Rgb, Style};
 use crate::csv;
 use crate::error::Error;
-use crate::field::Field;
+use crate::field::{self, Field};
 use crate::plan::{
     AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphOpts, GraphSpec,
-    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, ValExpr,
-    apply_stmts,
+    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, TableOpts,
+    ValExpr, apply_stmts,
 };
 use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
@@ -2049,6 +2049,7 @@ pub fn render<W: Write>(
     match plan.output {
         OutputFormat::Aligned(table) => {
             let numeric = numeric_columns(&rows);
+            shorten_numbers(&mut rows, &numeric, table);
             // Only a table that asked for stripes (`fmt -s`) gets them.
             let screen = Screen {
                 stripe: screen.stripe.filter(|_| table.stripes),
@@ -2190,6 +2191,21 @@ fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
             saw_number
         })
         .collect()
+}
+
+/// Rewrite the data cells of the `numeric` columns as `table` shows them (see
+/// [`field::table_num`]).
+fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts) {
+    if table.decimals.is_none() {
+        return;
+    }
+    for row in rows.iter_mut().skip(1) {
+        for (cell, _) in row.iter_mut().zip(numeric).filter(|(_, n)| **n) {
+            if let Some(short) = field::table_num(cell, table.decimals) {
+                *cell = short;
+            }
+        }
+    }
 }
 
 /// Whitespace-align columns (`fmt` / `column -t`): each column padded to its
@@ -2558,6 +2574,10 @@ pub fn describe(plan: &Plan) -> String {
             out.push_str("output: aligned");
             if table.stripes {
                 out.push_str(", striped");
+            }
+            match table.decimals {
+                Some(n) => out.push_str(&format!(", up to {n} decimals")),
+                None => out.push_str(", every digit"),
             }
             out.push('\n');
         }
@@ -3123,6 +3143,14 @@ mod tests {
         // `-D` is the other half of that pair.
         let d = describe(&parse("graph hist countZ -D").unwrap());
         assert!(d.contains("graph: hist [\"countZ\"] data\n"), "{d}");
+    }
+
+    #[test]
+    fn describe_shows_the_table_options() {
+        let d = |src: &str| describe(&parse(src).unwrap());
+        assert!(d("fmt").contains("output: aligned, up to 6 decimals\n"));
+        assert!(d("fmt -s -p 2").contains("output: aligned, striped, up to 2 decimals\n"));
+        assert!(d("fmt -f").contains("output: aligned, every digit\n"));
     }
 
     #[test]
@@ -4306,6 +4334,28 @@ mod tests {
         // Colour off ⇒ no escapes (aligned, but plain).
         let plain = render_str("color red countZ == '0' | fmt", INPUT, false);
         assert!(!plain.contains('\x1b'));
+    }
+
+    #[test]
+    fn fmt_shortens_numbers_in_numeric_columns_only() {
+        // `n` is numeric; `mixed` holds text too, and `id` is text.
+        let input = "n,mixed,id\n3.14159265,2.718281828,v1.23456789\n\
+                     1234567.5,none,x\n,0.5,y\n";
+        assert_eq!(
+            render_str("fmt", input, false),
+            "        n  mixed        id\n\
+             \x203.141593  2.718281828  v1.23456789\n\
+             1234567.5  none         x\n\
+             \x20          0.5          y\n"
+        );
+        assert_eq!(
+            render_str("fmt -p 0", input, false).lines().nth(1),
+            Some("      3  2.718281828  v1.23456789")
+        );
+        assert_eq!(
+            render_str("fmt -f", input, false).lines().nth(1),
+            Some("3.14159265  2.718281828  v1.23456789")
+        );
     }
 
     #[test]

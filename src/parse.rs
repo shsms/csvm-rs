@@ -1039,13 +1039,48 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// `fmt [-s] [-f | -p N]`: align the output as a table.
     fn parse_fmt(&mut self, rest: &str) -> Result<(), Error> {
-        let stripes = match rest.trim() {
-            "" => false,
-            "-s" | "--stripes" => true,
-            other => return Err(err(format!("fmt takes only -s (--stripes), not {other:?}"))),
-        };
-        self.output = OutputFormat::Aligned(TableOpts { stripes });
+        let mut table = TableOpts::default();
+        let (mut saw_full, mut saw_precision) = (false, false);
+        let mut s = rest.trim();
+        while !s.is_empty() {
+            let (word, after) = split_first_word(s);
+            let flag = if let Some(v) = flag_value(word, after, &["-p", "--precision"]) {
+                let (n, tail) = v?;
+                table.decimals = Some(n.parse().map_err(|_| {
+                    err(format!(
+                        "fmt -p expects a number of decimals from 0 to 255, not {n:?}"
+                    ))
+                })?);
+                s = tail.trim_start();
+                &mut saw_precision
+            } else {
+                s = after;
+                match word {
+                    "-s" | "--stripes" => &mut table.stripes,
+                    "-f" | "--full" => {
+                        table.decimals = None;
+                        &mut saw_full
+                    }
+                    other => {
+                        return Err(err(format!(
+                            "fmt takes -s (--stripes), -f (--full) and -p N (--precision), not {other:?}"
+                        )));
+                    }
+                }
+            };
+            if std::mem::replace(flag, true) {
+                let name = word.split_once('=').map_or(word, |(name, _)| name);
+                return Err(err(format!("fmt takes {name} only once")));
+            }
+        }
+        if saw_full && saw_precision {
+            return Err(err(
+                "fmt takes -f (every digit) or -p N (N decimals), not both",
+            ));
+        }
+        self.output = OutputFormat::Aligned(table);
         Ok(())
     }
 
@@ -3609,12 +3644,68 @@ mod tests {
             parse("fmt").unwrap().output,
             OutputFormat::Aligned(TableOpts::default())
         );
+    }
+
+    #[test]
+    fn fmt_flags() {
+        let table = |src: &str| match parse(src).unwrap().output {
+            OutputFormat::Aligned(t) => t,
+            OutputFormat::Csv => panic!("{src}: no table"),
+        };
+        let six = TableOpts::default();
+        assert_eq!(six.decimals, Some(6));
         for striped in ["fmt -s", "fmt --stripes"] {
             assert_eq!(
-                parse(striped).unwrap().output,
-                OutputFormat::Aligned(TableOpts { stripes: true })
+                table(striped),
+                TableOpts {
+                    stripes: true,
+                    ..six
+                }
             );
         }
+        for full in ["fmt -f", "fmt --full"] {
+            assert_eq!(
+                table(full),
+                TableOpts {
+                    decimals: None,
+                    ..six
+                }
+            );
+        }
+        for two in [
+            "fmt -p 2",
+            "fmt --precision 2",
+            "fmt -p=2",
+            "fmt --precision=2",
+        ] {
+            assert_eq!(
+                table(two),
+                TableOpts {
+                    decimals: Some(2),
+                    ..six
+                }
+            );
+        }
+        assert_eq!(
+            table("fmt -s -p 0"),
+            TableOpts {
+                stripes: true,
+                decimals: Some(0),
+            }
+        );
+
+        let msg = |src: &str| parse(src).unwrap_err().to_string();
+        assert!(
+            msg("fmt -f -p 2").contains("not both"),
+            "{}",
+            msg("fmt -f -p 2")
+        );
+        assert!(msg("fmt -p").contains("-p expects a value"));
+        assert!(msg("fmt -p=2 -p 3").contains("fmt takes -p only once"));
+        assert!(msg("fmt -p 2 -p=3").contains("fmt takes -p only once"));
+        assert!(msg("fmt -p x").contains("\"x\""));
+        assert!(msg("fmt -p -1").contains("\"-1\""));
+        assert!(msg("fmt -x").contains("-p N (--precision), not \"-x\""));
     }
 
     #[test]
@@ -3726,8 +3817,9 @@ mod tests {
         assert!(parse(r#"select "a > 0""#).is_err());
         assert!(parse("head abc").is_err()); // head needs a number
         assert!(parse("rename old").is_err()); // rename needs old=new
-        assert!(parse("fmt x").is_err()); // fmt takes only -s
+        assert!(parse("fmt x").is_err()); // not a flag
         assert!(parse("fmt -s -s").is_err());
+        assert!(parse("fmt -p 2 --precision 3").is_err());
         assert!(parse("join r.csv").is_err()); // missing `on KEYS`
         assert!(parse("join on sku").is_err()); // missing file
         assert!(parse("join r.csv on").is_err()); // empty key list

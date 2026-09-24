@@ -304,6 +304,23 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   terminal that is not the process's own; else `$COLORFGBG`), and
   `color::stripe` moves it 18 steps a channel lighter on a dark background,
   darker on a light one.
+  In a numeric column (`numeric_columns`, read before any cell changes),
+  `shorten_numbers` rewrites the data cells through `field::table_num`: a
+  cell with more than `TableOpts.decimals` digits after its point (six by
+  default, `-p N` or `-p=N`; `-f` is `None`, every digit) is rounded, its
+  trailing zeros dropped, and a negative one that rounds to zero shows `0`.
+  A plain decimal of at most 15 significant digits, zeros at the end not
+  counted, rounds on its own digits, a half away from zero
+  (`field::Decimal`: `2.675` to two decimals is `2.68`). Any other cell
+  rounds through the float, where an exact half
+  goes to the even digit; when the shortest text that reads back as the
+  number has no more decimals than that, it is used as it is, so rounding
+  never turns `0.1` into `0.10000000000000001`. A cell with no more
+  decimals keeps its own spelling (`2.50`), and so does a cell with an
+  exponent that rounding leaves at the same value (`1e5`, but `1e-7` shows
+  `0`).
+  Colour rules are computed on the cells as they were. `-f` and `-p` are
+  exclusive, and each flag is taken once.
 - **`graph KIND COLS [flags]`** is a chart **sink**: it draws from the columns
   reaching it instead of emitting CSV, so it must be the *last* command (the
   parser rejects anything after it). Without a `KIND` the first word is a

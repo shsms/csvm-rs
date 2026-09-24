@@ -444,6 +444,8 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         synopsis: &[
             "fmt             align columns like `column -t`",
             "fmt -s          …and shade every other row (--stripes)",
+            "fmt -p N        show at most N decimals, not 6 (--precision)",
+            "fmt -f          show every digit of a number (--full)",
         ],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
 the final output, so it composes after everything else. With colour on (see --color) the \
@@ -452,8 +454,17 @@ header row is bold and an empty cell shows a dim ∅. Shown on a terminal with n
 With colour on, a cell holding an http:// or https:// address is a link the terminal can \
 open (only on the terminal, and through a pager only when it is less 581 or later). With -s, \
 on a terminal with colour, the first data row and every other one after it are shaded a \
-little off the terminal's background (asked of the terminal, else read from $COLORFGBG).",
-        examples: &["csvm 'stats | fmt' data.csv"],
+little off the terminal's background (asked of the terminal, else read from $COLORFGBG). \
+In a column of numbers, a number with more than 6 decimals (N with -p N) is rounded to at \
+most that many, its trailing zeros dropped; one with no more shows as written, and so does \
+one with an exponent, like 1e5, unless rounding changes it (1e-7 shows 0). A half \
+rounds away from zero in a number with no exponent and up to 15 significant digits (zeros \
+at the end not counted); any other rounds as its float does (with -p 2, 2.675 shows 2.68 \
+but 2.675e0 shows 2.67).",
+        examples: &[
+            "csvm 'stats | fmt' data.csv",
+            "csvm 'stats | fmt -p 2' data.csv",
+        ],
     },
 ];
 

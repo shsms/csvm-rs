@@ -766,10 +766,22 @@ pub enum OutputFormat {
 }
 
 /// How `fmt` lays out a table.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableOpts {
     /// `fmt -s`: shade every other data row on a terminal.
     pub stripes: bool,
+    /// The most decimals a number in a numeric column shows (`fmt -p N`,
+    /// six by default), or `None` for every digit (`fmt -f`).
+    pub decimals: Option<u8>,
+}
+
+impl Default for TableOpts {
+    fn default() -> Self {
+        TableOpts {
+            stripes: false,
+            decimals: Some(6),
+        }
+    }
 }
 
 /// What a predicate colour rule paints.

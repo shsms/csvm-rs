@@ -67,6 +67,16 @@ link (an OSC 8 hyperlink) in terminals that support them: only on the
 terminal, never into a file or a pipe, and through a pager only when it is
 `less` 581 or later, which passes them on.
 
+In a `fmt` table, a column of numbers shows at most six decimals:
+`3.14159265` shows as `3.141593` and `2.50000000` as `2.5`, while a cell with
+six or fewer, like `2.50`, shows as written. So does a cell with an exponent,
+like `1e5`, unless rounding changes it: `1e-7` shows as `0`. A half rounds away
+from zero in a number with no exponent and up to 15 significant digits, zeros
+at the end not counted: with `-p 2`, `2.675` shows as `2.68`. Any other number
+rounds as its float does, so `2.675e0` shows as `2.67`. `-p N` (`--precision`)
+shows at most `N` decimals and `-f` (`--full`) every digit.
+Only the table changes; CSV output and `color` rules still see every digit.
+
 `fmt -s` (`--stripes`) shades the first data row of a table and every other one
 after it, with colour on the terminal: a little lighter than the terminal's
 background on a dark one and a little darker on a light one. csvm asks the
@@ -116,7 +126,7 @@ Each stage is a command with comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
-| `fmt [-s]`         | whitespace-aligned table (`column -t`); numbers right-justified; in colour, a bold header and a dim `∅` for an empty cell; `-s` stripes the rows |
+| `fmt [-s] [-f\|-p N]` | whitespace-aligned table (`column -t`); numbers right-justified, at most six decimals; in colour, a bold header and a dim `∅` for an empty cell; `-s` stripes the rows; `-p N` shows at most N decimals, `-f` every digit |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL V[,V2…]` | one horizontal bar per row and value column (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |
