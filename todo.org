@@ -14,9 +14,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 - JSON-lines output (the Sink half of the pluggable-formats roadmap); parquet
   write is listed under the parquet follow-ups.
 - A first tagged release: the tool is well past =0.1.0= in practice.
-- Numbers print rounded to six decimals, so =add v = 1e-7= prints =0=
-  while =--explain= shows =0.0000001=. That is the output formatter, not
-  the lexer, but exponent literals make it easy to hit.
 
 ** TODO Interface simplifications
 - The =join= item grammar has a documented ambiguity: a keyless file after an
@@ -389,10 +386,6 @@ below the chart rather than coercing to 0. Settle this before the binning code.
 - =add= =epoch()= / date function — folded into the "string and date functions"
   feature idea under Open items.
 - Time-axis labels honour the source offset (currently formatted as UTC).
-- Chart data fidelity is capped at =format_num='s 6 decimals because charts
-  re-parse the serialized output (the buffer reuse =fmt=/=color= share), so a
-  column of sub-1e-6 values collapses to 0. A faithful fix feeds the charts raw
-  =Field::Num= values instead of re-parsing — a deep change to the sink design.
 - Real images in the terminal: draw a chart as pixels through the kitty
   graphics protocol or sixel, where the terminal has one, instead of block
   and braille glyphs. Needs a design pass before code: which protocols (and

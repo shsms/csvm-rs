@@ -159,7 +159,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `count/count_distinct/sum/min/max/mean/stddev` (a bare `count` counts rows;
   `count(col)` counts non-empty cells, `count_distinct(col)` the distinct
   ones, told apart by their output text like a `by` key, so a typed number
-  counts once per six-decimal rendering — one `HashSet` per group and
+  counts once per printed rendering — one `HashSet` per group and
   column, merged by union); output cols are named
   `col_func` (`amount_sum`) or `count`, or whatever a `NAME=FN(col)` spec
   gives (`AggSpec.name`). `sum/mean/stddev` are blank for a
@@ -496,6 +496,14 @@ resolve time — see the `sort` bullet above):
   reused so the common all-numeric case costs the same as an explicit cast.
   Pin a genuinely-text column back to lexical with `add c = str(c)`.
 - Numbers always serialize correctly on output — no `str()` needed to print.
+  A number prints in plain notation to 15 significant digits and at least
+  six decimals, but no decimal past the 17th significant digit, trailing
+  zeros trimmed (`field::format_num`): `1e-7` prints `0.0000001`, `0.1 +
+  0.2` prints `0.3`, the float's noise past the 15th digit left out, and
+  `1727136000.123456` keeps its six decimals. From 1e9 up those extra
+  decimals can show the noise (`1e11 + 0.1` prints `100000000000.10001`),
+  and from 1e17 up a number prints its whole value. A chart's labels are
+  shorter (`graph::label_num`: at most six decimals).
 - `add c = num(c)` / `add c = str(c)` are the explicit **type overrides**,
   affecting later column-vs-column comparisons and the default sort mode for
   that column.
@@ -584,7 +592,7 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   key**, and sort their
   block into a run (kept in memory, or spilled to a temp file past the budget
   as length-prefixed key + line records, so the merge never re-derives a key
-  from the six-decimal serialized line).
+  from the rounded serialized line).
   A single-threaded binary-heap k-way merge then picks the smallest key and
   emits the row's already-serialized bytes via a callback — no per-field
   allocation, no re-serialization on output. A block is a contiguous input
@@ -597,7 +605,7 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   (`RowChain::only_windows`), else the typed cell codec (`encode_row` /
   `decode_row`),
   which keeps a `Field::Num` exact for the statements after the sort instead
-  of handing them its six-decimal output text.
+  of handing them its rounded output text.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls

@@ -9,8 +9,7 @@ use crate::chart::{
     value_pos,
 };
 use crate::color::{Ramp, rgb_hex};
-use crate::field::format_num;
-use crate::graph::{XAxis, series_rgb};
+use crate::graph::{XAxis, label_num, series_rgb};
 
 const W: f64 = 720.0;
 const H: f64 = 440.0;
@@ -119,8 +118,8 @@ fn ylabels(lo: f64, hi: f64) -> String {
         x = L - 6.0,
         ty = T + 4.0,
         by = T + PLOT_H,
-        hi = format_num(hi),
-        lo = format_num(lo),
+        hi = label_num(hi),
+        lo = label_num(lo),
     )
 }
 
@@ -230,9 +229,9 @@ pub fn bars(frame: &Frame, b: &BarData) -> String {
             let y = T + ri as f64 * rh + i as f64 * sh;
             // The label heads its group; every row of it prints its own value.
             let text = match (i == 0, value_at(row, i)) {
-                (true, Some(v)) => format!("{} ({})", esc(&row.0), format_num(v)),
+                (true, Some(v)) => format!("{} ({})", esc(&row.0), label_num(v)),
                 (true, None) => esc(&row.0),
-                (false, Some(v)) => format!("({})", format_num(v)),
+                (false, Some(v)) => format!("({})", label_num(v)),
                 (false, None) => String::new(),
             };
             let label = if text.is_empty() {

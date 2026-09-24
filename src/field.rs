@@ -107,9 +107,15 @@ fn parse_num_soft(s: &str) -> Option<f64> {
     }
 }
 
-/// Format a number the way csvm does: six decimal places, then trim trailing
-/// zeros and a trailing decimal point. So `25.0 -> "25"`, `25.5 -> "25.5"`,
-/// `0.1 -> "0.1"`. NaN and inf print as `NaN`, `inf` and `-inf`.
+/// Format a number the way csvm does: in plain notation, to 15 significant
+/// digits and at least six decimals, but no decimal past the 17th
+/// significant digit (17 tell every double apart), with trailing zeros and
+/// a trailing decimal point trimmed. So `25.0 -> "25"`, `25.5 -> "25.5"`,
+/// `1e-7 -> "0.0000001"`, `0.1 + 0.2` prints `0.3` (the float's own noise
+/// past the 15th digit left out), and `1727136000.123456` keeps its six
+/// decimals. From 1e9 up the decimals past the 15th digit can show that
+/// noise, and from 1e17 up a number prints its whole value. NaN and inf
+/// print as `NaN`, `inf` and `-inf`.
 pub fn format_num(n: f64) -> String {
     let mut s = String::new();
     format_num_into(n, &mut s);
@@ -119,12 +125,50 @@ pub fn format_num(n: f64) -> String {
 /// [`format_num`] appended to `buf` (no allocation once `buf` has room).
 pub fn format_num_into(n: f64, buf: &mut String) {
     use std::fmt::Write;
-    // A finite "{:.6}" always emits a '.', so trimming the fractional zeros
+    /// Digits a double holds for certain.
+    const SIGNIFICANT: i32 = 15;
+    /// Decimals a number keeps, up to `MAX_SIGNIFICANT` digits.
+    const MIN_DECIMALS: i32 = 6;
+    /// Digits that tell every double apart.
+    const MAX_SIGNIFICANT: i32 = 17;
+    // A whole number that small prints as an integer (and fast); `-0.0`
+    // keeps its sign below.
+    if n.fract() == 0.0 && n.abs() < 1e15 && (n != 0.0 || n.is_sign_positive()) {
+        write!(buf, "{}", n as i64).unwrap();
+        return;
+    }
+    if !n.is_finite() {
+        write!(buf, "{n}").unwrap();
+        return;
+    }
+    // The number's exponent. `log10` can land on the wrong side of a power
+    // of ten, so close to one it is read off the scientific form instead.
+    let log = n.abs().log10();
+    let exponent = if (log - log.round()).abs() > 1e-9 {
+        log.floor() as i32
+    } else {
+        let start = buf.len();
+        write!(buf, "{n:e}").unwrap();
+        let exponent = buf[start..]
+            .rsplit_once('e')
+            .and_then(|(_, e)| e.parse().ok())
+            .unwrap_or(0);
+        buf.truncate(start);
+        exponent
+    };
+    // Past 17 significant digits every double is told apart already.
+    let decimals = (SIGNIFICANT - 1 - exponent)
+        .max(MIN_DECIMALS)
+        .min(MAX_SIGNIFICANT - 1 - exponent)
+        .max(0) as usize;
+    write!(buf, "{n:.decimals$}").unwrap();
+    // With decimals the text holds a '.', so trimming the fractional zeros
     // and then the dot can never eat into the integer part or the text
-    // before it; NaN/inf render as is and have nothing to trim.
-    write!(buf, "{n:.6}").unwrap();
-    let end = buf.trim_end_matches('0').trim_end_matches('.').len();
-    buf.truncate(end);
+    // before it.
+    if decimals > 0 {
+        let end = buf.trim_end_matches('0').trim_end_matches('.').len();
+        buf.truncate(end);
+    }
 }
 
 #[cfg(test)]
@@ -140,8 +184,28 @@ mod tests {
         assert_eq!(format_num(-25.0), "-25");
         assert_eq!(format_num(1_000_000.0), "1000000");
         assert_eq!(format_num(0.0), "0");
-        // 1/3 -> six decimals, no trailing-zero trim needed
-        assert_eq!(format_num(1.0 / 3.0), "0.333333");
+        // 15 significant digits, however small.
+        assert_eq!(format_num(1.0 / 3.0), "0.333333333333333");
+        assert_eq!(format_num(1e-7), "0.0000001");
+        assert_eq!(format_num(-2.5e-10), "-0.00000000025");
+        assert_eq!(format_num(123456.789), "123456.789");
+        assert_eq!(format_num(0.1 + 0.2), "0.3");
+        assert_eq!(format_num(1e20), "100000000000000000000");
+        assert_eq!(format_num(100.0), "100");
+        assert_eq!(format_num(-0.0), "-0");
+        assert_eq!(format_num(-42.0), "-42");
+        assert_eq!(format_num(999_999_999_999_999.0), "999999999999999");
+        assert_eq!(format_num(1e15), "1000000000000000");
+        // Just under a power of ten, and rounding up to one.
+        assert_eq!(format_num(9.999999999999994e-5), "0.0000999999999999999");
+        assert_eq!(format_num(1e-4_f64.next_down()), "0.0001");
+        // Never fewer than six decimals, so big values stay apart.
+        assert_eq!(format_num(1727136000.123456), "1727136000.123456");
+        assert_eq!(format_num(1727136000.123461), "1727136000.123461");
+        assert_eq!(format_num(1e15 + 0.5), "1000000000000000.5");
+        // No decimal past the 17th digit; a big number prints its whole value.
+        assert_eq!(format_num(1e11 + 0.1), "100000000000.10001");
+        assert_eq!(format_num(1e20 + 0.5), "100000000000000000000");
     }
 
     #[test]

@@ -76,7 +76,7 @@ price,qty
 fn sqrt_of_a_column() {
     assert_eq!(
         run_checked("add r = sqrt(price * qty) | cols r", NUM),
-        "r\n5.477226\n6.324555\n4.472136\n"
+        "r\n5.47722557505166\n6.32455532033676\n4.47213595499958\n"
     );
 }
 
@@ -110,7 +110,7 @@ fn exp_and_log_family() {
     );
     assert_eq!(
         run_checked("add l2 = log2(x) | add l10 = log10(x) | cols l2,l10", input),
-        "l2,l10\n0,0\n3,0.90309\n6.643856,2\n"
+        "l2,l10\n0,0\n3,0.903089986991944\n6.64385618977472,2\n"
     );
 }
 

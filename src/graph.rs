@@ -9,17 +9,30 @@ use crate::chart::{
     value_pos,
 };
 use crate::color::{Color, Depth, Ramp, Rgb, Style};
-use crate::field::format_num;
+
+/// A number as a chart labels it: at most six decimals, trailing zeros
+/// trimmed, and `0` for a value that rounds to zero either side. A label
+/// only has to be read, not to keep values apart the way a cell must.
+pub(crate) fn label_num(v: f64) -> String {
+    let mut s = format!("{v:.6}");
+    // NaN and inf have no zeros to trim.
+    let end = s.trim_end_matches('0').trim_end_matches('.').len();
+    s.truncate(end);
+    if s == "-0" {
+        s.replace_range(.., "0");
+    }
+    s
+}
 
 /// Format `v` rounded to `step`'s precision (one digit finer than the step's
 /// magnitude), then trimmed — keeps bin-edge labels readable.
 fn fmt_to_step(v: f64, step: f64) -> String {
     if step <= 0.0 || !step.is_finite() {
-        return format_num(v);
+        return label_num(v);
     }
     let decimals = (1.0 - step.log10().floor()).clamp(0.0, 6.0) as i32;
     let factor = 10f64.powi(decimals);
-    format_num((v * factor).round() / factor)
+    label_num((v * factor).round() / factor)
 }
 
 /// Min and max of `values`, or `None` when empty. The chart data builders lean
@@ -35,7 +48,7 @@ pub(crate) fn minmax(values: impl IntoIterator<Item = f64>) -> Option<(f64, f64)
 /// The left gutter of a framed chart (scatter, line, heatmap): the wider of the
 /// two y-bound labels, which is what the gutter has to hold.
 pub(crate) fn gutter_width(lo: f64, hi: f64) -> usize {
-    format_num(hi).len().max(format_num(lo).len())
+    label_num(hi).len().max(label_num(lo).len())
 }
 
 /// How many cells of a `width`-wide chart are left for the canvas once the
@@ -147,8 +160,8 @@ fn render_hist(frame: &Frame, h: &HistData) -> String {
     out.push_str(&format!(
         "n={}  min={}  max={}  bins={}",
         h.total,
-        format_num(h.lo),
-        format_num(h.hi),
+        label_num(h.lo),
+        label_num(h.hi),
         nbins
     ));
     out.push_str(&frame.notes_tail());
@@ -221,9 +234,9 @@ fn render_bars(frame: &Frame, b: &BarData) -> String {
                 (None, _) => drawn,
             };
             // The label heads its group; the rows below it line up under a gap.
-            let label = if i == 0 { row.0.as_str() } else { "" };
-            let value = v.map(format_num).unwrap_or_default();
-            out.push_str(&format!("{label:>label_w$} {axis_v}{drawn} {value}\n"));
+            let name = if i == 0 { row.0.as_str() } else { "" };
+            let value = v.map(label_num).unwrap_or_default();
+            out.push_str(&format!("{name:>label_w$} {axis_v}{drawn} {value}\n"));
         }
     }
     if let Some(x) = &frame.xlabel {
@@ -310,7 +323,7 @@ fn render_spark(frame: &Frame, s: &SparkData) -> String {
     if let Some(x) = &frame.xlabel {
         out.push_str(&format!("  {x}\n"));
     }
-    out.push_str(&format!("min={}  max={}", format_num(dlo), format_num(dhi)));
+    out.push_str(&format!("min={}  max={}", label_num(dlo), label_num(dhi)));
     out.push_str(&frame.notes_tail());
     out.push('\n');
     out
@@ -455,7 +468,7 @@ fn ticks(lo: f64, hi: f64, k: usize, fmt: impl Fn(f64) -> String) -> Vec<(f64, S
 fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<(f64, String)> {
     let span = hi - lo;
     if span <= 0.0 || target == 0 {
-        return vec![(0.0, format_num(lo))];
+        return vec![(0.0, label_num(lo))];
     }
     let raw = span / target as f64;
     let mag = 10f64.powf(raw.log10().floor());
@@ -473,7 +486,7 @@ fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<(f64, String)> {
     let mut out = Vec::new();
     let mut v = (lo / step).ceil() * step;
     while v <= hi + step * 1e-9 {
-        out.push(((v - lo) / span, format_num(v)));
+        out.push(((v - lo) / span, label_num(v)));
         // When the values dwarf the step (huge magnitude, tiny span), `v + step`
         // can't change the float — stop rather than loop forever.
         let next = v + step;
@@ -608,7 +621,7 @@ pub(crate) fn spacing_note(xaxis: &XAxis) -> Option<&'static str> {
 pub(crate) fn axis_label_width(xaxis: &XAxis, xlo: f64, xhi: f64) -> usize {
     match xaxis {
         XAxis::Ends(lo, hi) => lo.chars().count().max(hi.chars().count()),
-        XAxis::Numeric => format_num(xlo).len().max(format_num(xhi).len()),
+        XAxis::Numeric => label_num(xlo).len().max(label_num(xhi).len()),
         XAxis::Time if crate::datetime::same_day(xlo, xhi) => 8,
         XAxis::Time => 19,
     }
@@ -657,8 +670,8 @@ fn render_xy(frame: &Frame, xy: &XyData) -> String {
 
     // Left gutter holds the y-axis labels (top = yhi, bottom = ylo) — the real
     // values, whatever the axis does with them.
-    let yhi_s = format_num(yhi);
-    let ylo_s = format_num(ylo);
+    let yhi_s = label_num(yhi);
+    let ylo_s = label_num(ylo);
     let gutter = gutter_width(ylo, yhi);
     let wcells = canvas_cells(frame.width, ylo, yhi);
     let hcells = frame.height.max(2);
@@ -852,8 +865,8 @@ fn shade_level(count: u64, max: u64, log: bool) -> usize {
 /// the *count* axis here, not the y axis: both dimensions are binned, so the
 /// log belongs to the density.
 fn render_heat(frame: &Frame, h: &HeatData) -> String {
-    let yhi_s = format_num(h.yhi);
-    let ylo_s = format_num(h.ylo);
+    let yhi_s = label_num(h.yhi);
+    let ylo_s = label_num(h.ylo);
     let gutter = gutter_width(h.ylo, h.yhi);
     let max = h.counts.iter().copied().max().unwrap_or(0);
     // The ramp spans one point to the busiest cell, on the count axis — the
@@ -900,6 +913,7 @@ mod tests {
     use super::*;
     use crate::chart::XyRow;
     use crate::chart::fixtures::{bar_data, heat_data, one_series, xy_data};
+    use crate::field::format_num;
 
     #[test]
     fn bins_span_min_to_max_inclusive() {
@@ -1131,6 +1145,17 @@ mod tests {
         // the default one — colour alone is enough to paint.
         f.ramp = None;
         assert!(render_heat(&f, &heat_data(vec![0, 1, 2, 4])).contains("\x1b[38;2;"));
+    }
+
+    #[test]
+    fn label_num_keeps_six_decimals_and_no_minus_zero() {
+        assert_eq!(label_num(1.0 / 3.0), "0.333333");
+        assert_eq!(label_num(25.0), "25");
+        assert_eq!(label_num(0.1 + 0.2), "0.3");
+        // A tick a step's float error puts just below zero.
+        assert_eq!(label_num(-1.4e-17), "0");
+        assert_eq!(label_num(-0.5), "-0.5");
+        assert_eq!(label_num(f64::NAN), "NaN");
     }
 
     #[test]

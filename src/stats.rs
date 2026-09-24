@@ -305,7 +305,7 @@ mod tests {
         let cells = profile(&["1", "2", "inf"]);
         assert_eq!(cells[1], "3"); // count: all three non-empty
         assert_eq!(&cells[3..7], ["1", "2", "3", "1.5"]); // min,max,sum,mean over finite
-        assert_eq!(cells[7], "0.707107"); // stddev over the two finite values
+        assert_eq!(cells[7], "0.707106781186548"); // stddev over the two finite values
         // A column of only non-finite values has no finite aggregates.
         let only = profile(&["nan", "inf"]);
         assert_eq!(only[1], "2"); // counted

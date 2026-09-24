@@ -16,8 +16,8 @@
 //!
 //! Small inputs never touch disk; larger ones spill sorted runs to temp files
 //! as key + row records, so a spilled key is exactly the one computed from
-//! the live row (re-deriving it from the serialized row would round numbers
-//! to six decimals). With many runs the merge is multi-level.
+//! the live row (re-deriving it from the serialized row would round
+//! numbers). With many runs the merge is multi-level.
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -150,7 +150,7 @@ pub enum LineFormat {
     /// The output CSV line, written out as is.
     Csv,
     /// Typed cells ([`encode_row`] / [`decode_row`]): a number keeps its full
-    /// value for the statements after the sort instead of its six-decimal
+    /// value for the statements after the sort instead of its rounded
     /// output text.
     Typed,
 }
@@ -839,9 +839,9 @@ mod tests {
     #[test]
     fn spilled_runs_keep_full_key_precision() {
         // `add v = num(v)` makes the sort key a `Field::Num`, which serializes
-        // with six decimals. The spilled order must still be the in-memory
-        // order, so values that differ past the sixth decimal (and the
-        // stability of ties) cannot depend on `--sort-buffer`.
+        // to 15 significant digits. The spilled order must still be the
+        // in-memory order, so values that differ past the 15th digit (and
+        // the stability of ties) cannot depend on `--sort-buffer`.
         let mut plan = crate::parse::parse("add v = num(v) | sort v=nr").unwrap();
         plan.resolve(&["v".to_string(), "tag".to_string()]).unwrap();
         let [
@@ -852,10 +852,10 @@ mod tests {
             panic!("unexpected plan shape");
         };
         let lines = [
-            "1.00000010,a",
-            "1.00000030,b",
-            "1.00000020,c",
-            "1.00000025,d",
+            "1.0000000000000010,a",
+            "1.0000000000000030,b",
+            "1.0000000000000020,c",
+            "1.0000000000000025,d",
         ];
         let expected = ["1,b", "1,d", "1,c", "1,a"];
         assert_eq!(sort_lines_with(sort, pre, &lines, 4, 1 << 30), expected);
@@ -887,7 +887,7 @@ mod tests {
     #[test]
     fn typed_rows_survive_a_spill() {
         // With the typed format a number comes back exact through the spilled
-        // key + row records, not as its six-decimal text.
+        // key + row records, not as its rounded text.
         let mut plan = crate::parse::parse("add v = num(v) | sort v=nr").unwrap();
         plan.resolve(&["v".to_string(), "tag".to_string()]).unwrap();
         let [

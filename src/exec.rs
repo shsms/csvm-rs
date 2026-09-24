@@ -3169,10 +3169,10 @@ mod tests {
         let out = run_str("stats", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "field,count,empty,min,max,sum,mean,stddev");
-        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
+        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.29099444873581");
         // text column: lexical min/max, numeric stats blank
         assert_eq!(lines[2], "fieldA,4,0,f,t,,,");
-        assert_eq!(lines[3], "countZ,4,0,0,9,14,3.5,4.358899");
+        assert_eq!(lines[3], "countZ,4,0,0,9,14,3.5,4.35889894354067");
     }
 
     #[test]
@@ -3181,7 +3181,7 @@ mod tests {
         let out = run_str("select fieldA == 't' | stats countZ", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2); // header + countZ
-        assert!(lines[1].starts_with("countZ,3,0,0,9,14,4.666667,"));
+        assert!(lines[1].starts_with("countZ,3,0,0,9,14,4.66666666666667,"));
     }
 
     #[test]
@@ -3253,7 +3253,7 @@ mod tests {
         // A blocking stage before stats falls back to the materializing path.
         let out = run_str("sort id=nr | stats id", INPUT).unwrap();
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.290994");
+        assert_eq!(lines[1], "id,4,0,1,4,10,2.5,1.29099444873581");
     }
 
     #[test]
@@ -3276,7 +3276,7 @@ mod tests {
             lines[0],
             "fieldA,countZ_sum,countZ_mean,countZ_min,countZ_max"
         );
-        assert_eq!(lines[1], "t,14,4.666667,0,9");
+        assert_eq!(lines[1], "t,14,4.66666666666667,0,9");
         assert_eq!(lines[2], "f,0,0,0,0");
     }
 
@@ -3296,7 +3296,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "fieldA,total,n,countZ_mean\nt,14,3,4.666667\nf,0,1,0\n"
+            "fieldA,total,n,countZ_mean\nt,14,3,4.66666666666667\nf,0,1,0\n"
         );
         // A given name survives a positional column spec too.
         let out = run_str("agg total=sum(3) by fieldA", INPUT).unwrap();
@@ -3359,14 +3359,19 @@ mod tests {
     fn count_distinct_keys_a_number_by_its_output_text() {
         // A typed number's identity is its output text, as it is for a `by`
         // key and for `uniq`: `1` and `1.0` are one value, and so are two
-        // values that agree to six decimals. As text they stay apart.
-        let input = "g,v\nx,1\nx,1.0\nx,1.00000021\nx,1.00000019\nx,2\n";
+        // values that agree to 15 significant digits. As text they stay
+        // apart.
+        let input = "g,v\nx,1\nx,1.0\nx,1.0000000000000021\nx,1.0000000000000019\nx,2\n";
         let out = run_str("agg count_distinct(v) by g", input).unwrap();
         assert_eq!(out, "g,v_count_distinct\nx,5\n");
         let out = run_str("add v = num(v) | agg count_distinct(v) by g", input).unwrap();
         assert_eq!(out, "g,v_count_distinct\nx,2\n");
         let out = run_str("add v = num(v) | agg count by v | agg count", input).unwrap();
         assert_eq!(out, "count\n2\n");
+        // A big value keeps its six decimals, so microseconds stay apart.
+        let input = "g,v\nx,1727136000.123456\nx,1727136000.123461\n";
+        let out = run_str("add v = num(v) | agg count_distinct(v) by g", input).unwrap();
+        assert_eq!(out, "g,v_count_distinct\nx,2\n");
     }
 
     #[test]
