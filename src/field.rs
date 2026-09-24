@@ -166,8 +166,54 @@ pub fn format_num_into(n: f64, buf: &mut String) {
     // and then the dot can never eat into the integer part or the text
     // before it.
     if decimals > 0 {
-        let end = buf.trim_end_matches('0').trim_end_matches('.').len();
-        buf.truncate(end);
+        trim_decimals(buf);
+    }
+}
+
+/// A number cell as a `fmt` table shows it, or `None` when the cell shows as
+/// written. A cell with more than `decimals` digits after its point is
+/// rounded to that many (`None` keeps every digit), its trailing zeros
+/// dropped: `3.14159265` shows `3.141593` and `2.50000000` shows `2.5`, while
+/// `2.50` stays as written. A cell with an exponent stays as written unless
+/// rounding changes its value: `1e5` stays, `1e-7` shows `0`. A cell that is
+/// not a finite number shows as written.
+pub fn table_num(cell: &str, decimals: Option<u8>) -> Option<String> {
+    let n = Field::Str(cell).num_opt().filter(|n| n.is_finite())?;
+    let decimals = usize::from(decimals?);
+    let text = cell.trim();
+    let exponent = text.contains(['e', 'E']);
+    let written_decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
+    if !exponent && written_decimals <= decimals {
+        return None;
+    }
+    let s = round_num(n, decimals);
+    (!exponent || s.parse::<f64>() != Ok(n)).then_some(s)
+}
+
+/// `n` to at most `decimals` decimals, its trailing zeros dropped, and `0`
+/// for a number that rounds to zero from either side. When the shortest text
+/// that reads back as `n` fits, it is the answer, so no digit past the
+/// float's precision shows: `0.1` and not `0.10000000000000001`.
+fn round_num(n: f64, decimals: usize) -> String {
+    let shortest = n.to_string();
+    let mut s = if shortest.split_once('.').map_or(0, |(_, f)| f.len()) <= decimals {
+        shortest
+    } else {
+        format!("{n:.decimals$}")
+    };
+    trim_decimals(&mut s);
+    if s == "-0" {
+        s.remove(0);
+    }
+    s
+}
+
+/// Drop the zeros at the end of a number's decimals, and then its decimal
+/// point. A number without one keeps its zeros.
+fn trim_decimals(s: &mut String) {
+    if s.contains('.') {
+        let end = s.trim_end_matches('0').trim_end_matches('.').len();
+        s.truncate(end);
     }
 }
 
@@ -206,6 +252,39 @@ mod tests {
         // No decimal past the 17th digit; a big number prints its whole value.
         assert_eq!(format_num(1e11 + 0.1), "100000000000.10001");
         assert_eq!(format_num(1e20 + 0.5), "100000000000000000000");
+    }
+
+    #[test]
+    fn table_num_rounds_long_decimals_only() {
+        let six = |c| table_num(c, Some(6));
+        assert_eq!(six("3.14159265358979").as_deref(), Some("3.141593"));
+        assert_eq!(six("1234567.891").as_deref(), None);
+        assert_eq!(six("0.000012345678").as_deref(), Some("0.000012"));
+        assert_eq!(six("0.0000001").as_deref(), Some("0"));
+        assert_eq!(six("-0.0000001").as_deref(), Some("0"));
+        assert_eq!(six("-2.00000049").as_deref(), Some("-2"));
+        assert_eq!(six("0.1234565001").as_deref(), Some("0.123457"));
+        assert_eq!(six("1e-7").as_deref(), Some("0"));
+        assert_eq!(six("1.5e-7").as_deref(), Some("0"));
+        // A cell that needs no rounding keeps its own spelling.
+        for kept in ["2.50", "1e5", "007", " 42 ", "-0", "0.123456", "1e-3"] {
+            assert_eq!(six(kept), None, "{kept}");
+        }
+        // A cell with more decimals is rounded, even when that keeps its value.
+        assert_eq!(six("2.50000000").as_deref(), Some("2.5"));
+        assert_eq!(six("0.10000000000000001").as_deref(), Some("0.1"));
+        // No digit past the float's precision shows.
+        let p = |c, d| table_num(c, Some(d));
+        assert_eq!(p("0.100000000000000000", 17).as_deref(), Some("0.1"));
+        assert_eq!(p("1234567.10000000000", 10).as_deref(), Some("1234567.1"));
+        for text in ["", "abc", "NaN", "inf", "-inf"] {
+            assert_eq!(six(text), None, "{text}");
+        }
+        // No decimal point to trim at: whole numbers keep their zeros.
+        assert_eq!(table_num("1234.5", Some(0)).as_deref(), Some("1234"));
+        assert_eq!(table_num("100.4", Some(0)).as_deref(), Some("100"));
+        assert_eq!(table_num("3.14159", Some(2)).as_deref(), Some("3.14"));
+        assert_eq!(table_num("3.14159265358979", None), None);
     }
 
     #[test]
