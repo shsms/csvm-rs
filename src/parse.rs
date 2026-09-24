@@ -709,14 +709,14 @@ impl<'a> Builder<'a> {
         // One item list: the aggregates, then an unquoted `by` item, then
         // the keys (`by COLS`; without it, one global aggregate row).
         let items = split_specs(rest)?;
-        let by_at = items.iter().position(|t| t == "by");
+        let by_at = items.iter().position(|(t, _)| t == "by");
         let (specs, keys) = match by_at {
             Some(at) => (&items[..at], &items[at + 1..]),
             None => (&items[..], &[][..]),
         };
         let aggs = specs
             .iter()
-            .map(|t| parse_agg_spec(t))
+            .map(|(t, _)| parse_agg_spec(t))
             .collect::<Result<Vec<_>, _>>()?;
         if aggs.is_empty() {
             return Err(err(
@@ -726,7 +726,7 @@ impl<'a> Builder<'a> {
         if by_at.is_some() && keys.is_empty() {
             return Err(err("agg: `by` expects at least one key column"));
         }
-        let keys: Vec<String> = keys.iter().map(|k| unquote(k).to_string()).collect();
+        let keys: Vec<String> = keys.iter().map(|(k, _)| unquote(k).to_string()).collect();
         self.items.push(Item::Stage(Stage::Group(GroupStmt {
             keys,
             key_positions: Vec::new(),
@@ -1526,36 +1526,52 @@ fn joins_at_eq(c: char, after_eq: bool, rest: &str) -> bool {
 /// comma/space can be written `` `odd, name` ``). With `keep_quotes` the
 /// quote characters stay in the item, else they are stripped; with
 /// `nest_parens` a `func(a, b)` group is one item. An unquoted `=` binds
-/// tighter than whitespace: `a = b` is one item. The second value is a
-/// quote left open at the end (its text is in the last item).
-fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> (Vec<String>, Option<char>) {
+/// tighter than whitespace: `a = b` is one item. Each item comes with the
+/// byte range of `s` it is written at, quotes included. The second value is
+/// a quote left open at the end (its text is in the last item).
+fn split_items(
+    s: &str,
+    keep_quotes: bool,
+    nest_parens: bool,
+) -> (Vec<(String, Range<usize>)>, Option<char>) {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
     let mut depth = 0i32;
     let mut in_item = false;
+    // Where the current item is written.
+    let mut at = 0..0;
     // The last character pushed was an unquoted `=`.
     let mut after_eq = false;
     for (i, c) in s.char_indices() {
+        let next = i + c.len_utf8();
         match quote {
             Some(q) if c == q => {
                 quote = None;
                 if keep_quotes {
                     cur.push(c);
                 }
+                at.end = next;
             }
-            Some(_) => cur.push(c),
+            Some(_) => {
+                cur.push(c);
+                at.end = next;
+            }
             None if c == '"' || c == '\'' || c == '`' => {
                 quote = Some(c);
+                if !in_item {
+                    at.start = i;
+                }
                 in_item = true;
                 after_eq = false;
                 if keep_quotes {
                     cur.push(c);
                 }
+                at.end = next;
             }
             None if depth == 0 && (c == ',' || c.is_whitespace()) => {
                 if in_item && !joins_at_eq(c, after_eq, &s[i..]) {
-                    out.push(std::mem::take(&mut cur));
+                    out.push((std::mem::take(&mut cur), at.clone()));
                     in_item = false;
                 }
             }
@@ -1566,13 +1582,17 @@ fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> (Vec<String>, O
                     depth -= 1;
                 }
                 cur.push(c);
+                if !in_item {
+                    at.start = i;
+                }
                 in_item = true;
                 after_eq = c == '=';
+                at.end = next;
             }
         }
     }
     if in_item {
-        out.push(cur);
+        out.push((cur, at));
     }
     (out, quote)
 }
@@ -1580,13 +1600,17 @@ fn split_items(s: &str, keep_quotes: bool, nest_parens: bool) -> (Vec<String>, O
 /// A column/argument list: [`split_items`] with the quotes stripped (an
 /// open quote runs to the end).
 fn split_list(s: &str) -> Vec<String> {
-    split_items(s, false, false).0
+    split_items(s, false, false)
+        .0
+        .into_iter()
+        .map(|(item, _)| item)
+        .collect()
 }
 
 /// An `agg` argument: [`split_items`] keeping `func(col)` groups and quoted
 /// names intact, quotes included, so `by` can be told from `'by'` and a
 /// trailing `=` is known to be unquoted. An open quote is an error.
-fn split_specs(s: &str) -> Result<Vec<String>, Error> {
+fn split_specs(s: &str) -> Result<Vec<(String, Range<usize>)>, Error> {
     match split_items(s, true, true) {
         (items, None) => Ok(items),
         (_, Some('`')) => Err(err("agg: unterminated backtick")),
