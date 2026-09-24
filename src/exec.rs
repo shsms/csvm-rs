@@ -2054,7 +2054,8 @@ pub fn render<W: Write>(
                 .filter(|_| plan.output == OutputFormat::Aligned { stripes: true }),
             ..*screen
         };
-        align_and_write(&rows, styles.as_deref(), &screen, output)
+        let numeric = numeric_columns(&rows);
+        align_and_write(&rows, &numeric, styles.as_deref(), &screen, output)
     } else {
         write_csv_colored(&rows, styles.as_deref(), depth, output)
     }
@@ -2173,10 +2174,29 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
 /// reads as a value and not as a gap in the row.
 const EMPTY_CELL: &str = "∅";
 
+/// Which columns are numeric: every data cell reads as a number (blanks
+/// allowed, but at least one must be a real number).
+fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
+    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    (0..ncols)
+        .map(|i| {
+            let mut saw_number = false;
+            for row in rows.iter().skip(1) {
+                let cell = row.get(i).map_or("", String::as_str);
+                if Field::Str(cell).coerce_num().is_err() {
+                    return false;
+                }
+                saw_number |= !cell.trim().is_empty();
+            }
+            saw_number
+        })
+        .collect()
+}
+
 /// Whitespace-align columns (`fmt` / `column -t`): each column padded to its
-/// widest cell, two spaces between. A numeric column (every data cell reads as a
-/// number) is right-justified; text columns left-justified, trailing column
-/// unpadded. Padding is by visible width; the painted text carries the colour.
+/// widest cell, two spaces between. A `numeric` column is right-justified;
+/// text columns left-justified, trailing column unpadded. Padding is by visible
+/// width; the painted text carries the colour.
 /// With colour on the header row is bold and an empty data cell shows
 /// [`EMPTY_CELL`], dimmed over whatever the rules paint there. When the screen
 /// fits tables, text columns are cut so the lines fit its width (see
@@ -2186,6 +2206,7 @@ const EMPTY_CELL: &str = "∅";
 /// rules paint there.
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
+    numeric: &[bool],
     styles: Option<&[Vec<Style>]>,
     screen: &Screen,
     output: &mut W,
@@ -2220,23 +2241,8 @@ fn align_and_write<W: Write>(
         }
     };
 
-    // Right-justify a column when every data cell reads as a number (blanks
-    // allowed, but at least one must be a real number).
-    let numeric: Vec<bool> = (0..ncols)
-        .map(|i| {
-            let mut saw_number = false;
-            for row in rows.iter().skip(1) {
-                let cell = row.get(i).map_or("", String::as_str);
-                if Field::Str(cell).coerce_num().is_err() {
-                    return false;
-                }
-                saw_number |= !cell.trim().is_empty();
-            }
-            saw_number
-        })
-        .collect();
     if let Some(width) = fit_to {
-        widths = fit_widths(&widths, &numeric, width);
+        widths = fit_widths(&widths, numeric, width);
     }
 
     let mut line = String::new();
