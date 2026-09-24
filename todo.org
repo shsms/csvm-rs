@@ -20,10 +20,6 @@ git history; this file is the "what next / what was decided" scratchpad.
 - Numbers print rounded to six decimals, so =add v = 1e-7= prints =0=
   while =--explain= shows =0.0000001=. That is the output formatter, not
   the lexer, but exponent literals make it easy to hit.
-- =next_chunk_available= (=exec.rs=) allocates a fresh zeroed chunk buffer
-  per read; on a pipe a read returns ~64 KiB, so a whole-input stream
-  (=tail +N= with no head, any serial transform on stdin) pays a 1 MiB
-  alloc per 64 KiB. Hoist a caller-owned buffer through the serial loops.
 - A =head= after a =join= still reads the whole input: =join= is not a
   =RowChain= step (=exec.rs=), so the chain ends before it. An inner or left
   join passes each left row on as it probes the right side's table, so it

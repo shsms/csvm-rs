@@ -103,22 +103,47 @@ fn next_chunk<R: BufRead>(input: &mut R, size: usize) -> Result<Option<String>, 
 /// `select`/`cols` would withhold all output until a megabyte accumulated.
 /// (`sort` and the in-memory fallback must read all input first, so they stay
 /// on the throughput-batched [`next_chunk`].)
-fn next_chunk_available<R: BufRead>(input: &mut R, size: usize) -> Result<Option<String>, Error> {
-    let mut buf = vec![0u8; size];
-    let n = input.read(&mut buf)?;
+fn next_chunk_available<'b, R: BufRead>(
+    input: &mut R,
+    size: usize,
+    space: &'b mut ChunkSpace,
+) -> Result<Option<&'b str>, Error> {
+    let ChunkSpace { buf, rest } = space;
+    if buf.len() < size {
+        // Fresh zeroed memory, which the system maps only as the reads fill
+        // it, so a large `--chunk-size` costs no more than the input.
+        *buf = vec![0; size];
+    }
+    let n = input.read(&mut buf[..size])?;
     if n == 0 {
         return Ok(None);
     }
-    buf.truncate(n);
     // A single read may stop mid-line; finish that line so the chunk ends on a
     // row boundary. This blocks only until the current line completes, not for
     // a whole chunk.
-    if buf.last() != Some(&b'\n') {
-        input.read_until(b'\n', &mut buf)?;
+    let mut len = n;
+    if buf[n - 1] != b'\n' {
+        rest.clear();
+        input.read_until(b'\n', rest)?;
+        len = n + rest.len();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        buf[n..len].copy_from_slice(rest);
     }
-    let chunk = String::from_utf8(buf)
-        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
-    Ok(Some(chunk))
+    std::str::from_utf8(&buf[..len])
+        .map(Some)
+        .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))
+}
+
+/// Room for [`next_chunk_available`] to read into, kept from chunk to chunk
+/// so a read neither allocates nor clears a chunk-sized buffer.
+#[derive(Default)]
+struct ChunkSpace {
+    /// The chunk; only its first bytes hold the latest one.
+    buf: Vec<u8>,
+    /// The end of a line a read stopped in.
+    rest: Vec<u8>,
 }
 
 fn read_fully<R: io::Read>(input: &mut R, buf: &mut [u8]) -> io::Result<usize> {
@@ -465,13 +490,14 @@ fn scan<R: BufRead>(
     input: &mut R,
     sink: &mut impl RowSink,
 ) -> Result<(), Error> {
+    let mut space = ChunkSpace::default();
     while !chain.done() {
-        let Some(chunk) = next_chunk_available(input, chunk_size)? else {
+        let Some(chunk) = next_chunk_available(input, chunk_size, &mut space)? else {
             break;
         };
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
-        csv::parse_chunk(&chunk, |row| {
+        csv::parse_chunk(chunk, |row| {
             if err.is_some() || chain.done() {
                 return;
             }
@@ -1161,10 +1187,11 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
         // make progress on a live stream instead of waiting for a 1 MB fill.
         let mut id = 0u64;
         let mut read_err = None;
+        let mut space = ChunkSpace::default();
         loop {
-            match next_chunk_available(input, chunk_size) {
+            match next_chunk_available(input, chunk_size, &mut space) {
                 Ok(Some(chunk)) => {
-                    if chunk_tx.send((id, chunk)).is_err() {
+                    if chunk_tx.send((id, chunk.to_owned())).is_err() {
                         break;
                     }
                     id += 1;
