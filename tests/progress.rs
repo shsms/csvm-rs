@@ -1,25 +1,22 @@
-//! The progress meter end to end: csvm runs with stderr on a terminal (a pty
-//! from util-linux `script`) and its output going to a file. Skipped where
-//! `script` is not the util-linux one.
+//! The progress meter end to end: csvm runs with stderr on a terminal the
+//! test plays (`support/pty.rs`) and its output going to a file.
 
 mod common;
-#[path = "support/terminal.rs"]
-mod terminal;
+#[path = "support/pty.rs"]
+mod pty;
 use common::temp_csv;
-use terminal::{have_script, script};
+use pty::Terminal;
 
-/// Run `shell` under `script`, so stdin, stdout and stderr start out on a
-/// terminal; returns what reached it.
+/// Run `shell` on a terminal the test plays, so stdin, stdout and stderr
+/// start out on it; returns what reached it.
 fn on_terminal(shell: &str) -> String {
-    let out = script(shell).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    let mut term = Terminal::shell(shell, &[]);
+    term.finish();
+    term.text()
 }
 
 #[test]
 fn a_slow_run_shows_how_far_it_has_read_then_clears_the_line() {
-    if !have_script() {
-        return;
-    }
     // The shell's `>` overwrites it, and it is removed when dropped.
     let out = temp_csv("");
     let csvm = env!("CARGO_BIN_EXE_csvm");

@@ -1,12 +1,11 @@
-//! The pager end to end: csvm is run on a terminal (a pty from util-linux
-//! `script`) with a stand-in `less` that records what it was given. Skipped
-//! where `script` is not the util-linux one.
+//! The pager end to end: csvm is run on a terminal the test plays
+//! (`support/pty.rs`) with a stand-in `less` that records what it was given.
 
 mod common;
-#[path = "support/terminal.rs"]
-mod terminal;
+#[path = "support/pty.rs"]
+mod pty;
 use common::temp_csv;
-use terminal::{have_script, script};
+use pty::{Terminal, csvm};
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,34 +53,21 @@ impl Drop for FakeLess {
 
 /// Run csvm with `args` on a terminal `rows` lines tall, with `CSVM_PAGER`
 /// set to `pager`; returns what reached the terminal.
-fn on_terminal(pager: &Path, rows: usize, args: &[&str]) -> String {
+fn on_terminal(pager: &Path, rows: u16, args: &[&str]) -> String {
     on_terminal_as("xterm", pager, rows, args)
 }
 
 /// [`on_terminal`] with `TERM` set to `term`.
-fn on_terminal_as(term: &str, pager: &Path, rows: usize, args: &[&str]) -> String {
-    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
-    let line: Vec<String> = std::iter::once(env!("CARGO_BIN_EXE_csvm"))
-        .chain(args.iter().copied())
-        .map(quote)
-        .collect();
-    let shell = format!("stty rows {rows} cols 80; {}", line.join(" "));
-    let out = script(&shell)
-        .env("CSVM_PAGER", pager)
-        .env("TERM", term)
-        .env_remove("LESS")
-        .env_remove("LINES")
-        .env_remove("COLUMNS")
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).replace('\r', "")
+fn on_terminal_as(term: &str, pager: &Path, rows: u16, args: &[&str]) -> String {
+    let pager = pager.to_str().unwrap();
+    let env = [("CSVM_PAGER", pager), ("TERM", term)];
+    let mut shown = Terminal::sized(&csvm(args), rows, &env);
+    shown.finish();
+    shown.text().replace('\r', "")
 }
 
 #[test]
 fn a_tall_table_goes_through_less_with_its_header_pinned() {
-    if !have_script() {
-        return;
-    }
     let data = temp_csv("name,n\nalpha,1\nbeta,22\n");
     let path = data.to_str().unwrap();
     let fake = FakeLess::new("table");
@@ -97,9 +83,6 @@ fn a_tall_table_goes_through_less_with_its_header_pinned() {
 
 #[test]
 fn a_short_table_gets_no_header_so_less_can_just_print_it() {
-    if !have_script() {
-        return;
-    }
     let data = temp_csv("name,n\nalpha,1\n");
     let path = data.to_str().unwrap();
     let fake = FakeLess::new("short");
@@ -109,9 +92,6 @@ fn a_short_table_gets_no_header_so_less_can_just_print_it() {
 
 #[test]
 fn a_table_one_line_short_of_the_window_gets_no_header() {
-    if !have_script() {
-        return;
-    }
     // Two lines fit on a three-line terminal, prompt line and all.
     let data = temp_csv("name,n\nalpha,1\n");
     let path = data.to_str().unwrap();
@@ -122,9 +102,6 @@ fn a_table_one_line_short_of_the_window_gets_no_header() {
 
 #[test]
 fn a_dumb_terminal_is_neither_paged_nor_coloured() {
-    if !have_script() {
-        return;
-    }
     let data = temp_csv("name,n\nalpha,1\n");
     let path = data.to_str().unwrap();
     let fake = FakeLess::new("dumb");
@@ -136,9 +113,6 @@ fn a_dumb_terminal_is_neither_paged_nor_coloured() {
 
 #[test]
 fn explain_is_paged_even_with_an_output_file() {
-    if !have_script() {
-        return;
-    }
     // --explain prints the plan to stdout whatever -o says.
     let data = temp_csv("name,n\nalpha,1\n");
     let path = data.to_str().unwrap();
@@ -154,9 +128,6 @@ fn explain_is_paged_even_with_an_output_file() {
 
 #[test]
 fn a_paged_table_keeps_its_wide_cells_whole() {
-    if !have_script() {
-        return;
-    }
     // Wider than the 80-column terminal: less scrolls it, so nothing is cut.
     let wide = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
     let data = temp_csv(&format!("name,note\nalpha,{wide}\n"));
@@ -168,9 +139,6 @@ fn a_paged_table_keeps_its_wide_cells_whole() {
 
 #[test]
 fn links_reach_a_less_that_shows_them() {
-    if !have_script() {
-        return;
-    }
     let data = temp_csv("site\nhttps://example.org\n");
     let path = data.to_str().unwrap();
     let fake = FakeLess::new("links");
@@ -184,9 +152,6 @@ fn links_reach_a_less_that_shows_them() {
 
 #[test]
 fn a_tall_table_with_links_asks_less_its_release_once() {
-    if !have_script() {
-        return;
-    }
     // The header and the links both depend on the release.
     let data = temp_csv("site\nhttps://a.example\nhttps://b.example\n");
     let path = data.to_str().unwrap();
@@ -198,9 +163,6 @@ fn a_tall_table_with_links_asks_less_its_release_once() {
 
 #[test]
 fn help_goes_through_less_without_the_table_options() {
-    if !have_script() {
-        return;
-    }
     let fake = FakeLess::new("help");
     on_terminal(&fake.less(), 24, &["help", "fmt"]);
     assert_eq!(fake.saved("args").unwrap().trim(), "");
@@ -209,9 +171,6 @@ fn help_goes_through_less_without_the_table_options() {
 
 #[test]
 fn the_pager_stays_out_of_what_it_should_not_page() {
-    if !have_script() {
-        return;
-    }
     let data = temp_csv("name,n\nalpha,1\n");
     let path = data.to_str().unwrap();
     let fake = FakeLess::new("skip");
