@@ -45,9 +45,15 @@ pub const DEFAULT_BUDGET_BYTES: usize = 256 << 20;
 const DEFAULT_FANOUT: usize = 32;
 
 /// Smallest raw input block a sort worker is handed; the worker count is
-/// capped so `2 * workers` of them fit the budget. A higher floor keeps the
-/// run count (temp files, merge levels) down.
-const MIN_BLOCK: usize = 1 << 20;
+/// capped so what they hold at once fits the budget. A higher floor keeps the
+/// run count (temp files, merge levels) down, a lower one lets a small budget
+/// keep more workers.
+const MIN_BLOCK: usize = 256 << 10;
+
+/// Blocks' worth of memory each worker may hold at once: two raw blocks (one
+/// queued, one being read) and a block's working copy, which for rows of a
+/// few bytes is about six blocks (a key and its bookkeeping per row).
+const BLOCKS_PER_WORKER: usize = 8;
 
 /// Process-global run-file counter so concurrent sorters never collide on a
 /// temp file name (csvm uses the same trick).
@@ -222,6 +228,20 @@ pub struct Sorter {
     workers: Vec<JoinHandle<()>>,
 }
 
+/// How [`Sorter::new`] shares `budget` among `threads`: the run-generation
+/// workers, their block size, and what the runs kept in memory may take.
+/// Half the budget is for what the workers hold while they sort a block, the
+/// other half for the sorted runs. With the block-size floor a large thread
+/// count would exceed the first half: the workers are capped at what it
+/// holds. The merge width is not bound by it.
+fn split_budget(threads: usize, budget: usize) -> (usize, usize, usize) {
+    let budget = budget.max(1);
+    let working = budget / 2;
+    let workers = threads.clamp(1, (working / (BLOCKS_PER_WORKER * MIN_BLOCK)).max(1));
+    let block_size = (working / (BLOCKS_PER_WORKER * workers)).clamp(MIN_BLOCK, 64 << 20);
+    (workers, block_size, budget - working)
+}
+
 impl Sorter {
     pub fn new(
         sort: &SortStmt,
@@ -231,14 +251,9 @@ impl Sorter {
         temp_dir: PathBuf,
         budget: usize,
     ) -> Self {
-        let budget = budget.max(1);
-        // Up to `2 * workers` raw blocks are in flight, so with the block-size
-        // floor a large thread count would exceed the budget: cap the workers
-        // at what the budget holds. The merge width is not bound by it.
-        let workers = threads.clamp(1, (budget / (2 * MIN_BLOCK)).max(1));
-        let block_size = (budget / (2 * workers)).clamp(MIN_BLOCK, 64 << 20);
+        let (workers, block_size, run_budget) = split_budget(threads, budget);
         let mut sorter =
-            Self::with_params(sort, pre, format, workers, temp_dir, budget, block_size);
+            Self::with_params(sort, pre, format, workers, temp_dir, run_budget, block_size);
         sorter.threads = threads.max(1);
         sorter
     }
@@ -481,7 +496,15 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
         .iter()
         .map(|&i| std::mem::take(&mut keys[i as usize]))
         .collect();
-    let bytes = blob.len() + keys_sorted.iter().map(|k| k.len() + 16).sum::<usize>();
+    // What the run holds, allocations as they are: each key is one of its
+    // own, which the allocator rounds up and heads.
+    let bytes = blob.capacity()
+        + lines_sorted.capacity() * std::mem::size_of::<(u32, u32)>()
+        + keys_sorted.capacity() * std::mem::size_of::<Box<[u8]>>()
+        + keys_sorted
+            .iter()
+            .map(|k| k.len().next_multiple_of(16) + 16)
+            .sum::<usize>();
 
     let prev = ctx.in_mem.fetch_add(bytes, AtomicOrdering::Relaxed);
     if prev + bytes <= ctx.budget {
@@ -819,9 +842,9 @@ mod tests {
             )
             .block_size()
         };
-        // Two blocks per worker in flight share the budget.
-        assert_eq!(block(8, 256 << 20), 16 << 20);
-        assert_eq!(block(64, 256 << 20), 2 << 20);
+        // What the workers hold at once shares half the budget.
+        assert_eq!(block(8, 256 << 20), 2 << 20);
+        assert_eq!(block(4, 256 << 20), 4 << 20);
         // Floor and ceiling.
         assert_eq!(block(4, 1 << 20), MIN_BLOCK);
         assert_eq!(block(64, 1 << 20), MIN_BLOCK);
@@ -829,11 +852,43 @@ mod tests {
         // Workers are capped so their in-flight blocks fit the budget; the
         // merge width stays as requested.
         let sorter = Sorter::new(&s, &[], LineFormat::Csv, 64, std::env::temp_dir(), 4 << 20);
-        assert_eq!((sorter.workers(), sorter.threads), (2, 64));
+        assert_eq!((sorter.workers(), sorter.threads), (1, 64));
+        let sorter = Sorter::new(&s, &[], LineFormat::Csv, 64, std::env::temp_dir(), 64 << 20);
+        assert_eq!((sorter.workers(), sorter.threads), (16, 64));
         let sorter = Sorter::new(&s, &[], LineFormat::Csv, 4, std::env::temp_dir(), 1 << 20);
         assert_eq!((sorter.workers(), sorter.threads), (1, 4));
         let sorter = Sorter::new(&s, &[], LineFormat::Csv, 8, std::env::temp_dir(), 256 << 20);
         assert_eq!((sorter.workers(), sorter.threads), (8, 8));
+        // The other half is for the runs.
+        assert_eq!(split_budget(8, 256 << 20).2, 128 << 20);
+    }
+
+    #[test]
+    fn a_run_counts_its_allocations_against_the_budget() {
+        let s = SortStmt {
+            keys: vec![key(0, false, SortMode::Numeric)],
+        };
+        let ctx = |budget| WorkerCtx {
+            sort: Arc::new(s.clone()),
+            pre: Arc::new(Vec::new()),
+            format: LineFormat::Csv,
+            in_mem: AtomicUsize::new(0),
+            budget,
+            temp_dir: std::env::temp_dir(),
+        };
+        // Two bytes of text a row, but each row's key is an allocation of
+        // its own, and each row has an entry in two tables.
+        let block: String = (0..1000).map(|i| format!("{}\n", i % 10)).collect();
+        let roomy = ctx(1 << 20);
+        let run = make_run(&roomy, 0, &block).unwrap();
+        assert!(matches!(run.data, RunData::Mem { .. }));
+        let held = roomy.in_mem.load(AtomicOrdering::Relaxed);
+        assert!(held >= 1000 * (8 + 16 + 32), "{held}");
+        // A budget the text fits in but the allocations do not: it spills.
+        let tight = ctx(4 * block.len());
+        let run = make_run(&tight, 0, &block).unwrap();
+        assert!(matches!(run.data, RunData::File(_)));
+        assert_eq!(tight.in_mem.load(AtomicOrdering::Relaxed), 0);
     }
 
     #[test]

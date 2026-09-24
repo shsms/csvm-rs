@@ -595,26 +595,26 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   all input before emitting, so batching wins there).
 - `sort` is a blocking stage handled by a **parallel external merge sort**
   (`src/sort.rs`, modeled on csvm): the driver reads raw input blocks; up to
-  `-n` workers (capped so their `2 × workers` in-flight blocks, 1 MiB each at
-  least, fit `--sort-buffer`) each parse + apply the pre-sort statements,
-  **serialize each row to bytes once**, compute an **order-preserving encoded
-  key**, and sort their
-  block into a run (kept in memory, or spilled to a temp file past the budget
-  as length-prefixed key + line records, so the merge never re-derives a key
-  from the rounded serialized line).
-  A single-threaded binary-heap k-way merge then picks the smallest key and
-  emits the row's already-serialized bytes via a callback — no per-field
-  allocation, no re-serialization on output. A block is a contiguous input
-  range, so its sequence number keeps the merge stable. The stages after
-  the sort that pass rows on one at a time (statements, stateful ones too,
-  windows, `uniq`, an inner or left `join`) run on the merge output as a
-  `RowChain` in `run_staged`, and a full `head` stops the merge; anything
-  else after the sort materializes. The row's serialized form is the
-  `LineFormat`: the output CSV line when only windows follow the sort
+  `-n` workers each parse + apply the pre-sort statements, **serialize each row
+  to bytes once**, compute an **order-preserving encoded key**, and sort their
+  block into a run (kept in memory, or spilled to a temp file past the budget as
+  length-prefixed key + line records, so the merge never re-derives a key from
+  the rounded serialized line). `--sort-buffer` is split in half: one for what
+  the workers hold at once, `BLOCKS_PER_WORKER` blocks each of at least
+  `MIN_BLOCK` (256 KiB), which caps the workers and sizes the blocks; the other
+  for the runs kept in memory, counted by their allocations, so peak memory
+  stays near the budget.  A single-threaded binary-heap k-way merge then picks
+  the smallest key and emits the row's already-serialized bytes via a callback —
+  no per-field allocation, no re-serialization on output. A block is a
+  contiguous input range, so its sequence number keeps the merge stable. The
+  stages after the sort that pass rows on one at a time (statements, stateful
+  ones too, windows, `uniq`, an inner or left `join`) run on the merge output as
+  a `RowChain` in `run_staged`, and a full `head` stops the merge; anything else
+  after the sort materializes. The row's serialized form is the `LineFormat`:
+  the output CSV line when only windows follow the sort
   (`RowChain::only_windows`), else the typed cell codec (`encode_row` /
-  `decode_row`),
-  which keeps a `Field::Num` exact for the statements after the sort instead
-  of handing them its rounded output text.
+  `decode_row`), which keeps a `Field::Num` exact for the statements after the
+  sort instead of handing them its rounded output text.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls

@@ -44,7 +44,7 @@ options (--flag VALUE or --flag=VALUE):
   -t, --temp-dir DIR   directory for sort spill files (default: system temp)
       --chunk-size SZ  input read chunk; K/M/G suffix ok (default: 1M)
       --sort-buffer SZ in-memory budget before sort spills; K/M/G (default: 256M;
-                       also caps sort workers at SZ / 2M)
+                       also caps sort workers at SZ / 4M)
       --color WHEN     auto (a TTY, not TERM=dumb) | always | never
       --no-pager       never page; by default a terminal's fmt table, chart, help
                        or --explain goes through $CSVM_PAGER, else $PAGER, else

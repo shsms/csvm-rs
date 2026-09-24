@@ -22,10 +22,29 @@ git history; this file is the "what next / what was decided" scratchpad.
   distinct item separator, removes the trap.
 
 ** TODO Correctness / edges
-- sort: the in-memory budget is *soft* — N workers can each =fetch_add= before any
-  spill, so peak memory may exceed =--sort-buffer= by ~N blocks (=sort.rs:389=).
-  A string sort key containing a literal =\0= (rare in CSV) sorts slightly off
-  (documented in CLAUDE.md).
+- sort: a string sort key containing a literal =\0= (rare in CSV) sorts
+  slightly off (documented in CLAUDE.md).
+- sort: =BLOCKS_PER_WORKER= (=sort.rs=) budgets each worker as eight blocks,
+  six of them its working copy, right for rows of a few bytes but four or
+  more times too much for wide rows, so a small =--sort-buffer= gets small
+  blocks and many runs (a second merge pass past 1024 runs). The same small
+  blocks make a =sort | head= at =-n 8= sort more runs and merge them in more
+  steps. Sizing the blocks from what =make_run= measures would keep the
+  budget and fewer runs.
+- A =RowChain= followed by =stats= or =agg= (=add r = rownum() | stats=)
+  collects the chain's rows before reducing them. Letting the reducers be a
+  =RowSink= would stream them in memory proportional to columns or groups.
+- =agg= with a float aggregate (=sum=/=mean=/=stddev=) over many groups
+  pays for its size-based shards (at most 16): every shard builds a partial
+  group per key and the partials merge, about 50% slower at =-n 1= than one
+  pass for 2M groups. An order-independent float sum (an exact
+  accumulator) would let such a run stream again at =-n 1= and still match
+  every =-n=.
+- graph: a chart's labels print at most six decimals (=graph::label_num=), so
+  data around 1e-7 labels its axis =0=, and =nice_ticks= reaches each tick by
+  adding the step, so float error builds up. Ticks as whole multiples of the
+  step, labelled at its precision, and bounds to a few significant digits
+  would fix both.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a
