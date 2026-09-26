@@ -87,11 +87,11 @@ fn run() -> Result<(), Failure> {
             writeln!(io::stdout(), "csvm {}", csvm::VERSION)?;
             return Ok(());
         }
-        Ok(Parsed::Highlight) => {
+        Ok(Parsed::ModeServer) => {
             // inkline's helper: requests on stdin, replies on stdout, and
             // never the terminal, a pager or colour.
             let mut output = BufWriter::new(io::stdout().lock());
-            return match csvm::highlight::serve(&mut io::stdin().lock(), &mut output) {
+            return match csvm::mode_server::serve(&mut io::stdin().lock(), &mut output) {
                 // inkline talks to the helper over a socket, which it may
                 // close with a reply still unread. That resets the
                 // connection: inkline has gone, as when a pipe is closed.

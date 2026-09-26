@@ -149,7 +149,7 @@ impl Session {
         let args = match cli::parse_at(words) {
             Ok(Parsed::Run(args)) => args,
             // Help, the version and the helper itself take no script.
-            Ok(Parsed::Help { .. } | Parsed::Version | Parsed::Highlight) => return reply,
+            Ok(Parsed::Help { .. } | Parsed::Version | Parsed::ModeServer) => return reply,
             Err(usage) => {
                 // A line that stops before its script is still being typed,
                 // so an error with no argument to point at is not sent. The
@@ -1147,8 +1147,8 @@ mod tests {
 
     impl TempDir {
         fn new(name: &str) -> TempDir {
-            let dir =
-                std::env::temp_dir().join(format!("csvm_highlight_{}_{name}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("csvm_mode_server_{}_{name}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             TempDir(dir)
         }

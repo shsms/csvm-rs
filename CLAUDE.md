@@ -698,9 +698,9 @@ reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)
 
 `--highlight` (alone) makes csvm inkline's colouring helper
-(`src/highlight.rs`, protocol in inkline's `docs/highlight-protocol.md`):
-`highlight::serve` reads requests on stdin and answers each on stdout. A
-`highlight::Session` runs `cli::parse_at` (a usage error says which argument
+(`src/mode_server.rs`, protocol in inkline's `docs/highlight-protocol.md`):
+`mode_server::serve` reads requests on stdin and answers each on stdout. A
+`mode_server::Session` runs `cli::parse_at` (a usage error says which argument
 it is about) and `parse::parse_recorded`, the real parser with a
 `parse::Recorder` that notes each part's byte range and kind where the
 parser reads it (`Builder::note`); a plain `parse` passes no recorder and
@@ -722,9 +722,9 @@ and returns when stdin ends. A request that breaks the protocol ends it with
 exit status 1 and the reason on stderr; a closed stdout, or a connection
 reset (inkline's socket closed with a reply still unread), ends it quietly,
 like any run whose reader stopped (`Failure::Closed`).
-The first line names `indent` (`highlight::GREETING`), so inkline also
+The first line names `indent` (`mode_server::GREETING`), so inkline also
 sends `:indent` requests: the same `:cwd`/`:arg` blocks, then `:at ARG
-OFFSET` before `:done` (`Request.at`). `highlight::indent` finds the script
+OFFSET` before `:done` (`Request.at`). `mode_server::indent` finds the script
 as for colours and answers `:depth NEW CURRENT` from `parse::depths`, or
 only `:end` when `:at` is not in the script or the script is `raw`; a
 malformed `:at` breaks the protocol like any bad request. `parse::depths`

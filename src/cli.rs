@@ -184,7 +184,7 @@ pub enum Parsed {
     Version,
     /// `--highlight`: answer inkline's colouring and indenting requests on
     /// stdin.
-    Highlight,
+    ModeServer,
 }
 
 /// A usage error: what is wrong with the command line, and the argument it
@@ -357,7 +357,7 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
                 "--highlight takes no other arguments",
             ));
         }
-        return Ok(Parsed::Highlight);
+        return Ok(Parsed::ModeServer);
     }
 
     // `csvm help [TOPIC]` (without -f) prints help and exits, like a subcommand.
@@ -432,7 +432,7 @@ mod tests {
             Parsed::Run(a) => Ok(*a),
             Parsed::Help { .. } => Err("help".into()),
             Parsed::Version => Err("version".into()),
-            Parsed::Highlight => Err("highlight".into()),
+            Parsed::ModeServer => Err("mode server".into()),
         }
     }
 
@@ -713,7 +713,7 @@ mod tests {
     fn highlight_takes_no_other_arguments() {
         assert!(matches!(
             parse_at(["--highlight".to_string()]),
-            Ok(Parsed::Highlight)
+            Ok(Parsed::ModeServer)
         ));
         let e = parse_at(["--highlight".to_string(), "cols a".to_string()])
             .err()

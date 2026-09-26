@@ -24,7 +24,7 @@ git history; this file is the "what next / what was decided" scratchpad.
 - The =--highlight= join walk (=resolve_joins=) repeats =exec::prepare_joins=,
   and its header choice repeats =open_source=; sharing them would keep the
   helper and a real run from drifting apart. The test request helpers in
-  =src/highlight.rs= and =tests/highlight.rs= could be one.
+  =src/mode_server.rs= and =tests/mode_server.rs= could be one.
 
 ** TODO Correctness / edges
 - sort: a string sort key containing a literal =\0= (rare in CSV) sorts
