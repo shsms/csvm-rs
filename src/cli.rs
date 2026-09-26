@@ -6,7 +6,7 @@
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
 //! `--header`, `--color`, `--format` (csv | parquet), `--no-pager`,
-//! `--no-progress` and `--explain`.
+//! `--no-progress`, `--explain` and `--highlight`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -182,6 +182,8 @@ pub enum Parsed {
         no_pager: bool,
     },
     Version,
+    /// `--highlight`: answer inkline's colouring requests on stdin.
+    Highlight,
 }
 
 /// A usage error: what is wrong with the command line, and the argument it
@@ -238,6 +240,9 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
     let mut header = None;
     let mut format = None;
 
+    let args: Vec<String> = args.into_iter().collect();
+    let total = args.len();
+    let mut highlight = None;
     let mut it = args.into_iter().enumerate();
     while let Some((at, raw)) = it.next() {
         // Accept the GNU `--flag=value` form alongside `--flag value`: split a
@@ -272,6 +277,7 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
                 });
             }
             "-V" | "--version" => return Ok(Parsed::Version),
+            "--highlight" => highlight = Some(at),
             "-o" | "--output" => out_file = Some(value!().0),
             "-n" | "--threads" => {
                 let (v, v_at) = value!();
@@ -339,6 +345,18 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
             }
             _ => positionals.push((at, arg)),
         }
+    }
+
+    // `--highlight` is how inkline starts csvm as its helper; it takes
+    // nothing else.
+    if let Some(at) = highlight {
+        if total > 1 {
+            return Err(Usage::on_whole_line(
+                at,
+                "--highlight takes no other arguments",
+            ));
+        }
+        return Ok(Parsed::Highlight);
     }
 
     // `csvm help [TOPIC]` (without -f) prints help and exits, like a subcommand.
@@ -413,6 +431,7 @@ mod tests {
             Parsed::Run(a) => Ok(*a),
             Parsed::Help { .. } => Err("help".into()),
             Parsed::Version => Err("version".into()),
+            Parsed::Highlight => Err("highlight".into()),
         }
     }
 
@@ -687,5 +706,24 @@ mod tests {
             InputFormat::Csv
         );
         assert_eq!(format(&["cols a"]), InputFormat::Csv);
+    }
+
+    #[test]
+    fn highlight_takes_no_other_arguments() {
+        assert!(matches!(
+            parse_at(["--highlight".to_string()]),
+            Ok(Parsed::Highlight)
+        ));
+        let e = parse_at(["--highlight".to_string(), "cols a".to_string()])
+            .err()
+            .unwrap();
+        assert_eq!(
+            e,
+            Usage {
+                message: "--highlight takes no other arguments".to_string(),
+                arg: Some(0),
+                whole_line: true,
+            }
+        );
     }
 }

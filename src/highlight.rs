@@ -143,8 +143,8 @@ impl Session {
         }
         let args = match cli::parse_at(words) {
             Ok(Parsed::Run(args)) => args,
-            // Help and the version take no script.
-            Ok(Parsed::Help { .. } | Parsed::Version) => return reply,
+            // Help, the version and the helper itself take no script.
+            Ok(Parsed::Help { .. } | Parsed::Version | Parsed::Highlight) => return reply,
             Err(usage) => {
                 // A line that stops before its script is still being typed,
                 // so an error with no argument to point at is not sent. The
@@ -419,6 +419,20 @@ pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<(
         }
     }
     writeln!(out, ":end {id}")
+}
+
+/// Be the helper: write [`GREETING`], then answer each request read from
+/// `input` on `output`, flushing after each reply, until `input` ends.
+pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
+    writeln!(output, "{GREETING}")?;
+    output.flush()?;
+    let mut session = Session::default();
+    while let Some(request) = read_request(input)? {
+        let reply = session.answer(&request);
+        write_reply(output, request.id, &reply)?;
+        output.flush()?;
+    }
+    Ok(())
 }
 
 /// `message` as one line: up to its first newline, at most [`MAX_MESSAGE`]
@@ -959,6 +973,27 @@ mod tests {
     }
 
     #[test]
+    fn a_highlight_command_line_is_not_a_script() {
+        // `csvm --highlight` alone starts the helper: there is no script.
+        assert_eq!(ask(&["csvm", "--highlight"]), Vec::<String>::new());
+        // With anything else it is a usage error, on `--highlight`.
+        assert_eq!(
+            ask(&["csvm", "--highlight", "cols a"]),
+            [":error 1 0 11 --highlight takes no other arguments"]
+        );
+        assert_eq!(
+            ask(&["csvm", "cols a", "data.csv", "--highlight"]),
+            [":error 3 0 11 --highlight takes no other arguments"]
+        );
+        // A raw argument may expand to nothing and leave `--highlight`
+        // alone, wherever it is on the line.
+        assert_eq!(
+            ask_raw(&["csvm", "--highlight", "$EMPTY"], &[2]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
     fn an_argument_that_is_not_utf8_is_an_error_at_its_first_bad_byte() {
         let mut req = request("/", &["csvm", "cols a"]);
         req.args[1].bytes = b"cols \xff a".to_vec();
@@ -1325,6 +1360,20 @@ mod tests {
         assert_eq!(
             ask_in(script).last().unwrap(),
             ":error 1 26 28 column not found: zz — have: k, a"
+        );
+    }
+
+    #[test]
+    fn serve_greets_then_answers_each_request_in_order() {
+        let input = b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 4\nfmt \n:done\n\
+                      :request 2\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 6\n--colr\n:done\n";
+        let mut out = Vec::new();
+        serve(&mut &input[..], &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "inkline-highlight 1\n\
+             :span 1 0 3 command\n:end 1\n\
+             :error 1 0 6 unknown option: --colr\n:end 2\n"
         );
     }
 }
