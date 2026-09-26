@@ -24,7 +24,9 @@
 //! Lengths and offsets count bytes. inkline's `docs/highlight-protocol.md`
 //! describes the whole protocol.
 
-use crate::parse::SpanKind;
+use crate::cli::{self, Parsed};
+use crate::error::Error;
+use crate::parse::{self, Recorder, SpanKind};
 use std::io::{self, BufRead, Read, Write};
 use std::ops::Range;
 
@@ -103,6 +105,94 @@ impl ReplyError {
             message: one_line(message),
         }
     }
+}
+
+/// What the helper keeps from one request to the next.
+#[derive(Default)]
+pub struct Session {}
+
+impl Session {
+    /// Answer one request: the script's colours, and the first thing csvm
+    /// would reject on this command line.
+    pub fn answer(&mut self, request: &Request) -> Reply {
+        let mut reply = Reply::default();
+        // Argument 0 is the command's name; csvm's own parser reads the rest.
+        let mut words = Vec::with_capacity(request.args.len());
+        for (i, arg) in request.args.iter().enumerate().skip(1) {
+            match std::str::from_utf8(&arg.bytes) {
+                Ok(text) => words.push(text.to_string()),
+                Err(e) => {
+                    // csvm cannot start with such an argument at all.
+                    let start = e.valid_up_to();
+                    let end = e.error_len().map_or(arg.bytes.len(), |n| start + n);
+                    reply.error = Some(ReplyError::new(
+                        Some((i, start..end)),
+                        "this argument is not valid UTF-8",
+                    ));
+                    return reply;
+                }
+            }
+        }
+        let args = match cli::parse_at(words) {
+            Ok(Parsed::Run(args)) => args,
+            // Help and the version take no script.
+            Ok(Parsed::Help { .. } | Parsed::Version) => return reply,
+            Err(usage) => {
+                // A line that stops before its script is still being typed,
+                // so an error with no argument to point at is not sent. The
+                // arguments are read left to right, so an error depends only
+                // on the arguments up to it, or on all of them when it is
+                // about the whole line; when one of those is `raw`, bash may
+                // still turn it into other words (or none), and csvm may not
+                // see this error at all.
+                if let Some(at) = usage.arg {
+                    let read = if usage.whole_line {
+                        &request.args[1..]
+                    } else {
+                        &request.args[1..=at + 1]
+                    };
+                    if !read.iter().any(|a| a.raw) {
+                        let len = request.args[at + 1].bytes.len();
+                        reply.error = Some(ReplyError::new(Some((at + 1, 0..len)), &usage.message));
+                    }
+                }
+                return reply;
+            }
+        };
+        // With `-f` the script is in a file, which is not coloured.
+        let Some(script_at) = args.script_at else {
+            return reply;
+        };
+        let arg = script_at + 1;
+        let mut rec = Recorder::default();
+        let parsed = parse::parse_recorded(&args.script, &mut rec);
+        reply.spans = rec
+            .into_spans()
+            .into_iter()
+            .map(|(at, kind)| Span { arg, at, kind })
+            .collect();
+        // A `raw` argument before the script may become other words, or
+        // none, so csvm may take another argument as its script; a raw
+        // script is not the text csvm gets. Either way, an error found in
+        // this text may not be csvm's.
+        if request.args[1..=arg].iter().any(|a| a.raw) {
+            return reply;
+        }
+        if let Err(e) = parsed {
+            reply.error = Some(script_error(arg, &args.script, &e));
+        }
+        reply
+    }
+}
+
+/// `e`, found in the script, which is argument `arg`, as a reply's error:
+/// on its place in the script when it has one.
+fn script_error(arg: usize, script: &str, e: &Error) -> ReplyError {
+    let place = e.span().map(|at| {
+        let end = at.end.min(script.len());
+        (arg, at.start.min(end)..end)
+    });
+    ReplyError::new(place, &e.to_string())
 }
 
 /// Read the next request; `None` when the input ends before one starts.
@@ -508,5 +598,253 @@ mod tests {
         let mut out = Vec::new();
         write_reply(&mut out, 11, &Reply::default()).unwrap();
         check_reply_is_well_formed(&out, 11);
+    }
+
+    /// A request for the command line `args` (the command's name first),
+    /// every argument `final`, from the directory `cwd`.
+    fn request(cwd: &str, args: &[&str]) -> Request {
+        Request {
+            id: 1,
+            cwd: cwd.as_bytes().to_vec(),
+            args: args
+                .iter()
+                .map(|a| Arg {
+                    raw: false,
+                    bytes: a.as_bytes().to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    /// The reply's lines as [`write_reply`] writes them, without `:end`.
+    fn reply_lines(reply: &Reply) -> Vec<String> {
+        let mut out = Vec::new();
+        write_reply(&mut out, 1, reply).unwrap();
+        String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.starts_with(":end"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The reply's lines for the command line `args`, from `/`.
+    fn ask(args: &[&str]) -> Vec<String> {
+        reply_lines(&Session::default().answer(&request("/", args)))
+    }
+
+    /// [`ask`], with the arguments at `raw` sent as `raw`.
+    fn ask_raw(args: &[&str], raw: &[usize]) -> Vec<String> {
+        let mut req = request("/", args);
+        for &i in raw {
+            req.args[i].raw = true;
+        }
+        reply_lines(&Session::default().answer(&req))
+    }
+
+    #[test]
+    fn the_script_is_coloured_where_it_is_on_the_line() {
+        assert_eq!(
+            ask(&["csvm", "-n", "2", "cols a | head 3"]),
+            [
+                ":span 3 0 4 command",
+                ":span 3 5 6 variable",
+                ":span 3 7 8 operator",
+                ":span 3 9 13 command",
+                ":span 3 14 15 number",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_multi_line_script_is_coloured_on_every_line() {
+        assert_eq!(
+            ask(&["csvm", "cols a\nselect a > 1"]),
+            [
+                ":span 1 0 4 command",
+                ":span 1 5 6 variable",
+                ":span 1 7 13 command",
+                ":span 1 14 15 variable",
+                ":span 1 16 17 operator",
+                ":span 1 18 19 number",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_error_is_sent_on_its_place() {
+        assert_eq!(
+            ask(&["csvm", "select a >> 1"]),
+            [
+                ":span 1 0 6 command",
+                ":span 1 7 8 variable",
+                ":span 1 9 10 operator",
+                ":span 1 10 11 operator",
+                ":span 1 12 13 number",
+                ":error 1 10 11 expected a column, number, string, or function, found '>'",
+            ]
+        );
+        // An unknown command, with its hint.
+        assert_eq!(
+            ask(&["csvm", "selct a"]),
+            [":error 1 0 5 unknown command: selct (did you mean `select`?)"]
+        );
+        // An error with no place in the script.
+        assert_eq!(
+            ask(&["csvm", "# only a comment"]),
+            [":span 1 0 16 comment", ":error - - - empty script"]
+        );
+    }
+
+    #[test]
+    fn an_option_error_is_sent_on_its_argument() {
+        assert_eq!(
+            ask(&["csvm", "--colr", "always", "cols a"]),
+            [":error 1 0 6 unknown option: --colr"]
+        );
+        assert_eq!(
+            ask(&["csvm", "cols a", "-n", "many"]),
+            [":error 3 0 4 invalid threads value: many"]
+        );
+        assert_eq!(
+            ask(&["csvm", "cols a", "-f"]),
+            [":error 2 0 2 missing value for -f"]
+        );
+        // A line that stops before its script: nothing to say yet.
+        assert_eq!(ask(&["csvm", "-n", "2"]), Vec::<String>::new());
+        assert_eq!(ask(&["csvm"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_usage_error_after_a_raw_argument_is_not_sent() {
+        // `$FLAGS` may become any number of words, options among them, so
+        // the arguments after it may not be what they look like here.
+        assert_eq!(
+            ask_raw(&["csvm", "$FLAGS", "select amount > 1", "data.csv"], &[1]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ask_raw(&["csvm", "$X", "--colr", "cols a"], &[1]),
+            Vec::<String>::new()
+        );
+        // Nor an error on the raw argument itself.
+        assert_eq!(
+            ask_raw(&["csvm", "-n", "$N", "cols a"], &[2]),
+            Vec::<String>::new()
+        );
+        // A usage error before any raw argument is still sent.
+        assert_eq!(
+            ask_raw(&["csvm", "--colr", "$X", "cols a"], &[2]),
+            [":error 1 0 6 unknown option: --colr"]
+        );
+        assert_eq!(
+            ask_raw(&["csvm", "cols a", "-n", "many", "$X"], &[4]),
+            [":error 3 0 4 invalid threads value: many"]
+        );
+        // An error found once every argument is read depends on all of
+        // them: `$X` may be `--help`.
+        assert_eq!(
+            ask_raw(&["csvm", "cols a", "in.csv", "extra", "$X"], &[4]),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ask_raw(&["csvm", "help", "fmt", "extra", "$X"], &[4]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_script_error_after_a_raw_argument_is_not_sent() {
+        // `$OUT` may become several words, so csvm may take another
+        // argument as its script: the colours stay, the error does not.
+        assert_eq!(
+            ask_raw(&["csvm", "-o", "$OUT", "cols a | selct"], &[2]),
+            [
+                ":span 3 0 4 command",
+                ":span 3 5 6 variable",
+                ":span 3 7 8 operator",
+            ]
+        );
+        // Nor in a raw script, sent as typed, quote marks included. Here
+        // the `|` is inside the quote marks, so the text is one stage whose
+        // first word, `"cols`, is not a command: nothing is coloured.
+        assert_eq!(
+            ask_raw(&["csvm", "\"cols a | selct\""], &[1]),
+            Vec::<String>::new()
+        );
+        // A raw argument after the script is taken to stay one argument
+        // that is not an option, so the script's error is still sent.
+        assert_eq!(
+            ask_raw(&["csvm", "cols a | selct", "$f"], &[2])
+                .last()
+                .unwrap(),
+            ":error 1 9 14 unknown command: selct (did you mean `select`?)"
+        );
+    }
+
+    #[test]
+    fn a_script_file_or_help_is_not_coloured() {
+        assert_eq!(
+            ask(&["csvm", "-f", "prog.csvm", "data.csv"]),
+            Vec::<String>::new()
+        );
+        assert_eq!(ask(&["csvm", "help", "select"]), Vec::<String>::new());
+        assert_eq!(ask(&["csvm", "--version"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_argument_that_is_not_utf8_is_an_error_at_its_first_bad_byte() {
+        let mut req = request("/", &["csvm", "cols a"]);
+        req.args[1].bytes = b"cols \xff a".to_vec();
+        assert_eq!(
+            reply_lines(&Session::default().answer(&req)),
+            [":error 1 5 6 this argument is not valid UTF-8"]
+        );
+        // Cut off inside a character: up to the end.
+        req.args[1].bytes = b"cols \xc3".to_vec();
+        assert_eq!(
+            reply_lines(&Session::default().answer(&req)),
+            [":error 1 5 6 this argument is not valid UTF-8"]
+        );
+    }
+
+    #[test]
+    fn an_empty_cwd_is_answered_like_any_other() {
+        assert_eq!(
+            reply_lines(&Session::default().answer(&request("", &["csvm", "cols a"]))),
+            [":span 1 0 4 command", ":span 1 5 6 variable"]
+        );
+    }
+
+    #[test]
+    fn a_reply_to_a_very_long_script_stays_under_inklines_limit() {
+        // Over 3 MiB of spans in all, and an error at the very end.
+        let script = format!("cols {}| selct", "a ".repeat(100_000));
+        let reply = Session::default().answer(&request("/", &["csvm", &script]));
+        // `cols`, each `a` and the `|`.
+        assert_eq!(reply.spans.len(), 100_002);
+        let mut out = Vec::new();
+        write_reply(&mut out, 1, &reply).unwrap();
+        assert!(out.len() < 1 << 20, "{} bytes", out.len());
+        check_reply_is_well_formed(&out, 1);
+        let lines = reply_lines(&reply);
+        let (error, spans) = lines.split_last().unwrap();
+        // The spans written are the first ones, as many as fit.
+        assert!(spans.len() > 20_000 && spans.len() < reply.spans.len());
+        assert_eq!(spans[0], ":span 1 0 4 command");
+        assert_eq!(spans[spans.len() - 1], {
+            let at = 5 + 2 * (spans.len() - 2);
+            format!(":span 1 {at} {} variable", at + 1)
+        });
+        // The error and the end are always written.
+        let at = script.len() - 5;
+        assert_eq!(
+            *error,
+            format!(
+                ":error 1 {at} {} unknown command: selct (did you mean `select`?)",
+                script.len()
+            )
+        );
+        assert!(out.ends_with(b":end 1\n"));
     }
 }
