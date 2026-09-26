@@ -117,7 +117,7 @@ impl Header {
 }
 
 /// The input format, set by `--format` or auto-detected from the extension.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputFormat {
     Csv,
     /// Read `.parquet` (only with the `parquet` build feature).

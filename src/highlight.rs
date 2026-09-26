@@ -24,11 +24,17 @@
 //! Lengths and offsets count bytes. inkline's `docs/highlight-protocol.md`
 //! describes the whole protocol.
 
-use crate::cli::{self, Parsed};
+use crate::cli::{self, InputFormat, Parsed};
 use crate::error::Error;
+use crate::exec;
 use crate::parse::{self, Recorder, SpanKind};
-use std::io::{self, BufRead, Read, Write};
+use crate::plan::{Plan, Stage};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// The line csvm writes first: the protocol's name and version.
 pub const GREETING: &str = "inkline-highlight 1";
@@ -109,7 +115,9 @@ impl ReplyError {
 
 /// What the helper keeps from one request to the next.
 #[derive(Default)]
-pub struct Session {}
+pub struct Session {
+    headers: Headers,
+}
 
 impl Session {
     /// Answer one request: the script's colours, and the first thing csvm
@@ -178,10 +186,51 @@ impl Session {
         if request.args[1..=arg].iter().any(|a| a.raw) {
             return reply;
         }
-        if let Err(e) = parsed {
-            reply.error = Some(script_error(arg, &args.script, &e));
-        }
+        let error = match parsed {
+            Ok(mut plan) => self.check_columns(request, &args, &mut plan),
+            Err(e) => Some(e),
+        };
+        reply.error = error.map(|e| script_error(arg, &args.script, &e));
         reply
+    }
+
+    /// The error csvm would find resolving `plan` against the input's
+    /// header. `None` when there is none, or when the header cannot be
+    /// known here: an argument is `raw`, or the input is stdin, a relative
+    /// path with no shell directory to take it from, not a regular file, or
+    /// cannot be read; or the script has a join.
+    fn check_columns(
+        &mut self,
+        request: &Request,
+        args: &cli::Args,
+        plan: &mut Plan,
+    ) -> Option<Error> {
+        // A join's file is not read yet, so a plan with one is not checked.
+        if plan.stages.iter().any(|s| matches!(s, Stage::Join(_))) {
+            return None;
+        }
+        // A `raw` argument anywhere may become other words, or none, and so
+        // change the input, its header, or what csvm makes of the line.
+        if request.args[1..].iter().any(|a| a.raw) {
+            return None;
+        }
+        let path = args.in_path()?;
+        let cwd = shell_dir(&request.cwd);
+        let path = from_dir(cwd, Path::new(path))?;
+        let format = args.input_format();
+        let header = match (&args.header, format) {
+            // csvm rejects `--header` for Parquet, which names its own columns.
+            (Some(_), InputFormat::Parquet) => return None,
+            (Some(cli::Header::Named(names)), _) => {
+                std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
+                names.clone()
+            }
+            (spec, _) => {
+                let first = self.headers.first_line(&path, format)?;
+                cli::Header::resolve(spec.as_ref(), first, 0).0
+            }
+        };
+        plan.resolve(&header).err()
     }
 }
 
@@ -193,6 +242,100 @@ fn script_error(arg: usize, script: &str, e: &Error) -> ReplyError {
         (arg, at.start.min(end)..end)
     });
     ReplyError::new(place, &e.to_string())
+}
+
+/// The shell's directory, from a request's `:cwd`. `None` when that is not
+/// an absolute UTF-8 path: bash sends an empty one when `PWD` is unset.
+fn shell_dir(cwd: &[u8]) -> Option<&Path> {
+    let dir = Path::new(std::str::from_utf8(cwd).ok()?);
+    dir.is_absolute().then_some(dir)
+}
+
+/// `path` as the shell sees it from its directory `cwd`. `None` for a
+/// relative path when that directory is not known: the helper's own
+/// directory is not the shell's, so it is never used.
+fn from_dir(cwd: Option<&Path>, path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        cwd.map(|dir| dir.join(path))
+    }
+}
+
+/// How many files [`Headers`] keeps; past that it starts again from none.
+const MAX_FILES: usize = 64;
+
+/// The most bytes read looking for the end of a CSV file's first line.
+const MAX_HEADER_BYTES: u64 = 1 << 20;
+
+/// The first line of each file read so far, by path and format. An entry
+/// is used again only while the file's size and modification time are
+/// what they were when it was read, so an unchanged file costs one look at
+/// its size and time per request. A read that failed is kept too, so it is
+/// not tried again until the file changes.
+#[derive(Default)]
+struct Headers {
+    files: HashMap<(PathBuf, InputFormat), Seen>,
+}
+
+/// One file's first line, or `None` when it could not be read, and the
+/// file's size and time when it was read.
+struct Seen {
+    len: u64,
+    modified: Option<SystemTime>,
+    columns: Option<Vec<String>>,
+}
+
+impl Headers {
+    /// The columns of the first line of the file at `path`, read as csvm
+    /// reads its input's. `None` when it is not a regular file (a FIFO or a
+    /// device could block or never end) or cannot be read as `format`.
+    fn first_line(&mut self, path: &Path, format: InputFormat) -> Option<Vec<String>> {
+        let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
+        let modified = meta.modified().ok();
+        let key = (path.to_path_buf(), format);
+        if let Some(seen) = self.files.get(&key)
+            && seen.len == meta.len()
+            && seen.modified == modified
+        {
+            return seen.columns.clone();
+        }
+        let columns = read_first_line(path, format, meta.len());
+        if self.files.len() >= MAX_FILES {
+            self.files.clear();
+        }
+        self.files.insert(
+            key,
+            Seen {
+                len: meta.len(),
+                modified,
+                columns: columns.clone(),
+            },
+        );
+        columns
+    }
+}
+
+/// The columns of the first line of `path`, a file `len` bytes long.
+fn read_first_line(path: &Path, format: InputFormat, len: u64) -> Option<Vec<String>> {
+    match format {
+        InputFormat::Csv => {
+            let mut line = Vec::new();
+            let file = File::open(path).ok()?;
+            BufReader::new(file.take(MAX_HEADER_BYTES))
+                .read_until(b'\n', &mut line)
+                .ok()?;
+            // A line the limit cut off is not the whole header.
+            if !line.ends_with(b"\n") && (line.len() as u64) < len {
+                return None;
+            }
+            exec::read_header(&mut line.as_slice()).ok()
+        }
+        #[cfg(feature = "parquet")]
+        InputFormat::Parquet => crate::parquet::read_header(path).ok(),
+        #[cfg(not(feature = "parquet"))]
+        InputFormat::Parquet => None,
+    }
 }
 
 /// Read the next request; `None` when the input ends before one starts.
@@ -846,5 +989,218 @@ mod tests {
             )
         );
         assert!(out.ends_with(b":end 1\n"));
+    }
+
+    use std::time::Duration;
+
+    /// A fresh directory under the system's temp directory, removed when
+    /// dropped.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let dir =
+                std::env::temp_dir().join(format!("csvm_highlight_{}_{name}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+
+        /// Write `content` to `file` in the directory; returns its path.
+        fn write(&self, file: &str, content: &str) -> PathBuf {
+            let path = self.0.join(file);
+            std::fs::write(&path, content).unwrap();
+            path
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().unwrap()
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Whether `lines` hold no error.
+    fn no_error(lines: &[String]) -> bool {
+        lines.iter().all(|l| l.starts_with(":span"))
+    }
+
+    #[test]
+    fn an_unknown_column_in_the_input_is_the_error() {
+        let dir = TempDir::new("columns");
+        dir.write("data.csv", "amount,region\n1,x\n");
+        let mut session = Session::default();
+        let mut ask_in = |args: &[&str]| reply_lines(&session.answer(&request(dir.path(), args)));
+        assert_eq!(
+            ask_in(&["csvm", "select amont > 1", "data.csv"])
+                .last()
+                .unwrap(),
+            ":error 1 7 12 column not found: amont (did you mean `amount`?) — have: amount, region"
+        );
+        assert!(no_error(&ask_in(&[
+            "csvm",
+            "select amount > 1",
+            "data.csv"
+        ])));
+        // `--header` names the columns instead of the first line.
+        assert_eq!(
+            ask_in(&["csvm", "--header", "p,q", "cols amount", "data.csv"])
+                .last()
+                .unwrap(),
+            ":error 3 5 11 column not found: amount — have: p, q"
+        );
+        assert!(no_error(&ask_in(&[
+            "csvm", "--header", "-", "cols c2", "data.csv"
+        ])));
+    }
+
+    #[test]
+    fn no_column_check_without_a_readable_regular_file() {
+        let dir = TempDir::new("nocheck");
+        dir.write("data.csv", "a\n1\n");
+        dir.write("empty.csv", "");
+        let ask_in =
+            |args: &[&str]| reply_lines(&Session::default().answer(&request(dir.path(), args)));
+        // stdin
+        assert!(no_error(&ask_in(&["csvm", "cols zz"])));
+        assert!(no_error(&ask_in(&["csvm", "cols zz", "-"])));
+        // no such file, not a regular file, no header line
+        assert!(no_error(&ask_in(&["csvm", "cols zz", "missing.csv"])));
+        assert!(no_error(&ask_in(&["csvm", "cols zz", "/dev/null"])));
+        assert!(no_error(&ask_in(&["csvm", "cols zz", "empty.csv"])));
+        // The input as bash will still change it.
+        let mut req = request(dir.path(), &["csvm", "cols zz", "data.csv"]);
+        req.args[2].raw = true;
+        assert!(no_error(&reply_lines(&Session::default().answer(&req))));
+        // Any other raw argument: before the script, csvm may take another
+        // argument as its script or its input; after it, `$H` may not be
+        // the header, and `$OUT` may add an argument.
+        for (args, raw) in [
+            (&["csvm", "-o", "$OUT", "cols zz", "data.csv"][..], 2),
+            (&["csvm", "cols zz", "data.csv", "--header", "$H"], 4),
+            (&["csvm", "cols zz", "data.csv", "-o", "$OUT"], 4),
+        ] {
+            let mut req = request(dir.path(), args);
+            req.args[raw].raw = true;
+            assert!(no_error(&reply_lines(&Session::default().answer(&req))));
+        }
+        // Parquet with `--header` is csvm's own error, not a column one.
+        assert!(no_error(&ask_in(&[
+            "csvm", "--header", "a", "--format", "parquet", "cols zz", "data.csv"
+        ])));
+        // A Parquet input csvm cannot read here: the file is not Parquet, or
+        // this build has no Parquet support.
+        assert!(no_error(&ask_in(&[
+            "csvm", "--format", "parquet", "cols zz", "data.csv"
+        ])));
+    }
+
+    #[test]
+    fn a_relative_path_needs_the_shells_directory() {
+        let dir = TempDir::new("cwd");
+        let data = dir.write("data.csv", "a\n1\n");
+        let data = data.to_str().unwrap();
+        let ask_from = |cwd: &[u8], args: &[&str]| {
+            let mut req = request("", args);
+            req.cwd = cwd.to_vec();
+            reply_lines(&Session::default().answer(&req))
+        };
+        // bash sends an empty `:cwd` when `PWD` is unset. A relative path
+        // is then not looked up at all, and never from the helper's own
+        // directory, where `cargo test` has a `Cargo.toml` whose first line
+        // has no column `zz`.
+        for cwd in [&b""[..], b"\xff", b"relative/dir"] {
+            assert!(no_error(&ask_from(cwd, &["csvm", "cols zz", "Cargo.toml"])));
+            // An absolute path is still checked.
+            assert_eq!(
+                ask_from(cwd, &["csvm", "cols zz", data]).last().unwrap(),
+                ":error 1 5 7 column not found: zz — have: a"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_is_never_opened() {
+        let dir = TempDir::new("fifo");
+        let fifo = std::ffi::CString::new(format!("{}/pipe.csv", dir.path())).unwrap();
+        // SAFETY: `fifo` is a valid C string for the whole call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        // Opening the FIFO to read would wait for a writer forever, so each
+        // answer runs on its own thread with a deadline.
+        let answer = |args: &[&str]| {
+            let req = request(dir.path(), args);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(reply_lines(&Session::default().answer(&req)));
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the answer waited on the FIFO")
+        };
+        assert!(no_error(&answer(&["csvm", "cols zz", "pipe.csv"])));
+    }
+
+    #[test]
+    fn a_header_is_read_again_only_when_its_file_changes() {
+        let dir = TempDir::new("cache");
+        let path = dir.write("data.csv", "aa,bb\n1,2\n");
+        let mut headers = Headers::default();
+        let names = |cols: &[&str]| Some(cols.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            headers.first_line(&path, InputFormat::Csv),
+            names(&["aa", "bb"])
+        );
+        // Same size and time: the kept header, though the bytes differ.
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::fs::write(&path, "cc,dd\n1,2\n").unwrap();
+        set_time(&path, time);
+        assert_eq!(
+            headers.first_line(&path, InputFormat::Csv),
+            names(&["aa", "bb"])
+        );
+        // A new time: read again.
+        set_time(&path, time + Duration::from_secs(1));
+        assert_eq!(
+            headers.first_line(&path, InputFormat::Csv),
+            names(&["cc", "dd"])
+        );
+        // A new size, at the same time: read again.
+        std::fs::write(&path, "eee,f\n").unwrap();
+        set_time(&path, time + Duration::from_secs(1));
+        assert_eq!(
+            headers.first_line(&path, InputFormat::Csv),
+            names(&["eee", "f"])
+        );
+        // A first line without a newline is still the header; one longer
+        // than the limit is not read at all.
+        let short = dir.write("short.csv", "x,y");
+        assert_eq!(
+            headers.first_line(&short, InputFormat::Csv),
+            names(&["x", "y"])
+        );
+        let wide = dir.write("wide.csv", &"a".repeat(MAX_HEADER_BYTES as usize + 10));
+        assert_eq!(headers.first_line(&wide, InputFormat::Csv), None);
+        // That is kept too: while the file is unchanged it is not read
+        // again, though its first line is now short.
+        let time = std::fs::metadata(&wide).unwrap().modified().unwrap();
+        let short_first = format!("x\n{}", "a".repeat(MAX_HEADER_BYTES as usize + 8));
+        std::fs::write(&wide, short_first).unwrap();
+        set_time(&wide, time);
+        assert_eq!(headers.first_line(&wide, InputFormat::Csv), None);
+        set_time(&wide, time + Duration::from_secs(1));
+        assert_eq!(headers.first_line(&wide, InputFormat::Csv), names(&["x"]));
+    }
+
+    /// Set the modification time of the file at `path`.
+    fn set_time(path: &Path, time: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
     }
 }
