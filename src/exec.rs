@@ -2170,10 +2170,6 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
         .unwrap_or_default()
 }
 
-/// What an empty data cell shows in a coloured table, dimmed, so a blank value
-/// reads as a value and not as a gap in the row.
-const EMPTY_CELL: &str = "∅";
-
 /// Which columns are numeric: every data cell reads as a number (blanks
 /// allowed, but at least one must be a real number).
 fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
@@ -2212,13 +2208,12 @@ fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts)
 /// widest cell, two spaces between. A `numeric` column is right-justified;
 /// text columns left-justified, trailing column unpadded. Padding is by visible
 /// width; the painted text carries the colour.
-/// With colour on the header row is bold and an empty data cell shows
-/// [`EMPTY_CELL`], dimmed over whatever the rules paint there. When the screen
-/// fits tables, text columns are cut so the lines fit its width (see
-/// [`fit_widths`]); when it shows links, a web address links to itself, whole
-/// even when its text is cut. With a stripe, every other data row is shaded
-/// with it from its first cell to the table's right edge, under whatever the
-/// rules paint there.
+/// With colour on the header row is bold; only a stripe colours an empty cell.
+/// When the screen fits tables, text columns are cut so the lines fit its width
+/// (see [`fit_widths`]); when it shows links, a web address links to itself,
+/// whole even when its text is cut. With a stripe, every other data row is
+/// shaded with it from its first cell to the table's right edge, under whatever
+/// the rules paint there.
 fn align_and_write<W: Write>(
     rows: &[Vec<String>],
     numeric: &[bool],
@@ -2228,21 +2223,15 @@ fn align_and_write<W: Write>(
 ) -> Result<(), Error> {
     let color = screen.color;
     let fit_to = screen.width.filter(|_| screen.fit);
-    let marked = |ri: usize, field: &str| color.is_some() && ri > 0 && field.is_empty();
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
-    for (ri, row) in rows.iter().enumerate() {
+    for row in rows {
         for (i, field) in row.iter().enumerate() {
-            let text = if marked(ri, field) { EMPTY_CELL } else { field };
-            widths[i] = widths[i].max(vis_width(text));
+            widths[i] = widths[i].max(vis_width(field));
         }
     }
     let bold = Style {
         bold: true,
-        ..Style::default()
-    };
-    let dim = Style {
-        dim: true,
         ..Style::default()
     };
     // The first data row and every other one after it.
@@ -2272,23 +2261,18 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 push_gap(&mut line, 2, shade_start.as_deref());
             }
-            let text = cut(
-                if marked(ri, field) { EMPTY_CELL } else { field },
-                widths[i],
-            );
+            let text = cut(field, widths[i]);
             let pad = widths[i].saturating_sub(vis_width(&text));
             let has_content = !text.is_empty();
             let painted: Cow<str> = match color {
-                Some(depth) => {
+                Some(depth) if has_content => {
                     let mut style = shade.over(style_at(styles, ri, i));
                     if ri == 0 {
                         style = style.over(bold);
-                    } else if marked(ri, field) {
-                        style = style.over(dim);
                     }
                     style.paint(&text, depth).into()
                 }
-                None => text,
+                Some(_) | None => text,
             };
             let painted = if screen.links && ri > 0 && is_web_address(field) {
                 hyperlink(field, &painted).into()
@@ -4372,23 +4356,24 @@ mod tests {
     }
 
     #[test]
-    fn fmt_in_colour_bolds_the_header_and_marks_empty_cells() {
+    fn fmt_in_colour_bolds_the_header_and_leaves_empty_cells_blank() {
         let out = render_str("fmt", "name,n\nab,\n,22\n", true);
         let lines: Vec<&str> = out.lines().collect();
         let bold = |s: &str| format!("\x1b[1m{s}\x1b[0m");
-        let dim = |s: &str| format!("\x1b[2m{s}\x1b[0m");
-        // The marker is a cell one column wide, so the columns still line up.
         assert_eq!(
             lines,
             [
                 format!("{}   {}", bold("name"), bold("n")),
-                format!("ab     {}", dim("∅")),
-                format!("{}     22", dim("∅")),
+                "ab".to_string(),
+                "      22".to_string(),
             ]
         );
-        // With colour off the table is plain, and an empty cell is a gap.
+        // With colour off the table is the same, except for the bold header.
         let plain = render_str("fmt", "name,n\nab,\n,22\n", false);
         assert_eq!(plain, "name   n\nab\n      22\n");
+        // An empty header cell gets no escapes either.
+        let blank_head = render_str("fmt", ",n\n1,2\n", true);
+        assert_eq!(blank_head.lines().next(), Some("   \x1b[1mn\x1b[0m"));
         // A line ends at its last cell with something in it, so an empty last
         // cell leaves no padding behind; a cell's own spaces stay.
         let empty_ends = render_str("fmt", "a,b,c\nxx,,\ny,z  ,\n", false);
@@ -4396,10 +4381,11 @@ mod tests {
     }
 
     #[test]
-    fn fmt_marks_empty_cells_under_colour_rules_too() {
-        // A row rule paints the marker with the rest of the row, dimmed.
+    fn fmt_leaves_empty_cells_blank_under_colour_rules_too() {
+        // A row rule paints the cells with something in them; an empty cell
+        // gets no escapes.
         let out = render_str("color red n > 1 | fmt", "a,n\n,2\n", true);
-        assert!(out.contains("\x1b[2;31m∅\x1b[0m"), "{out:?}");
+        assert_eq!(out.lines().nth(1), Some("   \x1b[31m2\x1b[0m"), "{out:?}");
     }
 
     const LONG_NOTE: &str = "id,name,note\n1,alpha,a long piece of text here\n2,b,short\n";
@@ -4437,14 +4423,7 @@ mod tests {
         assert_eq!(lines[2], "yy    20");
         assert_eq!(
             lines[3],
-            [
-                "\x1b[2;48;2;24;24;24m∅\x1b[0m".to_string(),
-                shaded("   "),
-                shaded("  "),
-                shaded(" "),
-                shaded("3"),
-            ]
-            .concat()
+            [shaded("    "), shaded("  "), shaded(" "), shaded("3")].concat()
         );
         // No colour, no stripes.
         let plain = Screen {

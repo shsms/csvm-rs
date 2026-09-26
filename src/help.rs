@@ -452,7 +452,7 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         ],
         detail: "All-numeric columns are right-justified; text columns left-justified. Applied to \
 the final output, so it composes after everything else. With colour on (see --color) the \
-header row is bold and an empty cell shows a dim ∅. Shown on a terminal with no pager \
+header row is bold. Shown on a terminal with no pager \
 (--no-pager), text columns are cut with … so each line fits the window; numbers are never cut. \
 With colour on, a cell holding an http:// or https:// address is a link the terminal can \
 open (only on the terminal, and through a pager only when it is less 581 or later). With -s, \

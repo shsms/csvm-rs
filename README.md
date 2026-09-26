@@ -231,7 +231,7 @@ comma- or space-separated arguments:
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
 | `rename old=new …` | rename columns (header only; row data unchanged)           |
 | `add NAME = EXPR`  | append a computed column (replaces `NAME` in place if it exists) |
-| `fmt [-s] [-f\|-p N] [-h]` | whitespace-aligned table (`column -t`); numbers right-justified, at most six decimals; in colour, a bold header and a dim `∅` for an empty cell; `-s` stripes the rows; `-p N` shows at most N decimals, `-f` every digit; `-h` shows `1.23M` for 1234567 |
+| `fmt [-s] [-f\|-p N] [-h]` | whitespace-aligned table (`column -t`); numbers right-justified, at most six decimals; in colour, a bold header; `-s` stripes the rows; `-p N` shows at most N decimals, `-f` every digit; `-h` shows `1.23M` for 1234567 |
 | `graph hist COL`   | terminal histogram of a numeric column (sink; must be last) |
 | `graph bar LABEL V[,V2…]` | one horizontal bar per row and value column (sink; use after group-by) |
 | `graph spark COL`  | one-line sparkline of a column (sink)                       |

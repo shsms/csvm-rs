@@ -283,8 +283,7 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `Plan.output` flag, applied by `exec::format_aligned` after the run produces
   CSV (so the executor itself is unchanged). Columns whose data cells are all
   numeric are right-justified (digits line up); text columns are left-justified.
-  With colour on, the header row is bold and an empty data cell shows a dim
-  `∅` (`EMPTY_CELL`), layered over whatever the `color` rules paint there.
+  With colour on, the header row is bold; only a stripe colours an empty cell.
   `exec::render` takes an `exec::Screen` (colour depth, terminal width, and
   `fit`); with `fit` — a terminal and no pager, which would scroll sideways
   instead — `fit_widths` cuts every text column wider than one shared cap
