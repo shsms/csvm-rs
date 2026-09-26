@@ -697,11 +697,13 @@ chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)
 
-`--highlight` (alone) makes csvm inkline's colouring helper
-(`src/mode_server.rs`, protocol in inkline's `docs/highlight-protocol.md`):
-`mode_server::serve` reads requests on stdin and answers each on stdout. A
-`mode_server::Session` runs `cli::parse_at` (a usage error says which argument
-it is about) and `parse::parse_recorded`, the real parser with a
+`--inkline-mode` (alone) makes csvm a mode server for inkline
+(`src/mode_server.rs`; inkline's `docs/mode-protocol.md` describes the
+inkline mode protocol): `mode_server::serve` reads requests on stdin and
+answers each on stdout. A request's first `:arg` is the command's name as
+typed (`csvm`, `c`, `./target/debug/csvm`); csvm skips it.
+A `mode_server::Session` runs `cli::parse_at` (a usage error says which
+argument it is about) and `parse::parse_recorded`, the real parser with a
 `parse::Recorder` that notes each part's byte range and kind where the
 parser reads it (`Builder::note`); a plain `parse` passes no recorder and
 builds the same plan. The first error is sent on its place: a usage error on
@@ -714,28 +716,30 @@ error when one is at or before the script (one after it is taken to stay
 one argument that is not an option), and no column error when any argument
 is `raw`. The input's header and each join file's are kept per file
 (`Headers`), a failed read too, until the file's size or modification time
-changes. Relative paths are taken from the request's `:cwd`; the helper
-never changes its own directory. `main` runs `serve` before it reads a
-`Console`, so the helper never pages, never writes colour and never asks the
-terminal anything. `serve` flushes after the greeting and after each `:end`,
-and returns when stdin ends. A request that breaks the protocol ends it with
-exit status 1 and the reason on stderr; a closed stdout, or a connection
-reset (inkline's socket closed with a reply still unread), ends it quietly,
-like any run whose reader stopped (`Failure::Closed`).
-The first line names `indent` (`mode_server::GREETING`), so inkline also
-sends `:indent` requests: the same `:cwd`/`:arg` blocks, then `:at ARG
-OFFSET` before `:done` (`Request.at`). `mode_server::indent` finds the script
-as for colours and answers `:depth NEW CURRENT` from `parse::depths`, or
-only `:end` when `:at` is not in the script or the script is `raw`; a
-malformed `:at` breaks the protocol like any bad request. `parse::depths`
-is one pass over the text, not the parser, since the line being typed is
-usually inside a group not yet closed: over `strip_comments`' output, with
-the group takers' quotes and `split_stages`' stage breaks (but not inside
-an `fn` header before its `{`), it counts each `{` whose stage's first
-word is `fn` and each `(` whose stage's first word is `join` (other
-brackets only have to be closed). A line that starts with the `)`/`}`
-closing one of those gets the depth just after that bracket, which is one
-step out when the brackets nest well. Nothing on the run path calls it.
+changes. Relative paths are taken from the request's `:cwd`; the mode
+server never changes its own directory. `main` runs `serve` before it reads
+a `Console`, so the mode server never pages, never writes colour and never
+asks the terminal anything. `serve` flushes after the greeting and after
+each `:end`, and returns when stdin ends. A request that breaks the
+protocol ends it with exit status 1 and the reason on stderr; a closed
+stdout, or a connection reset (inkline's socket closed with a reply still
+unread), ends it quietly, like any run whose reader stopped
+(`Failure::Closed`).
+The first line, `inkline-mode 1 indent` (`mode_server::GREETING`), names
+`indent`, so inkline also sends `:indent` requests: the same `:cwd`/`:arg`
+blocks, then `:at ARG OFFSET` before `:done` (`Request.at`).
+`mode_server::indent` finds the script as for colours and answers
+`:depth NEW CURRENT` from `parse::depths`, or only `:end` when `:at` is not
+in the script or the script is `raw`; a malformed `:at` breaks the protocol
+like any bad request. `parse::depths` is one pass over the text, not the
+parser, since the line being typed is usually inside a group not yet
+closed: over `strip_comments`' output, with the group takers' quotes and
+`split_stages`' stage breaks (but not inside an `fn` header before its
+`{`), it counts each `{` whose stage's first word is `fn` and each `(`
+whose stage's first word is `join` (other brackets only have to be
+closed). A line that starts with the `)`/`}` closing one of those gets the
+depth just after that bracket, which is one step out when the brackets nest
+well. Nothing on the run path calls it.
 
 ## Performance
 

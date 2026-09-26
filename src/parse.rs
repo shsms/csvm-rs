@@ -39,7 +39,7 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
 }
 
 /// [`parse`], noting in `rec` what each part of the script is, for
-/// `csvm --highlight`. It builds the same plan as [`parse`], or fails the
+/// `csvm --inkline-mode`. It builds the same plan as [`parse`], or fails the
 /// same way. What was noted before an error stays in `rec`, and each stage
 /// after the one that failed gets its command word noted. A `fn` definition
 /// that fails is skipped, and the ones after it are still noted.
@@ -106,7 +106,7 @@ fn place_on(script: &str, part: &str, e: Error) -> Error {
     }
 }
 
-/// What a part of the script is, for `csvm --highlight`: each kind is a
+/// What a part of the script is, for `csvm --inkline-mode`: each kind is a
 /// colour the editor paints that part with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpanKind {
@@ -122,7 +122,7 @@ pub enum SpanKind {
 }
 
 impl SpanKind {
-    /// The kind's name in the highlight protocol.
+    /// The kind's name in the inkline mode protocol.
     pub fn name(self) -> &'static str {
         match self {
             SpanKind::Command => "command",
@@ -356,7 +356,7 @@ struct Builder<'a> {
     /// The columns read since the last [`Builder::written_at`], and where
     /// each is written (see [`Builder::read_column`]).
     columns: Vec<(String, Range<usize>)>,
-    /// Where `--highlight` notes what each part of the script is; `None`
+    /// Where `--inkline-mode` notes what each part of the script is; `None`
     /// for a plain parse.
     rec: Option<&'a mut Recorder>,
 }
@@ -1771,7 +1771,7 @@ fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
 
 /// How deep two lines of a script sit, counted in the `fn NAME(…) { … }`
 /// bodies and `join (…)` groups open around them, for an editor that
-/// indents a line it is splitting (`csvm --highlight`).
+/// indents a line it is splitting (`csvm --inkline-mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Depths {
     /// The line that starts where the split is.

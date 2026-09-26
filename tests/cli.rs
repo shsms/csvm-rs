@@ -144,6 +144,18 @@ fn empty_input_errors_unless_the_header_is_named() {
 }
 
 #[test]
+fn the_help_lists_the_inkline_mode_flag() {
+    let (ok, out, err) = csvm(&["--help", "--no-pager"], "");
+    assert!(ok, "{err}");
+    assert!(
+        out.contains(
+            "      --inkline-mode   answer inkline's colour/indent requests on stdin (alone)\n"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
 fn removed_spellings_fail_with_a_pointer() {
     for (script, pointer) in [
         ("hdr a,b", "--header a,b,c"),

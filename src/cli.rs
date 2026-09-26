@@ -6,7 +6,7 @@
 //! `-o`/`--output` (default stdout), `-n`/`--threads`, `-f`/`--file` (read the
 //! script from a file), `-t`/`--temp-dir`, `--chunk-size`, `--sort-buffer`,
 //! `--header`, `--color`, `--format` (csv | parquet), `--no-pager`,
-//! `--no-progress`, `--explain` and `--highlight`.
+//! `--no-progress`, `--explain` and `--inkline-mode`.
 //! Long options take their value as `--flag VALUE` or `--flag=VALUE`. See the
 //! help registry for the full help.
 
@@ -182,8 +182,8 @@ pub enum Parsed {
         no_pager: bool,
     },
     Version,
-    /// `--highlight`: answer inkline's colouring and indenting requests on
-    /// stdin.
+    /// `--inkline-mode`: be a mode server for inkline, answering its
+    /// colouring and indenting requests on stdin.
     ModeServer,
 }
 
@@ -243,7 +243,7 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
 
     let args: Vec<String> = args.into_iter().collect();
     let total = args.len();
-    let mut highlight = None;
+    let mut mode_server = None;
     let mut it = args.into_iter().enumerate();
     while let Some((at, raw)) = it.next() {
         // Accept the GNU `--flag=value` form alongside `--flag value`: split a
@@ -278,7 +278,7 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
                 });
             }
             "-V" | "--version" => return Ok(Parsed::Version),
-            "--highlight" => highlight = Some(at),
+            "--inkline-mode" => mode_server = Some(at),
             "-o" | "--output" => out_file = Some(value!().0),
             "-n" | "--threads" => {
                 let (v, v_at) = value!();
@@ -348,13 +348,13 @@ pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage
         }
     }
 
-    // `--highlight` is how inkline starts csvm as its helper; it takes
-    // nothing else.
-    if let Some(at) = highlight {
+    // `--inkline-mode` is how inkline starts csvm as its mode server; it
+    // takes nothing else.
+    if let Some(at) = mode_server {
         if total > 1 {
             return Err(Usage::on_whole_line(
                 at,
-                "--highlight takes no other arguments",
+                "--inkline-mode takes no other arguments",
             ));
         }
         return Ok(Parsed::ModeServer);
@@ -710,20 +710,33 @@ mod tests {
     }
 
     #[test]
-    fn highlight_takes_no_other_arguments() {
+    fn inkline_mode_takes_no_other_arguments() {
         assert!(matches!(
-            parse_at(["--highlight".to_string()]),
+            parse_at(["--inkline-mode".to_string()]),
             Ok(Parsed::ModeServer)
         ));
-        let e = parse_at(["--highlight".to_string(), "cols a".to_string()])
+        let e = parse_at(["--inkline-mode".to_string(), "cols a".to_string()])
             .err()
             .unwrap();
         assert_eq!(
             e,
             Usage {
-                message: "--highlight takes no other arguments".to_string(),
+                message: "--inkline-mode takes no other arguments".to_string(),
                 arg: Some(0),
                 whole_line: true,
+            }
+        );
+    }
+
+    #[test]
+    fn highlight_is_not_an_option() {
+        let e = parse_at(["--highlight".to_string()]).err().unwrap();
+        assert_eq!(
+            e,
+            Usage {
+                message: "unknown option: --highlight".to_string(),
+                arg: Some(0),
+                whole_line: false,
             }
         );
     }

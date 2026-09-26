@@ -21,10 +21,11 @@ git history; this file is the "what next / what was decided" scratchpad.
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
   distinct item separator, removes the trap.
 - =cli::Usage= could be called =UsageError=, which says what it is.
-- The =--highlight= join walk (=resolve_joins=) repeats =exec::prepare_joins=,
-  and its header choice repeats =open_source=; sharing them would keep the
-  helper and a real run from drifting apart. The test request helpers in
-  =src/mode_server.rs= and =tests/mode_server.rs= could be one.
+- The =--inkline-mode= join walk (=resolve_joins=) repeats
+  =exec::prepare_joins=, and its header choice repeats =open_source=;
+  sharing them would keep the mode server and a real run from drifting
+  apart. The functions that build test requests in =src/mode_server.rs=
+  and =tests/mode_server.rs= could be one.
 
 ** TODO Correctness / edges
 - sort: a string sort key containing a literal =\0= (rare in CSV) sorts
@@ -50,38 +51,38 @@ git history; this file is the "what next / what was decided" scratchpad.
   adding the step, so float error builds up. Ticks as whole multiples of the
   step, labelled at its precision, and bounds to a few significant digits
   would fix both.
-- =--highlight=: a script bash will still expand (="select a > $min"=)
+- =--inkline-mode=: a script bash will still expand (="select a > $min"=)
   reaches the parser as typed, quote marks included, so it gets no colour.
   Parsing the text inside the quotes, and moving each span one byte on,
   would colour all of it but the =$min=.
-- =--highlight=: an option value bash will still expand (=-n $N=) reaches
-  =cli::parse_at= as typed, which rejects it, so the helper sends no error
-  (the argument is raw) but no colour either: the script is never found.
-  Putting a harmless value in its place before parsing (=1= for =-n=)
-  would let the script be coloured.
+- =--inkline-mode=: an option value bash will still expand (=-n $N=)
+  reaches =cli::parse_at= as typed, which rejects it, so the mode server
+  sends no error (the argument is raw) but no colour either: the script is
+  never found. Putting a harmless value in its place before parsing (=1=
+  for =-n=) would let the script be coloured.
 - A script nested about 3000 levels deep with =(= overflows the stack in
-  the expression parser (=ExprParser=), in csvm itself and in the
-  =--highlight= helper, which then exits, so inkline turns its colouring
-  off. A depth limit in the expression parser, an error past it, would
-  fix both.
-- =--highlight=: a raw argument after the script (=csvm '...' $f=) is
+  the expression parser (=ExprParser=), in csvm itself and in its mode
+  server (=csvm --inkline-mode=), which then exits, so inkline turns its
+  colouring off. A depth limit in the expression parser, an error past it,
+  would fix both.
+- =--inkline-mode=: a raw argument after the script (=csvm '...' $f=) is
   taken to stay one argument, so the script's errors are still sent. If
   =$f= expands to =--help= or to several words, csvm itself would not give
-  the error the helper shows. Asking inkline for the expanded words is the
-  only full fix.
-- =--highlight=: the "did you mean" hint for a fragment name can change
+  the error the mode server shows. Asking inkline for the expanded words is
+  the only full fix.
+- =--inkline-mode=: the "did you mean" hint for a fragment name can change
   from one keystroke to the next, because the fn table is a =HashMap=.
   Sorting the candidates (or keeping the table in definition order) makes
   the hint stable.
-- =--highlight=: between the regular-file check and the =open=, a FIFO
+- =--inkline-mode=: between the regular-file check and the =open=, a FIFO
   could take the file's place. Opening with =O_NONBLOCK= and checking the
   opened file would close the gap.
-- =--highlight --help= and =--highlight -V= print the help or the version
-  instead of the usage error, and =--highlight=x= is accepted with the
-  =x= dropped (as =--explain=x= is).
-- No test reads a real Parquet header through =--highlight= with
+- =--inkline-mode --help= and =--inkline-mode -V= print the help or the
+  version instead of the usage error, and =--inkline-mode=x= is accepted
+  with the =x= dropped (as =--explain=x= is).
+- No test reads a real Parquet header through =--inkline-mode= with
   =--features parquet=; only the cases with no check are covered.
-- Colouring details in =--highlight=: =fmt= colours every word as an
+- Colouring details in =--inkline-mode=: =fmt= colours every word as an
   option, not only the ones starting with =-=; a comment's colour on a
   CRLF line includes the =\r=; an =fn= header with no ={= yet colours the
   next definition's text as =variable=; =sort a = nr= colours the space

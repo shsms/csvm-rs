@@ -1,5 +1,5 @@
-//! `csvm --highlight`: the helper inkline asks to colour a csvm command
-//! line while it is typed.
+//! `csvm --inkline-mode`: the mode server inkline asks to colour a csvm
+//! command line while it is typed.
 //!
 //! inkline writes requests to stdin:
 //!
@@ -27,8 +27,8 @@
 //! breaks) before `:done`. csvm answers `:depth NEW CURRENT` (how deep the
 //! new line and the line being split sit), or nothing, then `:end ID`.
 //!
-//! Lengths and offsets count bytes. inkline's `docs/highlight-protocol.md`
-//! describes the whole protocol.
+//! Lengths and offsets count bytes. inkline's `docs/mode-protocol.md`
+//! describes the whole of the inkline mode protocol.
 
 use crate::cli::{self, InputFormat, Parsed};
 use crate::error::Error;
@@ -44,7 +44,7 @@ use std::time::SystemTime;
 
 /// The line csvm writes first: the protocol's name and version, and the
 /// one extra request csvm answers, `:indent`.
-pub const GREETING: &str = "inkline-highlight 1 indent";
+pub const GREETING: &str = "inkline-mode 1 indent";
 
 /// The longest `:` line a request may have, newline included.
 const MAX_LINE: u64 = 256;
@@ -54,8 +54,8 @@ const MAX_LINE: u64 = 256;
 /// memory.
 const MAX_BYTES: usize = 16 << 20;
 
-/// The most bytes of `:span` lines one reply may hold. inkline turns a
-/// helper off when a reply passes 1 MiB, so the spans past this are not
+/// The most bytes of `:span` lines one reply may hold. inkline turns a mode
+/// server off when a reply passes 1 MiB, so the spans past this are not
 /// sent (the end of a very long script is then not coloured), which leaves
 /// room for the error and `:end`.
 const MAX_SPAN_BYTES: usize = 900 << 10;
@@ -124,7 +124,7 @@ impl ReplyError {
     }
 }
 
-/// What the helper keeps from one request to the next.
+/// What the mode server keeps from one request to the next.
 #[derive(Default)]
 pub struct Session {
     headers: Headers,
@@ -148,7 +148,7 @@ impl Session {
         };
         let args = match cli::parse_at(words) {
             Ok(Parsed::Run(args)) => args,
-            // Help, the version and the helper itself take no script.
+            // Help, the version and the mode server itself take no script.
             Ok(Parsed::Help { .. } | Parsed::Version | Parsed::ModeServer) => return reply,
             Err(usage) => {
                 // A line that stops before its script is still being typed,
@@ -294,7 +294,7 @@ fn shell_dir(cwd: &[u8]) -> Option<&Path> {
 }
 
 /// `path` as the shell sees it from its directory `cwd`. `None` for a
-/// relative path when that directory is not known: the helper's own
+/// relative path when that directory is not known: the mode server's own
 /// directory is not the shell's, so it is never used.
 fn from_dir(cwd: Option<&Path>, path: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
@@ -505,10 +505,10 @@ pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<(
     writeln!(out, ":end {id}")
 }
 
-/// Be the helper: write [`GREETING`], then answer each request read from
-/// `input` on `output`, a colour request with [`Session::answer`] and an
-/// `:indent` one with [`indent`], flushing after each reply, until `input`
-/// ends.
+/// Be the mode server: write [`GREETING`], then answer each request read
+/// from `input` on `output`, a colour request with [`Session::answer`] and
+/// an `:indent` one with [`indent`], flushing after each reply, until
+/// `input` ends.
 pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "{GREETING}")?;
     output.flush()?;
@@ -587,7 +587,7 @@ fn read_bytes(input: &mut impl BufRead, len: usize) -> io::Result<Vec<u8>> {
 fn bad(what: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("not a highlight request: {what:?}"),
+        format!("not an inkline mode request: {what:?}"),
     )
 }
 
@@ -1063,24 +1063,44 @@ mod tests {
     }
 
     #[test]
-    fn a_highlight_command_line_is_not_a_script() {
-        // `csvm --highlight` alone starts the helper: there is no script.
-        assert_eq!(ask(&["csvm", "--highlight"]), Vec::<String>::new());
-        // With anything else it is a usage error, on `--highlight`.
+    fn an_inkline_mode_command_line_is_not_a_script() {
+        // `csvm --inkline-mode` alone starts the mode server: there is no
+        // script.
+        assert_eq!(ask(&["csvm", "--inkline-mode"]), Vec::<String>::new());
+        // With anything else it is a usage error, on `--inkline-mode`.
         assert_eq!(
-            ask(&["csvm", "--highlight", "cols a"]),
-            [":error 1 0 11 --highlight takes no other arguments"]
+            ask(&["csvm", "--inkline-mode", "cols a"]),
+            [":error 1 0 14 --inkline-mode takes no other arguments"]
         );
         assert_eq!(
-            ask(&["csvm", "cols a", "data.csv", "--highlight"]),
-            [":error 3 0 11 --highlight takes no other arguments"]
+            ask(&["csvm", "cols a", "data.csv", "--inkline-mode"]),
+            [":error 3 0 14 --inkline-mode takes no other arguments"]
         );
-        // A raw argument may expand to nothing and leave `--highlight`
+        // A raw argument may expand to nothing and leave `--inkline-mode`
         // alone, wherever it is on the line.
         assert_eq!(
-            ask_raw(&["csvm", "--highlight", "$EMPTY"], &[2]),
+            ask_raw(&["csvm", "--inkline-mode", "$EMPTY"], &[2]),
             Vec::<String>::new()
         );
+    }
+
+    #[test]
+    fn the_command_name_is_not_used() {
+        // inkline sends the command's name as typed: an alias, or a path to
+        // csvm. Only the arguments after it are csvm's.
+        let want = ask(&["csvm", "select a >> 1"]);
+        assert!(!want.is_empty());
+        for name in [
+            "c",
+            "./target/debug/csvm",
+            "/usr/local/bin/csvm",
+            "--inkline-mode",
+        ] {
+            assert_eq!(ask(&[name, "select a >> 1"]), want, "{name}");
+        }
+        let mut req = request("/", &["csvm", "select a >> 1"]);
+        req.args[0].bytes = b"c\xff".to_vec();
+        assert_eq!(reply_lines(&Session::default().answer(&req)), want);
     }
 
     #[test]
@@ -1258,7 +1278,7 @@ mod tests {
             reply_lines(&Session::default().answer(&req))
         };
         // bash sends an empty `:cwd` when `PWD` is unset. A relative path
-        // is then not looked up at all, and never from the helper's own
+        // is then not looked up at all, and never from the mode server's own
         // directory, where `cargo test` has a `Cargo.toml` whose first line
         // has no column `zz`.
         for cwd in [&b""[..], b"\xff", b"relative/dir"] {
@@ -1461,7 +1481,7 @@ mod tests {
         serve(&mut &input[..], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "inkline-highlight 1 indent\n\
+            "inkline-mode 1 indent\n\
              :span 1 0 3 command\n:end 1\n\
              :error 1 0 6 unknown option: --colr\n:end 2\n"
         );
@@ -1685,7 +1705,7 @@ mod tests {
         serve(&mut &input[..], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "inkline-highlight 1 indent\n\
+            "inkline-mode 1 indent\n\
              :span 1 0 3 command\n:end 1\n\
              :depth 1 0\n:end 2\n\
              :end 3\n"

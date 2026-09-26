@@ -1,4 +1,4 @@
-//! `csvm --highlight` end to end: the built binary reads requests on its
+//! `csvm --inkline-mode` end to end: the built binary reads requests on its
 //! stdin and answers each on its stdout, in order, until its stdin ends.
 
 mod common;
@@ -8,40 +8,40 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-/// A running `csvm --highlight`. Dropped before it is finished (a failed
-/// test), it is killed, so no helper is left behind.
-struct Helper {
+/// A running `csvm --inkline-mode`. Dropped before it is finished (a
+/// failed test), it is killed, so no mode server is left behind.
+struct Server {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     id: u64,
 }
 
-impl Helper {
-    /// Start the helper and read its first line.
-    fn start() -> Helper {
+impl Server {
+    /// Start the mode server and read its first line.
+    fn start() -> Server {
         let mut child = Command::new(env!("CARGO_BIN_EXE_csvm"))
-            .arg("--highlight")
+            .arg("--inkline-mode")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("start csvm --highlight");
+            .expect("start csvm --inkline-mode");
         let stdin = child.stdin.take();
         let stdout = BufReader::new(child.stdout.take().unwrap());
-        let mut helper = Helper {
+        let mut server = Server {
             child,
             stdin,
             stdout,
             id: 0,
         };
         let mut first = String::new();
-        helper.stdout.read_line(&mut first).unwrap();
-        assert_eq!(first, "inkline-highlight 1 indent\n");
-        helper
+        server.stdout.read_line(&mut first).unwrap();
+        assert_eq!(first, "inkline-mode 1 indent\n");
+        server
     }
 
-    /// Write `bytes` to the helper's stdin.
+    /// Write `bytes` to the mode server's stdin.
     fn send(&mut self, bytes: &[u8]) {
         let stdin = self.stdin.as_mut().expect("stdin still open");
         stdin.write_all(bytes).unwrap();
@@ -83,7 +83,7 @@ impl Helper {
             let mut line = String::new();
             assert!(
                 self.stdout.read_line(&mut line).unwrap() > 0,
-                "the helper stopped"
+                "the mode server stopped"
             );
             let line = line.strip_suffix('\n').expect("a whole line").to_string();
             if line == format!(":end {}", self.id) {
@@ -94,7 +94,7 @@ impl Helper {
         }
     }
 
-    /// Close the helper's stdin and wait, at most ten seconds, for it to
+    /// Close the mode server's stdin and wait, at most ten seconds, for it to
     /// exit; return how it exited and what it wrote on stderr.
     fn finish(mut self) -> (ExitStatus, String) {
         drop(self.stdin.take());
@@ -103,7 +103,7 @@ impl Helper {
             if let Some(status) = self.child.try_wait().unwrap() {
                 break status;
             }
-            assert!(Instant::now() < deadline, "the helper did not exit");
+            assert!(Instant::now() < deadline, "the mode server did not exit");
             std::thread::sleep(Duration::from_millis(10));
         };
         let mut err = String::new();
@@ -128,7 +128,7 @@ fn blocks(cwd: &str, args: &[&str], raw: Option<usize>) -> Vec<u8> {
     out
 }
 
-impl Drop for Helper {
+impl Drop for Server {
     fn drop(&mut self) {
         // Already exited when finished; else stopped here.
         let _ = self.child.kill();
@@ -137,15 +137,15 @@ impl Drop for Helper {
 }
 
 #[test]
-fn csvm_highlight_answers_each_request_in_order() {
+fn csvm_mode_server_answers_each_request_in_order() {
     let data = temp_csv("amount,region\n1,x\n");
     let dir = data.parent().unwrap().to_str().unwrap();
     let name = data.file_name().unwrap().to_str().unwrap();
-    let mut helper = Helper::start();
+    let mut server = Server::start();
 
     // A clean script: its colours and no error.
     assert_eq!(
-        helper.ask(dir, &["csvm", "cols amount | select amount > 1", name]),
+        server.ask(dir, &["csvm", "cols amount | select amount > 1", name]),
         [
             ":span 1 0 4 command",
             ":span 1 5 11 variable",
@@ -158,7 +158,7 @@ fn csvm_highlight_answers_each_request_in_order() {
     );
     // A script that does not parse.
     assert_eq!(
-        helper.ask(dir, &["csvm", "select a >> 1"]),
+        server.ask(dir, &["csvm", "select a >> 1"]),
         [
             ":span 1 0 6 command",
             ":span 1 7 8 variable",
@@ -170,7 +170,7 @@ fn csvm_highlight_answers_each_request_in_order() {
     );
     // A column the input file does not have, found from `:cwd`.
     assert_eq!(
-        helper.ask(dir, &["csvm", "select amont > 1", name]),
+        server.ask(dir, &["csvm", "select amont > 1", name]),
         [
             ":span 1 0 6 command",
             ":span 1 7 12 variable",
@@ -181,7 +181,7 @@ fn csvm_highlight_answers_each_request_in_order() {
     );
     // The same input as bash will still change it: no column check.
     assert_eq!(
-        helper.ask_with(dir, &["csvm", "select amont > 1", name], Some(2)),
+        server.ask_with(dir, &["csvm", "select amont > 1", name], Some(2)),
         [
             ":span 1 0 6 command",
             ":span 1 7 12 variable",
@@ -191,7 +191,7 @@ fn csvm_highlight_answers_each_request_in_order() {
     );
     // A script on two lines of one argument.
     assert_eq!(
-        helper.ask(dir, &["csvm", "cols amount\nselect amount > 1", name]),
+        server.ask(dir, &["csvm", "cols amount\nselect amount > 1", name]),
         [
             ":span 1 0 4 command",
             ":span 1 5 11 variable",
@@ -203,87 +203,90 @@ fn csvm_highlight_answers_each_request_in_order() {
     );
     // `-f`: only the options are checked.
     assert_eq!(
-        helper.ask(dir, &["csvm", "-f", "prog.csvm", name]),
+        server.ask(dir, &["csvm", "-f", "prog.csvm", name]),
         Vec::<String>::new()
     );
     // A bad option, on its argument.
     assert_eq!(
-        helper.ask(dir, &["csvm", "--colr", "always", "cols a"]),
+        server.ask(dir, &["csvm", "--colr", "always", "cols a"]),
         [":error 1 0 6 unknown option: --colr"]
     );
-    // The line that starts the helper, typed with more after it.
+    // The line that starts the mode server, typed with more after it.
     assert_eq!(
-        helper.ask(dir, &["csvm", "--highlight", "cols a"]),
-        [":error 1 0 11 --highlight takes no other arguments"]
+        server.ask(dir, &["csvm", "--inkline-mode", "cols a"]),
+        [":error 1 0 14 --inkline-mode takes no other arguments"]
     );
-    let (status, err) = helper.finish();
+    let (status, err) = server.finish();
     assert!(status.success(), "{status}: {err}");
     assert_eq!(err, "");
 }
 
 #[test]
-fn csvm_highlight_answers_indent_requests_between_colour_ones() {
-    let mut helper = Helper::start();
+fn csvm_mode_server_answers_indent_requests_between_colour_ones() {
+    let mut server = Server::start();
     // Inside a join group, on the line after `join (`.
     let script = "head\n| join (\n  cols a,b";
     assert_eq!(
-        helper.indent(&["csvm", script, "x.csv"], (1, script.len()), None),
+        server.indent(&["csvm", script, "x.csv"], (1, script.len()), None),
         [":depth 1 1"]
     );
     // Before the `)` that closes it: the new line moves out.
     let script = "head\n| join (\n  cols a,b) other.csv on a";
     let at = script.find(')').unwrap();
     assert_eq!(
-        helper.indent(&["csvm", script], (1, at), None),
+        server.indent(&["csvm", script], (1, at), None),
         [":depth 0 1"]
     );
     // A colour request in between is answered as before.
-    assert_eq!(helper.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
+    assert_eq!(server.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
     // In an fn body, with an option before the script.
     let script = "fn prep(n) {\n  rename value=n";
     assert_eq!(
-        helper.indent(&["csvm", "-n", "1", script], (3, script.len()), None),
+        server.indent(&["csvm", "-n", "1", script], (3, script.len()), None),
         [":depth 1 1"]
     );
     // Split outside the script, or in a raw one: only the end.
     assert_eq!(
-        helper.indent(&["csvm", "join (", "x.csv"], (2, 1), None),
+        server.indent(&["csvm", "join (", "x.csv"], (2, 1), None),
         Vec::<String>::new()
     );
     assert_eq!(
-        helper.indent(&["csvm", "\"join (\n\""], (1, 8), Some(1)),
+        server.indent(&["csvm", "\"join (\n\""], (1, 8), Some(1)),
         Vec::<String>::new()
     );
-    let (status, err) = helper.finish();
+    let (status, err) = server.finish();
     assert!(status.success(), "{status}: {err}");
     assert_eq!(err, "");
 }
 
 #[test]
-fn csvm_highlight_stops_with_an_error_on_a_broken_request() {
-    let mut helper = Helper::start();
-    helper.send(b"hello\n");
+fn csvm_mode_server_stops_with_an_error_on_a_broken_request() {
+    let mut server = Server::start();
+    server.send(b"hello\n");
     let mut rest = String::new();
-    helper.stdout.read_to_string(&mut rest).unwrap();
+    server.stdout.read_to_string(&mut rest).unwrap();
     assert_eq!(rest, "");
-    let (status, err) = helper.finish();
+    let (status, err) = server.finish();
     assert_eq!(status.code(), Some(1));
-    assert!(err.starts_with("csvm: not a highlight request"), "{err}");
+    assert!(
+        err.starts_with("csvm: not an inkline mode request"),
+        "{err}"
+    );
 }
 
 #[test]
-fn csvm_highlight_exits_quietly_when_its_output_is_closed() {
+fn csvm_mode_server_exits_quietly_when_its_output_is_closed() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_csvm"))
-        .arg("--highlight")
+        .arg("--inkline-mode")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start csvm --highlight");
+        .expect("start csvm --inkline-mode");
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
     stdout.read_line(&mut first).unwrap();
-    assert_eq!(first, "inkline-highlight 1 indent\n");
+    assert_eq!(first, "inkline-mode 1 indent\n");
     // Stop reading: the reply then has nowhere to go.
     drop(stdout);
     let mut stdin = child.stdin.take().unwrap();
@@ -297,25 +300,26 @@ fn csvm_highlight_exits_quietly_when_its_output_is_closed() {
     assert_eq!(err, "");
 }
 
-/// inkline talks to its helper over a socket pair. Closing a socket with
-/// bytes in it still unread resets the connection: the helper's next read
-/// fails with ECONNRESET instead of seeing the end of its input. That is a
-/// reader gone like any other, so the helper ends quietly then too.
+/// inkline talks to its mode server over a socket pair. Closing a socket
+/// with bytes in it still unread resets the connection: the mode server's
+/// next read fails with ECONNRESET instead of seeing the end of its input.
+/// That is a reader gone like any other, so the mode server ends quietly
+/// then too.
 #[cfg(target_os = "linux")]
 #[test]
-fn csvm_highlight_exits_quietly_when_its_connection_is_reset() {
+fn csvm_mode_server_exits_quietly_when_its_connection_is_reset() {
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
 
     let (ours, theirs) = UnixStream::pair().unwrap();
     let theirs_out = theirs.try_clone().unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_csvm"))
-        .arg("--highlight")
+        .arg("--inkline-mode")
         .stdin(Stdio::from(OwnedFd::from(theirs)))
         .stdout(Stdio::from(OwnedFd::from(theirs_out)))
         .stderr(Stdio::piped())
         .spawn()
-        .expect("start csvm --highlight");
+        .expect("start csvm --inkline-mode");
     // Wait for the greeting, but leave it unread.
     let mut byte = 0u8;
     // SAFETY: `byte` is one writable byte for the whole call.
