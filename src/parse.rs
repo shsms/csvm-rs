@@ -1767,6 +1767,212 @@ fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
     Err(err("unterminated `{` group"))
 }
 
+// --- nesting, for indenting a line ------------------------------------------
+
+/// How deep two lines of a script sit, counted in the `fn NAME(…) { … }`
+/// bodies and `join (…)` groups open around them, for an editor that
+/// indents a line it is splitting (`csvm --highlight`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Depths {
+    /// The line that starts where the split is.
+    pub new: usize,
+    /// The line the split is on.
+    pub current: usize,
+}
+
+/// The [`Depths`] for splitting `script` at byte `at` (at most its length). The
+/// script is read with the parser's own rules: comments as `strip_comments`
+/// finds them, `'…'`, `"…"` and `` `…` `` quotes as the group takers
+/// (`take_paren_group`, `take_brace_group`) skip them, and stages split on a
+/// lone `|` or a newline as in `split_stages`. A `{` opens an `fn` body when
+/// its stage's first word is `fn`, and a `(` opens a `join` group when its
+/// stage's first word is `join`; any other bracket only has to be closed. Text
+/// inside a string or a comment is at the depth where the string or comment
+/// started. A line that starts, blanks skipped, with a `)` or `}` that closes a
+/// group gets the depth just after that bracket. When the brackets nest well,
+/// that is one step out. The script need not parse: an unclosed group runs to
+/// the end, and a closing bracket with no group open is passed over, so no
+/// depth is ever below 0.
+pub fn depths(script: &str, at: usize) -> Depths {
+    let text = strip_comments(script);
+    let at = at.min(text.len());
+    let line_start = text.as_bytes()[..at]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |nl| nl + 1);
+    let mut nesting = Nesting::new(&text);
+    nesting.scan(0..line_start);
+    let current = nesting.line_depth(line_start);
+    nesting.scan(line_start..at);
+    let new = nesting.line_depth(at);
+    Depths { new, current }
+}
+
+/// What a stage's first word makes of the brackets in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandWord {
+    /// `join`: a `(` opens a sub-pipeline.
+    Join,
+    /// `fn`: a `{` opens a fragment body.
+    Fn,
+    /// Anything else: a bracket is only a bracket.
+    Other,
+}
+
+/// One bracket left open, or the whole script (the first entry).
+#[derive(Debug)]
+struct Bracket {
+    /// The byte that closes it: `)`, `}`, or 0 for the whole script.
+    close: u8,
+    /// A `join` group or an `fn` body: one step deeper.
+    counts: bool,
+    /// Where its current stage starts, when it holds stages (the whole
+    /// script, an `fn` body, a `join` group); `None` inside an expression.
+    stage: Option<usize>,
+    /// What the current stage's first word is, once a bracket asked.
+    command_word: Option<CommandWord>,
+}
+
+/// A left-to-right scan of comment-free script text that keeps the open
+/// brackets and whether it is inside a quote.
+struct Nesting<'s> {
+    text: &'s str,
+    /// Never empty: the first entry is the whole script and is never closed.
+    brackets: Vec<Bracket>,
+    /// The quote mark of the string the scan is inside.
+    quote: Option<u8>,
+}
+
+impl<'s> Nesting<'s> {
+    fn new(text: &'s str) -> Nesting<'s> {
+        Nesting {
+            text,
+            brackets: vec![Bracket {
+                close: 0,
+                counts: false,
+                stage: Some(0),
+                command_word: None,
+            }],
+            quote: None,
+        }
+    }
+
+    /// Read the bytes of `range`, which starts where the last scan ended.
+    fn scan(&mut self, range: Range<usize>) {
+        let bytes = self.text.as_bytes();
+        let mut i = range.start;
+        while i < range.end {
+            let c = bytes[i];
+            match self.quote {
+                Some(q) => {
+                    if c == q {
+                        self.quote = None;
+                    }
+                }
+                None => match c {
+                    b'\'' | b'"' | b'`' => self.quote = Some(c),
+                    b'(' | b'{' => self.open(c, i),
+                    b')' | b'}' => self.close(c, i),
+                    // `||` is the or-operator, not a stage separator.
+                    b'|' if bytes.get(i + 1) == Some(&b'|') => i += 1,
+                    b'|' | b'\n' => self.new_stage(i + 1),
+                    _ => {}
+                },
+            }
+            i += 1;
+        }
+    }
+
+    /// A stage starts at `at` in the innermost bracket, when that bracket holds
+    /// stages.
+    fn new_stage(&mut self, at: usize) {
+        let top = self.brackets.last_mut().expect("the whole script stays");
+        if top.stage.is_some() {
+            top.stage = Some(at);
+            top.command_word = None;
+        }
+    }
+
+    /// The bracket `c` at byte `i` opens a new level.
+    fn open(&mut self, c: u8, i: usize) {
+        let text = self.text;
+        let top = self.brackets.last_mut().expect("the whole script stays");
+        let word = match top.stage {
+            Some(start) => *top
+                .command_word
+                .get_or_insert_with(|| command_word(&text[start..i])),
+            None => CommandWord::Other,
+        };
+        let counts = matches!(
+            (c, word),
+            (b'(', CommandWord::Join) | (b'{', CommandWord::Fn)
+        );
+        self.brackets.push(Bracket {
+            close: if c == b'(' { b')' } else { b'}' },
+            counts,
+            stage: counts.then_some(i + 1),
+            command_word: None,
+        });
+    }
+
+    /// The bracket `c` at byte `i` closes the innermost bracket it can close,
+    /// and any left open inside it. After an `fn` body a new stage starts,
+    /// as the prologue reads on after the body's `}`.
+    fn close(&mut self, c: u8, i: usize) {
+        let Some(at) = self.closed_by(c) else {
+            return;
+        };
+        let fn_body = c == b'}' && self.brackets[at].counts;
+        self.brackets.truncate(at);
+        if fn_body {
+            self.new_stage(i + 1);
+        }
+    }
+
+    /// The index of the bracket `c` would close; `None` when none is open.
+    fn closed_by(&self, c: u8) -> Option<usize> {
+        self.brackets.iter().rposition(|f| f.close == c)
+    }
+
+    /// The depth of the brackets up to (not including) `end`.
+    fn depth_below(&self, end: usize) -> usize {
+        self.brackets[..end].iter().filter(|f| f.counts).count()
+    }
+
+    /// The depth of a line whose text starts at byte `at`, where the scan
+    /// has stopped: the depth there, or, when the text starts (blanks
+    /// skipped) with a bracket that closes an open one, the depth after it.
+    fn line_depth(&self, at: usize) -> usize {
+        let open = self.brackets.len();
+        if self.quote.is_some() {
+            return self.depth_below(open);
+        }
+        let first = self.text.as_bytes()[at..]
+            .iter()
+            .find(|&&b| b != b' ' && b != b'\t');
+        match first {
+            Some(&c @ (b')' | b'}')) => self.depth_below(self.closed_by(c).unwrap_or(open)),
+            _ => self.depth_below(open),
+        }
+    }
+}
+
+/// What the stage text before a bracket, `head`, makes of it: the stage's
+/// first word, when a blank ends it before the bracket. A bracket inside
+/// the first word (`prep(`, `join(`) is not after a command.
+fn command_word(head: &str) -> CommandWord {
+    let head = head.trim_start();
+    let (word, _) = split_first_word(head);
+    if word.len() == head.len() {
+        return CommandWord::Other;
+    }
+    match word {
+        "join" => CommandWord::Join,
+        "fn" => CommandWord::Fn,
+        _ => CommandWord::Other,
+    }
+}
+
 /// A bare identifier: ASCII letter or `_` first, then letters/digits/`_`.
 fn is_ident(s: &str) -> bool {
     !s.is_empty()
@@ -5135,5 +5341,159 @@ mod tests {
                 ("y", "variable"),
             ]
         );
+    }
+
+    /// [`depths`] for `marked`, a script with one `@` where it is split,
+    /// as `(new, current)`.
+    fn split_at(marked: &str) -> (usize, usize) {
+        let at = marked.find('@').expect("a split mark");
+        let d = depths(&marked.replacen('@', "", 1), at);
+        (d.new, d.current)
+    }
+
+    #[test]
+    fn top_level_lines_are_at_depth_0() {
+        assert_eq!(split_at("@"), (0, 0));
+        assert_eq!(split_at("head\n| sort x@"), (0, 0));
+        assert_eq!(split_at("head |@"), (0, 0));
+        assert_eq!(split_at("head@ | sort x"), (0, 0));
+    }
+
+    #[test]
+    fn an_fn_body_is_one_step_in() {
+        assert_eq!(split_at("fn prep(n) {@"), (1, 0));
+        assert_eq!(split_at("fn prep(n) {\n  rename value=n@"), (1, 1));
+        assert_eq!(
+            split_at("fn prep(n) {\n  rename value=n\n  | cols -v metric\n}@"),
+            (0, 0)
+        );
+        assert_eq!(split_at("fn prep(n) {\n  head\n}\nprep(pv)@"), (0, 0));
+        // The parameter list is not a group.
+        assert_eq!(split_at("fn prep(n@"), (0, 0));
+        // After a body's `}` a new stage starts, as the prologue reads on.
+        assert_eq!(split_at("fn f(x) { head } join (@"), (1, 0));
+    }
+
+    #[test]
+    fn a_join_group_is_one_step_in() {
+        assert_eq!(split_at("head\n| join (@"), (1, 0));
+        assert_eq!(split_at("head\n| join (\n  cols a,b@"), (1, 1));
+        assert_eq!(
+            split_at("head\n| join (\n  cols a,b\n) other.csv on a@"),
+            (0, 0)
+        );
+        // After flags, and in a second item.
+        assert_eq!(split_at("join -l --lsuffix _x (@"), (1, 0));
+        assert_eq!(split_at("join (cols a) a.csv on k, (@"), (1, 0));
+        // A lone `|` starts a stage; `||` does not.
+        assert_eq!(split_at("select a | join (@"), (1, 0));
+        assert_eq!(split_at("select a || join (@"), (0, 0));
+    }
+
+    #[test]
+    fn other_brackets_are_not_groups() {
+        assert_eq!(split_at("select (a > 1 ||@"), (0, 0));
+        assert_eq!(split_at("select (\n  a > 1@"), (0, 0));
+        assert_eq!(split_at("add b = abs(a@)"), (0, 0));
+        // A fragment call, and `join(` with no blank, which is not `join`.
+        assert_eq!(split_at("prep(@"), (0, 0));
+        assert_eq!(split_at("join(@"), (0, 0));
+        // A `)` that closes an expression's bracket is not a step out.
+        assert_eq!(split_at("join (select (a > 1@)"), (1, 0));
+    }
+
+    #[test]
+    fn groups_nest() {
+        assert_eq!(split_at("fn f(x) {\n  join (\n    join (@"), (3, 2));
+        assert_eq!(
+            split_at("fn f(x) {\n  join (\n    join (inner.csv) b.csv on k@"),
+            (2, 2)
+        );
+    }
+
+    #[test]
+    fn a_closing_bracket_after_the_split_moves_the_new_line_out() {
+        assert_eq!(split_at("fn f(x) {\n  head@}"), (0, 1));
+        assert_eq!(split_at("fn f(x) {\n  head@   }"), (0, 1));
+        assert_eq!(split_at("join (\n  cols a@ ) b.csv on k"), (0, 1));
+        // The line split starts with one: that line is one step out too.
+        assert_eq!(split_at("join (\n  cols a\n  ) b.csv on k@"), (0, 0));
+        assert_eq!(split_at("fn f(x) {\n  head\n  }@"), (0, 0));
+        // A closer that closes no group is passed over.
+        assert_eq!(split_at("join (\n  cols a\n  }@"), (1, 1));
+    }
+
+    #[test]
+    fn a_bracket_in_a_quote_or_a_comment_is_text() {
+        assert_eq!(split_at("select a == '{(' @"), (0, 0));
+        assert_eq!(split_at("select a == \"join (\" | head@"), (0, 0));
+        assert_eq!(split_at("join (`a)b` @"), (1, 0));
+        assert_eq!(split_at("fn f(x) { select a == '}' @"), (1, 0));
+        assert_eq!(split_at("head # join (@"), (0, 0));
+        assert_eq!(split_at("join ( # )\n  cols a@"), (1, 1));
+        // A `#` inside a quote is not a comment.
+        assert_eq!(split_at("select a == '#' | join (@"), (1, 0));
+        // Split inside a comment: the depth where the comment started.
+        assert_eq!(split_at("join ( # a@ b"), (1, 0));
+    }
+
+    #[test]
+    fn text_in_an_unclosed_string_is_at_the_depth_where_it_started() {
+        assert_eq!(split_at("join (\n  select a == 'x@"), (1, 1));
+        // A `)` inside the string does not close the group.
+        assert_eq!(split_at("join (\n  select a == 'x\n) y@"), (1, 1));
+        assert_eq!(split_at("join (\n  select a == 'x@\n) y"), (1, 1));
+    }
+
+    #[test]
+    fn depths_never_go_below_0() {
+        assert_eq!(split_at("head\n)@"), (0, 0));
+        assert_eq!(split_at("}})@)"), (0, 0));
+        assert_eq!(split_at("join (a.csv on k))\n)@"), (0, 0));
+    }
+
+    #[test]
+    fn a_split_past_the_end_or_inside_a_character_is_safe() {
+        assert_eq!(depths("join (", 99), Depths { new: 1, current: 0 });
+        assert_eq!(depths("é(", 1), Depths { new: 0, current: 0 });
+        // Byte 10 is inside the `é` of a comment.
+        assert_eq!(depths("join ( # é\n", 10), Depths { new: 1, current: 0 });
+    }
+
+    #[test]
+    fn tabs_and_crlf_lines_are_read_like_spaces_and_newlines() {
+        assert_eq!(split_at("fn f(x) {\n\thead@\t}"), (0, 1));
+        assert_eq!(split_at("join (\r\n  cols a@\r\n) b.csv on k"), (1, 1));
+        assert_eq!(split_at("join (\r\n  cols a\r\n\t) b.csv on k@"), (0, 0));
+    }
+
+    #[test]
+    fn a_split_at_the_start_of_a_line_reads_that_line() {
+        assert_eq!(split_at("join (\n@  cols a"), (1, 1));
+        assert_eq!(split_at("join (\n  cols a\n@) b.csv on k"), (0, 0));
+    }
+
+    #[test]
+    fn a_script_nested_very_deep_is_scanned_without_recursion() {
+        let script = format!("select {}", "(".repeat(100_000));
+        assert_eq!(depths(&script, script.len()), Depths { new: 0, current: 0 });
+        let script = "join (".repeat(10_000);
+        assert_eq!(
+            depths(&script, script.len()),
+            Depths {
+                new: 10_000,
+                current: 0
+            }
+        );
+    }
+
+    #[test]
+    fn closed_groups_before_the_split_are_gone() {
+        assert_eq!(split_at("fn f(x) { head }\nfn g(y) {@"), (1, 0));
+        assert_eq!(
+            split_at("fn f(x) {\n  join (cols a) b.csv on k\n}@"),
+            (0, 0)
+        );
+        assert_eq!(split_at("fn f(x) {\n  join (cols a) b.csv on k@"), (1, 1));
     }
 }
