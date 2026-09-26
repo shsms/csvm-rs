@@ -124,23 +124,17 @@ impl Session {
     /// would reject on this command line.
     pub fn answer(&mut self, request: &Request) -> Reply {
         let mut reply = Reply::default();
-        // Argument 0 is the command's name; csvm's own parser reads the rest.
-        let mut words = Vec::with_capacity(request.args.len());
-        for (i, arg) in request.args.iter().enumerate().skip(1) {
-            match std::str::from_utf8(&arg.bytes) {
-                Ok(text) => words.push(text.to_string()),
-                Err(e) => {
-                    // csvm cannot start with such an argument at all.
-                    let start = e.valid_up_to();
-                    let end = e.error_len().map_or(arg.bytes.len(), |n| start + n);
-                    reply.error = Some(ReplyError::new(
-                        Some((i, start..end)),
-                        "this argument is not valid UTF-8",
-                    ));
-                    return reply;
-                }
+        let words = match words(request) {
+            Ok(words) => words,
+            Err(place) => {
+                // csvm cannot start with such an argument at all.
+                reply.error = Some(ReplyError::new(
+                    Some(place),
+                    "this argument is not valid UTF-8",
+                ));
+                return reply;
             }
-        }
+        };
         let args = match cli::parse_at(words) {
             Ok(Parsed::Run(args)) => args,
             // Help, the version and the helper itself take no script.
@@ -231,6 +225,24 @@ impl Session {
         }
         plan.resolve(&header).err()
     }
+}
+
+/// The arguments after the command's name as text; `Err` with the place of
+/// the first bytes that are not UTF-8.
+fn words(request: &Request) -> Result<Vec<String>, (usize, Range<usize>)> {
+    let mut words = Vec::with_capacity(request.args.len());
+    // Argument 0 is the command's name; csvm's own parser reads the rest.
+    for (i, arg) in request.args.iter().enumerate().skip(1) {
+        match std::str::from_utf8(&arg.bytes) {
+            Ok(text) => words.push(text.to_string()),
+            Err(e) => {
+                let start = e.valid_up_to();
+                let end = e.error_len().map_or(arg.bytes.len(), |n| start + n);
+                return Err((i, start..end));
+            }
+        }
+    }
+    Ok(words)
 }
 
 /// `e`, found in the script, which is argument `arg`, as a reply's error:
