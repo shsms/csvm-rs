@@ -929,14 +929,15 @@ mod tests {
     #[test]
     fn a_multi_line_script_is_coloured_on_every_line() {
         assert_eq!(
-            ask(&["csvm", "cols a\nselect a > 1"]),
+            ask(&["csvm", "cols a\n| select a > 1"]),
             [
                 ":span 1 0 4 command",
                 ":span 1 5 6 variable",
-                ":span 1 7 13 command",
-                ":span 1 14 15 variable",
-                ":span 1 16 17 operator",
-                ":span 1 18 19 number",
+                ":span 1 7 8 operator",
+                ":span 1 9 15 command",
+                ":span 1 16 17 variable",
+                ":span 1 18 19 operator",
+                ":span 1 20 21 number",
             ]
         );
     }

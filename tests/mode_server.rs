@@ -191,14 +191,15 @@ fn csvm_mode_server_answers_each_request_in_order() {
     );
     // A script on two lines of one argument.
     assert_eq!(
-        server.ask(dir, &["csvm", "cols amount\nselect amount > 1", name]),
+        server.ask(dir, &["csvm", "cols amount\n| select amount > 1", name]),
         [
             ":span 1 0 4 command",
             ":span 1 5 11 variable",
-            ":span 1 12 18 command",
-            ":span 1 19 25 variable",
-            ":span 1 26 27 operator",
-            ":span 1 28 29 number",
+            ":span 1 12 13 operator",
+            ":span 1 14 20 command",
+            ":span 1 21 27 variable",
+            ":span 1 28 29 operator",
+            ":span 1 30 31 number",
         ]
     );
     // `-f`: only the options are checked.

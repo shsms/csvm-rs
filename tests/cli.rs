@@ -270,3 +270,22 @@ fn an_unknown_column_is_marked_where_it_is_named() {
         "{err}"
     );
 }
+
+#[test]
+fn a_script_file_splits_stages_only_at_a_pipe() {
+    // One stage over several lines, comments, blank lines, and `|`s at the
+    // start of the lines that start a stage.
+    let script = temp_csv(
+        "# keep the big ones\n\
+         select a > 1\n  \
+           && b != 'x'   # not the x rows\n\
+         \n\
+         | add c = a *\n    \
+             2\n\
+         | cols a,\n  \
+           c\n",
+    );
+    let (ok, out, err) = csvm(&["-f", script.to_str().unwrap()], "a,b\n1,y\n2,y\n3,x\n");
+    assert!(ok, "{err}");
+    assert_eq!(out, "a,c\n2,4\n");
+}

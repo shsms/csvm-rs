@@ -32,8 +32,8 @@ fn power_factor_pipeline_with_fragments() {
         "fn prep(n) {{ rename value=n | cols -v metric }}\n\
          fn pf(t, a, r) {{ add t = abs(a) / sqrt(a*a + r*r) }}\n\
          prep(active)\n\
-         join (prep(reactive)) {} on timestamp\n\
-         pf(pf_col, active, reactive)",
+         | join (prep(reactive)) {} on timestamp\n\
+         | pf(pf_col, active, reactive)",
         reactive.display()
     );
     let out = run(&script, "timestamp,metric,value\n1,p,4\n2,p,3\n").unwrap();

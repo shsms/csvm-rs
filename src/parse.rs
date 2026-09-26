@@ -65,8 +65,8 @@ fn parse_stages(
     builder.note_separators(script, &stages);
     for (i, stage) in stages.iter().enumerate() {
         let stage = stage.trim();
-        // Skip blank stages: a blank or comment-only line in a multi-line `-f`
-        // script, or a trailing `|`. A wholly empty script is caught below.
+        // Skip empty stages: `a | | b`, a trailing `|`, or only comments. A
+        // wholly empty script is caught below.
         if stage.is_empty() {
             continue;
         }
@@ -1592,9 +1592,10 @@ fn head_count_text(rest: &str) -> &str {
 // --- stage / word splitting -------------------------------------------------
 
 /// Remove `#`-to-end-of-line comments, respecting string and backtick quoting (a
-/// `#` inside `'…'`, `"…"`, or `` `…` `` is data, not a comment). Newlines are
-/// kept so stage splitting and trimming are unchanged. Mainly for multi-line
-/// scripts read via `-f`, but works inline too.
+/// `#` inside `'…'`, `"…"`, or `` `…` `` is data, not a comment). Each comment
+/// becomes blanks and its newline is kept, so every offset after it is the
+/// same as in the script. Mainly for multi-line scripts read via `-f`, but
+/// works inline too.
 fn strip_comments(script: &str) -> String {
     strip_comments_noting(script, |_| {})
 }
@@ -1641,11 +1642,12 @@ fn strip_comments_noting(script: &str, mut comment: impl FnMut(Range<usize>)) ->
     out
 }
 
-/// Split a script into stages on a lone, unquoted `|` **or a newline** — so a
-/// multi-line `-f` script can write one stage per line without trailing `|`s. A
-/// `||` (the *or* operator) and a `|`/newline inside a string literal or a
-/// `join (…)` group are left intact, so `select` expressions need no quoting of
-/// their own. Blank stages (blank or comment-only lines) are dropped by `parse`.
+/// Split a script into stages on a lone, unquoted `|`. A newline is a blank
+/// like any other, so one stage may run over several lines. A `||` (the *or*
+/// operator) and a `|` inside a string literal or any `( … )`, such as a
+/// `join (…)` group, are left intact, so `select` expressions need no quoting
+/// of their own. Blank stages (`a | | b`, a `|` at the end) are dropped by
+/// `parse`.
 fn split_stages(script: &str) -> Vec<&str> {
     let mut stages = Vec::new();
     let bytes = script.as_bytes();
@@ -1684,13 +1686,6 @@ fn split_stages(script: &str) -> Vec<&str> {
                     start = i + 1;
                     i += 1;
                 }
-            }
-            // A newline separates stages too (for multi-line `-f` scripts), but
-            // not inside a `join (…)` group, whose own stages split on their own.
-            None if c == b'\n' && depth == 0 => {
-                stages.push(&script[start..i]);
-                start = i + 1;
-                i += 1;
             }
             None => i += 1,
         }
@@ -3327,7 +3322,7 @@ mod tests {
         assert_eq!(span("select a @ 1"), Some(9..10));
         assert_eq!(span("add b = a +"), Some(11..11)); // the end
         // A comment keeps the offsets after it the script's own.
-        assert_eq!(span("cols a # note\nselect a >> 1"), Some(24..25));
+        assert_eq!(span("cols a # note\n| select a >> 1"), Some(26..27));
         // An unknown command's word; a call, from its name to its `)`.
         assert_eq!(span("cols a | selct a"), Some(9..14));
         assert_eq!(span("add c = pow(a)"), Some(8..14));
@@ -4810,11 +4805,21 @@ mod tests {
         }
     }
 
+    /// The statements of `script`'s one transform stage, as `{:?}` shows
+    /// them, to compare two scripts by.
+    fn one_transform(script: &str) -> String {
+        let plan = parse(script).unwrap();
+        let [Stage::Transform(stmts)] = plan.stages.as_slice() else {
+            panic!("expected one transform stage, got {:?}", plan.stages);
+        };
+        format!("{stmts:?}")
+    }
+
     #[test]
-    fn newlines_separate_stages_and_blank_lines_are_skipped() {
-        // A multi-line `-f`-style script: newlines split stages, and blank or
-        // comment-only lines are dropped.
-        let script = "# header comment\nselect a > 0\n\nadd b = a * 2   # trailing comment\nfmt";
+    fn a_stage_ends_only_at_a_pipe() {
+        // A newline is a blank: the stages are the ones the `|`s make.
+        let script =
+            "# header comment\nselect a > 0\n\n| add b = a * 2   # trailing comment\n| fmt";
         let plan = parse(script).unwrap();
         let Stage::Transform(stmts) = &plan.stages[0] else {
             panic!();
@@ -4822,12 +4827,51 @@ mod tests {
         assert!(matches!(stmts[0], Stmt::Select(_)));
         assert!(matches!(&stmts[1], Stmt::Add(a) if a.name == "b"));
         assert_eq!(plan.output, OutputFormat::Aligned(TableOpts::default()));
-
-        // A newline inside a `join (…)` group doesn't split the outer pipeline.
-        let plan = parse("rename value=a\njoin (\n rename value=b\n) r.csv on key\nfmt").unwrap();
-        assert!(plan.stages.iter().any(|s| matches!(s, Stage::Join(_))));
+        // An expression, a `?:` and a list, each over several lines, with
+        // comments inside the stage and inside a bracket.
+        assert_eq!(
+            one_transform("select a > 0 # first\n  && (b > 1 # in a bracket\n    || c > 2)"),
+            one_transform("select a > 0 && (b > 1 || c > 2)")
+        );
+        assert_eq!(
+            one_transform("add y = a > 1 ?\n  'big' :\n  'small'"),
+            one_transform("add y = a > 1 ? 'big' : 'small'")
+        );
+        assert_eq!(
+            one_transform("cols a,\n  b\n  c"),
+            one_transform("cols a,b,c")
+        );
+        let plan = parse("agg sum(a),\n  max(b)\n  by k").unwrap();
+        let [Stage::Group(g)] = plan.stages.as_slice() else {
+            panic!("expected a group stage, got {:?}", plan.stages);
+        };
+        assert_eq!(g.aggs.len(), 2);
+        assert_eq!(g.keys.len(), 1);
+        // A CRLF script, and blank lines and comments between stages.
+        assert_eq!(
+            one_transform("select a > 0\r\n\r\n# note\r\n| cols a\r\n"),
+            one_transform("select a > 0 | cols a")
+        );
+        // An empty stage is skipped.
+        assert_eq!(
+            one_transform("select a > 0 | | cols a |"),
+            one_transform("select a > 0 | cols a")
+        );
+        // A `join (…)` group over several lines, its own stages split by `|`.
+        let plan = parse(
+            "rename value=a\n| join (\n  rename value=b\n  | cols -v x\n) r.csv on key\n| fmt",
+        )
+        .unwrap();
+        let join = plan.stages.iter().find_map(|s| match s {
+            Stage::Join(j) => Some(j),
+            _ => None,
+        });
+        assert_eq!(join.expect("a join stage").right_plan.stages.len(), 1);
+        // `fn` definitions, a blank line, then the pipeline with no `|`.
+        let plan =
+            parse("fn f(x) {\n  rename value=x\n  | cols -v m\n}\n\nf(a)\n| head 3").unwrap();
+        assert_eq!(plan.stages.len(), 2);
     }
-
     #[test]
     fn prologue_extracts_fn_definitions() {
         let (fns, rest) =
@@ -4922,7 +4966,7 @@ mod tests {
             e.contains("in fn `f`") && e.contains("unknown command"),
             "{e}"
         );
-        assert!(m("head\nfn f(a) { tail }").contains("before the first stage"));
+        assert!(m("head\n| fn f(a) { tail }").contains("before the first stage"));
         // A defined fragment called without parens points at the call form.
         let e = m("fn prep(n) { head }\nprep pv");
         assert!(e.contains("call it as `prep(ARGS)`"), "{e}");
@@ -5073,11 +5117,12 @@ mod tests {
     #[test]
     fn recording_notes_comments_where_they_are() {
         assert_eq!(
-            noted("cols a # keep a\nselect a > 1 # and 'this'"),
+            noted("cols a # keep a\n| select a > 1 # and 'this'"),
             [
                 ("cols", "command"),
                 ("a", "variable"),
                 ("# keep a", "comment"),
+                ("|", "operator"),
                 ("select", "command"),
                 ("a", "variable"),
                 (">", "operator"),
