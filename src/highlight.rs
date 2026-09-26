@@ -198,17 +198,13 @@ impl Session {
     /// header. `None` when there is none, or when the header cannot be
     /// known here: an argument is `raw`, or the input is stdin, a relative
     /// path with no shell directory to take it from, not a regular file, or
-    /// cannot be read; or the script has a join.
+    /// cannot be read; or the same holds for a join's file.
     fn check_columns(
         &mut self,
         request: &Request,
         args: &cli::Args,
         plan: &mut Plan,
     ) -> Option<Error> {
-        // A join's file is not read yet, so a plan with one is not checked.
-        if plan.stages.iter().any(|s| matches!(s, Stage::Join(_))) {
-            return None;
-        }
         // A `raw` argument anywhere may become other words, or none, and so
         // change the input, its header, or what csvm makes of the line.
         if request.args[1..].iter().any(|a| a.raw) {
@@ -230,6 +226,9 @@ impl Session {
                 cli::Header::resolve(spec.as_ref(), first, 0).0
             }
         };
+        if let Err(e) = resolve_joins(plan, cwd, &mut self.headers) {
+            return e;
+        }
         plan.resolve(&header).err()
     }
 }
@@ -260,6 +259,30 @@ fn from_dir(cwd: Option<&Path>, path: &Path) -> Option<PathBuf> {
     } else {
         cwd.map(|dir| dir.join(path))
     }
+}
+
+/// Resolve each join's sub-pipeline in `plan` against its file's header,
+/// the sub-pipeline's own joins first, as `exec::prepare_joins` does at
+/// start-up, with a relative file taken from the shell's directory `cwd`.
+/// Each file's first line comes from `headers`, like the input's. The
+/// error is `None` when a file's header cannot be known here: its path is
+/// relative and `cwd` is not known, it is not a regular file (a FIFO or a
+/// device could block reading it), or its first line cannot be read.
+fn resolve_joins(
+    plan: &mut Plan,
+    cwd: Option<&Path>,
+    headers: &mut Headers,
+) -> Result<(), Option<Error>> {
+    for stage in &mut plan.stages {
+        if let Stage::Join(j) = stage {
+            resolve_joins(&mut j.right_plan, cwd, headers)?;
+            let path = from_dir(cwd, Path::new(&j.file)).ok_or(None)?;
+            // A join's right file is always CSV.
+            let header = headers.first_line(&path, InputFormat::Csv).ok_or(None)?;
+            j.right_header = j.right_plan.resolve(&header).map_err(Some)?;
+        }
+    }
+    Ok(())
 }
 
 /// How many files [`Headers`] keeps; past that it starts again from none.
@@ -1102,7 +1125,8 @@ mod tests {
     fn a_relative_path_needs_the_shells_directory() {
         let dir = TempDir::new("cwd");
         let data = dir.write("data.csv", "a\n1\n");
-        let data = data.to_str().unwrap();
+        let right = dir.write("right.csv", "a,b\n1,2\n");
+        let (data, right) = (data.to_str().unwrap(), right.to_str().unwrap());
         let ask_from = |cwd: &[u8], args: &[&str]| {
             let mut req = request("", args);
             req.cwd = cwd.to_vec();
@@ -1114,10 +1138,18 @@ mod tests {
         // has no column `zz`.
         for cwd in [&b""[..], b"\xff", b"relative/dir"] {
             assert!(no_error(&ask_from(cwd, &["csvm", "cols zz", "Cargo.toml"])));
-            // An absolute path is still checked.
+            let script = "join Cargo.toml on a | cols zz";
+            assert!(no_error(&ask_from(cwd, &["csvm", script, data])));
+            // An absolute path is still checked, the input's and a join's.
             assert_eq!(
                 ask_from(cwd, &["csvm", "cols zz", data]).last().unwrap(),
                 ":error 1 5 7 column not found: zz — have: a"
+            );
+            let script = format!("join {right} on a | cols zz");
+            let at = script.len() - 2;
+            assert_eq!(
+                *ask_from(cwd, &["csvm", &script, data]).last().unwrap(),
+                format!(":error 1 {at} {} column not found: zz — have: a, b", at + 2)
             );
         }
     }
@@ -1141,6 +1173,12 @@ mod tests {
                 .expect("the answer waited on the FIFO")
         };
         assert!(no_error(&answer(&["csvm", "cols zz", "pipe.csv"])));
+        dir.write("left.csv", "k\n1\n");
+        assert!(no_error(&answer(&[
+            "csvm",
+            "join pipe.csv on k | cols zz",
+            "left.csv"
+        ])));
     }
 
     #[test]
@@ -1202,5 +1240,91 @@ mod tests {
             .unwrap()
             .set_modified(time)
             .unwrap();
+    }
+
+    #[test]
+    fn a_join_is_checked_against_its_right_file() {
+        let dir = TempDir::new("join");
+        dir.write("left.csv", "k,a\n1,2\n");
+        dir.write("right.csv", "k,b\n1,3\n");
+        let ask_in = |script: &str| {
+            reply_lines(
+                &Session::default().answer(&request(dir.path(), &["csvm", script, "left.csv"])),
+            )
+        };
+        // A column the join brings in is there after it.
+        assert!(no_error(&ask_in("join right.csv on k | cols b")));
+        // One its sub-pipeline cannot find is the error, where it is named.
+        assert_eq!(
+            ask_in("join (cols zz) right.csv on k").last().unwrap(),
+            ":error 1 11 13 column not found: zz — have: k, b"
+        );
+        // A join inside a join's sub-pipeline is resolved first.
+        dir.write("inner.csv", "k,c\n1,4\n");
+        assert!(no_error(&ask_in(
+            "join (join inner.csv on k) right.csv on k | cols c"
+        )));
+        assert_eq!(
+            ask_in("join (join inner.csv on k | cols zz) right.csv on k")
+                .last()
+                .unwrap(),
+            ":error 1 33 35 column not found: zz — have: k, b, c"
+        );
+        // A right file that is not there is not a column error.
+        assert!(no_error(&ask_in("join nope.csv on k | cols b")));
+        // Nor is one whose first line is longer than the limit: it is not
+        // read to its end.
+        dir.write("wide.csv", &"k".repeat(MAX_HEADER_BYTES as usize + 10));
+        assert!(no_error(&ask_in("join wide.csv on k | cols zz")));
+    }
+
+    #[test]
+    fn a_join_file_is_read_again_only_when_it_changes() {
+        let dir = TempDir::new("joincache");
+        dir.write("left.csv", "k,a\n1,2\n");
+        let right = dir.write("right.csv", "k,bb\n1,3\n");
+        let mut session = Session::default();
+        let mut ask_in = |script: &str| {
+            reply_lines(&session.answer(&request(dir.path(), &["csvm", script, "left.csv"])))
+        };
+        let script = "join right.csv on k | cols bb";
+        assert!(no_error(&ask_in(script)));
+        // Same size and time: the kept header, though the bytes differ.
+        let time = std::fs::metadata(&right).unwrap().modified().unwrap();
+        std::fs::write(&right, "k,cc\n1,3\n").unwrap();
+        set_time(&right, time);
+        assert!(no_error(&ask_in(script)));
+        // A new time: read again.
+        set_time(&right, time + Duration::from_secs(1));
+        assert_eq!(
+            ask_in(script).last().unwrap(),
+            ":error 1 27 29 column not found: bb — have: k, a, cc"
+        );
+    }
+
+    #[test]
+    fn a_join_file_that_cannot_be_read_is_not_read_again_while_unchanged() {
+        let dir = TempDir::new("joinfail");
+        dir.write("left.csv", "k,a\n1,2\n");
+        let mut session = Session::default();
+        let mut ask_in = |script: &str| {
+            reply_lines(&session.answer(&request(dir.path(), &["csvm", script, "left.csv"])))
+        };
+        // A first line too long to read: no check, and while the file is
+        // unchanged it is not read again, though its first line is now
+        // short.
+        let wide = dir.write("wide.csv", &"k".repeat(MAX_HEADER_BYTES as usize + 10));
+        let script = "join wide.csv on k | cols zz";
+        assert!(no_error(&ask_in(script)));
+        let time = std::fs::metadata(&wide).unwrap().modified().unwrap();
+        let short_first = format!("k\n{}", "k".repeat(MAX_HEADER_BYTES as usize + 8));
+        std::fs::write(&wide, short_first).unwrap();
+        set_time(&wide, time);
+        assert!(no_error(&ask_in(script)));
+        set_time(&wide, time + Duration::from_secs(1));
+        assert_eq!(
+            ask_in(script).last().unwrap(),
+            ":error 1 26 28 column not found: zz — have: k, a"
+        );
     }
 }
