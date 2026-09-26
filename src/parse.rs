@@ -509,6 +509,62 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Note a flag's name: `word` up to an `=` that gives its value.
+    fn note_flag(&mut self, word: &str) {
+        if !self.recording() {
+            return;
+        }
+        self.note(
+            &word[..word.find('=').unwrap_or(word.len())],
+            SpanKind::Option,
+        );
+    }
+
+    /// Note a `head`/`tail` count: the number, and the flag written before
+    /// it (`-n`, `--lines`).
+    fn note_count(&mut self, rest: &str) {
+        if !self.recording() {
+            return;
+        }
+        let rest = rest.trim();
+        let number = head_count_text(rest);
+        let flag = rest[..rest.len() - number.len()]
+            .trim_end()
+            .trim_end_matches('=');
+        self.note(flag, SpanKind::Option);
+        self.note(number, SpanKind::Number);
+    }
+
+    /// Note the parts of one `agg` item as written: the output name and its
+    /// `=` when given, and the function's name.
+    fn note_agg_item(&mut self, text: &str) {
+        if !self.recording() {
+            return;
+        }
+        let call = match split_name_eq(text) {
+            Ok((_, after, Some(call))) => {
+                self.note(text[..text.len() - after.len()].trim(), SpanKind::Variable);
+                self.note(&after[..1], SpanKind::Operator);
+                call.trim()
+            }
+            _ => text.trim(),
+        };
+        let func = call.find('(').map_or(call, |open| call[..open].trim_end());
+        self.note(func, SpanKind::Function);
+    }
+
+    /// Note the `=` of an `old=new` pair written as `text`, and the name
+    /// after it.
+    fn note_pair_rhs(&mut self, text: &str) {
+        if !self.recording() {
+            return;
+        }
+        if let Some(eq) = text.find('=') {
+            self.note(&text[eq..eq + 1], SpanKind::Operator);
+            self.note(text[eq + 1..].trim_start(), SpanKind::Variable);
+        }
+    }
+
     /// Group the flat item list into stages: runs of statements become a
     /// `Transform`; every other item is already a stage of its own.
     fn take_plan(&mut self) -> Plan {
@@ -765,6 +821,7 @@ impl<'a> Builder<'a> {
                 .push(Item::Stage(Stage::DropLast(n.unsigned_abs() as usize))),
             Count::From(_) => return Err(err("head doesn't support +N (that is tail's form)")),
         }
+        self.note_count(rest);
         Ok(())
     }
 
@@ -779,6 +836,7 @@ impl<'a> Builder<'a> {
                 .items
                 .push(Item::Stage(Stage::Skip(n.saturating_sub(1)))),
         }
+        self.note_count(rest);
         Ok(())
     }
 
@@ -814,6 +872,9 @@ impl<'a> Builder<'a> {
         let mut rsuffix = None;
         loop {
             let (word, after) = split_first_word(s);
+            if word.starts_with('-') && word != "-" {
+                self.note_flag(word);
+            }
             // `-L S` / `-R S` (or `=S`) set per-side clash suffixes.
             if let Some(v) = flag_value(word, after, &["-L", "--lsuffix"]) {
                 let (val, rest_after) = v?;
@@ -888,6 +949,12 @@ impl<'a> Builder<'a> {
             if file == "-" {
                 return Err(err("join's right side must be a file, not stdin"));
             }
+            // The path as written, quotes included.
+            let typed = f.trim_start();
+            self.note(
+                typed[..typed.len() - after.len()].trim_end(),
+                SpanKind::String,
+            );
             f = after.trim_start();
 
             // Optional `on KEY[,KEY...]`.
@@ -897,6 +964,7 @@ impl<'a> Builder<'a> {
                 if kw != "on" {
                     return Err(err("join expects `on KEY[,KEY...]` after the file"));
                 }
+                self.note(kw, SpanKind::Keyword);
                 self.parse_join_keys(key_str, &mut keys)?;
                 if keys.is_empty() {
                     return Err(err("join `on` expects at least one key column"));
@@ -957,8 +1025,10 @@ impl<'a> Builder<'a> {
                 Some((l, r)) if !l.is_empty() && !r.is_empty() => (l, r),
                 Some(_) => return Err(err(format!("join `on`: bad key '{spec}'"))),
             };
+            let text = &spec_list[at.clone()];
             // Only the left key is looked up in the stream this part reads.
             self.read_column_in(l, spec_list, at, 0);
+            self.note_pair_rhs(text);
             keys.push((l.to_string(), r.to_string()));
         }
         Ok(())
@@ -990,6 +1060,7 @@ impl<'a> Builder<'a> {
         let mut aggs = Vec::new();
         for (spec, at) in specs {
             let agg = parse_agg_spec(spec)?;
+            self.note_agg_item(&rest[at.clone()]);
             if let Some(col) = &agg.col {
                 // The column is inside the call's parentheses, after any
                 // `NAME=` (which may hold a `(` too), as parse_agg_spec reads it.
@@ -1003,6 +1074,9 @@ impl<'a> Builder<'a> {
                 self.read_column_in(col, rest, at.clone(), from);
             }
             aggs.push(agg);
+        }
+        if let Some(i) = by_at {
+            self.note(&rest[items[i].1.clone()], SpanKind::Keyword);
         }
         if aggs.is_empty() {
             return Err(err(
@@ -1037,7 +1111,10 @@ impl<'a> Builder<'a> {
         // choose the chart (see `default_graph_kind`).
         let (kind_word, after_kind) = split_first_word(rest.trim());
         let (named, rest) = match graph_kind(kind_word) {
-            Some(kind) => (Some(kind), after_kind),
+            Some(kind) => {
+                self.note(kind_word, SpanKind::Keyword);
+                (Some(kind), after_kind)
+            }
             None => (None, rest.trim()),
         };
         let mut opts = GraphOpts::default();
@@ -1045,6 +1122,9 @@ impl<'a> Builder<'a> {
         let mut s = rest.trim();
         while !s.is_empty() {
             let (word, after) = split_first_word(s);
+            if word.starts_with('-') && word != "-" {
+                self.note_flag(word);
+            }
             if let Some(v) = flag_value(word, after, &["-b", "--bins"]) {
                 let (val, tail) = v?;
                 opts.bins = Some(parse_positive(&val, "-b/--bins", MAX_CELLS)?);
@@ -1140,6 +1220,9 @@ impl<'a> Builder<'a> {
     /// output rows at render time.
     fn parse_color(&mut self, rest: &str) -> Result<(), Error> {
         let (first, after) = split_first_word(rest.trim());
+        if first == "-g" || first == "-c" {
+            self.note(first, SpanKind::Option);
+        }
         match first {
             "" => Err(err("color expects arguments")),
             "-g" => self.parse_color_gradient(after),
@@ -1148,6 +1231,7 @@ impl<'a> Builder<'a> {
                 if col.is_empty() {
                     return Err(err("color -c expects a column name"));
                 }
+                self.note(col, SpanKind::Variable);
                 self.parse_color_predicate(ColorScope::Cell(ColRef::new(col.to_string())), tail)
             }
             // Colour-first: the rest (colour + expression) is the predicate form.
@@ -1161,6 +1245,7 @@ impl<'a> Builder<'a> {
             return Err(err("color expects a colour"));
         }
         let style = parse_style(spec).map_err(err)?;
+        self.note(spec, SpanKind::Keyword);
         let expr_src = expr_src.trim();
         if expr_src.is_empty() {
             return Err(err("color expects a condition expression"));
@@ -1187,7 +1272,9 @@ impl<'a> Builder<'a> {
             if t.contains(':') || t.parse::<f64>().is_ok() {
                 break;
             }
-            cols.push(it.next().unwrap().to_string());
+            let t = it.next().unwrap();
+            self.note(t, SpanKind::Variable);
+            cols.push(t.to_string());
         }
         if cols.is_empty() {
             return Err(err("color -g expects a column name"));
@@ -1195,16 +1282,25 @@ impl<'a> Builder<'a> {
         // The ramp is optional (defaults to green:red); when present it applies
         // to every listed column, as do the bounds.
         let ramp = match it.peek() {
-            Some(t) if t.contains(':') => parse_ramp(it.next().unwrap()).map_err(err)?,
+            Some(t) if t.contains(':') => {
+                let t = it.next().unwrap();
+                self.note(t, SpanKind::Keyword);
+                parse_ramp(t).map_err(err)?
+            }
             _ => Ramp::default(),
         };
         let bounds = match (it.next(), it.next()) {
-            (Some(lo), Some(hi)) => Some((
-                lo.parse::<f64>()
-                    .map_err(|_| err(format!("color -g: bad lower bound '{lo}'")))?,
-                hi.parse::<f64>()
-                    .map_err(|_| err(format!("color -g: bad upper bound '{hi}'")))?,
-            )),
+            (Some(lo), Some(hi)) => {
+                let bounds = (
+                    lo.parse::<f64>()
+                        .map_err(|_| err(format!("color -g: bad lower bound '{lo}'")))?,
+                    hi.parse::<f64>()
+                        .map_err(|_| err(format!("color -g: bad upper bound '{hi}'")))?,
+                );
+                self.note(lo, SpanKind::Number);
+                self.note(hi, SpanKind::Number);
+                Some(bounds)
+            }
             (None, None) => None,
             _ => return Err(err("color -g needs both LO and HI, or neither")),
         };
@@ -1226,7 +1322,9 @@ impl<'a> Builder<'a> {
         for (spec, at) in split_items(rest, false, false).0 {
             match spec.split_once('=') {
                 Some((from, to)) if !from.is_empty() && !to.is_empty() => {
+                    let text = &rest[at.clone()];
                     self.read_column_in(from, rest, at, 0);
+                    self.note_pair_rhs(text);
                     pairs.push((from.to_string(), to.to_string()));
                 }
                 _ => return Err(err(format!("rename expects old=new pairs, got '{spec}'"))),
@@ -1247,6 +1345,7 @@ impl<'a> Builder<'a> {
         let mut s = rest.trim();
         while !s.is_empty() {
             let (word, after) = split_first_word(s);
+            self.note_flag(word);
             let flag = if let Some(v) = flag_value(word, after, &["-p", "--precision"]) {
                 let (n, tail) = v?;
                 table.decimals = Some(n.parse().map_err(|_| {
@@ -1289,7 +1388,10 @@ impl<'a> Builder<'a> {
 
     fn parse_cols(&mut self, rest: &str) -> Result<(), Error> {
         let (exclude, list) = match rest.strip_prefix("-v") {
-            Some(r) => (true, r.trim_start()),
+            Some(r) => {
+                self.note(&rest[..2], SpanKind::Option);
+                (true, r.trim_start())
+            }
             None => (false, rest),
         };
         let names = self.column_list(list);
@@ -1316,7 +1418,15 @@ impl<'a> Builder<'a> {
             ));
         }
         let expr_src = match assigned {
-            Some(e) => e.trim(),
+            Some(e) => {
+                let written = rest.trim_start();
+                self.note(
+                    written[..written.len() - after.len()].trim_end(),
+                    SpanKind::Variable,
+                );
+                self.note(&after[..1], SpanKind::Operator);
+                e.trim()
+            }
             None => {
                 let old = after.trim();
                 // The hints quote the name as the script must (a name with
@@ -1364,7 +1474,15 @@ impl<'a> Builder<'a> {
             if name.is_empty() {
                 return Err(err("sort spec is missing a column name"));
             }
+            let text = &rest[at.clone()];
             self.read_column_in(&name, rest, at, 0);
+            // The flags, from their `=` on.
+            if self.recording()
+                && !flags.is_empty()
+                && let Some(eq) = text.rfind('=')
+            {
+                self.note(&text[eq..], SpanKind::Option);
+            }
             let mut key = SortKey {
                 mode: SortMode::Auto,
                 name,
@@ -1399,9 +1517,13 @@ impl<'a> Builder<'a> {
         // (like `cols -v`) negates the *whole* expression — `select -v EXPR`
         // drops the matching rows — which is `!(EXPR)`, sidestepping the De
         // Morgan trap of negating each operator.
-        let (negate, expr_src) = match rest.trim().strip_prefix("-v") {
-            Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => (true, r.trim()),
-            _ => (false, rest.trim()),
+        let rest = rest.trim();
+        let (negate, expr_src) = match rest.strip_prefix("-v") {
+            Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => {
+                self.note(&rest[..2], SpanKind::Option);
+                (true, r.trim())
+            }
+            _ => (false, rest),
         };
         if expr_src.is_empty() {
             return Err(err("select expects an expression"));
@@ -4689,10 +4811,138 @@ mod tests {
             "select a >> 1",
             "join (selct a) r.csv on k | cols b",
             "join -l (cols a | select a >> 1) r.csv on k, (uniq k) s.csv on k",
+            "cols -v a | rename a = b | add t = abs(c) | select -v t > 1 | tail --lines=+3",
+            "color -g v w green:red 0 10 | graph hist v -b 5",
         ] {
             let plain = format!("{:?}", parse(script));
             let recorded = format!("{:?}", parse_recorded(script, &mut Recorder::default()));
             assert_eq!(plain, recorded, "{script}");
+        }
+    }
+
+    #[test]
+    fn recording_notes_flags_names_and_keywords() {
+        for (script, want) in [
+            (
+                "cols -v a",
+                vec![("cols", "command"), ("-v", "option"), ("a", "variable")],
+            ),
+            (
+                "select -v a > 1",
+                vec![
+                    ("select", "command"),
+                    ("-v", "option"),
+                    ("a", "variable"),
+                    (">", "operator"),
+                    ("1", "number"),
+                ],
+            ),
+            (
+                "sort d=nr e",
+                vec![
+                    ("sort", "command"),
+                    ("d", "variable"),
+                    ("=nr", "option"),
+                    ("e", "variable"),
+                ],
+            ),
+            (
+                "head -n 5",
+                vec![("head", "command"), ("-n", "option"), ("5", "number")],
+            ),
+            (
+                "tail --lines=+3",
+                vec![("tail", "command"), ("--lines", "option"), ("+3", "number")],
+            ),
+            (
+                "add t = abs(c)",
+                vec![
+                    ("add", "command"),
+                    ("t", "variable"),
+                    ("=", "operator"),
+                    ("abs", "function"),
+                    ("c", "variable"),
+                ],
+            ),
+            (
+                "rename a = b",
+                vec![
+                    ("rename", "command"),
+                    ("a", "variable"),
+                    ("=", "operator"),
+                    ("b", "variable"),
+                ],
+            ),
+            (
+                "agg n=sum(e), count by f",
+                vec![
+                    ("agg", "command"),
+                    ("n", "variable"),
+                    ("=", "operator"),
+                    ("sum", "function"),
+                    ("e", "variable"),
+                    ("count", "function"),
+                    ("by", "keyword"),
+                    ("f", "variable"),
+                ],
+            ),
+            (
+                "join -l --lsuffix=_x (cols k) 'r s.csv' on k=id",
+                vec![
+                    ("join", "command"),
+                    ("-l", "option"),
+                    ("--lsuffix", "option"),
+                    ("cols", "command"),
+                    ("k", "variable"),
+                    ("'r s.csv'", "string"),
+                    ("on", "keyword"),
+                    ("k", "variable"),
+                    ("=", "operator"),
+                    ("id", "variable"),
+                ],
+            ),
+            (
+                "color -c v red v > 1",
+                vec![
+                    ("color", "command"),
+                    ("-c", "option"),
+                    ("v", "variable"),
+                    ("red", "keyword"),
+                    ("v", "variable"),
+                    (">", "operator"),
+                    ("1", "number"),
+                ],
+            ),
+            (
+                "color -g v w green:red 0 10",
+                vec![
+                    ("color", "command"),
+                    ("-g", "option"),
+                    ("v", "variable"),
+                    ("w", "variable"),
+                    ("green:red", "keyword"),
+                    ("0", "number"),
+                    ("10", "number"),
+                ],
+            ),
+            (
+                "fmt -s -p 2",
+                vec![("fmt", "command"), ("-s", "option"), ("-p", "option")],
+            ),
+            (
+                "graph line x y -t T --color-by=z",
+                vec![
+                    ("graph", "command"),
+                    ("line", "keyword"),
+                    ("x", "variable"),
+                    ("y", "variable"),
+                    ("-t", "option"),
+                    ("--color-by", "option"),
+                    ("z", "variable"),
+                ],
+            ),
+        ] {
+            assert_eq!(noted(script), want, "{script}");
         }
     }
 }
