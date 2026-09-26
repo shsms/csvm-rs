@@ -289,3 +289,16 @@ fn a_script_file_splits_stages_only_at_a_pipe() {
     assert!(ok, "{err}");
     assert_eq!(out, "a,c\n2,4\n");
 }
+
+#[test]
+fn a_missing_pipe_in_a_script_file_is_noted() {
+    let script = temp_csv("select a > 1\nhead 5\n");
+    let (ok, _, err) = csvm(&["-f", script.to_str().unwrap()], "a\n1\n2\n");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "csvm: missing `|` before `head`? \
+         unexpected 'head' after the expression\n\
+         2 | head 5\n  | ^^^^\n"
+    );
+}

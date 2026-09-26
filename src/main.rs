@@ -116,7 +116,7 @@ fn run() -> Result<(), Failure> {
         None => args.script.clone(),
     };
     // Parse the pipe script into a plan here, once.
-    let mut plan = parse::parse(&script).map_err(|e| script_error(&script, &e, &console))?;
+    let mut plan = parse::parse(&script).map_err(|e| script_error(&script, e, &console))?;
     let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,
@@ -127,10 +127,10 @@ fn run() -> Result<(), Failure> {
 
     let (mut source, header) = open_source(&args)?;
     // Joins need each right file's header to resolve; read them (IO) first.
-    exec::prepare_joins(&mut plan).map_err(|e| script_error(&script, &e, &console))?;
+    exec::prepare_joins(&mut plan).map_err(|e| script_error(&script, e, &console))?;
     let out_header = plan
         .resolve(&header)
-        .map_err(|e| script_error(&script, &e, &console))?;
+        .map_err(|e| script_error(&script, e, &console))?;
 
     if args.explain {
         // The plan goes to stdout even with -o, so it pages by stdout.
@@ -201,8 +201,10 @@ fn run() -> Result<(), Failure> {
 
 /// A script error's message and, when it has a place in the script, the line
 /// it is on with the place marked (in colour when the console colours errors):
-/// for an unknown column, where the column is named.
-fn script_error(script: &str, e: &csvm::error::Error, console: &Console) -> String {
+/// for an unknown column, where the column is named. The message notes a `|`
+/// that may be missing (`parse::note_missing_pipe`).
+fn script_error(script: &str, e: csvm::error::Error, console: &Console) -> String {
+    let e = parse::note_missing_pipe(script, e);
     let Some(span) = e.span() else {
         return e.to_string();
     };

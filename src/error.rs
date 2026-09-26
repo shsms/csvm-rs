@@ -65,6 +65,24 @@ impl Error {
             error => error,
         }
     }
+
+    /// `self` with `note` before its message, at the same place. The
+    /// message is put on one line, so an editor that shows only a message's
+    /// first line (or cuts it at the screen's width) still shows the note.
+    pub fn with_note(self, note: &str) -> Error {
+        let message = breaks_to_spaces(&self.unplaced().to_string());
+        let noted = Error::Compile(format!("{note} {message}"));
+        match self.span() {
+            Some(span) => noted.at(span),
+            None => noted,
+        }
+    }
+}
+
+/// `text` with each line break (LF, CRLF or CR) turned into a space, so a
+/// message that quotes text from several lines of a script stays on one line.
+fn breaks_to_spaces(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\n', '\r'], " ")
 }
 
 /// The line of `script` that `span` starts on, with a `^` under each column
@@ -196,6 +214,29 @@ mod tests {
         assert_eq!(e.to_string(), "bad");
         assert!(matches!(e.unplaced(), Error::Compile(m) if m == "bad"));
         assert_eq!(Error::Compile("x".into()).span(), None);
+    }
+
+    #[test]
+    fn a_note_comes_before_the_message_and_keeps_the_place() {
+        let e = Error::Compile("bad".into()).at(3..5).with_note("try this?");
+        assert_eq!(e.span(), Some(3..5));
+        assert_eq!(e.to_string(), "try this? bad");
+        let e = Error::Column {
+            name: "fmt".into(),
+            available: vec!["a".into()],
+        }
+        .with_note("add `|`?");
+        assert_eq!(e.span(), None);
+        assert_eq!(e.to_string(), "add `|`? column not found: fmt — have: a");
+    }
+
+    #[test]
+    fn a_noted_message_is_on_one_line() {
+        // A message quoting text across a line break: LF, CRLF or CR.
+        for text in ["zz\nhead", "zz\r\nhead", "zz\rhead"] {
+            let e = Error::Compile(format!("bad '{text}'")).with_note("note?");
+            assert_eq!(e.to_string(), "note? bad 'zz head'");
+        }
     }
 
     #[test]

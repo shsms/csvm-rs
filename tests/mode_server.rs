@@ -202,6 +202,16 @@ fn csvm_mode_server_answers_each_request_in_order() {
             ":span 1 30 31 number",
         ]
     );
+    // The same without its `|`: `cols` reads on, and the column error
+    // notes the missing `|`.
+    assert_eq!(
+        server
+            .ask(dir, &["csvm", "cols amount\nselect amount > 1", name])
+            .last()
+            .unwrap(),
+        ":error 1 12 18 missing `|` before `select`? \
+         column not found: select — have: amount, region"
+    );
     // `-f`: only the options are checked.
     assert_eq!(
         server.ask(dir, &["csvm", "-f", "prog.csvm", name]),

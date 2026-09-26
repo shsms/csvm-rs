@@ -195,7 +195,7 @@ impl Session {
             Ok(mut plan) => self.check_columns(request, &args, &mut plan),
             Err(e) => Some(e),
         };
-        reply.error = error.map(|e| script_error(arg, &args.script, &e));
+        reply.error = error.map(|e| script_error(arg, &args.script, e));
         reply
     }
 
@@ -277,8 +277,10 @@ fn words(request: &Request) -> Result<Vec<String>, (usize, Range<usize>)> {
 }
 
 /// `e`, found in the script, which is argument `arg`, as a reply's error:
-/// on its place in the script when it has one.
-fn script_error(arg: usize, script: &str, e: &Error) -> ReplyError {
+/// on its place in the script when it has one, noting a `|` that may be
+/// missing (`parse::note_missing_pipe`).
+fn script_error(arg: usize, script: &str, e: Error) -> ReplyError {
+    let e = parse::note_missing_pipe(script, e);
     let place = e.span().map(|at| {
         let end = at.end.min(script.len());
         (arg, at.start.min(end)..end)
@@ -939,6 +941,21 @@ mod tests {
                 ":span 1 18 19 operator",
                 ":span 1 20 21 number",
             ]
+        );
+    }
+
+    #[test]
+    fn a_missing_pipe_is_noted_in_the_error() {
+        assert_eq!(
+            ask(&["csvm", "select a > 1\nhead"]).last().unwrap(),
+            ":error 1 13 17 missing `|` before `head`? \
+             unexpected 'head' after the expression"
+        );
+        // A row count quoted over two lines still sends the whole note.
+        assert_eq!(
+            ask(&["csvm", "head 5\nfmt"]).last().unwrap(),
+            ":error 1 0 10 missing `|` before `fmt`? \
+             head expects a row count, got '5 fmt'"
         );
     }
 

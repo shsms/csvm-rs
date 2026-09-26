@@ -26,6 +26,7 @@ use crate::plan::{
     OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Stage,
     StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
+use std::cell::OnceCell;
 use std::ops::Range;
 
 /// Compile a pipe script into an executable [`Plan`].
@@ -1587,6 +1588,159 @@ fn head_count_text(rest: &str) -> &str {
         return r.trim_start(); // obsolete `-N`
     }
     rest
+}
+
+// --- the missing-`|` note ---------------------------------------------------
+
+/// `e`, an error found in `script`, with a note that a `|` may be missing,
+/// when its place in the script covers a word a `|` may be missing before
+/// (see `missing_pipe_word`). For an error found parsing the script or
+/// resolving its plan; any other error comes back as it is.
+pub fn note_missing_pipe(script: &str, e: Error) -> Error {
+    let Some(span) = e.span() else {
+        return e;
+    };
+    let text = strip_comments(script);
+    // The fragment definitions and the pipeline after them, read only when
+    // a word is not a command or a line ends in an operator.
+    let prologue = OnceCell::new();
+    let prologue = || {
+        prologue.get_or_init(|| parse_prologue(&text).unwrap_or_else(|_| (FnTable::new(), &text)))
+    };
+    // Where each stage of the pipeline starts and whether its command takes
+    // an expression. A `join ( … )` group's stages are read as part of the
+    // `join`.
+    let stages = OnceCell::new();
+    let word = missing_pipe_word(
+        &text,
+        span,
+        |name| prologue().0.contains_key(name),
+        |at| {
+            let stages: &Vec<(usize, bool)> = stages.get_or_init(|| {
+                split_stages(prologue().1)
+                    .into_iter()
+                    .filter_map(|stage| Some((offset_in(&text, stage)?, takes_expression(stage))))
+                    .collect()
+            });
+            let next = stages.partition_point(|&(start, _)| start <= at);
+            next > 0 && stages[next - 1].1
+        },
+    );
+    match word {
+        Some(word) => e.with_note(&missing_pipe_note(word)),
+        None => e,
+    }
+}
+
+/// The note for a `|` missing before `word`.
+fn missing_pipe_note(word: &str) -> String {
+    format!("missing `|` before `{word}`?")
+}
+
+/// A blank byte on one line: the ASCII whitespace `str::trim` skips, except
+/// the `\n` that ends the line — space, tab, `\r`, and the two less common
+/// ASCII blanks, vertical tab and form feed.
+/// Shared by the forward scan below (a line with nothing else is skipped)
+/// and the backward one in [`missing_pipe_at`] (finding the last real
+/// character), so a line of nothing but one of these costs the same either
+/// way: a single pass, not a backward scan per line.
+fn is_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c)
+}
+
+/// The first word in `span` of `text`, comment-free script text, that a `|`
+/// may be missing before: a word that starts a line (only blanks before it
+/// on its line) but not a stage (the text before it, blanks and newlines
+/// skipped, is not the start of `text` nor a `|`, `(`, `{` or `}`), nor the
+/// next line of a stage that goes on (see [`continues_stage`];
+/// `in_expression` says whether the byte it is given is in an expression
+/// stage), and is a command other than `fn` (a removed one too, so its
+/// advice is reached), or a name `is_fn` takes for a defined fragment. The
+/// word ends at a blank or a `(`.
+fn missing_pipe_word(
+    text: &str,
+    span: Range<usize>,
+    mut is_fn: impl FnMut(&str) -> bool,
+    mut in_expression: impl FnMut(usize) -> bool,
+) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let end = span.end.min(bytes.len());
+    let mut at = span.start.min(end);
+    loop {
+        // Only blanks before `at` on its line.
+        let line_start = bytes[..at].iter().rposition(|&b| !is_blank(b));
+        if line_start.is_none_or(|i| bytes[i] == b'\n') {
+            // Skip the blanks at `at`. A line with nothing else — blank, or
+            // (after `strip_comments`) comment-only — is skipped without
+            // looking behind it, so a run of such lines costs one pass, not
+            // one backward scan per line.
+            let first = at + bytes[at..end].iter().take_while(|&&b| is_blank(b)).count();
+            if first < end
+                && bytes[first] != b'\n'
+                && let Some(word) = missing_pipe_at(text, first, &mut is_fn, &mut in_expression)
+            {
+                return Some(word);
+            }
+        }
+        // On to the next line in the span.
+        let nl = bytes[at..end].iter().position(|&b| b == b'\n')?;
+        at += nl + 1;
+    }
+}
+
+/// The word at byte `at` of `text`, the first text on its line, when a `|`
+/// may be missing before it: see [`missing_pipe_word`].
+fn missing_pipe_at<'t>(
+    text: &'t str,
+    at: usize,
+    is_fn: &mut impl FnMut(&str) -> bool,
+    in_expression: &mut impl FnMut(usize) -> bool,
+) -> Option<&'t str> {
+    let bytes = text.as_bytes();
+    // A word that starts a stage has nothing but blanks (and newlines) before
+    // it since the `|`, the bracket or the start of the script.
+    let before = bytes[..at]
+        .iter()
+        .rposition(|&b| !is_blank(b) && b != b'\n')?;
+    if matches!(bytes[before], b'|' | b'(' | b'{' | b'}') {
+        return None;
+    }
+    let len = bytes[at..]
+        .iter()
+        .position(|&b| b.is_ascii_whitespace() || b == b'(')
+        .unwrap_or(bytes.len() - at);
+    let word = text.get(at..at + len)?;
+    if !((is_reserved(word) && word != "fn") || is_fn(word)) {
+        return None;
+    }
+    (!continues_stage(bytes[before], || in_expression(before))).then_some(word)
+}
+
+/// The bytes an operator is made of, for [`continues_stage`].
+const OPERATOR_BYTES: &[u8] = b"&+-*/%?:=<>!~";
+
+/// Whether the stage goes on after a line whose last non-blank byte is
+/// `last`: it is a `,` (a list spilled onto the next line), or an operator
+/// byte in an expression (`in_expression`), spaced or not (`a &&`, `a+`).
+/// In any other command an operator byte at the end is part of a column's
+/// name (`cpu%`, or a column named `%`).
+fn continues_stage(last: u8, in_expression: impl FnOnce() -> bool) -> bool {
+    match last {
+        b',' => true,
+        b if OPERATOR_BYTES.contains(&b) => in_expression(),
+        _ => false,
+    }
+}
+
+/// Whether `stage`'s command takes an expression: `select`, `add`, or a
+/// `color` rule with a condition (not a `-g` gradient).
+fn takes_expression(stage: &str) -> bool {
+    let (command, rest) = split_first_word(stage.trim());
+    match command {
+        "select" | "add" => true,
+        "color" | "colour" => split_first_word(rest).0 != "-g",
+        _ => false,
+    }
 }
 
 // --- stage / word splitting -------------------------------------------------
@@ -4872,6 +5026,210 @@ mod tests {
             parse("fn f(x) {\n  rename value=x\n  | cols -v m\n}\n\nf(a)\n| head 3").unwrap();
         assert_eq!(plan.stages.len(), 2);
     }
+
+    /// The message of the error `script` fails to parse with, noted as
+    /// `csvm` shows it.
+    fn noted_error(script: &str) -> String {
+        note_missing_pipe(script, parse(script).unwrap_err()).to_string()
+    }
+
+    /// The message of the error `script`'s plan fails to resolve with over
+    /// the columns `header`, noted as `csvm` shows it.
+    fn noted_resolve_error(script: &str, header: &[&str]) -> String {
+        let mut plan = parse(script).unwrap();
+        let header: Vec<String> = header.iter().map(|h| h.to_string()).collect();
+        note_missing_pipe(script, plan.resolve(&header).unwrap_err()).to_string()
+    }
+
+    #[test]
+    fn a_missing_pipe_before_a_command_on_its_own_line_is_noted() {
+        // The error is at a command that starts a line.
+        assert_eq!(
+            noted_error("select a > 0\nhead 5"),
+            "missing `|` before `head`? \
+             unexpected 'head' after the expression"
+        );
+        // A comment and blanks before it on its line.
+        let e = noted_error("select a > 0 # keep\n  # more\n\thead 5");
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+        // An error on the whole stage: the first such command in it.
+        assert_eq!(
+            noted_error("rename value=a\nselect a > 1\nfmt"),
+            "missing `|` before `select`? \
+             rename expects old=new pairs, got 'select'"
+        );
+        assert_eq!(
+            noted_error("head 5\nfmt"),
+            "missing `|` before `fmt`? \
+             head expects a row count, got '5 fmt'"
+        );
+        // A defined fragment's call.
+        let e = noted_error("fn p(n) { head }\nselect a > 0\np(x)");
+        assert!(e.starts_with("missing `|` before `p`? "), "{e}");
+        // The place is unchanged.
+        let e = note_missing_pipe(
+            "select a > 0\nhead 5",
+            parse("select a > 0\nhead 5").unwrap_err(),
+        );
+        assert_eq!(e.span(), Some(13..17));
+    }
+
+    #[test]
+    fn a_resolve_error_at_a_command_on_its_own_line_is_noted() {
+        assert_eq!(
+            noted_resolve_error("cols a,b\nfmt", &["a", "b"]),
+            "missing `|` before `fmt`? column not found: fmt — have: a, b"
+        );
+    }
+
+    #[test]
+    fn a_line_ending_in_a_comma_is_a_continuation_not_a_missing_pipe() {
+        // `cols a,` spills its list onto the next line: `head` there reads
+        // as a second column, not a forgotten `|` before a command.
+        assert_eq!(
+            noted_resolve_error("cols a,\n  head", &["a", "b"]),
+            "column not found: head — have: a, b"
+        );
+        // No trailing comma: the note still applies (same as the test above).
+        let noted = noted_resolve_error("cols a,b\nfmt", &["a", "b"]);
+        assert!(noted.starts_with("missing `|` before `fmt`? "), "{noted}");
+    }
+
+    #[test]
+    fn a_line_ending_in_an_operator_is_a_continuation_not_a_missing_pipe() {
+        // The next line goes on with the expression: no note.
+        assert_eq!(
+            noted_resolve_error("select size > 2 &&\n  color == 'red'", &["size", "colr"]),
+            "column not found: color (did you mean `colr`?) — have: size, colr"
+        );
+        let e = noted_resolve_error("add x = size +\n  tail", &["size"]);
+        assert!(!e.contains("missing `|`"), "{e}");
+        let e = noted_error("select size =~\n  head");
+        assert!(!e.contains("missing `|`"), "{e}");
+        // An operator with no blank before it.
+        let e = noted_resolve_error("select size>2&&\n  color == 'red'", &["size", "colr"]);
+        assert!(e.starts_with("column not found: color"), "{e}");
+        let e = noted_resolve_error("add x = size+\n  head", &["size"]);
+        assert!(e.starts_with("column not found: head"), "{e}");
+        // In a list, an operator byte at the end is part of a column's name.
+        let e = noted_resolve_error("sort cpu%\nhead 1", &["id", "cpu%"]);
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+        let e = noted_resolve_error("cols id paid?\nfmt", &["id", "paid?"]);
+        assert!(e.starts_with("missing `|` before `fmt`? "), "{e}");
+        let e = noted_resolve_error("cols name %\nhead 5", &["name", "%"]);
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+        // The stage the line is in decides, after other stages and after
+        // `fn` definitions too.
+        let e = noted_resolve_error("cols size | add x = size +\n  tail", &["size"]);
+        assert!(e.starts_with("column not found: tail"), "{e}");
+        let e = noted_resolve_error("select size > 0 | sort cpu%\nhead 1", &["size", "cpu%"]);
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+        let script = "fn f() {\n  cols x\n  | head\n}\nselect x > 0 &&\n  head > 1";
+        let e = noted_resolve_error(script, &["x"]);
+        assert!(e.starts_with("column not found: head"), "{e}");
+    }
+
+    #[test]
+    fn select_add_and_a_color_condition_are_expressions() {
+        for stage in [
+            "select a > 1",
+            " add x = a",
+            "color red a > 1",
+            "colour -c a red a > 1",
+        ] {
+            assert!(takes_expression(stage), "{stage:?}");
+        }
+        for stage in ["color -g a b", "sort a", "cols a", "agg sum(a)", ""] {
+            assert!(!takes_expression(stage), "{stage:?}");
+        }
+    }
+
+    #[test]
+    fn a_removed_command_on_its_own_line_is_noted() {
+        let e = noted_error("select a > 0\ngroup by k");
+        assert!(e.starts_with("missing `|` before `group`? "), "{e}");
+        // With the `|`, its advice is reached.
+        let e = noted_error("select a > 0\n| group by k");
+        assert!(e.starts_with("group was removed: "), "{e}");
+    }
+
+    #[test]
+    fn no_missing_pipe_is_noted_where_a_stage_starts_or_the_error_is_mid_line() {
+        // An error in the middle of a line.
+        assert_eq!(
+            noted_error("select a >> 1\nhead"),
+            "expected a column, number, string, or function, found '>'"
+        );
+        // A command that starts a stage: after a `|`, at the start, after a
+        // `fn` body, or in a `join (…)` group.
+        assert_eq!(
+            noted_error("head |\nagg bogus(a)"),
+            "agg: unknown function `bogus`"
+        );
+        assert_eq!(
+            noted_error("\nagg bogus(a)"),
+            "agg: unknown function `bogus`"
+        );
+        assert_eq!(
+            noted_error("fn f(x) { head }\nagg bogus(a)"),
+            "agg: unknown function `bogus`"
+        );
+        assert!(!noted_error("join (\nagg bogus(a)) r.csv on k").contains("missing `|`"));
+        // A word that is not a command, and `fn`, which must come first.
+        assert!(!noted_error("select a > 0\nhed 5").contains("missing `|`"));
+        assert!(!noted_error("head\nfn f(a) { tail }").contains("missing `|`"));
+        // An error with no place.
+        assert_eq!(noted_error("# nothing"), "empty script");
+    }
+
+    #[test]
+    fn the_missing_pipe_note_reads_crlf_lines_and_comments() {
+        // A CRLF script, as an editor on Windows saves it.
+        let e = noted_error("select a > 0\r\nhead 5\r\n");
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+        // A comment with a quote mark or a `|` in it changes nothing.
+        let e = noted_error("select a > 0 # it's | not a stage\nhead 5");
+        assert!(e.starts_with("missing `|` before `head`? "), "{e}");
+    }
+
+    #[test]
+    fn the_missing_pipe_note_is_safe_on_any_place() {
+        // A place past the end, or inside a character.
+        let e = note_missing_pipe("é\nhead", err("x").at(1..99));
+        assert_eq!(e.span(), Some(1..99));
+        assert!(
+            e.to_string().starts_with("missing `|` before `head`? "),
+            "{e}"
+        );
+        let e = note_missing_pipe("select a\nhead", err("x").at(40..50));
+        assert_eq!(e.to_string(), "x");
+    }
+
+    #[test]
+    fn the_missing_pipe_note_on_a_long_stage_is_one_pass() {
+        // A `rename` over 200,000 real-content lines, then 20,000 blank,
+        // 20,000 comment-only (which `strip_comments` turns to blanks), and
+        // 20,000 form-feed-only lines, then the bad word: the note looks at
+        // every line once, so a long run of blank, comment or form-feed
+        // lines costs no more than its length. The bound is generous: this
+        // is a debug build and the machine may be loaded.
+        let script = format!(
+            "rename a=b\n{}{}{}{}select",
+            "  c=d\n".repeat(200_000),
+            "\n".repeat(20_000),
+            "  # note\n".repeat(20_000),
+            "\x0c\n".repeat(20_000),
+        );
+        let start = std::time::Instant::now();
+        let e = noted_error(&script);
+        assert!(e.starts_with("missing `|` before `select`? "), "{e}");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
     #[test]
     fn prologue_extracts_fn_definitions() {
         let (fns, rest) =
