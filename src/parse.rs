@@ -1784,15 +1784,16 @@ pub struct Depths {
 /// script is read with the parser's own rules: comments as `strip_comments`
 /// finds them, `'…'`, `"…"` and `` `…` `` quotes as the group takers
 /// (`take_paren_group`, `take_brace_group`) skip them, and stages split on a
-/// lone `|` or a newline as in `split_stages`. A `{` opens an `fn` body when
-/// its stage's first word is `fn`, and a `(` opens a `join` group when its
-/// stage's first word is `join`; any other bracket only has to be closed. Text
-/// inside a string or a comment is at the depth where the string or comment
-/// started. A line that starts, blanks skipped, with a `)` or `}` that closes a
-/// group gets the depth just after that bracket. When the brackets nest well,
-/// that is one step out. The script need not parse: an unclosed group runs to
-/// the end, and a closing bracket with no group open is passed over, so no
-/// depth is ever below 0.
+/// lone `|` or a newline as in `split_stages`, except in an `fn` header before
+/// its `{`, which `parse_fn_def` reads across newlines. A `{` opens an `fn`
+/// body when its stage's first word is `fn`, and a `(` opens a `join` group
+/// when its stage's first word is `join`; any other bracket only has to be
+/// closed. Text inside a string or a comment is at the depth where the string
+/// or comment started. A line that starts, blanks skipped, with a `)` or `}`
+/// that closes a group gets the depth just after that bracket. When the
+/// brackets nest well, that is one step out. The script need not parse: an
+/// unclosed group runs to the end, and a closing bracket with no group open is
+/// passed over, so no depth is ever below 0.
 pub fn depths(script: &str, at: usize) -> Depths {
     let text = strip_comments(script);
     let at = at.min(text.len());
@@ -1829,7 +1830,8 @@ struct Bracket {
     /// Where its current stage starts, when it holds stages (the whole
     /// script, an `fn` body, a `join` group); `None` inside an expression.
     stage: Option<usize>,
-    /// What the current stage's first word is, once a bracket asked.
+    /// What the current stage's first word is, once a bracket, a `|` or a
+    /// newline asked.
     command_word: Option<CommandWord>,
 }
 
@@ -1875,11 +1877,44 @@ impl<'s> Nesting<'s> {
                     b')' | b'}' => self.close(c, i),
                     // `||` is the or-operator, not a stage separator.
                     b'|' if bytes.get(i + 1) == Some(&b'|') => i += 1,
-                    b'|' | b'\n' => self.new_stage(i + 1),
+                    b'|' | b'\n' if !self.fn_header_pending(i) => self.new_stage(i + 1),
                     _ => {}
                 },
             }
             i += 1;
+        }
+    }
+
+    /// True while the innermost bracket's current stage, read so far, starts
+    /// `fn` and has not opened its body yet: `parse_fn_def` reads an `fn`'s
+    /// parameter list and the blank before its `{` across newlines, so a
+    /// `|` or a newline there does not start a new stage (the `}` that
+    /// closes the body still does, from [`close`](Self::close)). `at` is
+    /// the `|` or newline. A newline counts as the blank after `fn`, as it
+    /// does for the parser. The first word is kept once found, so a long
+    /// header is read once.
+    fn fn_header_pending(&mut self, at: usize) -> bool {
+        let end = if self.text.as_bytes()[at] == b'\n' {
+            at + 1
+        } else {
+            at
+        };
+        // A first word that is not `fn` is dropped with the stage, which
+        // starts again after this `|` or newline.
+        self.stage_command_word(end) == CommandWord::Fn
+    }
+
+    /// What the innermost bracket's current stage, read up to `end`, makes
+    /// of a bracket; `Other` inside an expression. The first word is kept
+    /// once found.
+    fn stage_command_word(&mut self, end: usize) -> CommandWord {
+        let text = self.text;
+        let top = self.brackets.last_mut().expect("the whole script stays");
+        match top.stage {
+            Some(start) => *top
+                .command_word
+                .get_or_insert_with(|| command_word(&text[start..end])),
+            None => CommandWord::Other,
         }
     }
 
@@ -1895,14 +1930,7 @@ impl<'s> Nesting<'s> {
 
     /// The bracket `c` at byte `i` opens a new level.
     fn open(&mut self, c: u8, i: usize) {
-        let text = self.text;
-        let top = self.brackets.last_mut().expect("the whole script stays");
-        let word = match top.stage {
-            Some(start) => *top
-                .command_word
-                .get_or_insert_with(|| command_word(&text[start..i])),
-            None => CommandWord::Other,
-        };
+        let word = self.stage_command_word(i);
         let counts = matches!(
             (c, word),
             (b'(', CommandWord::Join) | (b'{', CommandWord::Fn)
@@ -5375,6 +5403,23 @@ mod tests {
     }
 
     #[test]
+    fn an_fn_headers_brace_may_be_on_its_own_line() {
+        // `parse_fn_def` finds the body's `{` across newlines; a newline in
+        // the header must not read as a new, non-`fn` stage.
+        assert_eq!(split_at("fn f(x)\n{@"), (1, 0));
+        assert_eq!(split_at("fn f(x)\n{\n  head@"), (1, 1));
+        // The parameter list itself may start on its own line too.
+        assert_eq!(split_at("fn f\n(x) {@"), (1, 0));
+        assert_eq!(split_at("fn f\n(x) {\n  head@"), (1, 1));
+        // And so may the name: the parser reads a newline after `fn` as a
+        // blank.
+        assert_eq!(split_at("fn\nf(x) {@"), (1, 0));
+        assert_eq!(split_at("fn\nf(x) {\n  head@"), (1, 1));
+        // The `}` that closes the body still starts a new stage.
+        assert_eq!(split_at("fn f(x)\n{\n  head\n}@"), (0, 0));
+    }
+
+    #[test]
     fn a_join_group_is_one_step_in() {
         assert_eq!(split_at("head\n| join (@"), (1, 0));
         assert_eq!(split_at("head\n| join (\n  cols a,b@"), (1, 1));
@@ -5484,6 +5529,22 @@ mod tests {
                 new: 10_000,
                 current: 0
             }
+        );
+    }
+
+    #[test]
+    fn a_long_fn_header_of_blank_lines_does_not_go_quadratic() {
+        // `fn`, then 50,000 blank lines and no `(` yet: the stage's first
+        // word is read once, not again at each newline over all the blanks
+        // after `fn`. A generous bound: this is a debug build and the
+        // machine may be loaded.
+        let script = format!("fn {}", " \n".repeat(50_000));
+        let start = std::time::Instant::now();
+        assert_eq!(depths(&script, script.len()), Depths { new: 0, current: 0 });
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
         );
     }
 
