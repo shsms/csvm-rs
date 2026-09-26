@@ -27,7 +27,7 @@
 use crate::cli::{self, InputFormat, Parsed};
 use crate::error::Error;
 use crate::exec;
-use crate::parse::{self, Recorder, SpanKind};
+use crate::parse::{self, Depths, Recorder, SpanKind};
 use crate::plan::{Plan, Stage};
 use std::collections::HashMap;
 use std::fs::File;
@@ -229,6 +229,26 @@ impl Session {
         }
         plan.resolve(&header).err()
     }
+}
+
+/// The answer to an `:indent` request: the [`Depths`] where `at`, its
+/// `:at`, splits the script. `None`, for a reply with no `:depth`, when
+/// csvm finds no script on the line (an argument is not UTF-8, the line is
+/// a usage error, help, or has `-f`), when `at` is in another argument, or
+/// when the script is `raw`: bash will still change it, so its text is not
+/// what csvm gets. Unlike a colour request, a script that does not parse
+/// still gets depths.
+pub fn indent(request: &Request, at: (usize, usize)) -> Option<Depths> {
+    let (at_arg, offset) = at;
+    let words = words(request).ok()?;
+    let Ok(Parsed::Run(args)) = cli::parse_at(words) else {
+        return None;
+    };
+    let arg = args.script_at? + 1;
+    if at_arg != arg || request.args[arg].raw {
+        return None;
+    }
+    Some(parse::depths(&args.script, offset))
 }
 
 /// The arguments after the command's name as text; `Err` with the place of
@@ -1475,5 +1495,70 @@ mod tests {
             bad(b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:at 0 0\n:done\n"),
             InvalidData
         );
+    }
+
+    #[test]
+    fn the_script_is_split_where_it_is_on_the_line() {
+        let script = "head\n| join (\n  cols a";
+        assert_eq!(
+            indent(
+                &request("/", &["csvm", "-n", "2", script, "x.csv"]),
+                (3, script.len())
+            ),
+            Some(Depths { new: 1, current: 1 })
+        );
+        let script = "head\n| join (";
+        assert_eq!(
+            indent(&request("/", &["csvm", script]), (1, script.len())),
+            Some(Depths { new: 1, current: 0 })
+        );
+        // Offsets count bytes, as for colours.
+        let script = "select a == 'é' | join (\n  cols b";
+        assert_eq!(
+            indent(&request("/", &["csvm", script]), (1, script.len())),
+            Some(Depths { new: 1, current: 1 })
+        );
+        // A script that does not parse still gets depths from its brackets.
+        let script = "selct a\nfn f() {";
+        assert_eq!(
+            indent(&request("/", &["csvm", script]), (1, script.len())),
+            Some(Depths { new: 1, current: 0 })
+        );
+    }
+
+    #[test]
+    fn no_depths_without_a_script_to_split() {
+        // The split is in another argument than the script.
+        assert_eq!(
+            indent(&request("/", &["csvm", "join (", "x.csv"]), (2, 1)),
+            None
+        );
+        assert_eq!(indent(&request("/", &["csvm", "join ("]), (0, 2)), None);
+        // No script on the line: `-f`, help, a usage error, nothing yet.
+        assert_eq!(
+            indent(&request("/", &["csvm", "-f", "p.csvm", "x"]), (3, 1)),
+            None
+        );
+        assert_eq!(
+            indent(&request("/", &["csvm", "help", "join"]), (2, 1)),
+            None
+        );
+        assert_eq!(
+            indent(&request("/", &["csvm", "--colr", "join ("]), (2, 6)),
+            None
+        );
+        assert_eq!(indent(&request("/", &["csvm"]), (0, 4)), None);
+        // An argument that is not UTF-8.
+        let mut req = request("/", &["csvm", "join ("]);
+        req.args[1].bytes = b"join (\xff".to_vec();
+        assert_eq!(indent(&req, (1, 6)), None);
+        // A raw script is not the text csvm gets.
+        let mut req = request("/", &["csvm", "\"join (\n\""]);
+        req.args[1].raw = true;
+        assert_eq!(indent(&req, (1, 8)), None);
+        // A raw argument elsewhere does not stop it, as for colours.
+        let mut req = request("/", &["csvm", "join (", "$f"]);
+        req.args[2].raw = true;
+        assert_eq!(indent(&req, (1, 6)), Some(Depths { new: 1, current: 0 }));
     }
 }
