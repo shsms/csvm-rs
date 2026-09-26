@@ -20,6 +20,11 @@ git history; this file is the "what next / what was decided" scratchpad.
   =on= clause is lexically identical to more key columns, so a forgotten
   per-file =on= only surfaces at resolve time. Requiring =on= per item, or a
   distinct item separator, removes the trap.
+- =cli::Usage= could be called =UsageError=, which says what it is.
+- The =--highlight= join walk (=resolve_joins=) repeats =exec::prepare_joins=,
+  and its header choice repeats =open_source=; sharing them would keep the
+  helper and a real run from drifting apart. The test request helpers in
+  =src/highlight.rs= and =tests/highlight.rs= could be one.
 
 ** TODO Correctness / edges
 - sort: a string sort key containing a literal =\0= (rare in CSV) sorts
@@ -59,6 +64,28 @@ git history; this file is the "what next / what was decided" scratchpad.
   =--highlight= helper, which then exits, so inkline turns its colouring
   off. A depth limit in the expression parser, an error past it, would
   fix both.
+- =--highlight=: a raw argument after the script (=csvm '...' $f=) is
+  taken to stay one argument, so the script's errors are still sent. If
+  =$f= expands to =--help= or to several words, csvm itself would not give
+  the error the helper shows. Asking inkline for the expanded words is the
+  only full fix.
+- =--highlight=: the "did you mean" hint for a fragment name can change
+  from one keystroke to the next, because the fn table is a =HashMap=.
+  Sorting the candidates (or keeping the table in definition order) makes
+  the hint stable.
+- =--highlight=: between the regular-file check and the =open=, a FIFO
+  could take the file's place. Opening with =O_NONBLOCK= and checking the
+  opened file would close the gap.
+- =--highlight --help= and =--highlight -V= print the help or the version
+  instead of the usage error, and =--highlight=x= is accepted with the
+  =x= dropped (as =--explain=x= is).
+- No test reads a real Parquet header through =--highlight= with
+  =--features parquet=; only the cases with no check are covered.
+- Colouring details in =--highlight=: =fmt= colours every word as an
+  option, not only the ones starting with =-=; a comment's colour on a
+  CRLF line includes the =\r=; an =fn= header with no ={= yet colours the
+  next definition's text as =variable=; =sort a = nr= colours the space
+  after =\== as part of the option.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a
