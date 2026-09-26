@@ -41,10 +41,11 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
 /// [`parse`], noting in `rec` what each part of the script is, for
 /// `csvm --highlight`. It builds the same plan as [`parse`], or fails the
 /// same way. What was noted before an error stays in `rec`, and each stage
-/// after the one that failed gets its command word noted.
+/// after the one that failed gets its command word noted. A `fn` definition
+/// that fails is skipped, and the ones after it are still noted.
 pub fn parse_recorded(script: &str, rec: &mut Recorder) -> Result<Plan, Error> {
     let script = strip_comments_noting(script, |at| rec.push(at, SpanKind::Comment));
-    let (fns, rest) = parse_prologue(&script)?;
+    let (fns, rest) = parse_prologue_noting(&script, Some(&mut *rec))?;
     parse_stages(rest, &fns, 0, &script, Some(rec))
 }
 
@@ -1776,61 +1777,139 @@ fn is_ident(s: &str) -> bool {
 /// Peel leading `fn NAME(PARAM, ...) { BODY }` definitions off the
 /// (comment-stripped) script. Returns the table and the remaining script.
 fn parse_prologue(script: &str) -> Result<(FnTable, &str), Error> {
+    parse_prologue_noting(script, None)
+}
+
+/// [`parse_prologue`], noting each definition's parts in `rec` when there
+/// is one: `fn`, the name, the parameters, and each body's stages.
+///
+/// With a recorder, a definition that fails does not stop the reading: it
+/// is skipped (up to the `}` that closes its body, when there is one), the
+/// definitions after it are read and noted, and each stage after them gets
+/// its command word noted, as after a stage that fails. The first error is
+/// still what comes back.
+fn parse_prologue_noting<'s>(
+    script: &'s str,
+    mut rec: Option<&mut Recorder>,
+) -> Result<(FnTable, &'s str), Error> {
+    use std::collections::hash_map::Entry;
     let mut fns = FnTable::new();
+    // The bodies as written, noted once every fragment is defined.
+    let mut bodies: Vec<&'s str> = Vec::new();
+    // The first error, kept while a recorder reads on past it.
+    let mut first_error: Option<Error> = None;
     let mut rest = script.trim_start();
     loop {
         let (word, after) = split_first_word(rest);
         if word != "fn" {
-            return Ok((fns, rest));
+            break;
         }
-        let brace = after
-            .find('{')
-            .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
-        let header = after[..brace].trim();
-        let (name, params_text) = header
-            .split_once('(')
-            .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
-        let name = name.trim();
-        if !is_ident(name) {
+        if let Some(rec) = rec.as_deref_mut() {
+            rec.note(script, word, SpanKind::Keyword);
+        }
+        let error = match parse_fn_def(script, after, rec.as_deref_mut()) {
+            Ok((name, def, body, after_body)) => {
+                rest = after_body.trim_start();
+                bodies.push(body);
+                match fns.entry(name) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(def);
+                        continue;
+                    }
+                    Entry::Occupied(slot) => err(format!("fn `{}` is defined twice", slot.key())),
+                }
+            }
+            Err(e) => {
+                // Read on after the body's closing `}`; without one, the
+                // rest of the script is the body.
+                rest = after
+                    .find('{')
+                    .and_then(|brace| take_brace_group(&after[brace..]).ok())
+                    .map_or("", |(_, after_body)| after_body.trim_start());
+                e
+            }
+        };
+        if rec.is_none() {
+            return Err(error);
+        }
+        first_error.get_or_insert(error);
+    }
+    if let Some(rec) = rec {
+        for body in &bodies {
+            // A body's parameters stand for text each call gives, so it may
+            // not parse on its own: what parses is noted, and its errors
+            // are dropped. At the depth limit a fragment call in it is
+            // noted but not expanded.
+            let _ = parse_stages(body, &fns, MAX_FN_DEPTH, script, Some(&mut *rec));
+        }
+        if first_error.is_some() {
+            let stages = split_stages(rest);
+            let mut builder = Builder::new(&fns, 0, script, Some(rec));
+            builder.note_separators(rest, &stages);
+            builder.note_commands(&stages);
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok((fns, rest)),
+    }
+}
+
+/// Parse one definition, `after` being the text after its `fn`: its name,
+/// the fragment, its body as written, and the text after the body. The
+/// name and parameters are noted in `rec` when there is one.
+fn parse_fn_def<'s>(
+    script: &str,
+    after: &'s str,
+    rec: Option<&mut Recorder>,
+) -> Result<(String, FnDef, &'s str, &'s str), Error> {
+    let brace = after
+        .find('{')
+        .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
+    let header = after[..brace].trim();
+    let (name, params_text) = header
+        .split_once('(')
+        .ok_or_else(|| err("fn: malformed definition — expected `fn NAME(PARAMS) { BODY }`"))?;
+    let name = name.trim();
+    if !is_ident(name) {
+        return Err(err(format!(
+            "fn: `{name}` is not a valid name (bare identifier)"
+        )));
+    }
+    if is_reserved(name) {
+        return Err(err(format!("fn `{name}` collides with a built-in command")));
+    }
+    let params_text = params_text
+        .trim()
+        .strip_suffix(')')
+        .ok_or_else(|| err(format!("fn `{name}`: malformed parameter list")))?;
+    if let Some(rec) = rec {
+        rec.note(script, name, SpanKind::Function);
+        for (_, at) in split_items(params_text, false, false).0 {
+            if let Some(param) = params_text.get(at) {
+                rec.note(script, param, SpanKind::Variable);
+            }
+        }
+    }
+    let mut params = Vec::new();
+    for p in split_list(params_text) {
+        if !is_ident(&p) {
             return Err(err(format!(
-                "fn: `{name}` is not a valid name (bare identifier)"
+                "fn `{name}`: `{p}` is not a valid parameter name"
             )));
         }
-        if is_reserved(name) {
-            return Err(err(format!("fn `{name}` collides with a built-in command")));
+        if params.contains(&p) {
+            return Err(err(format!("fn `{name}`: duplicate parameter `{p}`")));
         }
-        let params_text = params_text
-            .trim()
-            .strip_suffix(')')
-            .ok_or_else(|| err(format!("fn `{name}`: malformed parameter list")))?;
-        let mut params = Vec::new();
-        for p in split_list(params_text) {
-            if !is_ident(&p) {
-                return Err(err(format!(
-                    "fn `{name}`: `{p}` is not a valid parameter name"
-                )));
-            }
-            if params.contains(&p) {
-                return Err(err(format!("fn `{name}`: duplicate parameter `{p}`")));
-            }
-            params.push(p);
-        }
-        let (body, after_body) = take_brace_group(&after[brace..])
-            .map_err(|_| err(format!("fn `{name}`: unterminated body — missing `}}`")))?;
-        if fns
-            .insert(
-                name.to_string(),
-                FnDef {
-                    params,
-                    body: body.trim().to_string(),
-                },
-            )
-            .is_some()
-        {
-            return Err(err(format!("fn `{name}` is defined twice")));
-        }
-        rest = after_body.trim_start();
+        params.push(p);
     }
+    let (body, after_body) = take_brace_group(&after[brace..])
+        .map_err(|_| err(format!("fn `{name}`: unterminated body — missing `}}`")))?;
+    let def = FnDef {
+        params,
+        body: body.trim().to_string(),
+    };
+    Ok((name.to_string(), def, body, after_body))
 }
 
 /// Split off the first token: a whitespace-delimited word, or a quoted run
@@ -4813,6 +4892,12 @@ mod tests {
             "join -l (cols a | select a >> 1) r.csv on k, (uniq k) s.csv on k",
             "cols -v a | rename a = b | add t = abs(c) | select -v t > 1 | tail --lines=+3",
             "color -g v w green:red 0 10 | graph hist v -b 5",
+            "fn f(x, y) { select x > 1 | g(y) }\nfn g(z) { uniq z }\nf(a, b) | cols c",
+            "fn t(n) { head n }\nt(3)",
+            "fn f(x) { head }\nfn f(y) { tail }\nf(a)",
+            "fn g(y { uniq y }\nfn h() { cols a }\nh() | sort b",
+            "fn g(y) { uniq y\ncols a",
+            "fn g(y { uniq y }\nfn f(x) { head }\nfn f(y) { tail }\nf(a)",
         ] {
             let plain = format!("{:?}", parse(script));
             let recorded = format!("{:?}", parse_recorded(script, &mut Recorder::default()));
@@ -4944,5 +5029,111 @@ mod tests {
         ] {
             assert_eq!(noted(script), want, "{script}");
         }
+    }
+
+    #[test]
+    fn recording_notes_fn_definitions_but_not_expansions() {
+        assert_eq!(
+            noted("fn f(x, y) { select x > 1 | g(y) }\nfn g(z) { uniq z }\nf(a, b) | cols c"),
+            [
+                ("fn", "keyword"),
+                ("f", "function"),
+                ("x", "variable"),
+                ("y", "variable"),
+                ("select", "command"),
+                ("x", "variable"),
+                (">", "operator"),
+                ("1", "number"),
+                ("|", "operator"),
+                ("g", "command"),
+                ("fn", "keyword"),
+                ("g", "function"),
+                ("z", "variable"),
+                ("uniq", "command"),
+                ("z", "variable"),
+                ("f", "command"),
+                ("|", "operator"),
+                ("cols", "command"),
+                ("c", "variable"),
+            ]
+        );
+        // A body that does not parse on its own is noted as far as it goes,
+        // and the script still parses.
+        let mut rec = Recorder::default();
+        assert!(parse_recorded("fn t(n) { head n }\nt(3)", &mut rec).is_ok());
+        let script = "fn t(n) { head n }\nt(3)";
+        let kinds: Vec<(&str, &str)> = rec
+            .into_spans()
+            .into_iter()
+            .map(|(at, kind)| (&script[at], kind.name()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("fn", "keyword"),
+                ("t", "function"),
+                ("n", "variable"),
+                ("head", "command"),
+                ("t", "command"),
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_after_a_fn_error_keeps_the_rest() {
+        // A definition that fails: the ones before and after it are noted,
+        // and each stage gets its command word, as after a stage error.
+        assert_eq!(
+            noted(
+                "fn f(x) { select x > 1 }\nfn g(y { uniq y }\nfn h() { cols a }\nf(b) | h() | sort c"
+            ),
+            [
+                ("fn", "keyword"),
+                ("f", "function"),
+                ("x", "variable"),
+                ("select", "command"),
+                ("x", "variable"),
+                (">", "operator"),
+                ("1", "number"),
+                ("fn", "keyword"),
+                ("fn", "keyword"),
+                ("h", "function"),
+                ("cols", "command"),
+                ("a", "variable"),
+                ("f", "command"),
+                ("|", "operator"),
+                ("h", "command"),
+                ("|", "operator"),
+                ("sort", "command"),
+            ]
+        );
+        // A name defined twice: both bodies are noted.
+        assert_eq!(
+            noted("fn f(x) { head }\nfn f(y) { tail }\nf(a)"),
+            [
+                ("fn", "keyword"),
+                ("f", "function"),
+                ("x", "variable"),
+                ("head", "command"),
+                ("fn", "keyword"),
+                ("f", "function"),
+                ("y", "variable"),
+                ("tail", "command"),
+                ("f", "command"),
+            ]
+        );
+        // A body left open runs to the end, so no stage follows it.
+        assert_eq!(
+            noted("fn f(x) { head }\nfn g(y) { uniq y\ncols a"),
+            [
+                ("fn", "keyword"),
+                ("f", "function"),
+                ("x", "variable"),
+                ("head", "command"),
+                ("fn", "keyword"),
+                ("g", "function"),
+                ("y", "variable"),
+            ]
+        );
     }
 }
