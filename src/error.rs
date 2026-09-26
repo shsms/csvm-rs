@@ -126,7 +126,9 @@ impl fmt::Display for Error {
         match self {
             Error::Compile(msg) => write!(f, "{msg}"),
             Error::Column { name, available } => {
-                write!(f, "column not found: {name}")?;
+                // A name read across a line break (`sum(zz⏎head)`) is
+                // shown on one line.
+                write!(f, "column not found: {}", breaks_to_spaces(name))?;
                 if let Some(s) = did_you_mean(name, available) {
                     write!(f, " (did you mean `{s}`?)")?;
                 }

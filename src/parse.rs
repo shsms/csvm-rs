@@ -91,6 +91,14 @@ fn err(msg: impl Into<String>) -> Error {
     Error::Compile(msg.into())
 }
 
+/// `text`, with every run of whitespace (a newline included) squeezed to one
+/// space: for quoting a piece of the script that may span several lines in
+/// an error message, so the message stays on one line for an editor or a
+/// mode-server client that shows only a message's first line.
+fn squeezed(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Where `part` starts in `script`, when it is a slice of it (and not, say,
 /// text a fragment call expanded to).
 fn offset_in(script: &str, part: &str) -> Option<usize> {
@@ -1365,7 +1373,12 @@ impl<'a> Builder<'a> {
                     self.note_pair_rhs(text);
                     pairs.push((from.to_string(), to.to_string()));
                 }
-                _ => return Err(err(format!("rename expects old=new pairs, got '{spec}'"))),
+                _ => {
+                    return Err(err(format!(
+                        "rename expects old=new pairs, got '{}'",
+                        squeezed(&spec)
+                    )));
+                }
             }
         }
         if pairs.is_empty() {
@@ -1588,6 +1601,9 @@ enum Count {
     From(usize),
 }
 
+/// How many characters of a bad row count [`parse_count`]'s error quotes.
+const COUNT_QUOTE_CHARS: usize = 40;
+
 /// Parse the row count shared by `head`/`tail`: no argument ⇒ 10; a bare
 /// count (`head 20`), `-n`/`--lines` (`-n 20`, `-n20`, `--lines=20`), or the
 /// obsolete `-N` (`head -20`, positive). A reduced text that itself starts
@@ -1599,7 +1615,18 @@ fn parse_count(rest: &str, verb: &str) -> Result<Count, Error> {
     if rest.is_empty() {
         return Ok(Count::Rows(DEFAULT_ROWS as i64));
     }
-    let bad = || err(format!("{verb} expects a row count, got '{rest}'"));
+    // The text quoted on one line (`squeezed`), so the whole message shows
+    // in an editor that shows only its first line, and only its start: a
+    // `|` left out after the count makes `rest` run on through the next
+    // stage, however long that is.
+    let bad = || {
+        let mut quoted = squeezed(rest);
+        if let Some((cut, _)) = quoted.char_indices().nth(COUNT_QUOTE_CHARS) {
+            quoted.truncate(cut);
+            quoted.push('…');
+        }
+        err(format!("{verb} expects a row count, got '{quoted}'"))
+    };
     let text = head_count_text(rest);
     match text.strip_prefix('+') {
         Some(from) if from.bytes().all(|b| b.is_ascii_digit()) => {
@@ -2313,7 +2340,8 @@ fn parse_fn_def<'s>(
     let name = name.trim();
     if !is_ident(name) {
         return Err(err(format!(
-            "fn: `{name}` is not a valid name (bare identifier)"
+            "fn: `{}` is not a valid name (bare identifier)",
+            squeezed(name)
         )));
     }
     if is_reserved(name) {
@@ -2335,7 +2363,8 @@ fn parse_fn_def<'s>(
     for p in split_list(params_text) {
         if !is_ident(&p) {
             return Err(err(format!(
-                "fn `{name}`: `{p}` is not a valid parameter name"
+                "fn `{name}`: `{}` is not a valid parameter name",
+                squeezed(&p)
             )));
         }
         if params.contains(&p) {
@@ -2846,7 +2875,10 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
     let (given, tok) = match split_name_eq(tok)? {
         (name, _, Some(spec)) => {
             if name.is_empty() {
-                return Err(err(format!("agg: `{tok}` has an empty output name")));
+                return Err(err(format!(
+                    "agg: `{}` has an empty output name",
+                    squeezed(tok)
+                )));
             }
             (Some(name), spec.trim())
         }
@@ -2861,10 +2893,13 @@ fn parse_agg_spec(tok: &str) -> Result<AggSpec, Error> {
         Some(open) => {
             let inner = tok[open + 1..]
                 .strip_suffix(')')
-                .ok_or_else(|| err(format!("agg: malformed aggregate `{tok}`")))?;
+                .ok_or_else(|| err(format!("agg: malformed aggregate `{}`", squeezed(tok))))?;
             let col = unquote(inner.trim());
             if col.is_empty() {
-                return Err(err(format!("agg: `{}` needs a column name", &tok[..open])));
+                return Err(err(format!(
+                    "agg: `{}` needs a column name",
+                    squeezed(&tok[..open])
+                )));
             }
             (tok[..open].trim(), Some(col.to_string()))
         }
@@ -5303,6 +5338,73 @@ mod tests {
             start.elapsed() < std::time::Duration::from_secs(5),
             "took {:?}",
             start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_message_quoting_multi_line_stage_text_stays_on_one_line() {
+        // An unclosed `(` in `agg` sucks up the rest of the stage, `by k`
+        // and the next line's `fmt` included: the quoted text, and so the
+        // whole message, must still read as one line, with the note before
+        // it — an editor or a mode-server client that shows only a
+        // message's first line must not lose the note.
+        let e = noted_error("agg sum(a\n  by k\nfmt");
+        assert!(!e.contains('\n'), "{e}");
+        assert_eq!(
+            e,
+            "missing `|` before `fmt`? agg: malformed aggregate `sum(a by k fmt`"
+        );
+        // An `fn` name read over two lines.
+        assert_eq!(
+            noted_error("fn f\ng(x) { head }\nf(a)"),
+            "fn: `f g` is not a valid name (bare identifier)"
+        );
+    }
+
+    #[test]
+    fn a_column_name_read_over_two_lines_is_shown_on_one_line() {
+        // `head` inside the call is read as more of the column's name,
+        // which then spans the line break.
+        for script in ["agg sum(zz\nhead)", "agg sum(zz\r\nhead)"] {
+            let mut plan = parse(script).unwrap();
+            let e = plan.resolve(&["a".to_string()]).unwrap_err();
+            assert_eq!(
+                note_missing_pipe(script, e).to_string(),
+                "column not found: zz head — have: a"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_row_count_quotes_only_the_start_of_the_stage() {
+        // A `|` left out after `head 5` runs the count on through a long
+        // stage: the message quotes its first 40 characters only.
+        let stage = format!("select {}", "a > 1 && ".repeat(500));
+        for verb in ["head", "tail"] {
+            let e = noted_error(&format!("{verb} 5\n{stage}"));
+            assert_eq!(
+                e,
+                format!(
+                    "missing `|` before `select`? {verb} expects a row count, \
+                     got '5 select a > 1 && a > 1 && a > 1 && a > …'"
+                )
+            );
+        }
+        // On one line, with no note to do it: `bogus` is not a command.
+        assert_eq!(
+            noted_error("head 5\nbogus 3"),
+            "head expects a row count, got '5 bogus 3'"
+        );
+        // A short one is quoted whole, with no `…`.
+        assert_eq!(
+            noted_error("head 5 x"),
+            "head expects a row count, got '5 x'"
+        );
+        // Exactly 40 characters: whole.
+        let forty = format!("5 {}", "x".repeat(38));
+        assert_eq!(
+            noted_error(&format!("head {forty}")),
+            format!("head expects a row count, got '{forty}'")
         );
     }
 
