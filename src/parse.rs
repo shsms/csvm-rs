@@ -1823,8 +1823,6 @@ enum CommandWord {
 /// One bracket left open, or the whole script (the first entry).
 #[derive(Debug)]
 struct Bracket {
-    /// The byte that closes it: `)`, `}`, or 0 for the whole script.
-    close: u8,
     /// A `join` group or an `fn` body: one step deeper.
     counts: bool,
     /// Where its current stage starts, when it holds stages (the whole
@@ -1843,6 +1841,11 @@ struct Nesting<'s> {
     brackets: Vec<Bracket>,
     /// The quote mark of the string the scan is inside.
     quote: Option<u8>,
+    /// Indices into `brackets` of the open brackets closed by `)`, oldest
+    /// first.
+    parens: Vec<usize>,
+    /// The same, for brackets closed by `}`.
+    braces: Vec<usize>,
 }
 
 impl<'s> Nesting<'s> {
@@ -1850,12 +1853,13 @@ impl<'s> Nesting<'s> {
         Nesting {
             text,
             brackets: vec![Bracket {
-                close: 0,
                 counts: false,
                 stage: Some(0),
                 command_word: None,
             }],
             quote: None,
+            parens: Vec::new(),
+            braces: Vec::new(),
         }
     }
 
@@ -1936,11 +1940,16 @@ impl<'s> Nesting<'s> {
             (b'(', CommandWord::Join) | (b'{', CommandWord::Fn)
         );
         self.brackets.push(Bracket {
-            close: if c == b'(' { b')' } else { b'}' },
             counts,
             stage: counts.then_some(i + 1),
             command_word: None,
         });
+        let idx = self.brackets.len() - 1;
+        if c == b'(' {
+            self.parens.push(idx);
+        } else {
+            self.braces.push(idx);
+        }
     }
 
     /// The bracket `c` at byte `i` closes the innermost bracket it can close,
@@ -1952,6 +1961,13 @@ impl<'s> Nesting<'s> {
         };
         let fn_body = c == b'}' && self.brackets[at].counts;
         self.brackets.truncate(at);
+        // The stacks keep only the open brackets.
+        while self.parens.last().is_some_and(|&p| p >= at) {
+            self.parens.pop();
+        }
+        while self.braces.last().is_some_and(|&b| b >= at) {
+            self.braces.pop();
+        }
         if fn_body {
             self.new_stage(i + 1);
         }
@@ -1959,7 +1975,12 @@ impl<'s> Nesting<'s> {
 
     /// The index of the bracket `c` would close; `None` when none is open.
     fn closed_by(&self, c: u8) -> Option<usize> {
-        self.brackets.iter().rposition(|f| f.close == c)
+        let stack = if c == b')' {
+            &self.parens
+        } else {
+            &self.braces
+        };
+        stack.last().copied()
     }
 
     /// The depth of the brackets up to (not including) `end`.
@@ -5529,6 +5550,36 @@ mod tests {
                 new: 10_000,
                 current: 0
             }
+        );
+    }
+
+    #[test]
+    fn a_closer_finds_the_innermost_open_group_of_its_kind() {
+        // A `}` closes the `(` left open inside its `{` too; the `)` after
+        // it then closes the `join` group.
+        assert_eq!(split_at("join ( x { ( } ) b.csv\nhead@"), (0, 0));
+        // A `(` closed that way is gone: a later `)` closes nothing.
+        assert_eq!(
+            split_at("fn g(y) {\n  { ( }\n  { { ) }\n  }\n  head@"),
+            (1, 1)
+        );
+        // The same the other way: a `)` closes a `{` left open inside it.
+        assert_eq!(split_at("fn f(x) {\n  join ( { )\n  head\n}@"), (0, 0));
+    }
+
+    #[test]
+    fn a_run_of_the_other_kind_of_stray_closer_does_not_go_quadratic() {
+        // 100,000 unmatched `(` (none of them a `join` or `fn` group), then
+        // 100,000 `}`: a `}` finds that no bracket it can close is open
+        // without walking every open bracket. A generous bound: this is a
+        // debug build and the machine may be loaded.
+        let script = format!("select {}{}", "(".repeat(100_000), "}".repeat(100_000));
+        let start = std::time::Instant::now();
+        assert_eq!(depths(&script, script.len()), Depths { new: 0, current: 0 });
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
         );
     }
 
