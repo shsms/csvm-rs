@@ -657,6 +657,23 @@ impl<'a> Builder<'a> {
                 }
             };
         }
+        // `fragment_call` above did not accept the whole stage as one call;
+        // when it is nonetheless a defined fragment's *complete* call,
+        // followed by more text starting on a later line — the
+        // forgotten-`|` shape, `NAME(ARGS)\nMORE` — say so and place the
+        // error on the whole stage, so the missing-`|` note can scan past
+        // the call for what follows it. An unclosed call (`p(a`), one
+        // followed by more on the *same* line (`p(a)x`, `p(a))`) is a
+        // different mistake and falls through to the usual handling below.
+        if let Some(name) = fragment_call_then_more(stage, self.fns) {
+            return Err(place_on(
+                self.script,
+                stage,
+                err(format!(
+                    "`{name}(…)` calls a fragment, which must be a stage of its own"
+                )),
+            ));
+        }
         let (cmd, rest) = split_first_word(stage);
         if let Some(e) = removed(cmd, rest) {
             return Err(e);
@@ -717,6 +734,20 @@ impl<'a> Builder<'a> {
             };
         }
         e
+    }
+
+    /// The word a `|` may be missing before in `stage`, a slice of `text`: see
+    /// [`missing_pipe_word`]. `stage` failed with no place of its own in
+    /// `text` (a fragment's body is not the script), so all of it is looked
+    /// at.
+    fn missing_pipe_in<'t>(&self, text: &'t str, stage: &str) -> Option<&'t str> {
+        let at = offset_in(text, stage)?;
+        missing_pipe_word(
+            text,
+            at..at + stage.len(),
+            |name| self.fns.contains_key(name),
+            |_| takes_expression(stage),
+        )
     }
 
     /// Parse the expression `src`, a slice of the stage being parsed, with
@@ -804,8 +835,13 @@ impl<'a> Builder<'a> {
                 if stage.is_empty() {
                     continue;
                 }
-                self.parse_stage(stage)
-                    .map_err(|e| err(format!("in fn `{name}`: {e}")))?;
+                self.parse_stage(stage).map_err(|e| {
+                    let e = match self.missing_pipe_in(&body, stage) {
+                        Some(word) => e.with_note(&missing_pipe_note(word)),
+                        None => e,
+                    };
+                    err(format!("in fn `{name}`: {e}"))
+                })?;
             }
             Ok(())
         })();
@@ -2360,13 +2396,40 @@ fn flag_value<'a>(
 /// the name and the raw argument text when the stage is exactly one
 /// identifier followed by one balanced paren group.
 fn fragment_call(stage: &str) -> Option<(&str, &str)> {
+    let (name, inner, after) = call_parts(stage)?;
+    after.trim().is_empty().then_some((name, inner))
+}
+
+/// The name, the text inside the parens and the text after them, when
+/// `stage` starts with one identifier followed by one balanced paren group.
+fn call_parts(stage: &str) -> Option<(&str, &str, &str)> {
     let open = stage.find('(')?;
     let name = &stage[..open];
     if !is_ident(name) {
         return None;
     }
     let (inner, after) = take_paren_group(&stage[open..]).ok()?;
-    after.trim().is_empty().then_some((name, inner))
+    Some((name, inner, after))
+}
+
+/// The fragment name, when `stage` (which [`fragment_call`] did not accept
+/// whole) is nonetheless a defined fragment's *complete* call — one
+/// identifier followed by one balanced paren group — followed by more text
+/// that starts on a later line: the forgotten-`|` shape, `NAME(ARGS)\nMORE`.
+/// `None` when the call itself has no matching `)` (a different mistake:
+/// the call isn't complete), or what follows starts on the *same* line
+/// (`NAME(ARGS)x`, `NAME(ARGS))`: also a different mistake, not a missing
+/// `|`), or the name isn't a defined fragment.
+fn fragment_call_then_more<'s>(stage: &'s str, fns: &FnTable) -> Option<&'s str> {
+    let (name, _, after) = call_parts(stage)?;
+    if !fns.contains_key(name) {
+        return None;
+    }
+    after
+        .chars()
+        .take_while(|c| c.is_whitespace())
+        .any(|c| c == '\n')
+        .then_some(name)
 }
 
 /// Split off the first whitespace-delimited word (the command) from the rest.
@@ -5066,6 +5129,19 @@ mod tests {
         // A defined fragment's call.
         let e = noted_error("fn p(n) { head }\nselect a > 0\np(x)");
         assert!(e.starts_with("missing `|` before `p`? "), "{e}");
+        // Inside a fragment's body, which is not where the error is placed.
+        let e = noted_error("fn p(n) {\n  rename value=n\n  cols -v m\n}\np(x)");
+        assert_eq!(
+            e,
+            "in fn `p`: missing `|` before `cols`? \
+             rename expects old=new pairs, got 'cols'"
+        );
+        // A body's expression that goes on after an operator gets none.
+        let e = noted_error("fn p(n) {\n  select n+\n  head >\n}\np(x)");
+        assert!(
+            e.starts_with("in fn `p`: ") && !e.contains("missing `|`"),
+            "{e}"
+        );
         // The place is unchanged.
         let e = note_missing_pipe(
             "select a > 0\nhead 5",
@@ -5331,6 +5407,38 @@ mod tests {
         // ...and a near-miss bare word suggests fragment names too.
         let e = m("fn prep(n) { head }\nprepp pv");
         assert!(e.contains("did you mean `prep`"), "{e}");
+        // A fragment call followed by more on its own line, no `|` between
+        // them: the whole stage is in error, so the missing-`|` note can
+        // scan past the call for what follows it.
+        let script = "fn prep(n) { head }\nprep(active)\njoin (rename value=b) r.csv on k";
+        let e = m(script);
+        assert!(
+            e.contains("`prep(…)` calls a fragment, which must be a stage of its own"),
+            "{e}"
+        );
+        let noted = noted_error(script);
+        assert!(noted.starts_with("missing `|` before `join`? "), "{noted}");
+        // Two calls back to back, same rule.
+        let script = "fn p(n) { head }\np(x)\np(y)";
+        let e = m(script);
+        assert!(
+            e.contains("`p(…)` calls a fragment, which must be a stage of its own"),
+            "{e}"
+        );
+        let noted = noted_error(script);
+        assert!(noted.starts_with("missing `|` before `p`? "), "{noted}");
+        // An unclosed call, or extra text on the *same* line: a different
+        // mistake than a missing `|`, so none of these get the "must be a
+        // stage of its own" message.
+        for bad in ["p(a", "p(", "p(a))", "p(a)x", "p(a)x\nhead", "p(a) x\nhead"] {
+            let e = m(&format!("fn p(n) {{ head }}\n{bad}"));
+            assert!(!e.contains("must be a stage of its own"), "{bad:?} -> {e}");
+        }
+        // A call of a name that is not a defined fragment, then a line.
+        for bad in ["q(x)\nhead", "select(a > 1)\nhead"] {
+            let e = m(&format!("fn p(n) {{ head }}\n{bad}"));
+            assert!(e.contains("unknown command"), "{bad:?} -> {e}");
+        }
     }
 
     #[test]
