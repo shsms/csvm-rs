@@ -29,7 +29,8 @@ pub fn usage_line() -> &'static str {
     "usage: csvm [OPTIONS] SCRIPT [INPUT]\n       csvm [OPTIONS] -f FILE [INPUT]"
 }
 
-const HEADER: &str = "  SCRIPT   pipe-syntax pipeline; quote it so the shell keeps | > and spaces
+const HEADER: &str = "  SCRIPT   pipe-syntax pipeline; quote it so the shell keeps | > and spaces.
+           A stage ends only at |; a newline counts as a space
   INPUT    input CSV (default: stdin; '-' is stdin); first line is the header
 
 options (--flag VALUE or --flag=VALUE):

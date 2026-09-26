@@ -89,11 +89,30 @@ git history; this file is the "what next / what was decided" scratchpad.
   after =\== as part of the option.
 - The parser's stage splitter (=split_stages=) takes only ='= and ="= as
   quotes, not backticks. So a =(= in a backtick-quoted column name opens
-  a bracket that never closes, and no later =|= or newline starts a
-  stage: =select `a(b` > 1=, then =| head= on the next line (or the same
-  one), fails with =unexpected character '|' in expression=.
-  =strip_comments=, the group takers and =parse::depths= all take
-  backticks as quotes; =split_stages= should too.
+  a bracket that never closes, and no later =|= starts a stage:
+  =select `a(b` > 1=, then =| head= on the next line (or the same one),
+  fails with =unexpected character '|' in expression=. =strip_comments=,
+  the group takers and =parse::depths= all take backticks as quotes;
+  =split_stages= should too.
+- A script written for the old rule, where a newline alone ended a stage,
+  can still run when a =color= stage is followed by a command on its own
+  line: =color -g a= then =fmt= reads =fmt= as one more column to colour,
+  and a colour rule naming a column the output does not have is dropped
+  with no error, so the table is not aligned and nothing says why. Noting a
+  colour column that is also a command name would catch it.
+- The same is true after =cols -v=, which ignores any name it does not
+  know. =cols -v c= then =select a > 1= on the next line, with no =|=,
+  runs with no error: the =select= line's words are read as more columns
+  for =cols -v= to drop. A word that names a column drops that column, and
+  so does a number (a column's position). Any other word is ignored. The
+  =select= never runs. On columns =a,b,head=, =cols -v head= then
+  =select zz > 1= outputs only =b=: the =1= drops =a=, column 1.
+  A warning when =cols -v= drops a name that is also a command name would
+  catch it.
+- The missing-=|= note inside a fragment's body covers parse errors only.
+  A column error from a body stage (=fn p() { sort a= then =head }=, called
+  as =p()=) is placed on the call, and no note says a =|= may be missing
+  in the body.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a

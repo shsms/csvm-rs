@@ -167,8 +167,9 @@ still indented. A script that bash will still change is not.
 
 ## The command language
 
-A script is a sequence of stages separated by `|` (or by a newline — see below).
-Each stage is a command with comma- or space-separated arguments:
+A script is a sequence of stages separated by `|`. A newline counts as a
+space, so a stage may run over several lines. Each stage is a command with
+comma- or space-separated arguments:
 
 | Command            | Does                                                       |
 |--------------------|------------------------------------------------------------|
@@ -239,28 +240,43 @@ A few things worth knowing up front:
 
 ### Long pipelines: script files
 
-A long pipeline is hard to read as one quoted string. Stages split on a newline
-just as they do on `|`, and `#` starts a comment, so put the pipeline in a file
-and run it with `-f` (the input is then the positional argument — no `cat … |`):
+A long pipeline is hard to read as one quoted string. Put it in a file and
+run it with `-f` (the input is then the positional argument — no `cat … |`):
 
 ```sh
 csvm -f pipeline.csvm data.csv
 ```
 
 ```text
-# pipeline.csvm — one stage per line, comments allowed
+# pipeline.csvm — comments allowed
 rename value=a
-select a > 1000
-join (rename value=b) b.csv on key
-add a_delta = a - prev(a)
-add b_delta = b - prev(b)
-color -g a b a_delta b_delta
-cols key a a_delta b b_delta
-fmt
+| select a > 1000
+| join (rename value=b) b.csv on key
+| add a_delta = a - prev(a)
+| add b_delta = b - prev(b)
+| color -g a b a_delta b_delta
+| cols key a a_delta b b_delta
+| fmt
 ```
 
-A trailing `|` at the end of a line is optional — a newline alone separates
-stages (it doesn't inside a `join (…)` group, whose own stages split normally).
+A stage ends only at `|`, in a file as on the command line: a newline
+counts as a space, so one stage may run over several lines, and `#` starts
+a comment to the end of its line. When a `|` is left out, csvm reads the
+next line as more of the stage before it. Usually that stage then fails,
+and the error asks whether a `|` is missing before the command that starts
+the next line. After `color` or `cols -v`, it can run with no error:
+`color -g a` then `fmt` on the next line reads `fmt` as one more column to
+colour, so the table is not aligned.
+
+A `|` left out after `cols -v` is easy to miss, because `cols -v` ignores
+any name it does not know. Take `cols -v c`, then `select a > 1` on the
+next line, with no `|` between them. It runs with no error. csvm reads the
+words of the `select` line as more columns for `cols -v` to drop. A word
+that names a column drops that column, and so does a number (a column's
+position). Any other word is ignored. The `select` never runs. On columns
+`a,b,head`, `cols -v head` then `select zz > 1` outputs only `b`: the `1`
+drops `a`, column 1. Check an old script that ends a line right after a
+`cols -v` for a missing `|`.
 
 ## Examples
 

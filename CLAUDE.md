@@ -17,7 +17,8 @@ owned Rust data and is `Send + Sync`, shared across worker threads behind an
 
 ## Command language (pipe syntax)
 
-A script is a sequence of stages separated by `|`. Commands take comma- or
+A script is a sequence of stages separated by `|`; a newline counts as a
+space, so a stage may run over several lines. Commands take comma- or
 space-separated arguments. `select` takes a **bare** infix expression (no
 surrounding quotes — only string *literals* are quoted).
 
@@ -454,9 +455,22 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   spellings) are rejected with a hint pointing at `add c = num(c)` / `str()`.
 - `parse` first strips `#`-to-EOL comments (quote-aware: `'…'`/`"…"`/`` `…` ``
   protect a literal `#`), then `split_stages` splits on a lone unquoted `|`
-  **or a newline** (so a multi-line `-f` script is one stage per line, no
-  trailing `|`s); a `||` (or) and a `|`/newline inside a string literal or a
-  `join (…)` group are left intact, and blank/comment-only stages are dropped.
+  only: a newline counts as a space, in `-f` files too, so a stage may run
+  over several lines. A `||` (or) and a `|` inside a string literal or any
+  `( … )`, such as a `join (…)` group, are left intact, and empty stages
+  (`a | | b`, a `|` at the end) are dropped. A script that leaves out a `|`
+  usually fails where the next command is read as more of the stage before
+  it;
+  `parse::note_missing_pipe` (called by `main` and the mode server on any
+  placed error, parse or resolve) puts ``missing `|` before `WORD`?`` first,
+  before the message (`Error::with_note`, which also puts the message on one
+  line), when the error's place covers a word that starts a line but not a
+  stage (nor follows a line ending in `,`, or in an operator in a `select`,
+  an `add` or a `color` condition: `parse::continues_stage`) and names a
+  command (not `fn`; a removed one too, so its advice is reached) or a
+  defined fragment. A parse error inside a fragment's body has no place in
+  the script, so `expand_fragment` adds the same note from the body's text;
+  a column error from a body stage is placed on the call, with no note.
   `parse.rs` is a hand-written tokenizer plus a recursive-descent expression
   parser producing the `BoolExpr`/`Cmp` IR (and the `ValExpr` value IR for
   `add`). The grammar is **single-pass**: each position parses once as a
