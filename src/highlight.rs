@@ -64,6 +64,10 @@ pub struct Request {
     pub cwd: Vec<u8>,
     /// Argument 0 is the command's name.
     pub args: Vec<Arg>,
+    /// For an `:indent` request, where the new line breaks: an argument's
+    /// index and a byte offset in it, at most its length. `None` for a
+    /// colour request.
+    pub at: Option<(usize, usize)>,
 }
 
 /// One argument of the command line.
@@ -373,21 +377,41 @@ fn read_first_line(path: &Path, format: InputFormat, len: u64) -> Option<Vec<Str
     }
 }
 
-/// Read the next request; `None` when the input ends before one starts.
-/// Input that is not a request is an [`io::ErrorKind::InvalidData`] error:
-/// after it, the stream cannot be followed.
+/// Read the next request, a colour (`:request`) or an `:indent` one;
+/// `None` when the input ends before one starts. Input that is not a
+/// request is an [`io::ErrorKind::InvalidData`] error: after it, the stream
+/// cannot be followed. So is an `:indent` request without `:at` just
+/// before its `:done`, an `:at` in a colour request, and an `:at` outside
+/// the request's arguments.
 pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
     let Some(line) = read_line(input)? else {
         return Ok(None);
     };
-    let id = number(field(&line, ":request ")?)?;
+    let (id, indent) = match line.strip_prefix(":indent ") {
+        Some(id) => (number(id)?, true),
+        None => (number(field(&line, ":request ")?)?, false),
+    };
     let line = need_line(input)?;
     let cwd = read_bytes(input, number(field(&line, ":cwd ")?)?)?;
     let mut args = Vec::new();
-    loop {
+    let at = loop {
         let line = need_line(input)?;
         if line == ":done" {
-            return Ok(Some(Request { id, cwd, args }));
+            if indent {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "an :indent request needs :at before :done",
+                ));
+            }
+            break None;
+        }
+        if indent && let Some(at) = line.strip_prefix(":at ") {
+            let at = read_at(at, &args)?;
+            let done = need_line(input)?;
+            if done != ":done" {
+                return Err(bad(&done));
+            }
+            break Some(at);
         }
         let (kind, len) = field(&line, ":arg ")?
             .split_once(' ')
@@ -401,6 +425,18 @@ pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
             raw,
             bytes: read_bytes(input, number(len)?)?,
         });
+    };
+    Ok(Some(Request { id, cwd, args, at }))
+}
+
+/// The fields of an `:at` line, `ARG OFFSET`: an argument of `args` and a
+/// byte offset in it, at most its length.
+fn read_at(fields: &str, args: &[Arg]) -> io::Result<(usize, usize)> {
+    let (arg, offset) = fields.split_once(' ').ok_or_else(|| bad(fields))?;
+    let (arg, offset): (usize, usize) = (number(arg)?, number(offset)?);
+    match args.get(arg) {
+        Some(a) if offset <= a.bytes.len() => Ok((arg, offset)),
+        _ => Err(bad(&format!(":at {fields}"))),
     }
 }
 
@@ -547,6 +583,7 @@ mod tests {
                         bytes: Vec::new()
                     },
                 ],
+                at: None,
             })
         );
         // Then the input ends: no more requests.
@@ -805,6 +842,7 @@ mod tests {
                     bytes: a.as_bytes().to_vec(),
                 })
                 .collect(),
+            at: None,
         }
     }
 
@@ -1386,6 +1424,56 @@ mod tests {
             "inkline-highlight 1\n\
              :span 1 0 3 command\n:end 1\n\
              :error 1 0 6 unknown option: --colr\n:end 2\n"
+        );
+    }
+
+    #[test]
+    fn an_indent_request_is_read_with_where_it_splits() {
+        let input = b":indent 8\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 7\njoin (\n\n\
+                      :at 1 7\n:done\n";
+        let mut r = &input[..];
+        let request = read_request(&mut r).unwrap().unwrap();
+        assert_eq!(request.id, 8);
+        assert_eq!(request.args.len(), 2);
+        assert_eq!(request.args[1].bytes, b"join (\n");
+        assert_eq!(request.at, Some((1, 7)));
+        assert_eq!(read_request(&mut r).unwrap(), None);
+        // A split at the start of an argument, or in the command's name.
+        let mut r = &b":indent 9\n:cwd 0\n\n:arg final 4\ncsvm\n:at 0 0\n:done\n"[..];
+        assert_eq!(read_request(&mut r).unwrap().unwrap().at, Some((0, 0)));
+    }
+
+    #[test]
+    fn an_indent_request_that_breaks_the_protocol_is_an_error() {
+        use io::ErrorKind::InvalidData;
+        let bad = |input: &[u8]| {
+            let mut r = input;
+            read_request(&mut r).unwrap_err().kind()
+        };
+        let head = ":indent 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 3\nabc\n";
+        let with = |tail: &str| format!("{head}{tail}").into_bytes();
+        // No `:at`, which the error names, or more than one.
+        assert_eq!(bad(&with(":done\n")), InvalidData);
+        let no_at = with(":done\n");
+        assert_eq!(
+            read_request(&mut &no_at[..]).unwrap_err().to_string(),
+            "an :indent request needs :at before :done"
+        );
+        assert_eq!(bad(&with(":at 1 0\n:at 1 1\n:done\n")), InvalidData);
+        // Anything but `:done` after it.
+        assert_eq!(bad(&with(":at 1 0\n:arg final 1\nx\n:done\n")), InvalidData);
+        // Fields that are not two plain numbers.
+        assert_eq!(bad(&with(":at 1\n:done\n")), InvalidData);
+        assert_eq!(bad(&with(":at 1 -1\n:done\n")), InvalidData);
+        assert_eq!(bad(&with(":at x 0\n:done\n")), InvalidData);
+        assert_eq!(bad(&with(":at 1 0 0\n:done\n")), InvalidData);
+        // Outside the arguments: no argument 2, and argument 1 has 3 bytes.
+        assert_eq!(bad(&with(":at 2 0\n:done\n")), InvalidData);
+        assert_eq!(bad(&with(":at 1 4\n:done\n")), InvalidData);
+        // A colour request has no `:at`.
+        assert_eq!(
+            bad(b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:at 0 0\n:done\n"),
+            InvalidData
         );
     }
 }
