@@ -36,6 +36,9 @@ pub struct Args {
     /// `--format`: input format override. `None` auto-detects from the file
     /// extension (`.parquet` ⇒ Parquet, else CSV).
     pub format: Option<InputFormat>,
+    /// Which argument the script is (counted from 0, the first argument
+    /// after the program's name), when it came from the command line.
+    pub script_at: Option<usize>,
 }
 
 impl Args {
@@ -181,10 +184,47 @@ pub enum Parsed {
     Version,
 }
 
+/// A usage error: what is wrong with the command line, and the argument it
+/// is about when there is one, counted from 0 (the first argument after
+/// the program's name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Usage {
+    pub message: String,
+    pub arg: Option<usize>,
+    /// Whether the error is about the whole command line, so that it
+    /// depends on every argument, and not only on the ones up to `arg`.
+    pub whole_line: bool,
+}
+
+impl Usage {
+    /// An error about argument `arg`.
+    fn on(arg: usize, message: impl Into<String>) -> Usage {
+        Usage {
+            message: message.into(),
+            arg: Some(arg),
+            whole_line: false,
+        }
+    }
+
+    /// An error about argument `arg`, found once every argument was read.
+    fn on_whole_line(arg: usize, message: impl Into<String>) -> Usage {
+        Usage {
+            whole_line: true,
+            ..Usage::on(arg, message)
+        }
+    }
+}
+
 /// Parse arguments (excluding argv[0]). Returns an error message suitable for
 /// printing to stderr.
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> {
-    let mut positionals: Vec<String> = Vec::new();
+    parse_at(args).map_err(|e| e.message)
+}
+
+/// [`parse`], with an error that says which argument it is about.
+pub fn parse_at<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, Usage> {
+    // Each positional with the argument it is.
+    let mut positionals: Vec<(usize, String)> = Vec::new();
     let mut out_file = None;
     let mut threads: Option<i64> = None;
     let mut temp_dir = None;
@@ -198,8 +238,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     let mut header = None;
     let mut format = None;
 
-    let mut it = args.into_iter();
-    while let Some(raw) = it.next() {
+    let mut it = args.into_iter().enumerate();
+    while let Some((at, raw)) = it.next() {
         // Accept the GNU `--flag=value` form alongside `--flag value`: split a
         // long option on its first `=` and use the right side as the value.
         let (arg, inline) = match raw.split_once('=') {
@@ -208,13 +248,16 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             }
             _ => (raw, None),
         };
+        // The option's value, and the argument it is in: the option's own
+        // (`--flag=value`) or the next one.
         macro_rules! value {
             () => {
                 match inline {
-                    Some(v) => v,
-                    None => it
-                        .next()
-                        .ok_or_else(|| format!("missing value for {arg}"))?,
+                    Some(v) => (v, at),
+                    None => match it.next() {
+                        Some((next, v)) => (v, next),
+                        None => return Err(Usage::on(at, format!("missing value for {arg}"))),
+                    },
                 }
             };
         }
@@ -222,25 +265,26 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "-h" | "--help" => {
                 // The rest of the line is not parsed, but a `--no-pager`
                 // after the `--help` still counts.
-                no_pager |= it.any(|a| a == "--no-pager");
+                no_pager |= it.any(|(_, a)| a == "--no-pager");
                 return Ok(Parsed::Help {
                     topic: None,
                     no_pager,
                 });
             }
             "-V" | "--version" => return Ok(Parsed::Version),
-            "-o" | "--output" => out_file = Some(value!()),
+            "-o" | "--output" => out_file = Some(value!().0),
             "-n" | "--threads" => {
-                let v = value!();
+                let (v, v_at) = value!();
                 threads = Some(
                     v.parse()
-                        .map_err(|_| format!("invalid threads value: {v}"))?,
+                        .map_err(|_| Usage::on(v_at, format!("invalid threads value: {v}")))?,
                 );
             }
-            "-f" | "--file" => script_file = Some(value!()),
-            "-t" | "--temp-dir" => temp_dir = Some(PathBuf::from(value!())),
+            "-f" | "--file" => script_file = Some(value!().0),
+            "-t" | "--temp-dir" => temp_dir = Some(PathBuf::from(value!().0)),
             "--chunk-size" => {
-                let n = parse_size(&value!(), "--chunk-size")?;
+                let (v, v_at) = value!();
+                let n = parse_size(&v, "--chunk-size").map_err(|m| Usage::on(v_at, m))?;
                 chunk_size = if n <= 0 {
                     DEFAULT_CHUNK_SIZE
                 } else {
@@ -248,7 +292,8 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
                 };
             }
             "--sort-buffer" => {
-                let n = parse_size(&value!(), "--sort-buffer")?;
+                let (v, v_at) = value!();
+                let n = parse_size(&v, "--sort-buffer").map_err(|m| Usage::on(v_at, m))?;
                 sort_buffer = if n <= 0 {
                     DEFAULT_SORT_BUFFER
                 } else {
@@ -258,39 +303,55 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
             "--explain" => explain = true,
             "--no-pager" => no_pager = true,
             "--no-progress" => no_progress = true,
-            "--header" => header = Some(Header::parse(&value!())?),
+            "--header" => {
+                let (v, v_at) = value!();
+                header = Some(Header::parse(&v).map_err(|m| Usage::on(v_at, m))?);
+            }
             "--format" => {
-                let v = value!();
+                let (v, v_at) = value!();
                 format = Some(match v.as_str() {
                     "csv" => InputFormat::Csv,
                     "parquet" => InputFormat::Parquet,
-                    _ => return Err(format!("invalid --format value: {v} (csv|parquet)")),
+                    _ => {
+                        return Err(Usage::on(
+                            v_at,
+                            format!("invalid --format value: {v} (csv|parquet)"),
+                        ));
+                    }
                 });
             }
             "--color" => {
-                let v = value!();
+                let (v, v_at) = value!();
                 color = match v.as_str() {
                     "auto" => ColorWhen::Auto,
                     "always" => ColorWhen::Always,
                     "never" => ColorWhen::Never,
-                    _ => return Err(format!("invalid --color value: {v} (auto|always|never)")),
+                    _ => {
+                        return Err(Usage::on(
+                            v_at,
+                            format!("invalid --color value: {v} (auto|always|never)"),
+                        ));
+                    }
                 };
             }
             other if other.starts_with('-') && other != "-" => {
-                return Err(format!("unknown option: {other}"));
+                return Err(Usage::on(at, format!("unknown option: {other}")));
             }
-            _ => positionals.push(arg),
+            _ => positionals.push((at, arg)),
         }
     }
 
     // `csvm help [TOPIC]` (without -f) prints help and exits, like a subcommand.
     // A bare `help` isn't a valid script, so this can't shadow a real pipeline.
-    if script_file.is_none() && positionals.first().is_some_and(|p| p == "help") {
-        if positionals.len() > 2 {
-            return Err("usage: csvm help [COMMAND|TOPIC]".to_string());
+    if script_file.is_none() && positionals.first().is_some_and(|(_, p)| p == "help") {
+        if let Some((at, _)) = positionals.get(2) {
+            return Err(Usage::on_whole_line(
+                *at,
+                "usage: csvm help [COMMAND|TOPIC]",
+            ));
         }
         return Ok(Parsed::Help {
-            topic: positionals.into_iter().nth(1),
+            topic: positionals.into_iter().nth(1).map(|(_, p)| p),
             no_pager,
         });
     }
@@ -301,16 +362,22 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
     // single positional is the input instead. (At most one input either way; a
     // second positional is an error.)
     let mut positionals = positionals.into_iter();
-    let script = if script_file.is_some() {
-        String::new()
+    let (script, script_at) = if script_file.is_some() {
+        (String::new(), None)
     } else {
-        positionals
-            .next()
-            .ok_or_else(|| "no script given".to_string())?
+        let (at, script) = positionals.next().ok_or_else(|| Usage {
+            message: "no script given".to_string(),
+            arg: None,
+            whole_line: true,
+        })?;
+        (script, Some(at))
     };
-    let in_file = positionals.next();
-    if positionals.next().is_some() {
-        return Err("too many arguments (expected [SCRIPT] [INPUT])".to_string());
+    let in_file = positionals.next().map(|(_, p)| p);
+    if let Some((at, _)) = positionals.next() {
+        return Err(Usage::on_whole_line(
+            at,
+            "too many arguments (expected [SCRIPT] [INPUT])",
+        ));
     }
 
     // Default to the core count; `-n 1` is the explicit single-threaded
@@ -333,6 +400,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Parsed, String> 
         no_progress,
         header,
         format,
+        script_at,
     })))
 }
 
@@ -560,6 +628,53 @@ mod tests {
         assert_eq!(a.in_file, None);
         // Without -f, a script is still required.
         assert!(parse(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn usage_errors_name_their_argument() {
+        let at = |parts: &[&str]| {
+            parse_at(parts.iter().map(|s| s.to_string()))
+                .err()
+                .map(|e| e.arg)
+        };
+        // The unknown option itself.
+        assert_eq!(at(&["--colr", "always", "cols a"]), Some(Some(0)));
+        // A bad value: the value, or the option when it holds the value.
+        assert_eq!(at(&["cols a", "-n", "x"]), Some(Some(2)));
+        assert_eq!(at(&["--threads=x", "cols a"]), Some(Some(0)));
+        assert_eq!(at(&["--header", "a,,b", "cols a"]), Some(Some(1)));
+        assert_eq!(at(&["--format", "tsv", "cols a"]), Some(Some(1)));
+        assert_eq!(at(&["--chunk-size", "5x", "cols a"]), Some(Some(1)));
+        assert_eq!(at(&["--color", "blue", "cols a"]), Some(Some(1)));
+        // A missing value: the option that wants it.
+        assert_eq!(at(&["cols a", "-f"]), Some(Some(1)));
+        // One positional too many: that one.
+        assert_eq!(at(&["s", "in.csv", "-n", "2", "extra"]), Some(Some(4)));
+        assert_eq!(at(&["help", "fmt", "extra"]), Some(Some(2)));
+        // No script: nothing to point at.
+        assert_eq!(at(&["-n", "2"]), Some(None));
+        assert_eq!(at(&["cols a"]), None);
+        let e = parse_at(["--colr".to_string()]).err().unwrap();
+        assert_eq!(e.message, "unknown option: --colr");
+        // An error found once every argument is read depends on all of them.
+        let whole = |parts: &[&str]| {
+            parse_at(parts.iter().map(|s| s.to_string()))
+                .err()
+                .map(|e| e.whole_line)
+        };
+        assert_eq!(whole(&["s", "in.csv", "extra"]), Some(true));
+        assert_eq!(whole(&["help", "fmt", "extra"]), Some(true));
+        assert_eq!(whole(&["--colr", "cols a"]), Some(false));
+    }
+
+    #[test]
+    fn arguments_say_where_the_script_is() {
+        let a = args(&["-n", "4", "cols a", "data.csv"]).unwrap();
+        assert_eq!(a.script_at, Some(2));
+        let a = args(&["--threads=4", "cols a"]).unwrap();
+        assert_eq!(a.script_at, Some(1));
+        let a = args(&["-f", "p.csvm", "data.csv"]).unwrap();
+        assert_eq!(a.script_at, None);
     }
 
     #[test]
