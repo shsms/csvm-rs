@@ -239,14 +239,21 @@ fn csvm_mode_server_answers_indent_requests_between_colour_ones() {
     let script = "head\n| join (\n  cols a,b";
     assert_eq!(
         server.indent(&["csvm", script, "x.csv"], (1, script.len()), None),
-        [":depth 1 1"]
+        [":depth 1 -"]
     );
     // Before the `)` that closes it: the new line moves out.
     let script = "head\n| join (\n  cols a,b) other.csv on a";
     let at = script.find(')').unwrap();
     assert_eq!(
         server.indent(&["csvm", script], (1, at), None),
-        [":depth 0 1"]
+        [":depth 0 -"]
+    );
+    // A line that starts with the bracket that closes a group moves out;
+    // the line the split is on in the replies before was left as it is.
+    let script = "fn f(x) {\n  join (\n    cols a\n  )";
+    assert_eq!(
+        server.indent(&["csvm", script], (1, script.len()), None),
+        [":depth 1 1"]
     );
     // A colour request in between is answered as before.
     assert_eq!(server.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
@@ -254,7 +261,7 @@ fn csvm_mode_server_answers_indent_requests_between_colour_ones() {
     let script = "fn prep(n) {\n  rename value=n";
     assert_eq!(
         server.indent(&["csvm", "-n", "1", script], (3, script.len()), None),
-        [":depth 1 1"]
+        [":depth 1 -"]
     );
     // Split outside the script, or in a raw one: only the end.
     assert_eq!(

@@ -25,9 +25,9 @@
 //! new line in the script goes: an `:indent ID` request, with the same
 //! `:cwd` and `:arg` blocks and then `:at ARG OFFSET` (where the line
 //! breaks) before `:done`. csvm answers `:depth NEW CURRENT` (how deep the
-//! new line and the line being split sit), or nothing, then `:end ID`. A
-//! `:span`'s `KIND` is one of `parse::SpanKind`'s names; a `|` between two
-//! stages is a `separator`.
+//! new line goes, and how deep the line being split goes, or `-` to leave
+//! it as it is), or nothing, then `:end ID`. A `:span`'s `KIND` is one of
+//! `parse::SpanKind`'s names; a `|` between two stages is a `separator`.
 //!
 //! Lengths and offsets count bytes. inkline's `docs/mode-protocol.md`
 //! describes the whole of the inkline mode protocol.
@@ -472,10 +472,14 @@ fn read_at(fields: &str, args: &[Arg]) -> io::Result<(usize, usize)> {
 }
 
 /// Write the answer to `:indent` request `id`: `:depth NEW CURRENT` when
-/// there are depths, then `:end ID`.
+/// there are depths, `CURRENT` being `-` when the line the split is on stays
+/// as it is, then `:end ID`.
 pub fn write_indent(out: &mut impl Write, id: u64, depths: Option<Depths>) -> io::Result<()> {
     if let Some(d) = depths {
-        writeln!(out, ":depth {} {}", d.new, d.current)?;
+        match d.current {
+            Some(current) => writeln!(out, ":depth {} {current}", d.new)?,
+            None => writeln!(out, ":depth {} -", d.new)?,
+        }
     }
     writeln!(out, ":end {id}")
 }
@@ -1560,8 +1564,20 @@ mod tests {
     #[test]
     fn an_indent_reply_is_its_depths_and_the_end() {
         let mut out = Vec::new();
-        write_indent(&mut out, 4, Some(Depths { new: 2, current: 1 })).unwrap();
+        let depths = Depths {
+            new: 2,
+            current: Some(1),
+        };
+        write_indent(&mut out, 4, Some(depths)).unwrap();
         assert_eq!(out, b":depth 2 1\n:end 4\n");
+        // The line the split is on stays as it is.
+        let mut out = Vec::new();
+        let depths = Depths {
+            new: 2,
+            current: None,
+        };
+        write_indent(&mut out, 6, Some(depths)).unwrap();
+        assert_eq!(out, b":depth 2 -\n:end 6\n");
         let mut out = Vec::new();
         write_indent(&mut out, 5, None).unwrap();
         assert_eq!(out, b":end 5\n");
@@ -1572,11 +1588,12 @@ mod tests {
     /// splits at its first space into a keyword and the rest; a line that
     /// does not start with `:` is a failure; `:depth` comes at most once,
     /// and its rest is exactly two fields, one space apart, each a number
-    /// made only of ASCII digits (no sign) that fits a `usize`; `:end`'s
-    /// rest is such a number, equal to `id`, and ends the reply; any other
-    /// `:` line is passed over. csvm writes nothing after `:end`, so the
-    /// reply must end there too.
-    fn read_as_inkline(bytes: &[u8], id: u64) -> Option<(usize, usize)> {
+    /// made only of ASCII digits (no sign) that fits a `usize`, except that
+    /// the second may be `-` instead (read as `None`); `:end`'s rest is
+    /// such a number, equal to `id`, and ends the reply; any other `:` line
+    /// is passed over. csvm writes nothing after `:end`, so the reply must
+    /// end there too.
+    fn read_as_inkline(bytes: &[u8], id: u64) -> Option<(usize, Option<usize>)> {
         fn number<T: std::str::FromStr>(field: &str) -> T {
             assert!(
                 !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()),
@@ -1600,7 +1617,8 @@ mod tests {
                     let [new, current] = fields[..] else {
                         panic!(":depth needs two fields: {line:?}");
                     };
-                    depths = Some((number(new), number(current)));
+                    let current = (current != "-").then(|| number(current));
+                    depths = Some((number(new), current));
                 }
                 ":end" => {
                     assert_eq!(number::<u64>(rest), id, "the wrong :end ID");
@@ -1616,12 +1634,18 @@ mod tests {
     #[test]
     fn an_indent_reply_reads_as_inkline_reads_it() {
         for (id, depths) in [
-            (1, Some(Depths { new: 0, current: 0 })),
+            (
+                1,
+                Some(Depths {
+                    new: 0,
+                    current: Some(0),
+                }),
+            ),
             (
                 2,
                 Some(Depths {
                     new: 3,
-                    current: 12,
+                    current: Some(12),
                 }),
             ),
             (3, None),
@@ -1629,7 +1653,14 @@ mod tests {
                 u64::MAX,
                 Some(Depths {
                     new: usize::MAX,
-                    current: 1,
+                    current: Some(1),
+                }),
+            ),
+            (
+                4,
+                Some(Depths {
+                    new: 1,
+                    current: None,
                 }),
             ),
         ] {
@@ -1648,7 +1679,7 @@ mod tests {
         let reply = out
             .strip_prefix(format!("{GREETING}\n").as_bytes())
             .unwrap();
-        assert_eq!(read_as_inkline(reply, 7), Some((1, 1)));
+        assert_eq!(read_as_inkline(reply, 7), Some((1, None)));
     }
 
     #[test]
@@ -1659,24 +1690,36 @@ mod tests {
                 &request("/", &["csvm", "-n", "2", script, "x.csv"]),
                 (3, script.len())
             ),
-            Some(Depths { new: 1, current: 1 })
+            Some(Depths {
+                new: 1,
+                current: None
+            })
         );
         let script = "head\n| join (";
         assert_eq!(
             indent(&request("/", &["csvm", script]), (1, script.len())),
-            Some(Depths { new: 1, current: 0 })
+            Some(Depths {
+                new: 1,
+                current: None
+            })
         );
         // Offsets count bytes, as for colours.
         let script = "select a == 'é' | join (\n  cols b";
         assert_eq!(
             indent(&request("/", &["csvm", script]), (1, script.len())),
-            Some(Depths { new: 1, current: 1 })
+            Some(Depths {
+                new: 1,
+                current: None
+            })
         );
         // A script that does not parse still gets depths from its brackets.
         let script = "selct a\nfn f() {";
         assert_eq!(
             indent(&request("/", &["csvm", script]), (1, script.len())),
-            Some(Depths { new: 1, current: 0 })
+            Some(Depths {
+                new: 1,
+                current: None
+            })
         );
     }
 
@@ -1713,7 +1756,13 @@ mod tests {
         // A raw argument elsewhere does not stop it, as for colours.
         let mut req = request("/", &["csvm", "join (", "$f"]);
         req.args[2].raw = true;
-        assert_eq!(indent(&req, (1, 6)), Some(Depths { new: 1, current: 0 }));
+        assert_eq!(
+            indent(&req, (1, 6)),
+            Some(Depths {
+                new: 1,
+                current: None
+            })
+        );
     }
 
     #[test]
@@ -1727,7 +1776,7 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "inkline-mode 1 indent\n\
              :span 1 0 3 command\n:end 1\n\
-             :depth 1 0\n:end 2\n\
+             :depth 1 -\n:end 2\n\
              :end 3\n"
         );
     }
