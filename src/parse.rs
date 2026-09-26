@@ -35,24 +35,44 @@ use std::ops::Range;
 pub fn parse(script: &str) -> Result<Plan, Error> {
     let script = strip_comments(script);
     let (fns, rest) = parse_prologue(&script)?;
-    parse_stages(rest, &fns, 0, &script)
+    parse_stages(rest, &fns, 0, &script, None)
+}
+
+/// [`parse`], noting in `rec` what each part of the script is, for
+/// `csvm --highlight`. It builds the same plan as [`parse`], or fails the
+/// same way. What was noted before an error stays in `rec`, and each stage
+/// after the one that failed gets its command word noted.
+pub fn parse_recorded(script: &str, rec: &mut Recorder) -> Result<Plan, Error> {
+    let script = strip_comments_noting(script, |at| rec.push(at, SpanKind::Comment));
+    let (fns, rest) = parse_prologue(&script)?;
+    parse_stages(rest, &fns, 0, &script, Some(rec))
 }
 
 /// Parse stage text into a plan. Sub-pipelines and fragment bodies re-enter
 /// here with the shared fn table and their expansion depth; `top` is the
-/// whole script, which error spans are offsets into.
-fn parse_stages(script: &str, fns: &FnTable, depth: usize, top: &str) -> Result<Plan, Error> {
-    let mut builder = Builder::new(fns, depth, top);
-    for stage in split_stages(script) {
+/// whole script, which error spans are offsets into. `rec`, when given,
+/// notes what each part of `top` is (see [`parse_recorded`]).
+fn parse_stages(
+    script: &str,
+    fns: &FnTable,
+    depth: usize,
+    top: &str,
+    rec: Option<&mut Recorder>,
+) -> Result<Plan, Error> {
+    let mut builder = Builder::new(fns, depth, top, rec);
+    let stages = split_stages(script);
+    builder.note_separators(script, &stages);
+    for (i, stage) in stages.iter().enumerate() {
         let stage = stage.trim();
         // Skip blank stages: a blank or comment-only line in a multi-line `-f`
         // script, or a trailing `|`. A wholly empty script is caught below.
         if stage.is_empty() {
             continue;
         }
-        builder
-            .parse_stage(stage)
-            .map_err(|e| place_on(top, stage, e))?;
+        if let Err(e) = builder.parse_stage(stage) {
+            builder.note_commands(&stages[i + 1..]);
+            return Err(place_on(top, stage, e));
+        }
         builder.written_at(offset_in(top, stage).map(|at| at..at + stage.len()));
     }
     if builder.items.is_empty()
@@ -82,6 +102,77 @@ fn place_on(script: &str, part: &str, e: Error) -> Error {
     match offset_in(script, part) {
         Some(at) => e.at(at..at + part.len()),
         None => e,
+    }
+}
+
+/// What a part of the script is, for `csvm --highlight`: each kind is a
+/// colour the editor paints that part with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpanKind {
+    Command,
+    Keyword,
+    Option,
+    Operator,
+    String,
+    Number,
+    Variable,
+    Function,
+    Comment,
+}
+
+impl SpanKind {
+    /// The kind's name in the highlight protocol.
+    pub fn name(self) -> &'static str {
+        match self {
+            SpanKind::Command => "command",
+            SpanKind::Keyword => "keyword",
+            SpanKind::Option => "option",
+            SpanKind::Operator => "operator",
+            SpanKind::String => "string",
+            SpanKind::Number => "number",
+            SpanKind::Variable => "variable",
+            SpanKind::Function => "function",
+            SpanKind::Comment => "comment",
+        }
+    }
+}
+
+/// The parts of a script [`parse_recorded`] noted: byte ranges of the
+/// script, each with its kind.
+#[derive(Debug, Default)]
+pub struct Recorder {
+    spans: Vec<(Range<usize>, SpanKind)>,
+}
+
+impl Recorder {
+    /// Note the bytes `at` of the script as `kind`. An empty range is not
+    /// noted.
+    fn push(&mut self, at: Range<usize>, kind: SpanKind) {
+        if at.start < at.end {
+            self.spans.push((at, kind));
+        }
+    }
+
+    /// Note `part` as `kind` when it is a slice of `script`. Text that is
+    /// not (what a fragment call expanded to) is not noted.
+    fn note(&mut self, script: &str, part: &str, kind: SpanKind) {
+        if let Some(at) = offset_in(script, part) {
+            self.push(at..at + part.len(), kind);
+        }
+    }
+
+    /// The noted parts in script order, none overlapping another. Of two
+    /// that overlap, the one that starts first is kept, and of two that
+    /// start together, the shorter one.
+    pub fn into_spans(mut self) -> Vec<(Range<usize>, SpanKind)> {
+        self.spans.sort_by_key(|(at, _)| (at.start, at.end));
+        let mut kept: Vec<(Range<usize>, SpanKind)> = Vec::with_capacity(self.spans.len());
+        for (at, kind) in self.spans {
+            if kept.last().is_none_or(|(last, _)| last.end <= at.start) {
+                kept.push((at, kind));
+            }
+        }
+        kept
     }
 }
 
@@ -137,10 +228,15 @@ pub(crate) fn removed(cmd: &str, args: &str) -> Option<Error> {
     Some(err(format!("{cmd} was removed: {}", (r.advice)(args))))
 }
 
+/// Whether `name` is a command or an alias.
+fn is_command(name: &str) -> bool {
+    name == "colour" || COMMANDS.contains(&name)
+}
+
 /// Whether `name` is taken by a command, an alias, or a removed command
 /// (kept reserved so its hint stays reachable), so a `fn` may not use it.
 fn is_reserved(name: &str) -> bool {
-    name == "colour" || COMMANDS.contains(&name) || REMOVED.iter().any(|r| r.name == name)
+    is_command(name) || REMOVED.iter().any(|r| r.name == name)
 }
 
 fn num_cast_advice(args: &str) -> String {
@@ -259,10 +355,13 @@ struct Builder<'a> {
     /// The columns read since the last [`Builder::written_at`], and where
     /// each is written (see [`Builder::read_column`]).
     columns: Vec<(String, Range<usize>)>,
+    /// Where `--highlight` notes what each part of the script is; `None`
+    /// for a plain parse.
+    rec: Option<&'a mut Recorder>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(fns: &'a FnTable, depth: usize, script: &'a str) -> Self {
+    fn new(fns: &'a FnTable, depth: usize, script: &'a str, rec: Option<&'a mut Recorder>) -> Self {
         Builder {
             fns,
             depth,
@@ -275,6 +374,7 @@ impl<'a> Builder<'a> {
             color_written: Vec::new(),
             graph_written: None,
             columns: Vec::new(),
+            rec,
         }
     }
 
@@ -300,8 +400,11 @@ impl<'a> Builder<'a> {
     /// fragment's expansion.
     fn read_column(&mut self, name: &str, src: &str, at: Range<usize>) {
         if let Some(base) = offset_in(self.script, src) {
-            self.columns
-                .push((name.to_string(), base + at.start..base + at.end));
+            let at = base + at.start..base + at.end;
+            if let Some(rec) = self.rec.as_deref_mut() {
+                rec.push(at.clone(), SpanKind::Variable);
+            }
+            self.columns.push((name.to_string(), at));
         }
     }
 
@@ -328,6 +431,82 @@ impl<'a> Builder<'a> {
             names.push(name);
         }
         names
+    }
+
+    /// Whether this parse notes what the script's parts are (see
+    /// [`parse_recorded`]).
+    fn recording(&self) -> bool {
+        self.rec.is_some()
+    }
+
+    /// Note `part`, a slice of the script, as `kind`. Does nothing without
+    /// a recorder, or when `part` is not a slice of the script.
+    fn note(&mut self, part: &str, kind: SpanKind) {
+        if let Some(rec) = self.rec.as_deref_mut() {
+            rec.note(self.script, part, kind);
+        }
+    }
+
+    /// Note each `|` between `stages`, the stages [`split_stages`] cut
+    /// `script` into. (A newline between stages is not noted.)
+    fn note_separators(&mut self, script: &str, stages: &[&str]) {
+        if !self.recording() {
+            return;
+        }
+        for stage in &stages[..stages.len().saturating_sub(1)] {
+            let Some(at) = offset_in(script, stage) else {
+                continue;
+            };
+            let end = at + stage.len();
+            if let Some(bar) = script.get(end..end + 1).filter(|c| *c == "|") {
+                self.note(bar, SpanKind::Operator);
+            }
+        }
+    }
+
+    /// Note the command word of `stage`: a known command, or a call of a
+    /// defined fragment. An unknown word is left for its error.
+    fn note_command(&mut self, stage: &str) {
+        if !self.recording() {
+            return;
+        }
+        let word = match fragment_call(stage) {
+            Some((name, _)) => self.fns.contains_key(name).then_some(name),
+            None => {
+                let (cmd, _) = split_first_word(stage);
+                is_command(cmd).then_some(cmd)
+            }
+        };
+        if let Some(word) = word {
+            self.note(word, SpanKind::Command);
+        }
+    }
+
+    /// Note the command word of each of `stages`: the stages after one that
+    /// failed, which are not parsed.
+    fn note_commands(&mut self, stages: &[&str]) {
+        for stage in stages {
+            self.note_command(stage.trim());
+        }
+    }
+
+    /// Note each token of the expression `src`, as [`lex_expr`] split it,
+    /// with each token's byte range in `src`.
+    fn note_tokens(&mut self, src: &str, toks: &[ETok], spans: &[Range<usize>]) {
+        for (i, (tok, at)) in toks.iter().zip(spans).enumerate() {
+            let kind = match tok {
+                ETok::Num(_) | ETok::Word(..) => SpanKind::Number,
+                ETok::Str(_) => SpanKind::String,
+                // A name right before `(` is a call, as `parse_atom` reads it.
+                ETok::Ident(_) if toks.get(i + 1) == Some(&ETok::Sym("(")) => SpanKind::Function,
+                ETok::Ident(_) => SpanKind::Variable,
+                ETok::Sym("(" | ")" | ",") => continue,
+                ETok::Sym(_) => SpanKind::Operator,
+            };
+            if let Some(part) = src.get(at.clone()) {
+                self.note(part, kind);
+            }
+        }
     }
 
     /// Group the flat item list into stages: runs of statements become a
@@ -396,6 +575,7 @@ impl<'a> Builder<'a> {
     }
 
     fn parse_stage(&mut self, stage: &str) -> Result<(), Error> {
+        self.note_command(stage);
         // `graph` is a terminal sink: it emits a chart, not rows, so nothing may
         // follow it in the pipeline.
         if self.graph.is_some() {
@@ -489,7 +669,22 @@ impl<'a> Builder<'a> {
         src: &str,
         parse: impl FnOnce(&mut ExprParser) -> Result<T, Error>,
     ) -> Result<T, Error> {
-        let (toks, spans) = lex_expr(src).map_err(|(e, at)| self.place_in(src, at, e))?;
+        let (toks, spans) = match lex_expr(src) {
+            Ok(lexed) => lexed,
+            Err((e, at)) => {
+                // The lexer reads left to right, so the text before the
+                // character it stopped at lexes to the same tokens.
+                if self.recording()
+                    && let Ok((toks, spans)) = lex_expr(&src[..at.start])
+                {
+                    self.note_tokens(src, &toks, &spans);
+                }
+                return Err(self.place_in(src, at, e));
+            }
+        };
+        if self.recording() {
+            self.note_tokens(src, &toks, &spans);
+        }
         let mut parser = ExprParser {
             toks,
             spans,
@@ -673,7 +868,13 @@ impl<'a> Builder<'a> {
                 if inner.trim().is_empty() {
                     Box::new(identity_plan())
                 } else {
-                    Box::new(parse_stages(inner, self.fns, self.depth, self.script)?)
+                    Box::new(parse_stages(
+                        inner,
+                        self.fns,
+                        self.depth,
+                        self.script,
+                        self.rec.as_deref_mut(),
+                    )?)
                 }
             } else {
                 Box::new(identity_plan())
@@ -1272,10 +1473,16 @@ fn head_count_text(rest: &str) -> &str {
 /// kept so stage splitting and trimming are unchanged. Mainly for multi-line
 /// scripts read via `-f`, but works inline too.
 fn strip_comments(script: &str) -> String {
+    strip_comments_noting(script, |_| {})
+}
+
+/// [`strip_comments`], calling `comment` with each comment's byte range:
+/// from its `#` up to the end of its line, the newline not included.
+fn strip_comments_noting(script: &str, mut comment: impl FnMut(Range<usize>)) -> String {
     let mut out = String::with_capacity(script.len());
     let mut quote: Option<char> = None;
-    let mut chars = script.chars();
-    while let Some(c) = chars.next() {
+    let mut chars = script.char_indices();
+    while let Some((i, c)) = chars.next() {
         match quote {
             Some(q) => {
                 out.push(c);
@@ -1293,13 +1500,16 @@ fn strip_comments(script: &str) -> String {
                     // so everything after the comment stays at its offset in
                     // the script (where an error's span points).
                     out.push(' ');
-                    for d in chars.by_ref() {
+                    let mut end = script.len();
+                    for (j, d) in chars.by_ref() {
                         if d == '\n' {
                             out.push('\n');
+                            end = j;
                             break;
                         }
                         out.extend(std::iter::repeat_n(' ', d.len_utf8()));
                     }
+                    comment(i..end);
                 }
                 _ => out.push(c),
             },
@@ -4299,5 +4509,190 @@ mod tests {
         // No fragment of that name: the plain unknown-function error stands.
         let e = parse("add x = bogus(a)").unwrap_err().to_string();
         assert!(!e.contains("whole stages"), "{e}");
+    }
+
+    /// Each part `parse_recorded` notes in `script`: its text and kind.
+    fn noted(script: &str) -> Vec<(&str, &'static str)> {
+        let mut rec = Recorder::default();
+        let _ = parse_recorded(script, &mut rec);
+        rec.into_spans()
+            .into_iter()
+            .map(|(at, kind)| (&script[at], kind.name()))
+            .collect()
+    }
+
+    #[test]
+    fn every_kind_has_its_protocol_name() {
+        let kinds = [
+            SpanKind::Command,
+            SpanKind::Keyword,
+            SpanKind::Option,
+            SpanKind::Operator,
+            SpanKind::String,
+            SpanKind::Number,
+            SpanKind::Variable,
+            SpanKind::Function,
+            SpanKind::Comment,
+        ];
+        assert_eq!(
+            kinds.map(SpanKind::name),
+            [
+                "command", "keyword", "option", "operator", "string", "number", "variable",
+                "function", "comment"
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_notes_commands_expressions_and_columns() {
+        assert_eq!(
+            noted("cols a | select b > 1.5 && name == 'x' || !(c =~ 'y')"),
+            [
+                ("cols", "command"),
+                ("a", "variable"),
+                ("|", "operator"),
+                ("select", "command"),
+                ("b", "variable"),
+                (">", "operator"),
+                ("1.5", "number"),
+                ("&&", "operator"),
+                ("name", "variable"),
+                ("==", "operator"),
+                ("'x'", "string"),
+                ("||", "operator"),
+                ("!", "operator"),
+                ("c", "variable"),
+                ("=~", "operator"),
+                ("'y'", "string"),
+            ]
+        );
+        // A name before `(` is a function; `inf` is a number.
+        assert_eq!(
+            noted("select abs(c) - inf < 2"),
+            [
+                ("select", "command"),
+                ("abs", "function"),
+                ("c", "variable"),
+                ("-", "operator"),
+                ("inf", "number"),
+                ("<", "operator"),
+                ("2", "number"),
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_after_an_error_keeps_what_came_before() {
+        // An unknown command: the stages after it get their command word only.
+        assert_eq!(
+            noted("cols a | selct b > 1 | sort c"),
+            [
+                ("cols", "command"),
+                ("a", "variable"),
+                ("|", "operator"),
+                ("|", "operator"),
+                ("sort", "command"),
+            ]
+        );
+        // An expression that does not parse: every token of it is noted.
+        assert_eq!(
+            noted("select a >> 1 | cols b"),
+            [
+                ("select", "command"),
+                ("a", "variable"),
+                (">", "operator"),
+                (">", "operator"),
+                ("1", "number"),
+                ("|", "operator"),
+                ("cols", "command"),
+            ]
+        );
+        // A token the lexer cannot finish: the tokens before it are noted.
+        assert_eq!(
+            noted("select a == 'ab | sort c"),
+            [("select", "command"), ("a", "variable"), ("==", "operator")]
+        );
+    }
+
+    #[test]
+    fn recording_notes_comments_where_they_are() {
+        assert_eq!(
+            noted("cols a # keep a\nselect a > 1 # and 'this'"),
+            [
+                ("cols", "command"),
+                ("a", "variable"),
+                ("# keep a", "comment"),
+                ("select", "command"),
+                ("a", "variable"),
+                (">", "operator"),
+                ("1", "number"),
+                ("# and 'this'", "comment"),
+            ]
+        );
+        // A `#` in a string is not a comment.
+        assert_eq!(
+            noted("select a == '#x'"),
+            [
+                ("select", "command"),
+                ("a", "variable"),
+                ("==", "operator"),
+                ("'#x'", "string"),
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_counts_bytes_not_characters() {
+        let mut rec = Recorder::default();
+        parse_recorded("cols café | select né > 1", &mut rec).unwrap();
+        assert_eq!(
+            rec.into_spans(),
+            [
+                (0..4, SpanKind::Command),
+                (5..10, SpanKind::Variable),
+                (11..12, SpanKind::Operator),
+                (13..19, SpanKind::Command),
+                (20..23, SpanKind::Variable),
+                (24..25, SpanKind::Operator),
+                (26..27, SpanKind::Number),
+            ]
+        );
+    }
+
+    #[test]
+    fn recorded_spans_are_in_order_and_never_overlap() {
+        let mut rec = Recorder::default();
+        rec.push(5..6, SpanKind::Number);
+        rec.push(0..4, SpanKind::Variable);
+        rec.push(0..4, SpanKind::Variable);
+        rec.push(2..3, SpanKind::Operator);
+        rec.push(0..2, SpanKind::Keyword);
+        rec.push(7..7, SpanKind::String);
+        assert_eq!(
+            rec.into_spans(),
+            [
+                (0..2, SpanKind::Keyword),
+                (2..3, SpanKind::Operator),
+                (5..6, SpanKind::Number),
+            ]
+        );
+    }
+
+    #[test]
+    fn recording_builds_the_same_plan() {
+        for script in [
+            "cols a,b | select a > 1 && b == 'x' | sort a=nr | head 5",
+            "fn f(x) { select x > 1 }\nf(a) | agg n=sum(a) by b",
+            "join -l (cols k | uniq k) r.csv on k=id | color red v > 1 | fmt -s",
+            "add c = a ++ '!' # note\ngraph line a c -t T",
+            "cols a | selct b",
+            "select a >> 1",
+            "join (selct a) r.csv on k | cols b",
+            "join -l (cols a | select a >> 1) r.csv on k, (uniq k) s.csv on k",
+        ] {
+            let plain = format!("{:?}", parse(script));
+            let recorded = format!("{:?}", parse_recorded(script, &mut Recorder::default()));
+            assert_eq!(plain, recorded, "{script}");
+        }
     }
 }
