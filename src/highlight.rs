@@ -21,6 +21,12 @@
 //! :end ID
 //! ```
 //!
+//! csvm names `indent` on its first line, so inkline may also ask where a
+//! new line in the script goes: an `:indent ID` request, with the same
+//! `:cwd` and `:arg` blocks and then `:at ARG OFFSET` (where the line
+//! breaks) before `:done`. csvm answers `:depth NEW CURRENT` (how deep the
+//! new line and the line being split sit), or nothing, then `:end ID`.
+//!
 //! Lengths and offsets count bytes. inkline's `docs/highlight-protocol.md`
 //! describes the whole protocol.
 
@@ -36,8 +42,9 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The line csvm writes first: the protocol's name and version.
-pub const GREETING: &str = "inkline-highlight 1";
+/// The line csvm writes first: the protocol's name and version, and the
+/// one extra request csvm answers, `:indent`.
+pub const GREETING: &str = "inkline-highlight 1 indent";
 
 /// The longest `:` line a request may have, newline included.
 const MAX_LINE: u64 = 256;
@@ -460,6 +467,15 @@ fn read_at(fields: &str, args: &[Arg]) -> io::Result<(usize, usize)> {
     }
 }
 
+/// Write the answer to `:indent` request `id`: `:depth NEW CURRENT` when
+/// there are depths, then `:end ID`.
+pub fn write_indent(out: &mut impl Write, id: u64, depths: Option<Depths>) -> io::Result<()> {
+    if let Some(d) = depths {
+        writeln!(out, ":depth {} {}", d.new, d.current)?;
+    }
+    writeln!(out, ":end {id}")
+}
+
 /// Write `reply` to request `id`, ending with `:end ID`. The spans stop
 /// before they pass `MAX_SPAN_BYTES`; the error, on one line of at most
 /// `MAX_MESSAGE` bytes, and the end are always written.
@@ -490,14 +506,18 @@ pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<(
 }
 
 /// Be the helper: write [`GREETING`], then answer each request read from
-/// `input` on `output`, flushing after each reply, until `input` ends.
+/// `input` on `output`, a colour request with [`Session::answer`] and an
+/// `:indent` one with [`indent`], flushing after each reply, until `input`
+/// ends.
 pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "{GREETING}")?;
     output.flush()?;
     let mut session = Session::default();
     while let Some(request) = read_request(input)? {
-        let reply = session.answer(&request);
-        write_reply(output, request.id, &reply)?;
+        match request.at {
+            Some(at) => write_indent(output, request.id, indent(&request, at))?,
+            None => write_reply(output, request.id, &session.answer(&request))?,
+        }
         output.flush()?;
     }
     Ok(())
@@ -1441,7 +1461,7 @@ mod tests {
         serve(&mut &input[..], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "inkline-highlight 1\n\
+            "inkline-highlight 1 indent\n\
              :span 1 0 3 command\n:end 1\n\
              :error 1 0 6 unknown option: --colr\n:end 2\n"
         );
@@ -1495,6 +1515,100 @@ mod tests {
             bad(b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:at 0 0\n:done\n"),
             InvalidData
         );
+    }
+
+    #[test]
+    fn an_indent_reply_is_its_depths_and_the_end() {
+        let mut out = Vec::new();
+        write_indent(&mut out, 4, Some(Depths { new: 2, current: 1 })).unwrap();
+        assert_eq!(out, b":depth 2 1\n:end 4\n");
+        let mut out = Vec::new();
+        write_indent(&mut out, 5, None).unwrap();
+        assert_eq!(out, b":end 5\n");
+    }
+
+    /// Read `bytes` as inkline reads an indent reply to request `id`, and
+    /// return its depths. inkline's rules: each line ends in a newline and
+    /// splits at its first space into a keyword and the rest; a line that
+    /// does not start with `:` is a failure; `:depth` comes at most once,
+    /// and its rest is exactly two fields, one space apart, each a number
+    /// made only of ASCII digits (no sign) that fits a `usize`; `:end`'s
+    /// rest is such a number, equal to `id`, and ends the reply; any other
+    /// `:` line is passed over. csvm writes nothing after `:end`, so the
+    /// reply must end there too.
+    fn read_as_inkline(bytes: &[u8], id: u64) -> Option<(usize, usize)> {
+        fn number<T: std::str::FromStr>(field: &str) -> T {
+            assert!(
+                !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()),
+                "not plain digits: {field:?}"
+            );
+            field.parse().ok().expect("a number too large")
+        }
+        let text = std::str::from_utf8(bytes).expect("a reply in UTF-8");
+        let body = text
+            .strip_suffix('\n')
+            .expect("the last line ends in a newline");
+        let mut depths = None;
+        let lines: Vec<&str> = body.split('\n').collect();
+        for (i, line) in lines.iter().enumerate() {
+            assert!(line.starts_with(':'), "not a reply line: {line:?}");
+            let (keyword, rest) = line.split_once(' ').unwrap_or((line, ""));
+            match keyword {
+                ":depth" => {
+                    assert!(depths.is_none(), "a second :depth: {line:?}");
+                    let fields: Vec<&str> = rest.split(' ').collect();
+                    let [new, current] = fields[..] else {
+                        panic!(":depth needs two fields: {line:?}");
+                    };
+                    depths = Some((number(new), number(current)));
+                }
+                ":end" => {
+                    assert_eq!(number::<u64>(rest), id, "the wrong :end ID");
+                    assert_eq!(i, lines.len() - 1, "a line after :end");
+                    return depths;
+                }
+                _ => {}
+            }
+        }
+        panic!("no :end");
+    }
+
+    #[test]
+    fn an_indent_reply_reads_as_inkline_reads_it() {
+        for (id, depths) in [
+            (1, Some(Depths { new: 0, current: 0 })),
+            (
+                2,
+                Some(Depths {
+                    new: 3,
+                    current: 12,
+                }),
+            ),
+            (3, None),
+            (
+                u64::MAX,
+                Some(Depths {
+                    new: usize::MAX,
+                    current: 1,
+                }),
+            ),
+        ] {
+            let mut out = Vec::new();
+            write_indent(&mut out, id, depths).unwrap();
+            assert_eq!(
+                read_as_inkline(&out, id),
+                depths.map(|d| (d.new, d.current))
+            );
+        }
+        // And a reply `serve` writes for a script split inside a group.
+        let input = b":indent 7\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 15\n\
+                      fn f() {\n  head\n:at 1 15\n:done\n";
+        let mut out = Vec::new();
+        serve(&mut &input[..], &mut out).unwrap();
+        let reply = out
+            .strip_prefix(format!("{GREETING}\n").as_bytes())
+            .unwrap();
+        assert_eq!(read_as_inkline(reply, 7), Some((1, 1)));
     }
 
     #[test]
@@ -1560,5 +1674,21 @@ mod tests {
         let mut req = request("/", &["csvm", "join (", "$f"]);
         req.args[2].raw = true;
         assert_eq!(indent(&req, (1, 6)), Some(Depths { new: 1, current: 0 }));
+    }
+
+    #[test]
+    fn serve_answers_colour_and_indent_requests_in_order() {
+        let input = b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 4\nfmt \n:done\n\
+                      :indent 2\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 6\njoin (\n:at 1 6\n:done\n\
+                      :indent 3\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 6\njoin (\n:at 0 4\n:done\n";
+        let mut out = Vec::new();
+        serve(&mut &input[..], &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "inkline-highlight 1 indent\n\
+             :span 1 0 3 command\n:end 1\n\
+             :depth 1 0\n:end 2\n\
+             :end 3\n"
+        );
     }
 }
