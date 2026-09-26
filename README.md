@@ -28,6 +28,7 @@ builds the release binary and copies it to your XDG user-binaries directory
 csvm [-o OUT] [-n THREADS] [-f FILE] [-t TEMPDIR] [--chunk-size SIZE]
      [--sort-buffer SIZE] [--color WHEN] [--no-pager] [--no-progress]
      [--explain] [SCRIPT] [INPUT]
+csvm --highlight
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
@@ -48,6 +49,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--no-pager`       | never page (see below)                                      |
 | `--no-progress`    | never show the progress line on stderr (see below)          |
 | `--explain`   | print the compiled plan and exit                            |
+| `--highlight`      | answer [inkline](https://github.com/shsms/inkline)'s colouring requests on stdin (see below); takes no other arguments |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
 
@@ -107,6 +109,34 @@ The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by
 default; `-n 1` runs serially). A streaming input
 (stdin) emits output as rows arrive rather than buffering a full chunk first.
+
+## Colouring scripts as you type
+
+[inkline](https://github.com/shsms/inkline) can colour a csvm script inside
+its quotes while you type it, and underline a mistake with csvm's own
+message under the line. csvm does the work: `csvm --highlight` reads
+inkline's requests on stdin and answers each with the colours of the
+script, found by csvm's own parser, and the first thing csvm would stop at:
+a bad option, a script that does not parse, or a column the input file does
+not have. Add this line to inkline's `init.el`:
+
+```elisp
+(inkline-highlight-arguments "csvm" '("csvm" "--highlight"))
+```
+
+An alias needs its own line: for `alias c=csvm`, add
+`(inkline-highlight-arguments "c" '("csvm" "--highlight"))`. Column errors
+need an input file named on the line, and no argument that bash will still
+change, such as `$f`, `*.csv` or `-o $out`: it may become other words, or
+none. When such an argument comes before the script, as in
+`csvm -o $out 'cols a' data.csv`, no error in the script is shown either,
+since csvm may then take another argument as its script. A script that
+bash will still change, such as `"select a > $min"`, is not coloured or
+checked. csvm reads a file's header again only when the file changes;
+inkline shows the new answer once you change the command's arguments, or on
+the next line. A script given with `-f` is not coloured, but the options on
+the line are still checked. inkline's `docs/highlight-protocol.md`
+describes the requests and replies.
 
 ## The command language
 

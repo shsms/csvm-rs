@@ -697,6 +697,32 @@ chunk = 1 MB, sort buffer = 256 MiB. (csvm used `-f IN` for *input*; this port
 reuses `-f` for the *script* file and takes input positionally — flags
 otherwise mirror csvm.)
 
+`--highlight` (alone) makes csvm inkline's colouring helper
+(`src/highlight.rs`, protocol in inkline's `docs/highlight-protocol.md`):
+`highlight::serve` reads requests on stdin and answers each on stdout. A
+`highlight::Session` runs `cli::parse_at` (a usage error says which argument
+it is about) and `parse::parse_recorded`, the real parser with a
+`parse::Recorder` that notes each part's byte range and kind where the
+parser reads it (`Builder::note`); a plain `parse` passes no recorder and
+builds the same plan. The first error is sent on its place: a usage error on
+its argument, a parse error on its span, or, when a readable regular input
+file is named, a `Plan::resolve` error against its header. A `raw` argument
+(one bash will still change) may become other words or none, so no usage
+error is sent when one is at or before the error's argument (anywhere on the
+line, for an error about the whole line: `Usage::whole_line`), no parse
+error when one is at or before the script (one after it is taken to stay
+one argument that is not an option), and no column error when any argument
+is `raw`. The input's header and each join file's are kept per file
+(`Headers`), a failed read too, until the file's size or modification time
+changes. Relative paths are taken from the request's `:cwd`; the helper
+never changes its own directory. `main` runs `serve` before it reads a
+`Console`, so the helper never pages, never writes colour and never asks the
+terminal anything. `serve` flushes after the greeting and after each `:end`,
+and returns when stdin ends. A request that breaks the protocol ends it with
+exit status 1 and the reason on stderr; a closed stdout, or a connection
+reset (inkline's socket closed with a reply still unread), ends it quietly,
+like any run whose reader stopped (`Failure::Closed`).
+
 ## Performance
 
 Benchmarked against the C++ csvm (`gen_csv` 3M rows / 151 MB, warm cache).

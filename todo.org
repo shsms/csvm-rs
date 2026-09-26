@@ -45,6 +45,20 @@ git history; this file is the "what next / what was decided" scratchpad.
   adding the step, so float error builds up. Ticks as whole multiples of the
   step, labelled at its precision, and bounds to a few significant digits
   would fix both.
+- =--highlight=: a script bash will still expand (="select a > $min"=)
+  reaches the parser as typed, quote marks included, so it gets no colour.
+  Parsing the text inside the quotes, and moving each span one byte on,
+  would colour all of it but the =$min=.
+- =--highlight=: an option value bash will still expand (=-n $N=) reaches
+  =cli::parse_at= as typed, which rejects it, so the helper sends no error
+  (the argument is raw) but no colour either: the script is never found.
+  Putting a harmless value in its place before parsing (=1= for =-n=)
+  would let the script be coloured.
+- A script nested about 3000 levels deep with =(= overflows the stack in
+  the expression parser (=ExprParser=), in csvm itself and in the
+  =--highlight= helper, which then exits, so inkline turns its colouring
+  off. A depth limit in the expression parser, an error past it, would
+  fix both.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a
