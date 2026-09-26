@@ -1709,7 +1709,8 @@ fn missing_pipe_note(word: &str) -> String {
 /// Shared by the forward scan below (a line with nothing else is skipped)
 /// and the backward one in [`missing_pipe_at`] (finding the last real
 /// character), so a line of nothing but one of these costs the same either
-/// way: a single pass, not a backward scan per line.
+/// way: a single pass, not a backward scan per line. [`depths`] uses it
+/// too, so a line of blanks changes nothing there.
 fn is_blank(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\r' | 0x0b | 0x0c)
 }
@@ -1984,9 +1985,9 @@ fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
 
 // --- nesting, for indenting a line ------------------------------------------
 
-/// How deep two lines of a script sit, counted in the `fn NAME(…) { … }`
-/// bodies and `join (…)` groups open around them, for an editor that
-/// indents a line it is splitting (`csvm --inkline-mode`).
+/// Where two lines of a script go, counted in steps, for an editor that
+/// indents a line it is splitting (`csvm --inkline-mode`). Each is a line's
+/// level, the depth inkline's `:depth` reply carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Depths {
     /// The line that starts where the split is.
@@ -1996,22 +1997,42 @@ pub struct Depths {
     pub current: Option<usize>,
 }
 
-/// The [`Depths`] for splitting `script` at byte `at` (at most its length). The
-/// script is read with the parser's own rules: comments as `strip_comments`
-/// finds them, `'…'`, `"…"` and `` `…` `` quotes as the group takers
-/// (`take_paren_group`, `take_brace_group`) skip them, and stages split on a
-/// lone `|` or a newline as in `split_stages`, except in an `fn` header before
-/// its `{`, which `parse_fn_def` reads across newlines. A `{` opens an `fn`
-/// body when its stage's first word is `fn`, and a `(` opens a `join` group
-/// when its stage's first word is `join`; any other bracket only has to be
-/// closed. Text inside a string or a comment is at the depth where the string
-/// or comment started. A line that starts, blanks skipped, with a `)` or `}`
-/// that closes a group gets the depth just after that bracket. When the
-/// brackets nest well, that is one step out. Only such a line has a depth
-/// for the line the split is on: any other line is left as it is (`current`
-/// is `None`), so a line indented by hand is never moved. The script need
-/// not parse: an unclosed group runs to the end, and a closing bracket with
-/// no group open is passed over, so no depth is ever below 0.
+/// The [`Depths`] for splitting `script` at byte `at` (at most its length).
+///
+/// Each line gets a level, in steps, from the lines before it:
+///
+/// - A line that starts a stage (after a line that ends with a lone `|`,
+///   or starting with one) is at the level of the group it is in: 0 at the
+///   top of the script, and inside a `join ( … )` group or an `fn … { … }`
+///   body the level its bracket gives, as the next point says.
+/// - Any `(`, `[` or `{` still open at the end of a line makes the lines
+///   after it one step deeper than the line that opened it, or, when that
+///   is a group's own first line (`join (select f(`), one step deeper than
+///   the group's lines; several opened on one line give one step. A line
+///   that starts (blanks skipped) with a closing bracket goes back one step
+///   from the lines inside that bracket, and so does the rest of a line
+///   after a closing bracket in it that closes a bracket opened on an
+///   earlier line (`b) {` after `fn f(a,`). A closing bracket with nothing
+///   open to close is passed over.
+/// - A line after one that ends with an operator (`&&`, `||`, `+`, `-`,
+///   `*`, `/`, `%`, `?`, `:`, `=`, `==`, `!=`, `<`, `>`, `<=`, `>=`) or a
+///   `,` is one step deeper than where the current stage started: its
+///   first line's level, or its group's level when that is deeper (a stage
+///   that starts on its group's `join (` line), one step however many
+///   lines continue. This holds only for a stage's own text, at the top or
+///   in a group; inside any other bracket the lines stay at its level. A
+///   `(` opens a group when its stage's first word is `join`, and a `{`
+///   when it is `fn`, the word followed by a blank.
+/// - A line that is blank or only a comment changes nothing for the lines
+///   after it. A line that starts inside a quote is at the level of the
+///   line the quote started on.
+///
+/// `new` is the level of the text after the split, read as a line of its
+/// own; `current` is the level of the line the split is on only when it
+/// starts with a closing bracket, so a line indented by hand is never
+/// moved. The script is read with the parser's own rules (comments as
+/// `strip_comments` finds them, `'…'`, `"…"` and `` `…` `` quotes), but
+/// need not parse. One pass over the text up to the split.
 pub fn depths(script: &str, at: usize) -> Depths {
     let text = strip_comments(script);
     let at = at.min(text.len());
@@ -2021,231 +2042,54 @@ pub fn depths(script: &str, at: usize) -> Depths {
         .map_or(0, |nl| nl + 1);
     let mut nesting = Nesting::new(&text);
     nesting.scan(0..line_start);
-    let current = nesting.closer_depth(line_start);
+    let current = nesting.closer_level(line_start);
     nesting.scan(line_start..at);
-    let new = nesting.line_depth(at);
+    nesting.end_line();
+    let new = nesting.line_level(at);
     Depths { new, current }
-}
-
-/// What a stage's first word makes of the brackets in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandWord {
-    /// `join`: a `(` opens a sub-pipeline.
-    Join,
-    /// `fn`: a `{` opens a fragment body.
-    Fn,
-    /// Anything else: a bracket is only a bracket.
-    Other,
 }
 
 /// One bracket left open, or the whole script (the first entry).
 #[derive(Debug)]
 struct Bracket {
-    /// A `join` group or an `fn` body: one step deeper.
-    counts: bool,
-    /// Where its current stage starts, when it holds stages (the whole
-    /// script, an `fn` body, a `join` group); `None` inside an expression.
-    stage: Option<usize>,
-    /// What the current stage's first word is, once a bracket, a `|` or a
-    /// newline asked.
+    /// The level of the lines inside it: 0 for the whole script, else one
+    /// more than the level of the line that opened it, or than its group's
+    /// lines on the group's own first line (see [`Nesting::open`]).
+    level: usize,
+    /// Its current stage, when it holds stages: the whole script, a `join`
+    /// group or an `fn` body. `None` for any other bracket.
+    stage: Option<OpenStage>,
+}
+
+/// The stage being read in a bracket that holds stages.
+#[derive(Debug, Default)]
+struct OpenStage {
+    /// The level where it started (its first line's level, or its
+    /// bracket's when that is deeper) and the byte its text starts at;
+    /// `None` before any text, and after a lone `|` or an `fn` body.
+    start: Option<(usize, usize)>,
+    /// What its first word makes of a bracket, read at its first bracket.
     command_word: Option<CommandWord>,
+    /// Whether the last line with text on it, inside this bracket, ended
+    /// with an operator or a `,`.
+    continued: bool,
 }
 
-/// A left-to-right scan of comment-free script text that keeps the open
-/// brackets and whether it is inside a quote.
-struct Nesting<'s> {
-    text: &'s str,
-    /// Never empty: the first entry is the whole script and is never closed.
-    brackets: Vec<Bracket>,
-    /// The quote mark of the string the scan is inside.
-    quote: Option<u8>,
-    /// Indices into `brackets` of the open brackets closed by `)`, oldest
-    /// first.
-    parens: Vec<usize>,
-    /// The same, for brackets closed by `}`.
-    braces: Vec<usize>,
-}
-
-impl<'s> Nesting<'s> {
-    fn new(text: &'s str) -> Nesting<'s> {
-        Nesting {
-            text,
-            brackets: vec![Bracket {
-                counts: false,
-                stage: Some(0),
-                command_word: None,
-            }],
-            quote: None,
-            parens: Vec::new(),
-            braces: Vec::new(),
-        }
-    }
-
-    /// Read the bytes of `range`, which starts where the last scan ended.
-    fn scan(&mut self, range: Range<usize>) {
-        let bytes = self.text.as_bytes();
-        let mut i = range.start;
-        while i < range.end {
-            let c = bytes[i];
-            match self.quote {
-                Some(q) => {
-                    if c == q {
-                        self.quote = None;
-                    }
-                }
-                None => match c {
-                    b'\'' | b'"' | b'`' => self.quote = Some(c),
-                    b'(' | b'{' => self.open(c, i),
-                    b')' | b'}' => self.close(c, i),
-                    // `||` is the or-operator, not a stage separator.
-                    b'|' if bytes.get(i + 1) == Some(&b'|') => i += 1,
-                    b'|' | b'\n' if !self.fn_header_pending(i) => self.new_stage(i + 1),
-                    _ => {}
-                },
-            }
-            i += 1;
-        }
-    }
-
-    /// True while the innermost bracket's current stage, read so far, starts
-    /// `fn` and has not opened its body yet: `parse_fn_def` reads an `fn`'s
-    /// parameter list and the blank before its `{` across newlines, so a
-    /// `|` or a newline there does not start a new stage (the `}` that
-    /// closes the body still does, from [`close`](Self::close)). `at` is
-    /// the `|` or newline. A newline counts as the blank after `fn`, as it
-    /// does for the parser. The first word is kept once found, so a long
-    /// header is read once.
-    fn fn_header_pending(&mut self, at: usize) -> bool {
-        let end = if self.text.as_bytes()[at] == b'\n' {
-            at + 1
-        } else {
-            at
-        };
-        // A first word that is not `fn` is dropped with the stage, which
-        // starts again after this `|` or newline.
-        self.stage_command_word(end) == CommandWord::Fn
-    }
-
-    /// What the innermost bracket's current stage, read up to `end`, makes
-    /// of a bracket; `Other` inside an expression. The first word is kept
-    /// once found.
-    fn stage_command_word(&mut self, end: usize) -> CommandWord {
-        let text = self.text;
-        let top = self.brackets.last_mut().expect("the whole script stays");
-        match top.stage {
-            Some(start) => *top
-                .command_word
-                .get_or_insert_with(|| command_word(&text[start..end])),
-            None => CommandWord::Other,
-        }
-    }
-
-    /// A stage starts at `at` in the innermost bracket, when that bracket holds
-    /// stages.
-    fn new_stage(&mut self, at: usize) {
-        let top = self.brackets.last_mut().expect("the whole script stays");
-        if top.stage.is_some() {
-            top.stage = Some(at);
-            top.command_word = None;
-        }
-    }
-
-    /// The bracket `c` at byte `i` opens a new level.
-    fn open(&mut self, c: u8, i: usize) {
-        let word = self.stage_command_word(i);
-        let counts = matches!(
-            (c, word),
-            (b'(', CommandWord::Join) | (b'{', CommandWord::Fn)
-        );
-        self.brackets.push(Bracket {
-            counts,
-            stage: counts.then_some(i + 1),
-            command_word: None,
-        });
-        let idx = self.brackets.len() - 1;
-        if c == b'(' {
-            self.parens.push(idx);
-        } else {
-            self.braces.push(idx);
-        }
-    }
-
-    /// The bracket `c` at byte `i` closes the innermost bracket it can close,
-    /// and any left open inside it. After an `fn` body a new stage starts,
-    /// as the prologue reads on after the body's `}`.
-    fn close(&mut self, c: u8, i: usize) {
-        let Some(at) = self.closed_by(c) else {
-            return;
-        };
-        let fn_body = c == b'}' && self.brackets[at].counts;
-        self.brackets.truncate(at);
-        // The stacks keep only the open brackets.
-        while self.parens.last().is_some_and(|&p| p >= at) {
-            self.parens.pop();
-        }
-        while self.braces.last().is_some_and(|&b| b >= at) {
-            self.braces.pop();
-        }
-        if fn_body {
-            self.new_stage(i + 1);
-        }
-    }
-
-    /// The index of the bracket `c` would close; `None` when none is open.
-    fn closed_by(&self, c: u8) -> Option<usize> {
-        let stack = if c == b')' {
-            &self.parens
-        } else {
-            &self.braces
-        };
-        stack.last().copied()
-    }
-
-    /// The depth of the brackets up to (not including) `end`.
-    fn depth_below(&self, end: usize) -> usize {
-        self.brackets[..end].iter().filter(|f| f.counts).count()
-    }
-
-    /// The depth of a line whose text starts at byte `at`, where the scan
-    /// has stopped, when the text starts (blanks skipped) with a bracket
-    /// that closes an open one: the depth after it. `None` for any other
-    /// line.
-    fn closer_depth(&self, at: usize) -> Option<usize> {
-        if self.quote.is_some() {
-            return None;
-        }
-        let first = self.text.as_bytes()[at..]
-            .iter()
-            .find(|&&b| b != b' ' && b != b'\t');
-        match first {
-            Some(&c @ (b')' | b'}')) => self.closed_by(c).map(|opened| self.depth_below(opened)),
-            _ => None,
-        }
-    }
-
-    /// The depth of a line whose text starts at byte `at`, where the scan
-    /// has stopped: the depth there, or, when the text starts (blanks
-    /// skipped) with a bracket that closes an open one, the depth after it.
-    fn line_depth(&self, at: usize) -> usize {
-        let open = self.brackets.len();
-        if self.quote.is_some() {
-            return self.depth_below(open);
-        }
-        let first = self.text.as_bytes()[at..]
-            .iter()
-            .find(|&&b| b != b' ' && b != b'\t');
-        match first {
-            Some(&c @ (b')' | b'}')) => self.depth_below(self.closed_by(c).unwrap_or(open)),
-            _ => self.depth_below(open),
-        }
-    }
+/// What a stage's first word makes of the brackets in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandWord {
+    /// `join`: a `(` opens a group of stages.
+    Join,
+    /// `fn`: a `{` opens a body of stages.
+    Fn,
+    /// Anything else: a bracket holds no stages.
+    Other,
 }
 
 /// What the stage text before a bracket, `head`, makes of it: the stage's
 /// first word, when a blank ends it before the bracket. A bracket inside
 /// the first word (`prep(`, `join(`) is not after a command.
 fn command_word(head: &str) -> CommandWord {
-    let head = head.trim_start();
     let (word, _) = split_first_word(head);
     if word.len() == head.len() {
         return CommandWord::Other;
@@ -2254,6 +2098,256 @@ fn command_word(head: &str) -> CommandWord {
         "join" => CommandWord::Join,
         "fn" => CommandWord::Fn,
         _ => CommandWord::Other,
+    }
+}
+
+/// A left-to-right scan of comment-free script text that keeps the open
+/// brackets, the level of the line it is on, and whether it is inside a
+/// quote.
+struct Nesting<'s> {
+    text: &'s str,
+    /// Never empty: the first entry is the whole script and is never closed.
+    brackets: Vec<Bracket>,
+    /// Indices into `brackets` of the brackets still open, one stack per
+    /// kind (`()`, `[]`, `{}`), each oldest first.
+    open_by_kind: [Vec<usize>; 3],
+    /// The quote mark of the string the scan is inside, and the level of
+    /// the line the quote started on.
+    quote: Option<(u8, usize)>,
+    /// The level of the line being read, once its first text is read (or
+    /// from its start, when it starts inside a quote).
+    line: Option<usize>,
+    /// Whether the last text on the line being read is an operator or a
+    /// `,`; `None` while the line has no text.
+    ends_in_operator: Option<bool>,
+}
+
+/// Which of [`Nesting::open_by_kind`] the bracket `c`, opening or closing,
+/// belongs to.
+fn bracket_kind(c: u8) -> usize {
+    match c {
+        b'(' | b')' => 0,
+        b'[' | b']' => 1,
+        // `{` or `}`, the only other brackets.
+        _ => 2,
+    }
+}
+
+impl<'s> Nesting<'s> {
+    fn new(text: &'s str) -> Nesting<'s> {
+        Nesting {
+            text,
+            brackets: vec![Bracket {
+                level: 0,
+                stage: Some(OpenStage::default()),
+            }],
+            open_by_kind: [Vec::new(), Vec::new(), Vec::new()],
+            quote: None,
+            line: None,
+            ends_in_operator: None,
+        }
+    }
+
+    fn top(&mut self) -> &mut Bracket {
+        self.brackets.last_mut().expect("the whole script stays")
+    }
+
+    /// Read the bytes of `range`, which starts where the last scan ended.
+    fn scan(&mut self, range: Range<usize>) {
+        let bytes = self.text.as_bytes();
+        let mut i = range.start;
+        while i < range.end {
+            let c = bytes[i];
+            if c == b'\n' {
+                self.end_line();
+            } else if let Some((q, _)) = self.quote {
+                if c == q {
+                    self.quote = None;
+                    self.ends_in_operator = Some(false);
+                }
+            } else if !is_blank(c) {
+                // The line's first text sets its level.
+                let line = match self.line {
+                    Some(line) => line,
+                    None => *self.line.insert(self.level_at(i)),
+                };
+                let top = self.top();
+                let start = line.max(top.level);
+                if let Some(stage) = &mut top.stage {
+                    stage.start.get_or_insert((start, i));
+                }
+                let mut operator = false;
+                match c {
+                    b'\'' | b'"' | b'`' => self.quote = Some((c, line)),
+                    b'(' | b'[' | b'{' => self.open(c, i, line),
+                    b')' | b']' | b'}' => self.close(c),
+                    // `||` and `&&` are operators; a lone `|` starts a stage.
+                    // A `|` at the end of `range` (the split in `depths`)
+                    // is lone even with a `|` after it in the text: the
+                    // split puts a line break between the two.
+                    b'|' | b'&' if i + 1 < range.end && bytes[i + 1] == c => {
+                        i += 1;
+                        operator = true;
+                    }
+                    b'|' => self.new_stage(),
+                    b'+' | b'-' | b'*' | b'/' | b'%' | b'?' | b':' | b'=' | b'<' | b'>' | b',' => {
+                        operator = true
+                    }
+                    _ => {}
+                }
+                self.ends_in_operator = Some(operator);
+            }
+            i += 1;
+        }
+    }
+
+    /// The line being read ends. When it had text and did not end inside a
+    /// quote, whether it ended with an operator says whether the next line
+    /// continues its stage, when its innermost bracket holds stages.
+    fn end_line(&mut self) {
+        if self.quote.is_none()
+            && let Some(operator) = self.ends_in_operator
+            && let Some(stage) = &mut self.top().stage
+        {
+            stage.continued = operator;
+        }
+        self.ends_in_operator = None;
+        // A line that starts inside a quote is at the quote's level.
+        self.line = self.quote.map(|(_, level)| level);
+    }
+
+    /// A new stage starts in the innermost bracket, when it holds stages.
+    fn new_stage(&mut self) {
+        if let Some(stage) = &mut self.top().stage {
+            *stage = OpenStage::default();
+        }
+    }
+
+    /// The bracket `c` at byte `at` opens a new level, on a line at `line`.
+    fn open(&mut self, c: u8, at: usize, line: usize) {
+        // On a group's own first line the step is past the group's lines,
+        // as for a stage that starts there: past the group itself, or past
+        // one step out from the lines of a bracket opened on the same line.
+        let top = self.brackets.last().expect("the whole script stays");
+        let base = match top.stage {
+            Some(_) => line.max(top.level),
+            None => line.max(top.level.saturating_sub(1)),
+        };
+        let stage = self.opens_stages(c, at).then(OpenStage::default);
+        self.brackets.push(Bracket {
+            level: base + 1,
+            stage,
+        });
+        let idx = self.brackets.len() - 1;
+        self.open_by_kind[bracket_kind(c)].push(idx);
+    }
+
+    /// Whether the bracket `c` at byte `at` opens a `join` group or an `fn`
+    /// body. Its stage's first word is read once, at the stage's first
+    /// bracket, and kept.
+    fn opens_stages(&mut self, c: u8, at: usize) -> bool {
+        let text = self.text;
+        let Some(stage) = &mut self.top().stage else {
+            return false;
+        };
+        let Some((_, from)) = stage.start else {
+            return false;
+        };
+        let word = *stage
+            .command_word
+            .get_or_insert_with(|| command_word(text.get(from..at).unwrap_or("")));
+        matches!(
+            (c, word),
+            (b'(', CommandWord::Join) | (b'{', CommandWord::Fn)
+        )
+    }
+
+    /// The closing bracket `c` closes the innermost bracket it can close,
+    /// and any left open inside it. After an `fn` body a new stage starts,
+    /// as the prologue reads on after the body's `}`.
+    fn close(&mut self, c: u8) {
+        let Some(at) = self.closed_by(c) else {
+            return;
+        };
+        let fn_body = c == b'}' && self.brackets[at].stage.is_some();
+        // The rest of the line goes one step out from the bracket's lines,
+        // when that is less: `b) {` after `fn f(a,`.
+        let outer = self.brackets[at].level.saturating_sub(1);
+        self.line = self.line.map(|line| line.min(outer));
+        self.brackets.truncate(at);
+        // The stacks keep only the open brackets.
+        for stack in &mut self.open_by_kind {
+            while stack.last().is_some_and(|&b| b >= at) {
+                stack.pop();
+            }
+        }
+        if fn_body {
+            self.new_stage();
+        }
+    }
+
+    /// The index of the bracket `c` would close; `None` when none is open.
+    fn closed_by(&self, c: u8) -> Option<usize> {
+        self.open_by_kind[bracket_kind(c)].last().copied()
+    }
+
+    /// The level one step out from the lines inside the bracket the byte at
+    /// `at` closes; `None` when it is not a closing bracket, or has nothing
+    /// open to close.
+    fn outer_level(&self, at: usize) -> Option<usize> {
+        let c = *self.text.as_bytes().get(at)?;
+        if !matches!(c, b')' | b']' | b'}') {
+            return None;
+        }
+        self.closed_by(c)
+            .map(|opened| self.brackets[opened].level - 1)
+    }
+
+    /// The level of a line whose first text is at byte `at` (or that has
+    /// none, when `at` is its end), outside a quote, where the scan has
+    /// stopped.
+    fn level_at(&self, at: usize) -> usize {
+        if let Some(level) = self.outer_level(at) {
+            return level;
+        }
+        let bytes = self.text.as_bytes();
+        let top = self.brackets.last().expect("the whole script stays");
+        if bytes.get(at) == Some(&b'|') && bytes.get(at + 1) != Some(&b'|') {
+            return top.level;
+        }
+        match &top.stage {
+            Some(OpenStage {
+                start: Some((start, _)),
+                continued: true,
+                ..
+            }) => start + 1,
+            _ => top.level,
+        }
+    }
+
+    /// Byte `at`, a line's start, moved past the blanks there.
+    fn skip_blanks(&self, at: usize) -> usize {
+        let bytes = self.text.as_bytes();
+        at + bytes[at..].iter().take_while(|&&b| is_blank(b)).count()
+    }
+
+    /// The level of a line that starts at byte `at`, where the scan has
+    /// stopped.
+    fn line_level(&self, at: usize) -> usize {
+        match self.quote {
+            Some((_, level)) => level,
+            None => self.level_at(self.skip_blanks(at)),
+        }
+    }
+
+    /// The level of the line that starts at byte `at`, where the scan has
+    /// stopped, when it starts (blanks skipped) with a closing bracket that
+    /// closes an open one; `None` for any other line.
+    fn closer_level(&self, at: usize) -> Option<usize> {
+        match self.quote {
+            Some(_) => None,
+            None => self.outer_level(self.skip_blanks(at)),
+        }
     }
 }
 
@@ -6071,148 +6165,336 @@ mod tests {
         (d.new, d.current)
     }
 
+    /// Type `script`, each line indented four spaces a level, line by line:
+    /// pressing Enter at the end of each line must start the next one at
+    /// its level (unless it starts with a closing bracket, which moves out
+    /// when Enter is pressed at its own end), and must leave the line
+    /// Enter is pressed on as it is, unless it starts with a closing
+    /// bracket. Blank lines are not checked.
+    fn assert_typed(script: &str) {
+        let level = |line: &str| (line.len() - line.trim_start().len()) / 4;
+        let closer = |line: &str| line.trim_start().starts_with([')', ']', '}']);
+        let mut end = 0;
+        for (k, line) in script.split('\n').enumerate() {
+            if k > 0 {
+                // Enter at the end of the line before this one.
+                let before = &script[..end];
+                if !line.trim().is_empty() && !closer(line) {
+                    assert_eq!(
+                        depths(before, before.len()).new,
+                        level(line),
+                        "line {k}: {line:?}"
+                    );
+                }
+                end += 1;
+            }
+            end += line.len();
+            // Enter at the end of this line.
+            let typed = &script[..end];
+            if !line.trim().is_empty() {
+                assert_eq!(
+                    depths(typed, typed.len()).current,
+                    closer(line).then_some(level(line)),
+                    "line {k}: {line:?}"
+                );
+            }
+        }
+    }
+
     #[test]
-    fn top_level_lines_are_at_depth_0() {
+    fn the_examples_are_indented_as_they_are_written() {
+        assert_typed(
+            "select amount > 0
+| add amount1 = amount * (
+    (price > 0 ? price : 1)
+    - 1
+) * (
+    qty < 185 ? 0 : 1
+)
+| add yn = qty < 185 ?
+    '' : 'yes'
+| color -g amount1 green:red
+| head -n 25",
+        );
+        assert_typed(
+            "add x = f(
+    g(
+        1
+    )
+)",
+        );
+        assert_typed(
+            "
+fn prep(n) {
+    rename value=n
+    | cols -v metric
+}
+
+prep(pv)
+| head",
+        );
+        assert_typed(
+            "head
+| join (
+    cols a,b
+) other.csv on a
+| sort x",
+        );
+    }
+
+    #[test]
+    fn a_stage_is_at_the_level_of_its_bracket() {
         assert_eq!(split_at("@"), (0, None));
         assert_eq!(split_at("head\n| sort x@"), (0, None));
         assert_eq!(split_at("head |@"), (0, None));
         assert_eq!(split_at("head@ | sort x"), (0, None));
-    }
-
-    #[test]
-    fn an_fn_body_is_one_step_in() {
-        assert_eq!(split_at("fn prep(n) {@"), (1, None));
-        assert_eq!(split_at("fn prep(n) {\n  rename value=n@"), (1, None));
-        assert_eq!(
-            split_at("fn prep(n) {\n  rename value=n\n  | cols -v metric\n}@"),
-            (0, Some(0))
-        );
-        assert_eq!(split_at("fn prep(n) {\n  head\n}\nprep(pv)@"), (0, None));
-        // The parameter list is not a group.
-        assert_eq!(split_at("fn prep(n@"), (0, None));
-        // After a body's `}` a new stage starts, as the prologue reads on.
-        assert_eq!(split_at("fn f(x) { head } join (@"), (1, None));
-    }
-
-    #[test]
-    fn an_fn_headers_brace_may_be_on_its_own_line() {
-        // `parse_fn_def` finds the body's `{` across newlines; a newline in
-        // the header must not read as a new, non-`fn` stage.
+        // The text after the split starts a stage.
+        assert_eq!(split_at("select a >@| head"), (0, None));
+        assert_eq!(split_at("join (\n    rename a=b\n    |@"), (1, None));
+        assert_eq!(split_at("join (\n    rename a=b@ | cols a"), (1, None));
+        // A `||` at the end of a line is an operator.
+        assert_eq!(split_at("select a ||@"), (1, None));
+        // After an `fn` body, the pipeline with no `|`.
+        assert_eq!(split_at("fn f(x) {\n    head\n}\n\nf(a)@"), (0, None));
+        // An `fn` header over several lines.
         assert_eq!(split_at("fn f(x)\n{@"), (1, None));
-        assert_eq!(split_at("fn f(x)\n{\n  head@"), (1, None));
-        // The parameter list itself may start on its own line too.
-        assert_eq!(split_at("fn f\n(x) {@"), (1, None));
-        assert_eq!(split_at("fn f\n(x) {\n  head@"), (1, None));
-        // And so may the name: the parser reads a newline after `fn` as a
-        // blank.
-        assert_eq!(split_at("fn\nf(x) {@"), (1, None));
-        assert_eq!(split_at("fn\nf(x) {\n  head@"), (1, None));
-        // The `}` that closes the body still starts a new stage.
-        assert_eq!(split_at("fn f(x)\n{\n  head\n}@"), (0, Some(0)));
+        assert_eq!(split_at("fn\nf(x) {\n    head@"), (1, None));
+        // A parameter list over two lines: the body is one step in, and its
+        // `}` lines up with `fn`.
+        assert_eq!(split_at("fn f(a,\n    b) {\n@"), (1, None));
+        assert_eq!(split_at("fn f(a,\n    b) {\n    head\n}@"), (0, Some(0)));
     }
 
     #[test]
-    fn a_join_group_is_one_step_in() {
-        assert_eq!(split_at("head\n| join (@"), (1, None));
-        assert_eq!(split_at("head\n| join (\n  cols a,b@"), (1, None));
+    fn a_closer_in_a_line_puts_the_rest_of_it_at_the_openers_level() {
+        assert_eq!(split_at("add x = f(a,\n    b) + g(\n@"), (1, None));
         assert_eq!(
-            split_at("head\n| join (\n  cols a,b\n) other.csv on a@"),
+            split_at("add x = f(a,\n    b) + g(\n    c\n)@"),
             (0, Some(0))
         );
-        // After flags, and in a second item.
-        assert_eq!(split_at("join -l --lsuffix _x (@"), (1, None));
-        assert_eq!(split_at("join (cols a) a.csv on k, (@"), (1, None));
-        // A lone `|` starts a stage; `||` does not.
-        assert_eq!(split_at("select a | join (@"), (1, None));
-        assert_eq!(split_at("select a || join (@"), (0, None));
+        // A closer of a bracket opened on the same line changes nothing.
+        assert_eq!(split_at("add x = f(\n    g(a) + h(\n@"), (2, None));
     }
 
     #[test]
-    fn other_brackets_are_not_groups() {
-        assert_eq!(split_at("select (a > 1 ||@"), (0, None));
-        assert_eq!(split_at("select (\n  a > 1@"), (0, None));
-        assert_eq!(split_at("add b = abs(a@)"), (0, None));
-        // A fragment call, and `join(` with no blank, which is not `join`.
-        assert_eq!(split_at("prep(@"), (0, None));
-        assert_eq!(split_at("join(@"), (0, None));
-        // A `)` that closes an expression's bracket is not a step out.
-        assert_eq!(split_at("join (select (a > 1@)"), (1, None));
-    }
-
-    #[test]
-    fn groups_nest() {
-        assert_eq!(split_at("fn f(x) {\n  join (\n    join (@"), (3, None));
+    fn a_stage_that_starts_on_its_groups_line_continues_one_step_past_the_group() {
+        assert_eq!(split_at("join (select a &&\n@"), (2, None));
+        assert_eq!(split_at("join (\n    select a &&\n@"), (2, None));
+        assert_eq!(split_at("fn f(x) { select a &&\n@"), (2, None));
+        // A bracket opened there is one step past the group too.
+        assert_eq!(split_at("join (select f(\n@"), (2, None));
+        assert_eq!(split_at("join (select f(\n    a\n)@"), (1, Some(1)));
+        assert_eq!(split_at("fn f(x) { add y = g(\n    a\n)@"), (1, Some(1)));
+        assert_eq!(split_at("join (join (\n@"), (2, None));
         assert_eq!(
-            split_at("fn f(x) {\n  join (\n    join (inner.csv) b.csv on k@"),
-            (2, None)
+            split_at("join (join (\n        cols a\n    )@"),
+            (1, Some(1))
         );
+        // And so is one opened inside a bracket opened there.
+        assert_eq!(split_at("join (select f(g(\n@"), (2, None));
+        assert_eq!(split_at("join (select f(g(\n    a\n))@"), (1, Some(1)));
     }
 
     #[test]
-    fn a_closing_bracket_after_the_split_moves_the_new_line_out() {
-        assert_eq!(split_at("fn f(x) {\n  head@}"), (0, None));
-        assert_eq!(split_at("fn f(x) {\n  head@   }"), (0, None));
-        assert_eq!(split_at("join (\n  cols a@ ) b.csv on k"), (0, None));
-        // The line split starts with one: that line is one step out too.
-        assert_eq!(split_at("join (\n  cols a\n  ) b.csv on k@"), (0, Some(0)));
-        assert_eq!(split_at("fn f(x) {\n  head\n  }@"), (0, Some(0)));
-        // A closer that closes no group is passed over.
-        assert_eq!(split_at("join (\n  cols a\n  }@"), (1, None));
+    fn a_bracket_open_at_the_end_of_a_line_is_one_step_in() {
+        for open in ["(", "[", "{"] {
+            assert_eq!(split_at(&format!("add x = f{open}@")), (1, None), "{open}");
+        }
+        // Several opened on one line give one step.
+        assert_eq!(split_at("add x = f([{@"), (1, None));
+        assert_eq!(split_at("select ((a > 1@"), (1, None));
+        // One step for each line that leaves one open.
+        assert_eq!(split_at("add x = f(\n    g(\n        h(@"), (3, None));
+        // A bracket closed on its line is gone.
+        assert_eq!(split_at("add x = f(a) + [b]@"), (0, None));
+        assert_eq!(split_at("fn f(x) { head }\nfn g(y) {@"), (1, None));
     }
 
     #[test]
-    fn a_bracket_in_a_quote_or_a_comment_is_text() {
-        assert_eq!(split_at("select a == '{(' @"), (0, None));
-        assert_eq!(split_at("select a == \"join (\" | head@"), (0, None));
-        assert_eq!(split_at("join (`a)b` @"), (1, None));
-        assert_eq!(split_at("fn f(x) { select a == '}' @"), (1, None));
-        assert_eq!(split_at("head # join (@"), (0, None));
-        assert_eq!(split_at("join ( # )\n  cols a@"), (1, None));
-        // A `#` inside a quote is not a comment.
-        assert_eq!(split_at("select a == '#' | join (@"), (1, None));
-        // Split inside a comment: the depth where the comment started.
-        assert_eq!(split_at("join ( # a@ b"), (1, None));
+    fn a_line_that_starts_with_its_closing_bracket_goes_back_out() {
+        assert_eq!(split_at("add x = f(\n    a\n)@"), (0, Some(0)));
+        assert_eq!(split_at("add x = f(\n    a\n    ]@"), (1, None));
+        assert_eq!(split_at("add x = f([{\n    1\n}])@"), (0, Some(0)));
+        assert_eq!(
+            split_at("fn f(x) {\n    join (\n        cols a\n    )@"),
+            (1, Some(1))
+        );
+        // `) * (` goes out, and the lines after it go in again.
+        assert_eq!(split_at("add x = (\n    a\n) * (@"), (1, Some(0)));
+        assert_eq!(split_at("add x = [\n    a\n]@"), (0, Some(0)));
+        // The first closer on the line decides where the line goes.
+        assert_eq!(
+            split_at("add x = f(\n    g(\n        a\n    ))@"),
+            (0, Some(1))
+        );
+        // A closing bracket after the split moves the new line out.
+        assert_eq!(split_at("fn f(x) {\n    head@}"), (0, None));
+        assert_eq!(split_at("fn f(x) {\n    head@   }"), (0, None));
+        assert_eq!(split_at("add x = abs(a@)"), (0, None));
+        assert_eq!(split_at("join (select (a > 1@)"), (1, None));
+        // A split at the start of a line reads that line.
+        assert_eq!(split_at("join (\n@    cols a"), (1, None));
+        assert_eq!(split_at("join (\n    cols a\n@) b.csv on k"), (0, Some(0)));
     }
 
     #[test]
-    fn text_in_an_unclosed_string_is_at_the_depth_where_it_started() {
-        assert_eq!(split_at("join (\n  select a == 'x@"), (1, None));
-        // A `)` inside the string does not close the group.
-        assert_eq!(split_at("join (\n  select a == 'x\n) y@"), (1, None));
-        assert_eq!(split_at("join (\n  select a == 'x@\n) y"), (1, None));
-    }
-
-    #[test]
-    fn depths_never_go_below_0() {
+    fn a_closing_bracket_with_nothing_open_is_passed_over() {
         assert_eq!(split_at("head\n)@"), (0, None));
         assert_eq!(split_at("}})@)"), (0, None));
         assert_eq!(split_at("join (a.csv on k))\n)@"), (0, None));
+        assert_eq!(split_at("add x = f(\n    a\n}@"), (1, None));
+        // A closer closes the innermost open bracket of its kind, and any
+        // left open inside it.
+        assert_eq!(split_at("join ( x { ( } ) b.csv\nhead@"), (0, None));
+        assert_eq!(
+            split_at("fn f(x) {\n    join ( { )\n    head\n}@"),
+            (0, Some(0))
+        );
+    }
+
+    #[test]
+    fn a_line_after_an_operator_or_a_comma_continues_its_stage() {
+        for op in [
+            "&&", "||", "+", "-", "*", "/", "%", "?", ":", "=", "==", "!=", "<", ">", "<=", ">=",
+            ",",
+        ] {
+            assert_eq!(split_at(&format!("select a {op}@")), (1, None), "{op}");
+        }
+        // One step however many lines continue, and none once it ends.
+        assert_eq!(split_at("select a &&\n    b &&\n    c &&@"), (1, None));
+        assert_eq!(split_at("add x = a +\n    b@"), (0, None));
+        // One step deeper than the line the stage started on.
+        assert_eq!(split_at("select a > 0 &&\n    b > 1 | head@"), (0, None));
+        assert_eq!(
+            split_at("select a > 0 &&\n    b > 1 | add x = a +@"),
+            (2, None)
+        );
+        // The split ends the line: what is before it counts.
+        assert_eq!(split_at("add x = a +@ b"), (1, None));
+        assert_eq!(split_at("add x = a + b@"), (0, None));
+        // A lone `|` at the end starts a stage instead.
+        assert_eq!(split_at("select a > 0 |@"), (0, None));
+        // A line that starts with `||` continues the stage.
+        assert_eq!(split_at("select a &&@|| b"), (1, None));
+        assert_eq!(split_at("select a &&\n    || f(\n@"), (2, None));
+        // A `|` just before the split is a lone one, whatever follows it.
+        assert_eq!(split_at("select a |@|| b"), (0, None));
+        // Not operators: a flag, `=~`, a quote.
+        assert_eq!(split_at("cols -v@"), (0, None));
+        assert_eq!(split_at("select a =~@"), (0, None));
+        assert_eq!(split_at("select a == '+'@"), (0, None));
+    }
+
+    #[test]
+    fn inside_a_bracket_a_line_after_an_operator_or_a_comma_stays_at_its_level() {
+        assert_eq!(split_at("add x = f(\n    a +@"), (1, None));
+        assert_eq!(split_at("add x = f(\n    a,@"), (1, None));
+        assert_eq!(split_at("add x = [\n    a,@"), (1, None));
+        assert_eq!(split_at("add x = {\n    a &&@"), (1, None));
+        assert_eq!(split_at("add x = f(a +@"), (1, None));
+        assert_eq!(split_at("add x = f(a,@"), (1, None));
+        // A bracket opened on a continued line: its own level.
+        assert_eq!(split_at("add x = a +\n    f(\n        b,@"), (2, None));
+        // A bracket right after a word is not a `join` group.
+        assert_eq!(split_at("select a | prep(\n    a +@"), (1, None));
+        assert_eq!(split_at("join(\n    select a &&@"), (1, None));
+        // An `fn`'s parameter list is not its body.
+        assert_eq!(split_at("fn f(a,\n@"), (1, None));
+        // A bracket in a stage inside a `join` group.
+        assert_eq!(split_at("join (\n    add x = f(\n        a +@"), (2, None));
+        assert_eq!(
+            split_at("fn f(x) {\n    add x = f(\n        a,@"),
+            (2, None)
+        );
+        assert_typed(
+            "add x = f(
+    a,
+    b,
+    c
+)
+| add y = (
+    price * qty +
+    fee
+)",
+        );
+    }
+
+    #[test]
+    fn a_stage_in_a_join_group_or_an_fn_body_continues_after_an_operator() {
+        assert_eq!(split_at("join (\n    select a &&@"), (2, None));
+        assert_eq!(split_at("join -l (\n    cols a,@"), (2, None));
+        // The second item of a `join` has a group too.
+        assert_eq!(
+            split_at("join (cols a) a.csv on k, (\n    select a &&@"),
+            (2, None)
+        );
+        assert_eq!(split_at("fn f(x) {\n    select a &&@"), (2, None));
+        assert_eq!(split_at("fn f(x)\n{\n    agg sum(x),@"), (2, None));
+        // After an `fn` body, the pipeline's stages continue as at the top.
+        assert_eq!(split_at("fn f(x) { head }\nf(a) | select a &&@"), (1, None));
+        assert_eq!(split_at("fn f(x) { head }\nselect a &&@"), (1, None));
+        assert_typed(
+            "join (
+    select a > 1 &&
+        b < 2
+    | cols a,
+        b
+) other.csv on a
+| head",
+        );
+        assert_typed(
+            "fn f(x) {
+    agg sum(x),
+        count
+    | head
+}
+
+f(a)
+| select a &&
+    b",
+        );
+    }
+
+    #[test]
+    fn comments_and_blank_lines_change_nothing() {
+        // A comment at the end of an operator line.
+        assert_eq!(split_at("select a > 0 && # both@"), (1, None));
+        // A blank and a comment-only line inside a continuation.
+        assert_eq!(split_at("select a > 0 &&\n\n    # the other@"), (1, None));
+        assert_eq!(split_at("select a > 0 &&\n\n    # the other\n@"), (1, None));
+        // And inside a bracket.
+        assert_eq!(split_at("add x = f(\n\n    # the args@"), (1, None));
+        // A bracket in a comment is text.
+        assert_eq!(split_at("head # join (@"), (0, None));
+        assert_eq!(split_at("join ( # )\n    cols a@"), (1, None));
+        // Split inside a comment: the rest of it is blanks.
+        assert_eq!(split_at("join ( # a@ b"), (1, None));
+        // A quote mark or a `|` in a comment is text too.
+        assert_eq!(split_at("select a > 0 && # it's | both@"), (1, None));
+        assert_eq!(split_at("join ( # it's\n    cols a@"), (1, None));
+    }
+
+    #[test]
+    fn text_in_a_quote_is_at_the_level_where_the_quote_started() {
+        assert_eq!(split_at("select a == '{(' @"), (0, None));
+        assert_eq!(split_at("select a == \"join (\" | head@"), (0, None));
+        assert_eq!(split_at("join (`a)b` @"), (1, None));
+        assert_eq!(split_at("select a == '#' | join (@"), (1, None));
+        assert_eq!(split_at("join (\n    select a == 'x@"), (1, None));
+        // A closing bracket inside the quote does not close anything.
+        assert_eq!(split_at("join (\n    select a == 'x\n) y@"), (1, None));
+        assert_eq!(split_at("join (\n    select a == 'x@\n) y"), (1, None));
+        // An operator inside a quote ends nothing.
+        assert_eq!(split_at("add x = '\n+'@"), (0, None));
     }
 
     #[test]
     fn a_split_past_the_end_or_inside_a_character_is_safe() {
-        assert_eq!(
-            depths("join (", 99),
-            Depths {
-                new: 1,
-                current: None
-            }
-        );
-        assert_eq!(
-            depths("é(", 1),
-            Depths {
-                new: 0,
-                current: None
-            }
-        );
+        let none = |new| Depths { new, current: None };
+        assert_eq!(depths("join (", 99), none(1));
+        assert_eq!(depths("é(", 1), none(0));
         // Byte 10 is inside the `é` of a comment.
-        assert_eq!(
-            depths("join ( # é\n", 10),
-            Depths {
-                new: 1,
-                current: None
-            }
-        );
+        assert_eq!(depths("join ( # é\n", 10), none(1));
     }
 
     #[test]
@@ -6223,58 +6505,57 @@ mod tests {
             split_at("join (\r\n  cols a\r\n\t) b.csv on k@"),
             (0, Some(0))
         );
-    }
-
-    #[test]
-    fn a_split_at_the_start_of_a_line_reads_that_line() {
-        assert_eq!(split_at("join (\n@  cols a"), (1, None));
-        assert_eq!(split_at("join (\n  cols a\n@) b.csv on k"), (0, Some(0)));
+        assert_eq!(split_at("select a &&\r\n@"), (1, None));
+        // A form feed is a blank too: a line of one changes nothing.
+        assert_eq!(split_at("select a &&\n\x0c\n@"), (1, None));
+        assert_eq!(split_at("join (\n\x0c)@"), (0, Some(0)));
+        // And a vertical tab.
+        assert_eq!(split_at("select a > 0 &&\n\x0b\n@"), (1, None));
     }
 
     #[test]
     fn a_script_nested_very_deep_is_scanned_without_recursion() {
+        let none = |new| Depths { new, current: None };
         let script = format!("select {}", "(".repeat(100_000));
-        assert_eq!(
-            depths(&script, script.len()),
-            Depths {
-                new: 0,
-                current: None
-            }
-        );
-        let script = "join (".repeat(10_000);
-        assert_eq!(
-            depths(&script, script.len()),
-            Depths {
-                new: 10_000,
-                current: None
-            }
-        );
-    }
-
-    #[test]
-    fn a_closer_finds_the_innermost_open_group_of_its_kind() {
-        // A `}` closes the `(` left open inside its `{` too; the `)` after
-        // it then closes the `join` group.
-        assert_eq!(split_at("join ( x { ( } ) b.csv\nhead@"), (0, None));
-        // A `(` closed that way is gone: a later `)` closes nothing.
-        assert_eq!(
-            split_at("fn g(y) {\n  { ( }\n  { { ) }\n  }\n  head@"),
-            (1, None)
-        );
-        // The same the other way: a `)` closes a `{` left open inside it.
-        assert_eq!(
-            split_at("fn f(x) {\n  join ( { )\n  head\n}@"),
-            (0, Some(0))
-        );
+        assert_eq!(depths(&script, script.len()), none(1));
+        let script = "(\n".repeat(10_000);
+        assert_eq!(depths(&script, script.len()), none(10_000));
     }
 
     #[test]
     fn a_run_of_the_other_kind_of_stray_closer_does_not_go_quadratic() {
-        // 100,000 unmatched `(` (none of them a `join` or `fn` group), then
-        // 100,000 `}`: a `}` finds that no bracket it can close is open
-        // without walking every open bracket. A generous bound: this is a
-        // debug build and the machine may be loaded.
-        let script = format!("select {}{}", "(".repeat(100_000), "}".repeat(100_000));
+        // 100,000 unmatched `(`, then 100,000 `}` and `]`: a closer finds
+        // that no bracket it can close is open without walking every open
+        // bracket. A generous bound: this is a debug build and the machine
+        // may be loaded.
+        let script = format!(
+            "select {}{}{}",
+            "(".repeat(100_000),
+            "}".repeat(100_000),
+            "]".repeat(100_000)
+        );
+        let start = std::time::Instant::now();
+        assert_eq!(
+            depths(&script, script.len()),
+            Depths {
+                new: 1,
+                current: None
+            }
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_long_script_is_read_in_one_pass() {
+        // About 7 MiB of stages over many lines, with brackets, operators,
+        // commas, quotes and comments, split at the end. A generous bound:
+        // this is a debug build and the machine may be loaded.
+        let stage = "| add x = f(a +   # sum\n    b, [c,\n    'd)']) *\n    2\n";
+        let script = stage.repeat(8 << 20 >> 6);
         let start = std::time::Instant::now();
         assert_eq!(
             depths(&script, script.len()),
@@ -6288,51 +6569,5 @@ mod tests {
             "took {:?}",
             start.elapsed()
         );
-    }
-
-    #[test]
-    fn a_long_fn_header_of_blank_lines_does_not_go_quadratic() {
-        // `fn`, then 50,000 blank lines and no `(` yet: the stage's first
-        // word is read once, not again at each newline over all the blanks
-        // after `fn`. A generous bound: this is a debug build and the
-        // machine may be loaded.
-        let script = format!("fn {}", " \n".repeat(50_000));
-        let start = std::time::Instant::now();
-        assert_eq!(
-            depths(&script, script.len()),
-            Depths {
-                new: 0,
-                current: None
-            }
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "took {:?}",
-            start.elapsed()
-        );
-    }
-
-    #[test]
-    fn closed_groups_before_the_split_are_gone() {
-        assert_eq!(split_at("fn f(x) { head }\nfn g(y) {@"), (1, None));
-        assert_eq!(
-            split_at("fn f(x) {\n  join (cols a) b.csv on k\n}@"),
-            (0, Some(0))
-        );
-        assert_eq!(
-            split_at("fn f(x) {\n  join (cols a) b.csv on k@"),
-            (1, None)
-        );
-    }
-
-    #[test]
-    fn only_a_line_that_starts_with_a_closing_bracket_moves() {
-        assert_eq!(
-            split_at("fn f(x) {\n  join (\n    cols a\n  )@"),
-            (1, Some(1))
-        );
-        assert_eq!(split_at("fn f(x) {\n  join (\n    cols a@"), (2, None));
-        // A closer inside a quote is text.
-        assert_eq!(split_at("join (\n  select a == 'x\n) y@"), (1, None));
     }
 }

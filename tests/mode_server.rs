@@ -255,6 +255,12 @@ fn csvm_mode_server_answers_indent_requests_between_colour_ones() {
         server.indent(&["csvm", script], (1, script.len()), None),
         [":depth 1 1"]
     );
+    // After an operator at the end of a line: one step in.
+    let script = "select a > 1 &&";
+    assert_eq!(
+        server.indent(&["csvm", script], (1, script.len()), None),
+        [":depth 1 -"]
+    );
     // A colour request in between is answered as before.
     assert_eq!(server.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
     // In an fn body, with an option before the script.
