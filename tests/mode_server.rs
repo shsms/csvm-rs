@@ -149,7 +149,7 @@ fn csvm_mode_server_answers_each_request_in_order() {
         [
             ":span 1 0 4 command",
             ":span 1 5 11 variable",
-            ":span 1 12 13 operator",
+            ":span 1 12 13 separator",
             ":span 1 14 20 command",
             ":span 1 21 27 variable",
             ":span 1 28 29 operator",
@@ -195,7 +195,7 @@ fn csvm_mode_server_answers_each_request_in_order() {
         [
             ":span 1 0 4 command",
             ":span 1 5 11 variable",
-            ":span 1 12 13 operator",
+            ":span 1 12 13 separator",
             ":span 1 14 20 command",
             ":span 1 21 27 variable",
             ":span 1 28 29 operator",

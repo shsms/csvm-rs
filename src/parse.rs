@@ -123,6 +123,8 @@ pub enum SpanKind {
     Keyword,
     Option,
     Operator,
+    /// A `|` that ends a stage.
+    Separator,
     String,
     Number,
     Variable,
@@ -138,6 +140,7 @@ impl SpanKind {
             SpanKind::Keyword => "keyword",
             SpanKind::Option => "option",
             SpanKind::Operator => "operator",
+            SpanKind::Separator => "separator",
             SpanKind::String => "string",
             SpanKind::Number => "number",
             SpanKind::Variable => "variable",
@@ -458,7 +461,7 @@ impl<'a> Builder<'a> {
     }
 
     /// Note each `|` between `stages`, the stages [`split_stages`] cut
-    /// `script` into. (A newline between stages is not noted.)
+    /// `script` into, as a separator.
     fn note_separators(&mut self, script: &str, stages: &[&str]) {
         if !self.recording() {
             return;
@@ -469,7 +472,7 @@ impl<'a> Builder<'a> {
             };
             let end = at + stage.len();
             if let Some(bar) = script.get(end..end + 1).filter(|c| *c == "|") {
-                self.note(bar, SpanKind::Operator);
+                self.note(bar, SpanKind::Separator);
             }
         }
     }
@@ -5596,6 +5599,7 @@ mod tests {
             SpanKind::Keyword,
             SpanKind::Option,
             SpanKind::Operator,
+            SpanKind::Separator,
             SpanKind::String,
             SpanKind::Number,
             SpanKind::Variable,
@@ -5605,8 +5609,16 @@ mod tests {
         assert_eq!(
             kinds.map(SpanKind::name),
             [
-                "command", "keyword", "option", "operator", "string", "number", "variable",
-                "function", "comment"
+                "command",
+                "keyword",
+                "option",
+                "operator",
+                "separator",
+                "string",
+                "number",
+                "variable",
+                "function",
+                "comment"
             ]
         );
     }
@@ -5618,7 +5630,7 @@ mod tests {
             [
                 ("cols", "command"),
                 ("a", "variable"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("select", "command"),
                 ("b", "variable"),
                 (">", "operator"),
@@ -5650,6 +5662,32 @@ mod tests {
     }
 
     #[test]
+    fn a_pipe_between_stages_is_a_separator_and_a_double_one_an_operator() {
+        assert_eq!(
+            noted("select a > 1 || b > 1 | join (cols a | head) r.csv on a"),
+            [
+                ("select", "command"),
+                ("a", "variable"),
+                (">", "operator"),
+                ("1", "number"),
+                ("||", "operator"),
+                ("b", "variable"),
+                (">", "operator"),
+                ("1", "number"),
+                ("|", "separator"),
+                ("join", "command"),
+                ("cols", "command"),
+                ("a", "variable"),
+                ("|", "separator"),
+                ("head", "command"),
+                ("r.csv", "string"),
+                ("on", "keyword"),
+                ("a", "variable"),
+            ]
+        );
+    }
+
+    #[test]
     fn recording_after_an_error_keeps_what_came_before() {
         // An unknown command: the stages after it get their command word only.
         assert_eq!(
@@ -5657,8 +5695,8 @@ mod tests {
             [
                 ("cols", "command"),
                 ("a", "variable"),
-                ("|", "operator"),
-                ("|", "operator"),
+                ("|", "separator"),
+                ("|", "separator"),
                 ("sort", "command"),
             ]
         );
@@ -5671,7 +5709,7 @@ mod tests {
                 (">", "operator"),
                 (">", "operator"),
                 ("1", "number"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("cols", "command"),
             ]
         );
@@ -5690,7 +5728,7 @@ mod tests {
                 ("cols", "command"),
                 ("a", "variable"),
                 ("# keep a", "comment"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("select", "command"),
                 ("a", "variable"),
                 (">", "operator"),
@@ -5719,7 +5757,7 @@ mod tests {
             [
                 (0..4, SpanKind::Command),
                 (5..10, SpanKind::Variable),
-                (11..12, SpanKind::Operator),
+                (11..12, SpanKind::Separator),
                 (13..19, SpanKind::Command),
                 (20..23, SpanKind::Variable),
                 (24..25, SpanKind::Operator),
@@ -5912,7 +5950,7 @@ mod tests {
                 ("x", "variable"),
                 (">", "operator"),
                 ("1", "number"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("g", "command"),
                 ("fn", "keyword"),
                 ("g", "function"),
@@ -5920,7 +5958,7 @@ mod tests {
                 ("uniq", "command"),
                 ("z", "variable"),
                 ("f", "command"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("cols", "command"),
                 ("c", "variable"),
             ]
@@ -5969,9 +6007,9 @@ mod tests {
                 ("cols", "command"),
                 ("a", "variable"),
                 ("f", "command"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("h", "command"),
-                ("|", "operator"),
+                ("|", "separator"),
                 ("sort", "command"),
             ]
         );

@@ -25,7 +25,9 @@
 //! new line in the script goes: an `:indent ID` request, with the same
 //! `:cwd` and `:arg` blocks and then `:at ARG OFFSET` (where the line
 //! breaks) before `:done`. csvm answers `:depth NEW CURRENT` (how deep the
-//! new line and the line being split sit), or nothing, then `:end ID`.
+//! new line and the line being split sit), or nothing, then `:end ID`. A
+//! `:span`'s `KIND` is one of `parse::SpanKind`'s names; a `|` between two
+//! stages is a `separator`.
 //!
 //! Lengths and offsets count bytes. inkline's `docs/mode-protocol.md`
 //! describes the whole of the inkline mode protocol.
@@ -921,7 +923,7 @@ mod tests {
             [
                 ":span 3 0 4 command",
                 ":span 3 5 6 variable",
-                ":span 3 7 8 operator",
+                ":span 3 7 8 separator",
                 ":span 3 9 13 command",
                 ":span 3 14 15 number",
             ]
@@ -935,7 +937,7 @@ mod tests {
             [
                 ":span 1 0 4 command",
                 ":span 1 5 6 variable",
-                ":span 1 7 8 operator",
+                ":span 1 7 8 separator",
                 ":span 1 9 15 command",
                 ":span 1 16 17 variable",
                 ":span 1 18 19 operator",
@@ -1050,7 +1052,7 @@ mod tests {
             [
                 ":span 3 0 4 command",
                 ":span 3 5 6 variable",
-                ":span 3 7 8 operator",
+                ":span 3 7 8 separator",
             ]
         );
         // Nor in a raw script, sent as typed, quote marks included. Here
