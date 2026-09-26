@@ -86,6 +86,13 @@ git history; this file is the "what next / what was decided" scratchpad.
   CRLF line includes the =\r=; an =fn= header with no ={= yet colours the
   next definition's text as =variable=; =sort a = nr= colours the space
   after =\== as part of the option.
+- The parser's stage splitter (=split_stages=) takes only ='= and ="= as
+  quotes, not backticks. So a =(= in a backtick-quoted column name opens
+  a bracket that never closes, and no later =|= or newline starts a
+  stage: =select `a(b` > 1=, then =| head= on the next line (or the same
+  one), fails with =unexpected character '|' in expression=.
+  =strip_comments=, the group takers and =parse::depths= all take
+  backticks as quotes; =split_stages= should too.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a
