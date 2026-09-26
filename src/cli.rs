@@ -48,6 +48,24 @@ impl Args {
     pub fn out_path(&self) -> Option<&str> {
         self.out_file.as_deref().filter(|p| *p != "-")
     }
+
+    /// The input format: `--format` when given, else `.parquet` files are
+    /// Parquet and everything else is CSV.
+    pub fn input_format(&self) -> InputFormat {
+        if let Some(f) = self.format {
+            return f;
+        }
+        match self.in_file.as_deref() {
+            Some(p)
+                if std::path::Path::new(p)
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("parquet")) =>
+            {
+                InputFormat::Parquet
+            }
+            _ => InputFormat::Csv,
+        }
+    }
 }
 
 /// `--header`: how a headerless input's columns are named.
@@ -542,5 +560,17 @@ mod tests {
         assert_eq!(a.in_file, None);
         // Without -f, a script is still required.
         assert!(parse(std::iter::empty()).is_err());
+    }
+
+    #[test]
+    fn input_format_follows_the_flag_then_the_extension() {
+        let format = |parts: &[&str]| args(parts).unwrap().input_format();
+        assert_eq!(format(&["cols a", "x.csv"]), InputFormat::Csv);
+        assert_eq!(format(&["cols a", "x.PARQUET"]), InputFormat::Parquet);
+        assert_eq!(
+            format(&["--format", "csv", "cols a", "x.parquet"]),
+            InputFormat::Csv
+        );
+        assert_eq!(format(&["cols a"]), InputFormat::Csv);
     }
 }

@@ -206,7 +206,7 @@ fn script_error(script: &str, e: &csvm::error::Error, console: &Console) -> Stri
 fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     // Parquet carries its own typed schema, so it bypasses the CSV header logic
     // (and, without the feature, reports the build hint before anything else).
-    if input_format(args) == cli::InputFormat::Parquet {
+    if args.input_format() == cli::InputFormat::Parquet {
         return open_parquet(args);
     }
     // A named header needs no look at the input (so an empty input is a
@@ -267,24 +267,6 @@ fn open_source(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
             }
             Ok((Source::Stream(reader), header))
         }
-    }
-}
-
-/// The input format: an explicit `--format` wins, else auto-detect from the
-/// input file's extension (`.parquet` ⇒ Parquet, everything else CSV).
-fn input_format(args: &cli::Args) -> cli::InputFormat {
-    if let Some(f) = args.format {
-        return f;
-    }
-    match args.in_file.as_deref() {
-        Some(p)
-            if Path::new(p)
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("parquet")) =>
-        {
-            cli::InputFormat::Parquet
-        }
-        _ => cli::InputFormat::Csv,
     }
 }
 
