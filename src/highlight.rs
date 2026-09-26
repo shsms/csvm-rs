@@ -24,7 +24,12 @@
 //! Lengths and offsets count bytes. inkline's `docs/highlight-protocol.md`
 //! describes the whole protocol.
 
-use std::io::{self, BufRead, Read};
+use crate::parse::SpanKind;
+use std::io::{self, BufRead, Read, Write};
+use std::ops::Range;
+
+/// The line csvm writes first: the protocol's name and version.
+pub const GREETING: &str = "inkline-highlight 1";
 
 /// The longest `:` line a request may have, newline included.
 const MAX_LINE: u64 = 256;
@@ -33,6 +38,16 @@ const MAX_LINE: u64 = 256;
 /// smaller; the limit keeps a corrupt length from asking for any amount of
 /// memory.
 const MAX_BYTES: usize = 16 << 20;
+
+/// The most bytes of `:span` lines one reply may hold. inkline turns a
+/// helper off when a reply passes 1 MiB, so the spans past this are not
+/// sent (the end of a very long script is then not coloured), which leaves
+/// room for the error and `:end`.
+const MAX_SPAN_BYTES: usize = 900 << 10;
+
+/// The most bytes of an error's message that are sent, so that a message
+/// quoting a very long word cannot push a reply past inkline's limit either.
+const MAX_MESSAGE: usize = 4 << 10;
 
 /// One request: the shell's directory and the command's arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +65,44 @@ pub struct Arg {
     /// csvm will get.
     pub raw: bool,
     pub bytes: Vec<u8>,
+}
+
+/// The answer to one request.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reply {
+    /// In order, none overlapping another.
+    pub spans: Vec<Span>,
+    pub error: Option<ReplyError>,
+}
+
+/// A coloured part of one argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Span {
+    /// The argument's index in the request.
+    pub arg: usize,
+    /// Byte offsets in the argument.
+    pub at: Range<usize>,
+    pub kind: SpanKind,
+}
+
+/// The one error a reply may carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplyError {
+    /// The argument, and the bytes of it, the error is about; `None` when
+    /// it has no place in the arguments.
+    pub place: Option<(usize, Range<usize>)>,
+    /// One line of text.
+    pub message: String,
+}
+
+impl ReplyError {
+    /// An error with `message` made one line, as [`write_reply`] writes it.
+    pub fn new(place: Option<(usize, Range<usize>)>, message: &str) -> ReplyError {
+        ReplyError {
+            place,
+            message: one_line(message),
+        }
+    }
 }
 
 /// Read the next request; `None` when the input ends before one starts.
@@ -81,6 +134,44 @@ pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
             bytes: read_bytes(input, number(len)?)?,
         });
     }
+}
+
+/// Write `reply` to request `id`, ending with `:end ID`. The spans stop
+/// before they pass `MAX_SPAN_BYTES`; the error, on one line of at most
+/// `MAX_MESSAGE` bytes, and the end are always written.
+pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<()> {
+    let mut written = 0;
+    for span in &reply.spans {
+        let line = format!(
+            ":span {} {} {} {}\n",
+            span.arg,
+            span.at.start,
+            span.at.end,
+            span.kind.name()
+        );
+        written += line.len();
+        if written > MAX_SPAN_BYTES {
+            break;
+        }
+        out.write_all(line.as_bytes())?;
+    }
+    if let Some(error) = &reply.error {
+        let message = one_line(&error.message);
+        match &error.place {
+            Some((arg, at)) => writeln!(out, ":error {arg} {} {} {message}", at.start, at.end)?,
+            None => writeln!(out, ":error - - - {message}")?,
+        }
+    }
+    writeln!(out, ":end {id}")
+}
+
+/// `message` as one line: up to its first newline, at most [`MAX_MESSAGE`]
+/// bytes, cut between two characters, a `\r` as a space, and no spaces at
+/// the end.
+fn one_line(message: &str) -> String {
+    let first = message.split('\n').next().unwrap_or("");
+    let first = &first[..first.floor_char_boundary(MAX_MESSAGE)];
+    first.replace('\r', " ").trim_end().to_string()
 }
 
 /// The rest of `line` after `keyword`, which it must start with.
@@ -209,5 +300,213 @@ mod tests {
         assert_eq!(bad(b":request 1\n:cwd 99999999999\n"), InvalidData);
         // The input ends before `:done`.
         assert_eq!(bad(b":request 1\n:cwd 1\n/\n"), UnexpectedEof);
+    }
+
+    #[test]
+    fn a_reply_is_written_line_by_line() {
+        let reply = Reply {
+            spans: vec![
+                Span {
+                    arg: 1,
+                    at: 0..4,
+                    kind: SpanKind::Command,
+                },
+                Span {
+                    arg: 1,
+                    at: 5..6,
+                    kind: SpanKind::Variable,
+                },
+            ],
+            error: Some(ReplyError::new(Some((1, 7..7)), "bad thing\nsecond line")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 3, &reply).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            ":span 1 0 4 command\n:span 1 5 6 variable\n:error 1 7 7 bad thing\n:end 3\n"
+        );
+        // An error with no place; a stray `\r` does not reach the line.
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError::new(None, "no place\r")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 4, &reply).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            ":error - - - no place\n:end 4\n"
+        );
+        // Nothing to say: only the end.
+        let mut out = Vec::new();
+        write_reply(&mut out, 5, &Reply::default()).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), ":end 5\n");
+    }
+
+    /// inkline's reader requires the space before `MESSAGE` even when the
+    /// message is empty (`:error ARG START END ` / `:error - - - `), so a
+    /// consumer can always split off four fields. This checks the exact
+    /// bytes for both an empty message with a place and one without.
+    #[test]
+    fn an_error_with_an_empty_message_still_gets_its_trailing_space() {
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError::new(Some((0, 3..3)), "")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 1, &reply).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), ":error 0 3 3 \n:end 1\n");
+
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError::new(None, "")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 2, &reply).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), ":error - - - \n:end 2\n");
+    }
+
+    #[test]
+    fn a_message_is_written_on_one_line_however_it_was_built() {
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError {
+                place: None,
+                message: "a\nb".to_string(),
+            }),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 1, &reply).unwrap();
+        assert_eq!(out, b":error - - - a\n:end 1\n");
+        // A `\r` is a space; a message too long is cut on a character.
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError {
+                place: Some((1, 0..1)),
+                message: format!("a\rb{}", "é".repeat(MAX_MESSAGE)),
+            }),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 2, &reply).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let message = text
+            .strip_prefix(":error 1 0 1 ")
+            .and_then(|t| t.strip_suffix("\n:end 2\n"))
+            .unwrap();
+        assert!(message.starts_with("a b\u{e9}"));
+        assert!(message.len() <= MAX_MESSAGE);
+        assert!(message.len() > MAX_MESSAGE - 2);
+    }
+
+    /// Check that `bytes` is a well-formed reply to request `id`, by the
+    /// protocol's shape: every line ends in a newline and is a `:span`,
+    /// `:error` or `:end` line; a number field is plain ASCII digits, no
+    /// sign; `:span` and `:error` each carry exactly four space-separated
+    /// fields (so `MESSAGE`'s leading space is required even when it is
+    /// empty); a span has `START < END` and a placed error `START <= END`;
+    /// a placeless error is exactly `- - -`; there is at most one `:error`;
+    /// and the reply ends with `:end ID`, naming the request's `ID`, and
+    /// nothing after it. It does not know the arguments, so it cannot check
+    /// an offset against an argument's length, nor that spans do not
+    /// overlap, nor a span's `KIND`.
+    fn check_reply_is_well_formed(bytes: &[u8], id: u64) {
+        fn is_number(s: &str) -> bool {
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+        }
+
+        let text = std::str::from_utf8(bytes).expect("reply must be UTF-8");
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(
+            lines.pop(),
+            Some(""),
+            "every line, :end included, ends in a newline"
+        );
+        assert!(!lines.is_empty(), "a reply always has :end");
+
+        let mut error_seen = false;
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.starts_with(':'),
+                "a reply line starts with ':': {line:?}"
+            );
+            if let Some(rest) = line.strip_prefix(":span ") {
+                let fields: Vec<&str> = rest.splitn(4, ' ').collect();
+                assert_eq!(fields.len(), 4, ":span needs ARG START END KIND: {line:?}");
+                assert!(is_number(fields[0]), "ARG is not plain digits: {line:?}");
+                assert!(is_number(fields[1]), "START is not plain digits: {line:?}");
+                assert!(is_number(fields[2]), "END is not plain digits: {line:?}");
+                let start: u64 = fields[1].parse().unwrap();
+                let end: u64 = fields[2].parse().unwrap();
+                assert!(start < end, "a span needs START < END: {line:?}");
+                assert!(!fields[3].is_empty(), "KIND is missing: {line:?}");
+            } else if let Some(rest) = line.strip_prefix(":error ") {
+                assert!(!error_seen, "at most one :error line per reply");
+                error_seen = true;
+                let fields: Vec<&str> = rest.splitn(4, ' ').collect();
+                assert_eq!(
+                    fields.len(),
+                    4,
+                    ":error needs ARG START END MESSAGE, MESSAGE's leading \
+                     space included even when it is empty: {line:?}"
+                );
+                if fields[0] == "-" || fields[1] == "-" || fields[2] == "-" {
+                    assert_eq!(
+                        (fields[0], fields[1], fields[2]),
+                        ("-", "-", "-"),
+                        "a placeless error is exactly '- - -': {line:?}"
+                    );
+                } else {
+                    assert!(is_number(fields[0]), "ARG is not plain digits: {line:?}");
+                    assert!(is_number(fields[1]), "START is not plain digits: {line:?}");
+                    assert!(is_number(fields[2]), "END is not plain digits: {line:?}");
+                    let start: u64 = fields[1].parse().unwrap();
+                    let end: u64 = fields[2].parse().unwrap();
+                    assert!(start <= end, "an error needs START <= END: {line:?}");
+                }
+            } else if let Some(rest) = line.strip_prefix(":end ") {
+                assert_eq!(i, lines.len() - 1, ":end must be the reply's last line");
+                assert!(is_number(rest), "ID is not plain digits: {line:?}");
+                assert_eq!(rest.parse::<u64>().unwrap(), id, "wrong :end ID");
+            } else {
+                panic!("not a reply line: {line:?}");
+            }
+        }
+        assert!(
+            lines.last().unwrap().starts_with(":end "),
+            "a reply must end with :end"
+        );
+    }
+
+    #[test]
+    fn a_written_reply_is_well_formed() {
+        let reply = Reply {
+            spans: vec![
+                Span {
+                    arg: 1,
+                    at: 0..4,
+                    kind: SpanKind::Command,
+                },
+                Span {
+                    arg: 1,
+                    at: 5..6,
+                    kind: SpanKind::Variable,
+                },
+            ],
+            error: Some(ReplyError::new(Some((1, 7..7)), "bad thing")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 9, &reply).unwrap();
+        check_reply_is_well_formed(&out, 9);
+
+        let reply = Reply {
+            spans: Vec::new(),
+            error: Some(ReplyError::new(None, "")),
+        };
+        let mut out = Vec::new();
+        write_reply(&mut out, 10, &reply).unwrap();
+        check_reply_is_well_formed(&out, 10);
+
+        let mut out = Vec::new();
+        write_reply(&mut out, 11, &Reply::default()).unwrap();
+        check_reply_is_well_formed(&out, 11);
     }
 }
