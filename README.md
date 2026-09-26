@@ -116,10 +116,11 @@ default; `-n 1` runs serially). A streaming input
 its quotes while you type it, and underline a mistake with csvm's own
 message under the line. csvm does the work as a mode server for inkline:
 `csvm --inkline-mode` reads inkline's requests on stdin and answers each
-with the colours of the script, found by csvm's own parser, and the first
-thing csvm would stop at: a bad option, a script that does not parse, or a
-column the input file does not have. Add these lines to inkline's
-`init.el`:
+with the colours of the script, found by csvm's own parser (a `|` between
+two stages is sent as a separator, which inkline draws in the operator
+colour unless you set a `separator` colour), and the first thing csvm
+would stop at: a bad option, a script that does not parse, or a column the
+input file does not have. Add these lines to inkline's `init.el`:
 
 ```elisp
 (inkline-define-mode 'csvm-mode '("csvm" "--inkline-mode"))
@@ -147,23 +148,65 @@ the next line. A script given with `-f` is not coloured, but the options on
 the line are still checked. inkline's `docs/mode-protocol.md` describes the
 requests and replies (the inkline mode protocol).
 
-inkline also asks csvm where a new line of a script goes. When you press
-Enter inside the quotes, the new line starts one step in from the line the
-command is on, one more step for each `fn … { … }` body or `join ( … )`
-group still open, and a line that starts with the `}` or `)` that closes
-one moves back out. With inkline's `inkline-indent` at 2:
+inkline also asks csvm where a new line of a script goes, counted in steps
+of `inkline-indent`. A stage at the top of the script is one step in from
+the line the command is on, and then:
+
+- any `(`, `[` or `{` left open at the end of a line puts the lines after
+  it one more step in (one step past the group's lines, for one opened on
+  the first line of a `join ( … )` group or an `fn … { … }` body, as in
+  `join (select f(`), and a line that starts with the bracket that closes
+  it goes back one step. So does the rest of a line after a bracket in it
+  that closes one opened on an earlier line: in `fn f(a,` then `b) {`, the
+  body is one step in and its `}` lines up with `fn`;
+- a line after one that ends with an operator (`&&`, `||`, `+`, `-`, `*`,
+  `/`, `%`, `?`, `:`, `=`, `==`, `!=`, `<`, `>`, `<=`, `>=`) or a `,` is one
+  step further in than its stage, however many lines continue: than the
+  line the stage started on, or than the `join ( … )` group or `fn` body
+  it is in when that is further in. Inside any other `(`, `[` or `{`, the
+  line stays at the bracket's level;
+- a line that starts a stage, with its `|`, is at the level of the bracket
+  it is in.
+
+When you press Enter, only a line that starts with a closing bracket moves;
+any other line stays where you put it. With inkline's `inkline-indent` at 4:
 
 ```
-csvm "head
-  | join (
-    cols a,b
-  ) other.csv on a
-  | sort x"
+csvm "select amount > 0
+    | add amount1 = amount * (
+        (price > 0 ? price : 1)
+        - 1
+    ) * (
+        qty < 185 ? 0 : 1
+    )
+    | add yn = qty < 185 ?
+        '' : 'yes'
+    | color -g amount1 green:red
+    | head -n 25" /tmp/huge.csv
+
+csvm "add x = f(
+        g(
+            1
+        )
+    )"
+
+csvm '
+    fn prep(n) {
+        rename value=n
+        | cols -v metric
+    }
+
+    prep(pv)
+    | head
+' pv.csv
 ```
 
-csvm counts the groups with its parser's own rules, so a bracket inside a
-quote or a comment does not count, and a script with a mistake in it is
-still indented. A script that bash will still change is not.
+A line that starts with its operator, such as `? a : b` on a line of its
+own, goes at its stage's level, not one step further in: indent it by
+hand, and it is left where it is. csvm reads the brackets with its
+parser's own rules, so a bracket inside a quote or a comment does not
+count, and a script with a mistake in it is still indented. A script that
+bash will still change is not.
 
 ## The command language
 

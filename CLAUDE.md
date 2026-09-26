@@ -719,7 +719,8 @@ typed (`csvm`, `c`, `./target/debug/csvm`); csvm skips it.
 A `mode_server::Session` runs `cli::parse_at` (a usage error says which
 argument it is about) and `parse::parse_recorded`, the real parser with a
 `parse::Recorder` that notes each part's byte range and kind where the
-parser reads it (`Builder::note`); a plain `parse` passes no recorder and
+parser reads it (`Builder::note`; a `|` between stages is a `separator`, a
+`||` an `operator`); a plain `parse` passes no recorder and
 builds the same plan. The first error is sent on its place: a usage error on
 its argument, a parse error on its span, or, when a readable regular input
 file is named, a `Plan::resolve` error against its header. A `raw` argument
@@ -743,17 +744,31 @@ The first line, `inkline-mode 1 indent` (`mode_server::GREETING`), names
 `indent`, so inkline also sends `:indent` requests: the same `:cwd`/`:arg`
 blocks, then `:at ARG OFFSET` before `:done` (`Request.at`).
 `mode_server::indent` finds the script as for colours and answers
-`:depth NEW CURRENT` from `parse::depths`, or only `:end` when `:at` is not
-in the script or the script is `raw`; a malformed `:at` breaks the protocol
+`:depth NEW CURRENT` from `parse::depths`, `CURRENT` being `-` when the
+line the split is on stays as it is, or only `:end` when `:at` is not in
+the script or the script is `raw`; a malformed `:at` breaks the protocol
 like any bad request. `parse::depths` is one pass over the text, not the
-parser, since the line being typed is usually inside a group not yet
-closed: over `strip_comments`' output, with the group takers' quotes and
-`split_stages`' stage breaks (but not inside an `fn` header before its
-`{`), it counts each `{` whose stage's first word is `fn` and each `(`
-whose stage's first word is `join` (other brackets only have to be
-closed). A line that starts with the `)`/`}` closing one of those gets the
-depth just after that bracket, which is one step out when the brackets nest
-well. Nothing on the run path calls it.
+parser, since the line being typed is usually inside a bracket not yet
+closed: over `strip_comments`' output, with the parser's quotes, a
+`Nesting` gives each line a level. Any `(`, `[` or `{` left open at the
+end of a line puts the lines after it one step deeper than the line that
+opened it, or, when that is a group's own first line (`join (select f(`),
+one step deeper than the group's lines, one step however many open on
+that line; a line that starts with the closing bracket goes back one step
+from the bracket's lines, and so does the rest of a line after a closer of
+a bracket opened on an earlier line (`b) {` after `fn f(a,`); a line after
+one ending with an operator or `,` is one step deeper than where its stage
+started (its first line's level, or its group's when that is deeper), but
+only in a stage's own text (the top level, a `join ( … )` group or an `fn`
+body, found from the stage's first word): inside any other bracket it
+stays at that bracket's level; a lone `|` starts a stage at its bracket's
+level; blank and comment-only lines change nothing; a line that starts
+inside a quote is at the quote's line's level.
+`NEW` is the level of the text after the split; `CURRENT` is sent only
+when the cursor's line starts with a closing bracket that closes an open
+one, so a line indented by hand never moves. Each open bracket is kept on
+one stack per closing kind, so a closer finds what it closes without a
+walk, and the pass stays linear. Nothing on the run path calls it.
 
 ## Performance
 

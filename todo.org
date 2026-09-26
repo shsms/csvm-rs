@@ -94,6 +94,11 @@ git history; this file is the "what next / what was decided" scratchpad.
   fails with =unexpected character '|' in expression=. =strip_comments=,
   the group takers and =parse::depths= all take backticks as quotes;
   =split_stages= should too.
+- =parse::depths= puts a line that continues a stage by starting with its
+  operator (=? a : b= on a line of its own) at its stage's level, not one
+  step further in, and does the same for the line after one that ends
+  with =\=~= or =!~=, which are not among the operators that continue a
+  line. inkline leaves such a line where it was typed.
 - A script written for the old rule, where a newline alone ended a stage,
   can still run when a =color= stage is followed by a command on its own
   line: =color -g a= then =fmt= reads =fmt= as one more column to colour,
