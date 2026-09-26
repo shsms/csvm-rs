@@ -16,6 +16,7 @@ pub mod exec;
 pub mod field;
 pub mod graph;
 pub mod help;
+pub mod highlight;
 pub mod pager;
 #[cfg(feature = "parquet")]
 pub mod parquet;
