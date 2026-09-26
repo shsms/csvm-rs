@@ -722,6 +722,20 @@ and returns when stdin ends. A request that breaks the protocol ends it with
 exit status 1 and the reason on stderr; a closed stdout, or a connection
 reset (inkline's socket closed with a reply still unread), ends it quietly,
 like any run whose reader stopped (`Failure::Closed`).
+The first line names `indent` (`highlight::GREETING`), so inkline also
+sends `:indent` requests: the same `:cwd`/`:arg` blocks, then `:at ARG
+OFFSET` before `:done` (`Request.at`). `highlight::indent` finds the script
+as for colours and answers `:depth NEW CURRENT` from `parse::depths`, or
+only `:end` when `:at` is not in the script or the script is `raw`; a
+malformed `:at` breaks the protocol like any bad request. `parse::depths`
+is one pass over the text, not the parser, since the line being typed is
+usually inside a group not yet closed: over `strip_comments`' output, with
+the group takers' quotes and `split_stages`' stage breaks (but not inside
+an `fn` header before its `{`), it counts each `{` whose stage's first
+word is `fn` and each `(` whose stage's first word is `join` (other
+brackets only have to be closed). A line that starts with the `)`/`}`
+closing one of those gets the depth just after that bracket, which is one
+step out when the brackets nest well. Nothing on the run path calls it.
 
 ## Performance
 

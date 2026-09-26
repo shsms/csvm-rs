@@ -49,7 +49,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--no-pager`       | never page (see below)                                      |
 | `--no-progress`    | never show the progress line on stderr (see below)          |
 | `--explain`   | print the compiled plan and exit                            |
-| `--highlight`      | answer [inkline](https://github.com/shsms/inkline)'s colouring requests on stdin (see below); takes no other arguments |
+| `--highlight`      | answer [inkline](https://github.com/shsms/inkline)'s colouring and indenting requests on stdin (see below); takes no other arguments |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
 
@@ -137,6 +137,24 @@ inkline shows the new answer once you change the command's arguments, or on
 the next line. A script given with `-f` is not coloured, but the options on
 the line are still checked. inkline's `docs/highlight-protocol.md`
 describes the requests and replies.
+
+inkline also asks csvm where a new line of a script goes. When you press
+Enter inside the quotes, the new line starts one step in from the line the
+command is on, one more step for each `fn … { … }` body or `join ( … )`
+group still open, and a line that starts with the `}` or `)` that closes
+one moves back out. With inkline's `inkline-indent` at 2:
+
+```
+csvm "head
+  | join (
+    cols a,b
+  ) other.csv on a
+  | sort x"
+```
+
+csvm counts the groups with its parser's own rules, so a bracket inside a
+quote or a comment does not count, and a script with a mistake in it is
+still indented. A script that bash will still change is not.
 
 ## The command language
 

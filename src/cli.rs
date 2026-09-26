@@ -182,7 +182,8 @@ pub enum Parsed {
         no_pager: bool,
     },
     Version,
-    /// `--highlight`: answer inkline's colouring requests on stdin.
+    /// `--highlight`: answer inkline's colouring and indenting requests on
+    /// stdin.
     Highlight,
 }
 
