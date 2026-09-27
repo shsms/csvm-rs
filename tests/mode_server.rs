@@ -74,6 +74,17 @@ impl Server {
         self.exchange(&request)
     }
 
+    /// Ask for the completion items at byte `at.1` of argument `at.0` of
+    /// the command line `args`, run from `cwd`; return the reply's lines
+    /// before its `:end`.
+    fn complete(&mut self, cwd: &str, args: &[&str], at: (usize, usize)) -> Vec<String> {
+        self.id += 1;
+        let mut request = format!(":complete {}\n", self.id).into_bytes();
+        request.extend(blocks(cwd, args, None));
+        request.extend(format!(":at {} {}\n:done\n", at.0, at.1).as_bytes());
+        self.exchange(&request)
+    }
+
     /// Send `request`, the whole of request `self.id`; return the reply's
     /// lines before its `:end`.
     fn exchange(&mut self, request: &[u8]) -> Vec<String> {
@@ -276,6 +287,28 @@ fn csvm_mode_server_answers_indent_requests_between_colour_ones() {
     );
     assert_eq!(
         server.indent(&["csvm", "\"join (\n\""], (1, 8), Some(1)),
+        Vec::<String>::new()
+    );
+    let (status, err) = server.finish();
+    assert!(status.success(), "{status}: {err}");
+    assert_eq!(err, "");
+}
+
+#[test]
+fn csvm_mode_server_answers_complete_requests_between_colour_ones() {
+    let mut server = Server::start();
+    // The start of a stage: the commands, each noted with its help, each
+    // replacing the word `he`.
+    let script = "sort id | he";
+    let lines = server.complete("/", &["csvm", script], (1, script.len()));
+    let head = lines.iter().position(|l| l == ":item 10 12 head");
+    let note = head.and_then(|i| lines.get(i + 1));
+    assert!(note.is_some_and(|l| l.starts_with(":note ")), "{lines:?}");
+    // A colour request in between is answered as before.
+    assert_eq!(server.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
+    // Outside the script: only the end.
+    assert_eq!(
+        server.complete("/", &["csvm", "sort", "x.csv"], (2, 1)),
         Vec::<String>::new()
     );
     let (status, err) = server.finish();

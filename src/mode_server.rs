@@ -41,6 +41,7 @@
 //! describes the whole of the inkline mode protocol.
 
 use crate::cli::{self, InputFormat, Parsed};
+use crate::complete::{self, Place};
 use crate::error::Error;
 use crate::exec;
 use crate::parse::{self, Depths, Recorder, SpanKind};
@@ -229,11 +230,28 @@ impl Session {
         reply
     }
 
-    /// The completion items for the argument at `at`: the script's
-    /// commands, columns and functions where the cursor is. Always empty.
+    /// The completion items at `at`, an argument and a byte offset in it:
+    /// what fits where the cursor is in the script (see [`complete::find`]),
+    /// each replacing the word the cursor is in. Commands and the script's
+    /// `fn` names at the start of a stage, a command's flags, and the
+    /// functions in an expression. None when `at` is not in the script
+    /// argument, or csvm finds no script on the line (an argument is not
+    /// UTF-8, the line is a usage error, help, or has `-f`), or the script
+    /// is `raw`.
     pub fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
-        let _ = (request, at);
-        Vec::new()
+        let Some(args) = script_args(request, at) else {
+            return Vec::new();
+        };
+        let offset = at.1;
+        let found = complete::find(&args.script, offset);
+        let word = &found.word;
+        match &found.place {
+            Place::StageStart => complete::command_items(word, &found.fns),
+            Place::Flag(command) => complete::flag_items(word, command),
+            Place::Column => Vec::new(),
+            Place::Expression => complete::function_items(word),
+            Place::Nothing => Vec::new(),
+        }
     }
 
     /// The error csvm would find resolving `plan` against the input's
@@ -283,16 +301,21 @@ impl Session {
 /// what csvm gets. Unlike a colour request, a script that does not parse
 /// still gets depths.
 pub fn indent(request: &Request, at: (usize, usize)) -> Option<Depths> {
-    let (at_arg, offset) = at;
+    script_args(request, at).map(|args| parse::depths(&args.script, at.1))
+}
+
+/// What csvm makes of `request`'s command line, when `at`, its `:at`
+/// place, is in the script argument. `None` when csvm finds no script on
+/// the line (an argument is not UTF-8, the line is a usage error, help, or
+/// has `-f`), when `at` is in another argument, or when the script is
+/// `raw`.
+fn script_args(request: &Request, at: (usize, usize)) -> Option<Box<cli::Args>> {
     let words = words(request).ok()?;
     let Ok(Parsed::Run(args)) = cli::parse_at(words) else {
         return None;
     };
     let arg = args.script_at? + 1;
-    if at_arg != arg || request.args[arg].raw {
-        return None;
-    }
-    Some(parse::depths(&args.script, offset))
+    (at.0 == arg && !request.args[arg].raw).then_some(args)
 }
 
 /// The arguments after the command's name as text; `Err` with the place of
@@ -1904,5 +1927,82 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         let ends: Vec<&str> = out.lines().filter(|l| l.starts_with(":end")).collect();
         assert_eq!(ends, [":end 1", ":end 2"]);
+    }
+
+    /// The items for the command line `args` (after `csvm`), run from
+    /// `dir`, with the argument `SCRIPT` replaced by `marked` less its `@`,
+    /// which marks the cursor, as (text, note) pairs.
+    fn complete_in(dir: &TempDir, args: &[&str], marked: &str) -> Vec<(String, Option<String>)> {
+        let at = marked.find('@').unwrap();
+        let script = marked.replacen('@', "", 1);
+        let pos = args.iter().position(|a| *a == "SCRIPT").unwrap();
+        let mut all = vec!["csvm"];
+        all.extend(
+            args.iter()
+                .map(|a| if *a == "SCRIPT" { script.as_str() } else { a }),
+        );
+        let mut session = Session::default();
+        let req = request(dir.path(), &all);
+        session
+            .complete(&req, (pos + 1, at))
+            .into_iter()
+            .map(|i| (i.text, i.note))
+            .collect()
+    }
+
+    fn texts(items: &[(String, Option<String>)]) -> Vec<&str> {
+        items.iter().map(|(t, _)| t.as_str()).collect()
+    }
+
+    #[test]
+    fn a_stage_start_offers_commands_and_fns() {
+        let dir = TempDir::new("complete-commands");
+        let items = complete_in(&dir, &["SCRIPT"], "fn prep(n) { cols n }\nsort a | @");
+        assert!(items.contains(&("sort".into(), Some("stable multi-key sort".into()))));
+        assert!(items.contains(&("prep".into(), Some("fn".into()))));
+    }
+
+    #[test]
+    fn a_flag_place_offers_that_commands_flags() {
+        let dir = TempDir::new("complete-flags");
+        let items = complete_in(&dir, &["SCRIPT"], "fmt -@");
+        assert!(texts(&items).contains(&"-s"), "{items:?}");
+        assert!(items.iter().all(|(t, n)| t.starts_with('-') && n.is_some()));
+        // `colour` takes `color`'s flags.
+        let items = complete_in(&dir, &["SCRIPT"], "colour -@");
+        assert!(texts(&items).contains(&"-c"), "{items:?}");
+    }
+
+    #[test]
+    fn nothing_for_other_arguments_or_a_raw_script() {
+        let dir = TempDir::new("complete-other");
+        let mut session = Session::default();
+        let req = request(dir.path(), &["csvm", "sort a", "data.csv"]);
+        assert!(
+            session.complete(&req, (2, 4)).is_empty(),
+            "the file argument"
+        );
+        let mut req = request(dir.path(), &["csvm", "sort $x", "data.csv"]);
+        req.args[1].raw = true;
+        assert!(session.complete(&req, (1, 7)).is_empty(), "a raw script");
+        let req = request(dir.path(), &["csvm", "-f", "s.csvm", "data.csv"]);
+        assert!(session.complete(&req, (2, 0)).is_empty(), "a script file");
+        let req = request(dir.path(), &["csvm", "--help", "sort"]);
+        assert!(session.complete(&req, (2, 0)).is_empty(), "help");
+        let req = request(dir.path(), &["csvm", "--nope", "sort"]);
+        assert!(session.complete(&req, (2, 0)).is_empty(), "a usage error");
+        let mut req = request(dir.path(), &["csvm", "so"]);
+        req.args[1].bytes.push(0xff);
+        assert!(session.complete(&req, (1, 2)).is_empty(), "not UTF-8");
+    }
+
+    #[test]
+    fn items_replace_the_word_at_the_cursor() {
+        let dir = TempDir::new("complete-word");
+        let mut session = Session::default();
+        let req = request(dir.path(), &["csvm", "sort id | he"]);
+        let items = session.complete(&req, (1, 12));
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|i| i.at == (10..12)));
     }
 }

@@ -8,10 +8,13 @@
 
 use std::ops::Range;
 
+use crate::help::COMMANDS;
+use crate::mode_server::Item;
 use crate::parse::{
     CommandWord, bracket_kind, command_word, is_ident, split_first_word, strip_comments,
     strip_comments_noting, take_token,
 };
+use crate::plan::Func;
 
 /// What fits at the cursor in a script.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +135,50 @@ pub fn find(script: &str, at: usize) -> Found {
         group,
         stages_before,
         fns: scan.fns,
+    }
+}
+
+// --- the items -------------------------------------------------------------
+
+/// The items for the start of a stage: each command, noted with its
+/// one-line help, then each of the script's `fn` names, noted `fn`. Each
+/// replaces the bytes `at`.
+pub fn command_items(at: &Range<usize>, fns: &[String]) -> Vec<Item> {
+    let commands = COMMANDS.iter().map(|c| (c.name, c.summary));
+    let fns = fns.iter().map(|name| (name.as_str(), "fn"));
+    commands
+        .chain(fns)
+        .map(|(text, note)| item(at, text, note))
+        .collect()
+}
+
+/// The items for a flag of `command`: every spelling of each of its flags,
+/// noted with that flag's help. None for a name that is not a command.
+pub fn flag_items(at: &Range<usize>, command: &str) -> Vec<Item> {
+    let Some(help) = COMMANDS.iter().find(|c| c.name == command) else {
+        return Vec::new();
+    };
+    help.flags
+        .iter()
+        .flat_map(|flag| flag.names.iter().map(|name| item(at, name, flag.help)))
+        .collect()
+}
+
+/// The items for the functions an expression may call, noted `function`:
+/// the built-in ones, then `prev` and `rownum`.
+pub fn function_items(at: &Range<usize>) -> Vec<Item> {
+    Func::NAMES
+        .iter()
+        .chain(&["prev", "rownum"])
+        .map(|name| item(at, name, "function"))
+        .collect()
+}
+
+fn item(at: &Range<usize>, text: &str, note: &str) -> Item {
+    Item {
+        at: at.clone(),
+        text: text.to_string(),
+        note: Some(note.to_string()),
     }
 }
 
@@ -1030,5 +1077,11 @@ mod tests {
         );
         // A name defined twice is listed once.
         assert_eq!(at("fn p() { uniq }\nfn p() { head }\n@").fns, ["p"]);
+    }
+
+    #[test]
+    fn unknown_commands_have_no_flags() {
+        assert!(flag_items(&(0..1), "nope").is_empty());
+        assert_eq!(flag_items(&(0..1), "select")[0].text, "-v");
     }
 }
