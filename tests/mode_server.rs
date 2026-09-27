@@ -306,6 +306,19 @@ fn csvm_mode_server_answers_complete_requests_between_colour_ones() {
     assert!(note.is_some_and(|l| l.starts_with(":note ")), "{lines:?}");
     // A colour request in between is answered as before.
     assert_eq!(server.ask("/", &["csvm", "fmt"]), [":span 1 0 3 command"]);
+    // Where a command takes a column: the input file's columns.
+    let data = temp_csv("id,amount\n");
+    let dir = data.parent().unwrap().to_str().unwrap();
+    let name = data.file_name().unwrap().to_str().unwrap();
+    assert_eq!(
+        server.complete(dir, &["csvm", "sort am", name], (1, 7)),
+        [
+            ":item 5 7 id",
+            ":note column",
+            ":item 5 7 amount",
+            ":note column"
+        ]
+    );
     // Outside the script: only the end.
     assert_eq!(
         server.complete("/", &["csvm", "sort", "x.csv"], (2, 1)),

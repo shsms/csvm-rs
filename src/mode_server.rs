@@ -41,7 +41,7 @@
 //! describes the whole of the inkline mode protocol.
 
 use crate::cli::{self, InputFormat, Parsed};
-use crate::complete::{self, Place};
+use crate::complete::{self, Found, Group, Place};
 use crate::error::Error;
 use crate::exec;
 use crate::parse::{self, Depths, Recorder, SpanKind};
@@ -71,9 +71,10 @@ const MAX_BYTES: usize = 16 << 20;
 /// room for the error and `:end`.
 const MAX_SPAN_BYTES: usize = 900 << 10;
 
-/// The most bytes of an error's message that are sent, so that a message
-/// quoting a very long word cannot push a reply past inkline's limit either.
-const MAX_MESSAGE: usize = 4 << 10;
+/// The most bytes of an error's message, or of an item's text or note, that
+/// are sent, so that a message quoting a very long word cannot push a reply
+/// past inkline's limit either.
+pub const MAX_MESSAGE: usize = 4 << 10;
 
 /// One request: the shell's directory and the command's arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,11 +234,13 @@ impl Session {
     /// The completion items at `at`, an argument and a byte offset in it:
     /// what fits where the cursor is in the script (see [`complete::find`]),
     /// each replacing the word the cursor is in. Commands and the script's
-    /// `fn` names at the start of a stage, a command's flags, and the
-    /// functions in an expression. None when `at` is not in the script
-    /// argument, or csvm finds no script on the line (an argument is not
-    /// UTF-8, the line is a usage error, help, or has `-f`), or the script
-    /// is `raw`.
+    /// `fn` names at the start of a stage, a command's flags, the columns at
+    /// the cursor's stage, and the functions in an expression. None when
+    /// `at` is not in the script argument, or csvm finds no script on the
+    /// line (an argument is not UTF-8, the line is a usage error, help, or
+    /// has `-f`), or the script is `raw`. When the columns cannot be known
+    /// (no input file, a file that cannot be read, a `raw` argument, a stage
+    /// before that does not resolve), the other items are still given.
     pub fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
         let Some(args) = script_args(request, at) else {
             return Vec::new();
@@ -245,13 +248,53 @@ impl Session {
         let offset = at.1;
         let found = complete::find(&args.script, offset);
         let word = &found.word;
+        let columns = |session: &mut Session| -> Vec<Item> {
+            session
+                .columns_at(request, &args, &found)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|name| complete::column_item(word, name))
+                .collect()
+        };
         match &found.place {
             Place::StageStart => complete::command_items(word, &found.fns),
             Place::Flag(command) => complete::flag_items(word, command),
-            Place::Column => Vec::new(),
-            Place::Expression => complete::function_items(word),
+            Place::Column => columns(self),
+            Place::Expression => {
+                let mut items = columns(self);
+                items.extend(complete::function_items(word));
+                items
+            }
             Place::Nothing => Vec::new(),
         }
+    }
+
+    /// The columns at the cursor's stage, as `found` places it in the
+    /// script of `args`: in the pipeline itself, the input's header (see
+    /// [`Session::input_header`]); in a `join ( … )` group, the header of
+    /// the file after the group, from the shell's directory; either one
+    /// carried through the stages before the cursor's in its group. `None`
+    /// when that header cannot be known, a stage before does not parse or
+    /// resolve, or the cursor is in a group with no file yet or in an `fn`
+    /// body.
+    fn columns_at(
+        &mut self,
+        request: &Request,
+        args: &cli::Args,
+        found: &Found,
+    ) -> Option<Vec<String>> {
+        let cwd = shell_dir(&request.cwd);
+        let header = match &found.group {
+            Group::Top => self.input_header(request, args)?,
+            Group::Join { file: Some(file) } => join_header(&mut self.headers, cwd, file)?,
+            Group::Join { file: None } | Group::FnBody => return None,
+        };
+        if found.stages_before.is_empty() {
+            return Some(header);
+        }
+        let mut plan = parse::parse(&found.stages_before).ok()?;
+        resolve_joins(&mut plan, cwd, &mut self.headers).ok()?;
+        plan.resolve(&header).ok()
     }
 
     /// The error csvm would find resolving `plan` against the input's
@@ -388,13 +431,18 @@ fn resolve_joins(
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
             resolve_joins(&mut j.right_plan, cwd, headers)?;
-            let path = from_dir(cwd, Path::new(&j.file)).ok_or(None)?;
-            // A join's right file is always CSV.
-            let header = headers.first_line(&path, InputFormat::Csv).ok_or(None)?;
+            let header = join_header(headers, cwd, &j.file).ok_or(None)?;
             j.right_header = j.right_plan.resolve(&header).map_err(Some)?;
         }
     }
     Ok(())
+}
+
+/// The header of a join's right file, `file` from `cwd`. `None` when it
+/// cannot be known (see [`from_dir`] and [`Headers::first_line`]).
+fn join_header(headers: &mut Headers, cwd: Option<&Path>, file: &str) -> Option<Vec<String>> {
+    // A join's right file is always CSV.
+    headers.first_line(&from_dir(cwd, Path::new(file))?, InputFormat::Csv)
 }
 
 /// How many files [`Headers`] keeps; past that it starts again from none.
@@ -1981,6 +2029,109 @@ mod tests {
     }
 
     #[test]
+    fn columns_follow_the_stages_before() {
+        let dir = TempDir::new("complete-columns");
+        dir.write("data.csv", "id,amount,first name\n1,2,x\n");
+        let items = complete_in(
+            &dir,
+            &["SCRIPT", "data.csv"],
+            "rename id=key | add t = 1 | sort @",
+        );
+        assert_eq!(texts(&items), ["key", "amount", "`first name`", "t"]);
+        assert!(items.iter().all(|(_, n)| n.as_deref() == Some("column")));
+    }
+
+    #[test]
+    fn columns_follow_a_fragment_call_and_a_join_before() {
+        let dir = TempDir::new("complete-fragment");
+        dir.write("data.csv", "id,a,b\n");
+        dir.write("right.csv", "id,c\n");
+        let items = complete_in(
+            &dir,
+            &["SCRIPT", "data.csv"],
+            "fn keep(n) { cols id, n }\nkeep(b) | sort @",
+        );
+        assert_eq!(texts(&items), ["id", "b"]);
+        let items = complete_in(
+            &dir,
+            &["SCRIPT", "data.csv"],
+            "join right.csv on id | sort @",
+        );
+        assert_eq!(texts(&items), ["id", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn an_expression_offers_columns_then_functions() {
+        let dir = TempDir::new("complete-expr");
+        dir.write("data.csv", "id,amount\n");
+        let items = complete_in(&dir, &["SCRIPT", "data.csv"], "select am@");
+        let t = texts(&items);
+        assert_eq!(&t[..2], ["id", "amount"]);
+        assert!(t.contains(&"len") && t.contains(&"rownum"), "{t:?}");
+        assert!(t.contains(&"prev"), "{t:?}");
+        assert!(
+            items[2..]
+                .iter()
+                .all(|(_, n)| n.as_deref() == Some("function"))
+        );
+    }
+
+    #[test]
+    fn a_join_group_takes_its_own_files_columns() {
+        let dir = TempDir::new("complete-join");
+        dir.write("left.csv", "id,a\n");
+        dir.write("right.csv", "id,b,c\n");
+        let items = complete_in(
+            &dir,
+            &["SCRIPT", "left.csv"],
+            "join (cols -v c | sort @) right.csv on id",
+        );
+        assert_eq!(texts(&items), ["id", "b"]);
+        // No file after the group yet: no columns.
+        let items = complete_in(&dir, &["SCRIPT", "left.csv"], "join (sort @");
+        assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn the_input_header_follows_the_header_flag() {
+        let dir = TempDir::new("complete-header");
+        dir.write("data.csv", "1,2\n");
+        let items = complete_in(&dir, &["--header", "x,y", "SCRIPT", "data.csv"], "sort @");
+        assert_eq!(texts(&items), ["x", "y"]);
+        let items = complete_in(&dir, &["--header=", "SCRIPT", "data.csv"], "sort @");
+        assert_eq!(texts(&items), ["c1", "c2"]);
+    }
+
+    #[test]
+    fn unknown_columns_leave_the_other_items() {
+        let dir = TempDir::new("complete-unknown");
+        // No file on the line: no columns, but functions still.
+        let items = complete_in(&dir, &["SCRIPT"], "select am@");
+        assert!(texts(&items).contains(&"len"));
+        assert!(!items.iter().any(|(_, n)| n.as_deref() == Some("column")));
+        // A file that is not there.
+        let items = complete_in(&dir, &["SCRIPT", "none.csv"], "sort @");
+        assert!(items.is_empty());
+        // A stage before that does not resolve, or does not parse.
+        dir.write("data.csv", "id\n");
+        let items = complete_in(&dir, &["SCRIPT", "data.csv"], "cols nope | sort @");
+        assert!(items.is_empty());
+        let items = complete_in(&dir, &["SCRIPT", "data.csv"], "head -n x | sort @");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn a_raw_argument_hides_the_input_columns() {
+        let dir = TempDir::new("complete-raw");
+        dir.write("data.csv", "id\n");
+        let mut session = Session::default();
+        let mut req = request(dir.path(), &["csvm", "sort ", "data.csv"]);
+        assert_eq!(session.complete(&req, (1, 5)).len(), 1);
+        req.args[2].raw = true;
+        assert!(session.complete(&req, (1, 5)).is_empty());
+    }
+
+    #[test]
     fn nothing_for_other_arguments_or_a_raw_script() {
         let dir = TempDir::new("complete-other");
         let mut session = Session::default();
@@ -2001,6 +2152,20 @@ mod tests {
         let mut req = request(dir.path(), &["csvm", "so"]);
         req.args[1].bytes.push(0xff);
         assert!(session.complete(&req, (1, 2)).is_empty(), "not UTF-8");
+    }
+
+    #[test]
+    fn nothing_is_glued_onto_a_closed_name_string_or_call() {
+        let dir = TempDir::new("complete-glued");
+        dir.write("data.csv", "id,amount,first name\n");
+        for marked in [
+            "cols id,`first name`@",
+            "select len(amount)@",
+            "select id == \"x\"@",
+        ] {
+            let items = complete_in(&dir, &["SCRIPT", "data.csv"], marked);
+            assert!(items.is_empty(), "{marked}: {items:?}");
+        }
     }
 
     #[test]

@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 use crate::help::COMMANDS;
-use crate::mode_server::Item;
+use crate::mode_server::{Item, MAX_MESSAGE};
 use crate::parse::{
     CommandWord, bracket_kind, command_word, is_ident, split_first_word, strip_comments,
     strip_comments_noting, take_token,
@@ -172,6 +172,35 @@ pub fn function_items(at: &Range<usize>) -> Vec<Item> {
         .chain(&["prev", "rownum"])
         .map(|name| item(at, name, "function"))
         .collect()
+}
+
+/// The item for column `name`, noted `column`: the name as it is when it is a
+/// plain identifier, else in backticks, so it reads as a column in an
+/// expression and where most commands take columns. The parser does not take
+/// the backticks off in `color -c`, `color -g` or `graph`'s `-c=COL`
+/// (`--color-by=COL`), and `graph` splits its column list at blanks, so there a
+/// backticked item may not work. `None` for a name a script cannot write in
+/// backticks: an empty one, or one with a backtick or a line break in it; and
+/// for one whose text is longer than [`MAX_MESSAGE`], which an item line would
+/// cut short.
+pub fn column_item(at: &Range<usize>, name: &str) -> Option<Item> {
+    if name.is_empty() || name.contains(['`', '\n', '\r']) {
+        return None;
+    }
+    // `inf` and `nan` are numbers in an expression unless backticked.
+    let text = if is_ident(name) && name.parse::<f64>().is_err() {
+        name.to_string()
+    } else {
+        format!("`{name}`")
+    };
+    if text.len() > MAX_MESSAGE {
+        return None;
+    }
+    Some(Item {
+        at: at.clone(),
+        text,
+        note: Some("column".to_string()),
+    })
 }
 
 fn item(at: &Range<usize>, text: &str, note: &str) -> Item {
@@ -1077,6 +1106,32 @@ mod tests {
         );
         // A name defined twice is listed once.
         assert_eq!(at("fn p() { uniq }\nfn p() { head }\n@").fns, ["p"]);
+    }
+
+    #[test]
+    fn a_column_is_written_as_the_script_needs_it() {
+        let text = |name: &str| column_item(&(0..0), name).map(|i| i.text);
+        assert_eq!(text("amount").as_deref(), Some("amount"));
+        assert_eq!(text("_x1").as_deref(), Some("_x1"));
+        assert_eq!(text("first name").as_deref(), Some("`first name`"));
+        assert_eq!(text("a-b").as_deref(), Some("`a-b`"));
+        assert_eq!(text("2024").as_deref(), Some("`2024`"));
+        assert_eq!(text("é").as_deref(), Some("`é`"));
+        // A plain word that reads as a number in an expression.
+        assert_eq!(text("inf").as_deref(), Some("`inf`"));
+        assert_eq!(text("NaN").as_deref(), Some("`NaN`"));
+        // Names no backticks can hold are left out.
+        assert_eq!(text(""), None);
+        assert_eq!(text("a`b"), None);
+        assert_eq!(text("a\nb"), None);
+        // A name too long for one item line would be cut: left out.
+        let long = "a".repeat(MAX_MESSAGE + 1);
+        assert_eq!(text(&long), None);
+        let fits = format!("a {}", "b".repeat(MAX_MESSAGE - 4));
+        assert_eq!(text(&fits).map(|t| t.len()), Some(MAX_MESSAGE));
+        assert_eq!(text(&format!("{fits}c")), None);
+        let item = column_item(&(3..5), "id").unwrap();
+        assert_eq!((item.at, item.note.as_deref()), (3..5, Some("column")));
     }
 
     #[test]
