@@ -71,6 +71,13 @@ const MAX_BYTES: usize = 16 << 20;
 /// room for the error and `:end`.
 const MAX_SPAN_BYTES: usize = 900 << 10;
 
+/// The most items one reply to a `:complete` request holds.
+const MAX_ITEMS: usize = 1000;
+
+/// The most bytes of `:item` and `:note` lines one reply holds, well under
+/// inkline's 1 MiB limit, past which it turns a mode server off.
+const MAX_ITEM_BYTES: usize = MAX_SPAN_BYTES;
+
 /// The most bytes of an error's message, or of an item's text or note, that
 /// are sent, so that a message quoting a very long word cannot push a reply
 /// past inkline's limit either.
@@ -241,6 +248,9 @@ impl Session {
     /// has `-f`), or the script is `raw`. When the columns cannot be known
     /// (no input file, a file that cannot be read, a `raw` argument, a stage
     /// before that does not resolve), the other items are still given.
+    /// When a reply cannot hold every item (see [`write_items`]), the ones
+    /// that start with the typed part of the word, from its start to the
+    /// cursor, come first.
     pub fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
         let Some(args) = script_args(request, at) else {
             return Vec::new();
@@ -248,6 +258,7 @@ impl Session {
         let offset = at.1;
         let found = complete::find(&args.script, offset);
         let word = &found.word;
+        let typed = args.script.get(word.start..offset).unwrap_or("");
         let columns = |session: &mut Session| -> Vec<Item> {
             session
                 .columns_at(request, &args, &found)
@@ -256,7 +267,7 @@ impl Session {
                 .filter_map(|name| complete::column_item(word, name))
                 .collect()
         };
-        match &found.place {
+        let items = match &found.place {
             Place::StageStart => complete::command_items(word, &found.fns),
             Place::Flag(command) => complete::flag_items(word, command),
             Place::Column => columns(self),
@@ -266,7 +277,8 @@ impl Session {
                 items
             }
             Place::Nothing => Vec::new(),
-        }
+        };
+        typed_first(items, typed)
     }
 
     /// The columns at the cursor's stage, as `found` places it in the
@@ -611,19 +623,59 @@ pub fn write_indent(out: &mut impl Write, id: u64, depths: Option<Depths>) -> io
 /// START END TEXT`, then `:note TEXT` when it has one, then `:end ID`. An
 /// item's text and note go through `one_line`, so a newline in either can
 /// never break a line; an item whose text is empty once it does is not
-/// written (nor is its note).
+/// written (nor is its note). At most `MAX_ITEMS` items are written, and
+/// they stop before their lines pass `MAX_ITEM_BYTES`.
 pub fn write_items(out: &mut impl Write, id: u64, items: &[Item]) -> io::Result<()> {
-    for item in items {
-        let text = one_line(&item.text);
-        if text.is_empty() {
-            continue;
+    let mut written = 0;
+    for lines in items.iter().filter_map(item_lines).take(MAX_ITEMS) {
+        written += lines.len();
+        if written > MAX_ITEM_BYTES {
+            break;
         }
-        writeln!(out, ":item {} {} {text}", item.at.start, item.at.end)?;
-        if let Some(note) = &item.note {
-            writeln!(out, ":note {}", one_line(note))?;
-        }
+        out.write_all(lines.as_bytes())?;
     }
     writeln!(out, ":end {id}")
+}
+
+/// The lines [`write_items`] writes for `item`: its `:item` line and its
+/// `:note` line, if any. `None` when its text is empty once it is one line.
+fn item_lines(item: &Item) -> Option<String> {
+    let text = one_line(&item.text);
+    if text.is_empty() {
+        return None;
+    }
+    let mut lines = format!(":item {} {} {text}\n", item.at.start, item.at.end);
+    if let Some(note) = &item.note {
+        lines.push_str(&format!(":note {}\n", one_line(note)));
+    }
+    Some(lines)
+}
+
+/// `items`, with the ones whose text starts with `typed` first when a reply
+/// cannot hold them all, so that the ones cut are the others. A backtick at
+/// the start of either is not compared. The order is kept otherwise.
+fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
+    // Stops at the first item past either limit.
+    let fits = items
+        .iter()
+        .filter_map(item_lines)
+        .try_fold((0, 0), |(n, b), l| {
+            let (n, b) = (n + 1, b + l.len());
+            (n <= MAX_ITEMS && b <= MAX_ITEM_BYTES).then_some((n, b))
+        })
+        .is_some();
+    if fits {
+        return items;
+    }
+    fn unquoted(text: &str) -> &str {
+        text.strip_prefix('`').unwrap_or(text)
+    }
+    let typed = unquoted(typed);
+    let (mut first, rest): (Vec<Item>, Vec<Item>) = items
+        .into_iter()
+        .partition(|item| unquoted(&item.text).starts_with(typed));
+    first.extend(rest);
+    first
 }
 
 /// Write `reply` to request `id`, ending with `:end ID`. The spans stop
@@ -1961,6 +2013,107 @@ mod tests {
             String::from_utf8(out).unwrap(),
             ":item 5 7 amount\n:note column\n:item 5 7 first name\n:end 9\n"
         );
+    }
+
+    #[test]
+    fn a_reply_holds_at_most_so_many_items_and_bytes() {
+        let items = |n: usize, len: usize| -> Vec<Item> {
+            (0..n)
+                .map(|i| Item {
+                    at: 0..0,
+                    text: format!("{i:0len$}"),
+                    note: Some("column".into()),
+                })
+                .collect()
+        };
+        let written = |items: &[Item]| {
+            let mut out = Vec::new();
+            write_items(&mut out, 1, items).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.ends_with(":end 1\n"));
+            let bytes = out.len() - ":end 1\n".len();
+            (
+                out.lines().filter(|l| l.starts_with(":item")).count(),
+                bytes,
+            )
+        };
+        let (count, bytes) = written(&items(MAX_ITEMS + 5, 4));
+        assert_eq!(count, MAX_ITEMS);
+        assert!(bytes <= MAX_ITEM_BYTES);
+        let (count, bytes) = written(&items(500, 4000));
+        assert!(count < 500);
+        assert!(bytes <= MAX_ITEM_BYTES && bytes > MAX_ITEM_BYTES - 4100);
+    }
+
+    /// The `:item` texts of the reply to a `:complete` request for the
+    /// script `script` with the cursor at its end, on `data.csv` in `dir`,
+    /// and the reply's length in bytes.
+    fn reply_items(dir: &TempDir, script: &str) -> (Vec<String>, usize) {
+        let mut session = Session::default();
+        let req = request(dir.path(), &["csvm", script, "data.csv"]);
+        let mut out = Vec::new();
+        write_items(&mut out, 1, &session.complete(&req, (1, script.len()))).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.ends_with(":end 1\n"));
+        let texts = out
+            .lines()
+            .filter_map(|l| l.strip_prefix(":item "))
+            .map(|l| l.splitn(3, ' ').nth(2).unwrap().to_string())
+            .collect();
+        (texts, out.len())
+    }
+
+    #[test]
+    fn a_very_wide_header_keeps_the_reply_small_and_the_typed_columns() {
+        let dir = TempDir::new("complete-wide");
+        // 40,000 columns, the ones that start with `zz` last.
+        let mut names: Vec<String> = (0..39_990).map(|i| format!("column_{i:05}")).collect();
+        names.extend((0..10).map(|i| format!("zz {i}")));
+        dir.write("data.csv", &format!("{}\n", names.join(",")));
+        let (texts, len) = reply_items(&dir, "sort zz");
+        assert!(len < 1 << 20, "{len}");
+        assert_eq!(texts.len(), MAX_ITEMS);
+        let zz: Vec<String> = (0..10).map(|i| format!("`zz {i}`")).collect();
+        assert_eq!(texts[..10], zz);
+        assert_eq!(texts[10], "column_00000");
+        // Typed with its backtick, too.
+        let (texts, _) = reply_items(&dir, "sort `zz");
+        assert_eq!(texts[..10], zz);
+        // Nothing typed: the first columns, in order.
+        let (texts, _) = reply_items(&dir, "sort ");
+        assert_eq!(texts.len(), MAX_ITEMS);
+        assert_eq!(texts[..2], ["column_00000", "column_00001"]);
+    }
+
+    #[test]
+    fn more_columns_than_a_reply_holds_keep_the_typed_ones() {
+        let dir = TempDir::new("complete-many");
+        // 1,100 short columns, the ones that start with `zz` last: more
+        // items than a reply holds, but far fewer bytes.
+        let mut names: Vec<String> = (0..1_090).map(|i| format!("c{i:04}")).collect();
+        names.extend((0..10).map(|i| format!("zz{i}")));
+        dir.write("data.csv", &format!("{}\n", names.join(",")));
+        let (texts, len) = reply_items(&dir, "sort zz");
+        assert!(len < MAX_ITEM_BYTES / 10, "{len}");
+        assert_eq!(texts.len(), MAX_ITEMS);
+        assert_eq!(texts[..10], names[1_090..]);
+        assert_eq!(texts[10], "c0000");
+    }
+
+    #[test]
+    fn long_column_names_keep_the_reply_small_and_the_typed_columns() {
+        let dir = TempDir::new("complete-long");
+        // 250 names of 4000 bytes: more item bytes than a reply holds.
+        let mut names: Vec<String> = (0..248)
+            .map(|i| format!("c{i:03}{}", "x".repeat(3996)))
+            .collect();
+        names.extend((0..2).map(|i| format!("zz{i}{}", "x".repeat(3997))));
+        dir.write("data.csv", &format!("{}\n", names.join(",")));
+        let (texts, len) = reply_items(&dir, "sort zz");
+        assert!(len <= MAX_ITEM_BYTES + 100, "{len}");
+        assert!(texts.len() < 250);
+        assert_eq!(texts[..2], names[248..]);
+        assert_eq!(texts[2], names[0]);
     }
 
     #[test]
