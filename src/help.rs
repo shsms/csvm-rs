@@ -54,7 +54,7 @@ options (--flag VALUE or --flag=VALUE):
                        (on a terminal, when output goes to a file or waits for
                        the run, and the input is not typed in)
       --explain        print the compiled plan and exit
-      --inkline-mode   answer inkline's colour/indent requests on stdin (alone)
+      --inkline-mode   answer inkline's requests on stdin (alone)
   -h, --help           show this help
   -V, --version        print version and exit";
 

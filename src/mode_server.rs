@@ -1,5 +1,5 @@
-//! `csvm --inkline-mode`: the mode server inkline asks to colour a csvm
-//! command line while it is typed.
+//! `csvm --inkline-mode`: the mode server inkline asks to colour, indent
+//! and complete a csvm command line while it is typed.
 //!
 //! inkline writes requests to stdin:
 //!
@@ -29,6 +29,14 @@
 //! it as it is), or nothing, then `:end ID`. A `:span`'s `KIND` is one of
 //! `parse::SpanKind`'s names; a `|` between two stages is a `separator`.
 //!
+//! csvm also names `complete` on its first line, so inkline may ask for
+//! completion items at a place in an argument: a `:complete ID` request,
+//! with the same `:cwd` and `:arg` blocks and then `:at ARG OFFSET` before
+//! `:done`, as for `:indent`. csvm answers zero or more items, each an
+//! `:item START END TEXT` line (the bytes `START..END` of the `:at`
+//! argument that the item replaces) with an optional `:note TEXT` line
+//! right after it, then `:end ID`.
+//!
 //! Lengths and offsets count bytes. inkline's `docs/mode-protocol.md`
 //! describes the whole of the inkline mode protocol.
 
@@ -45,8 +53,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// The line csvm writes first: the protocol's name and version, and the
-/// one extra request csvm answers, `:indent`.
-pub const GREETING: &str = "inkline-mode 1 indent";
+/// extra requests csvm answers, `:indent` and `:complete`.
+pub const GREETING: &str = "inkline-mode 1 indent complete";
 
 /// The longest `:` line a request may have, newline included.
 const MAX_LINE: u64 = 256;
@@ -73,10 +81,21 @@ pub struct Request {
     pub cwd: Vec<u8>,
     /// Argument 0 is the command's name.
     pub args: Vec<Arg>,
-    /// For an `:indent` request, where the new line breaks: an argument's
-    /// index and a byte offset in it, at most its length. `None` for a
-    /// colour request.
-    pub at: Option<(usize, usize)>,
+    /// What kind of request this is, and its `:at` place when it has one.
+    pub ask: Ask,
+}
+
+/// What one request asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    /// A colour request: the script's spans and its first error.
+    Colors,
+    /// An `:indent` request, with its `:at` place: an argument's index and
+    /// a byte offset in it, at most its length.
+    Indent((usize, usize)),
+    /// A `:complete` request, with its `:at` place, the same shape as
+    /// `Indent`'s.
+    Complete((usize, usize)),
 }
 
 /// One argument of the command line.
@@ -104,6 +123,15 @@ pub struct Span {
     /// Byte offsets in the argument.
     pub at: Range<usize>,
     pub kind: SpanKind,
+}
+
+/// One completion item, the answer to a `:complete` request: it replaces
+/// the bytes `at` of the `:at` argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub at: Range<usize>,
+    pub text: String,
+    pub note: Option<String>,
 }
 
 /// The one error a reply may carry.
@@ -199,6 +227,13 @@ impl Session {
         };
         reply.error = error.map(|e| script_error(arg, &args.script, e));
         reply
+    }
+
+    /// The completion items for the argument at `at`: the script's
+    /// commands, columns and functions where the cursor is. Always empty.
+    pub fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
+        let _ = (request, at);
+        Vec::new()
     }
 
     /// The error csvm would find resolving `plan` against the input's
@@ -408,41 +443,51 @@ fn read_first_line(path: &Path, format: InputFormat, len: u64) -> Option<Vec<Str
     }
 }
 
-/// Read the next request, a colour (`:request`) or an `:indent` one;
-/// `None` when the input ends before one starts. Input that is not a
-/// request is an [`io::ErrorKind::InvalidData`] error: after it, the stream
-/// cannot be followed. So is an `:indent` request without `:at` just
-/// before its `:done`, an `:at` in a colour request, and an `:at` outside
-/// the request's arguments.
+/// Read the next request, a colour (`:request`), an `:indent` or a
+/// `:complete` one; `None` when the input ends before one starts. Input
+/// that is not a request is an [`io::ErrorKind::InvalidData`] error: after
+/// it, the stream cannot be followed. So is an `:indent` or `:complete`
+/// request without `:at` just before its `:done`, an `:at` in a colour
+/// request, and an `:at` outside the request's arguments.
 pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
     let Some(line) = read_line(input)? else {
         return Ok(None);
     };
-    let (id, indent) = match line.strip_prefix(":indent ") {
-        Some(id) => (number(id)?, true),
-        None => (number(field(&line, ":request ")?)?, false),
-    };
+    // When this request needs an `:at` before its `:done`, the word its
+    // kind is named by and the `Ask` it makes of the place; `None` for a
+    // colour request, which does not.
+    type MakeAsk = fn((usize, usize)) -> Ask;
+    let (id, needs_at): (u64, Option<(&str, MakeAsk)>) =
+        if let Some(id) = line.strip_prefix(":indent ") {
+            (number(id)?, Some(("indent", Ask::Indent)))
+        } else if let Some(id) = line.strip_prefix(":complete ") {
+            (number(id)?, Some(("complete", Ask::Complete)))
+        } else {
+            (number(field(&line, ":request ")?)?, None)
+        };
     let line = need_line(input)?;
     let cwd = read_bytes(input, number(field(&line, ":cwd ")?)?)?;
     let mut args = Vec::new();
-    let at = loop {
+    let ask = loop {
         let line = need_line(input)?;
         if line == ":done" {
-            if indent {
+            if let Some((name, _)) = needs_at {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "an :indent request needs :at before :done",
+                    format!("an :{name} request needs :at before :done"),
                 ));
             }
-            break None;
+            break Ask::Colors;
         }
-        if indent && let Some(at) = line.strip_prefix(":at ") {
+        if let Some((_, ask)) = needs_at
+            && let Some(at) = line.strip_prefix(":at ")
+        {
             let at = read_at(at, &args)?;
             let done = need_line(input)?;
             if done != ":done" {
                 return Err(bad(&done));
             }
-            break Some(at);
+            break ask(at);
         }
         let (kind, len) = field(&line, ":arg ")?
             .split_once(' ')
@@ -457,7 +502,7 @@ pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
             bytes: read_bytes(input, number(len)?)?,
         });
     };
-    Ok(Some(Request { id, cwd, args, at }))
+    Ok(Some(Request { id, cwd, args, ask }))
 }
 
 /// The fields of an `:at` line, `ARG OFFSET`: an argument of `args` and a
@@ -479,6 +524,25 @@ pub fn write_indent(out: &mut impl Write, id: u64, depths: Option<Depths>) -> io
         match d.current {
             Some(current) => writeln!(out, ":depth {} {current}", d.new)?,
             None => writeln!(out, ":depth {} -", d.new)?,
+        }
+    }
+    writeln!(out, ":end {id}")
+}
+
+/// Write the answer to a `:complete` request `id`: each item as `:item
+/// START END TEXT`, then `:note TEXT` when it has one, then `:end ID`. An
+/// item's text and note go through `one_line`, so a newline in either can
+/// never break a line; an item whose text is empty once it does is not
+/// written (nor is its note).
+pub fn write_items(out: &mut impl Write, id: u64, items: &[Item]) -> io::Result<()> {
+    for item in items {
+        let text = one_line(&item.text);
+        if text.is_empty() {
+            continue;
+        }
+        writeln!(out, ":item {} {} {text}", item.at.start, item.at.end)?;
+        if let Some(note) = &item.note {
+            writeln!(out, ":note {}", one_line(note))?;
         }
     }
     writeln!(out, ":end {id}")
@@ -514,17 +578,18 @@ pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<(
 }
 
 /// Be the mode server: write [`GREETING`], then answer each request read
-/// from `input` on `output`, a colour request with [`Session::answer`] and
-/// an `:indent` one with [`indent`], flushing after each reply, until
-/// `input` ends.
+/// from `input` on `output`, a colour request with [`Session::answer`], an
+/// `:indent` one with [`indent`], and a `:complete` one with
+/// [`Session::complete`], flushing after each reply, until `input` ends.
 pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
     writeln!(output, "{GREETING}")?;
     output.flush()?;
     let mut session = Session::default();
     while let Some(request) = read_request(input)? {
-        match request.at {
-            Some(at) => write_indent(output, request.id, indent(&request, at))?,
-            None => write_reply(output, request.id, &session.answer(&request))?,
+        match request.ask {
+            Ask::Colors => write_reply(output, request.id, &session.answer(&request))?,
+            Ask::Indent(at) => write_indent(output, request.id, indent(&request, at))?,
+            Ask::Complete(at) => write_items(output, request.id, &session.complete(&request, at))?,
         }
         output.flush()?;
     }
@@ -631,7 +696,7 @@ mod tests {
                         bytes: Vec::new()
                     },
                 ],
-                at: None,
+                ask: Ask::Colors,
             })
         );
         // Then the input ends: no more requests.
@@ -890,7 +955,7 @@ mod tests {
                     bytes: a.as_bytes().to_vec(),
                 })
                 .collect(),
-            at: None,
+            ask: Ask::Colors,
         }
     }
 
@@ -1505,7 +1570,7 @@ mod tests {
         serve(&mut &input[..], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "inkline-mode 1 indent\n\
+            "inkline-mode 1 indent complete\n\
              :span 1 0 3 command\n:end 1\n\
              :error 1 0 6 unknown option: --colr\n:end 2\n"
         );
@@ -1520,11 +1585,14 @@ mod tests {
         assert_eq!(request.id, 8);
         assert_eq!(request.args.len(), 2);
         assert_eq!(request.args[1].bytes, b"join (\n");
-        assert_eq!(request.at, Some((1, 7)));
+        assert_eq!(request.ask, Ask::Indent((1, 7)));
         assert_eq!(read_request(&mut r).unwrap(), None);
         // A split at the start of an argument, or in the command's name.
         let mut r = &b":indent 9\n:cwd 0\n\n:arg final 4\ncsvm\n:at 0 0\n:done\n"[..];
-        assert_eq!(read_request(&mut r).unwrap().unwrap().at, Some((0, 0)));
+        assert_eq!(
+            read_request(&mut r).unwrap().unwrap().ask,
+            Ask::Indent((0, 0))
+        );
     }
 
     #[test]
@@ -1774,10 +1842,67 @@ mod tests {
         serve(&mut &input[..], &mut out).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "inkline-mode 1 indent\n\
+            "inkline-mode 1 indent complete\n\
              :span 1 0 3 command\n:end 1\n\
              :depth 1 -\n:end 2\n\
              :end 3\n"
         );
+    }
+
+    #[test]
+    fn a_complete_request_is_read_with_its_place() {
+        let input =
+            ":complete 4\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 2\nso\n:at 1 2\n:done\n";
+        let request = read_request(&mut input.as_bytes()).unwrap().unwrap();
+        assert_eq!(request.id, 4);
+        assert_eq!(request.ask, Ask::Complete((1, 2)));
+        // `:at` is needed, and must be inside the arguments.
+        let no_at = ":complete 4\n:cwd 0\n\n:arg final 1\nx\n:done\n";
+        assert!(read_request(&mut no_at.as_bytes()).is_err());
+        let outside = ":complete 4\n:cwd 0\n\n:arg final 1\nx\n:at 0 5\n:done\n";
+        assert!(read_request(&mut outside.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn items_are_written_one_per_line_with_their_notes() {
+        let mut out = Vec::new();
+        let items = [
+            Item {
+                at: 5..7,
+                text: "amount".into(),
+                note: Some("column".into()),
+            },
+            Item {
+                at: 5..7,
+                text: "first name".into(),
+                note: None,
+            },
+        ];
+        write_items(&mut out, 9, &items).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            ":item 5 7 amount\n:note column\n:item 5 7 first name\n:end 9\n"
+        );
+    }
+
+    #[test]
+    fn the_greeting_names_complete() {
+        let mut out = Vec::new();
+        serve(&mut "".as_bytes(), &mut out).unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "inkline-mode 1 indent complete\n"
+        );
+    }
+
+    #[test]
+    fn a_complete_request_is_answered_in_turn() {
+        let input = ":complete 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 1\nx\n:at 1 1\n:done\n\
+                     :request 2\n:cwd 1\n/\n:arg final 4\ncsvm\n:done\n";
+        let mut out = Vec::new();
+        serve(&mut input.as_bytes(), &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let ends: Vec<&str> = out.lines().filter(|l| l.starts_with(":end")).collect();
+        assert_eq!(ends, [":end 1", ":end 2"]);
     }
 }

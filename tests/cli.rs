@@ -148,9 +148,7 @@ fn the_help_lists_the_inkline_mode_flag() {
     let (ok, out, err) = csvm(&["--help", "--no-pager"], "");
     assert!(ok, "{err}");
     assert!(
-        out.contains(
-            "      --inkline-mode   answer inkline's colour/indent requests on stdin (alone)\n"
-        ),
+        out.contains("      --inkline-mode   answer inkline's requests on stdin (alone)\n"),
         "{out}"
     );
 }

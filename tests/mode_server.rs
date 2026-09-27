@@ -37,7 +37,7 @@ impl Server {
         };
         let mut first = String::new();
         server.stdout.read_line(&mut first).unwrap();
-        assert_eq!(first, "inkline-mode 1 indent\n");
+        assert_eq!(first, "inkline-mode 1 indent complete\n");
         server
     }
 
@@ -310,7 +310,7 @@ fn csvm_mode_server_exits_quietly_when_its_output_is_closed() {
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
     stdout.read_line(&mut first).unwrap();
-    assert_eq!(first, "inkline-mode 1 indent\n");
+    assert_eq!(first, "inkline-mode 1 indent complete\n");
     // Stop reading: the reply then has nowhere to go.
     drop(stdout);
     let mut stdin = child.stdin.take().unwrap();

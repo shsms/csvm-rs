@@ -183,7 +183,7 @@ pub enum Parsed {
     },
     Version,
     /// `--inkline-mode`: be a mode server for inkline, answering its
-    /// colouring and indenting requests on stdin.
+    /// colouring, indenting and completion requests on stdin.
     ModeServer,
 }
 
