@@ -256,40 +256,47 @@ impl Session {
 
     /// The error csvm would find resolving `plan` against the input's
     /// header. `None` when there is none, or when the header cannot be
-    /// known here: an argument is `raw`, or the input is stdin, a relative
-    /// path with no shell directory to take it from, not a regular file, or
-    /// cannot be read; or the same holds for a join's file.
+    /// known here (see [`Session::input_header`]), or the same holds for a
+    /// join's file.
     fn check_columns(
         &mut self,
         request: &Request,
         args: &cli::Args,
         plan: &mut Plan,
     ) -> Option<Error> {
+        let header = self.input_header(request, args)?;
+        if let Err(e) = resolve_joins(plan, shell_dir(&request.cwd), &mut self.headers) {
+            return e;
+        }
+        plan.resolve(&header).err()
+    }
+
+    /// The input's header, as csvm would read it for `args`: the file's
+    /// first line, or the names `--header` gives. `None` when it cannot be
+    /// known here: an argument is `raw`, or the input is stdin, a relative
+    /// path with no shell directory to take it from, not a regular file, or
+    /// cannot be read, or `--header` is given for Parquet.
+    fn input_header(&mut self, request: &Request, args: &cli::Args) -> Option<Vec<String>> {
         // A `raw` argument anywhere may become other words, or none, and so
         // change the input, its header, or what csvm makes of the line.
         if request.args[1..].iter().any(|a| a.raw) {
             return None;
         }
         let path = args.in_path()?;
-        let cwd = shell_dir(&request.cwd);
-        let path = from_dir(cwd, Path::new(path))?;
+        let path = from_dir(shell_dir(&request.cwd), Path::new(path))?;
         let format = args.input_format();
-        let header = match (&args.header, format) {
+        match (&args.header, format) {
             // csvm rejects `--header` for Parquet, which names its own columns.
-            (Some(_), InputFormat::Parquet) => return None,
+            (Some(_), InputFormat::Parquet) => None,
             (Some(cli::Header::Named(names)), _) => {
                 std::fs::metadata(&path).ok().filter(|m| m.is_file())?;
-                names.clone()
+                Some(names.clone())
             }
             (spec, _) => {
                 let first = self.headers.first_line(&path, format)?;
-                cli::Header::resolve(spec.as_ref(), first, 0).0
+                Some(cli::Header::resolve(spec.as_ref(), first, 0).0)
             }
-        };
-        if let Err(e) = resolve_joins(plan, cwd, &mut self.headers) {
-            return e;
         }
-        plan.resolve(&header).err()
     }
 }
 
