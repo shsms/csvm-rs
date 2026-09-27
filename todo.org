@@ -118,6 +118,26 @@ git history; this file is the "what next / what was decided" scratchpad.
   A column error from a body stage (=fn p() { sort a= then =head }=, called
   as =p()=) is placed on the call, and no note says a =|= may be missing
   in the body.
+- =--inkline-mode=: completion items never name a file, so a =join ( … )=
+  file, or the input file itself, gets no help from csvm; typing one is
+  plain text. Listing the shell's directory (=:cwd=) and filtering by the
+  typed part would need to be its own place, distinct from a column or a
+  flag.
+- =--inkline-mode=: a stage-start completion item is a command's own name
+  only, never one of its aliases, so typing =colour= offers nothing to
+  pick (only =color= does). Adding each alias as its own item, noted like
+  the name it stands for, would fix that.
+- Backticked column names do not work in =color -c=, =color -g= or
+  =graph -c=COL= (=--color-by=COL=): the parser keeps the backticks as
+  part of the name, so =color -g `a-b`= colours nothing and
+  =color -c `first name` ...= fails. =graph= also splits its column list
+  at blanks, so a name with a blank in it cannot be one of its positional
+  columns (=graph -c COL= takes one). =--inkline-mode= completion offers
+  such names in backticks there too. The parser should take the backticks
+  off, as =cols= and =sort= do.
+- =--inkline-mode=: a word that starts with a dash right after =select=
+  (=select -am=) is read as a flag, so completion offers only =-v=, though
+  the parser reads =-amount > 5= as an expression.
 
 ** DONE Numeric-vs-string footgun resolved (per-row auto for bare-column orderings)
 =select qty > stock= used to compare *lexically* (=\"100\" < \"9\"=). Resolved by a

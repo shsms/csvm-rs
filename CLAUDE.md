@@ -739,9 +739,11 @@ protocol ends it with exit status 1 and the reason on stderr; a closed
 stdout, or a connection reset (inkline's socket closed with a reply still
 unread), ends it quietly, like any run whose reader stopped
 (`Failure::Closed`).
-The first line, `inkline-mode 1 indent` (`mode_server::GREETING`), names
-`indent`, so inkline also sends `:indent` requests: the same `:cwd`/`:arg`
-blocks, then `:at ARG OFFSET` before `:done` (`Request.at`).
+The first line, `inkline-mode 1 indent complete` (`mode_server::GREETING`),
+names `indent` and `complete`, so inkline also sends `:indent` and
+`:complete` requests: the same `:cwd`/`:arg` blocks, then `:at ARG OFFSET`
+before `:done` (`Ask::Indent`/`Ask::Complete` hold that pair; `read_request`
+puts either into `Request.ask`).
 `mode_server::indent` finds the script as for colours and answers
 `:depth NEW CURRENT` from `parse::depths`, `CURRENT` being `-` when the
 line the split is on stays as it is, or only `:end` when `:at` is not in
@@ -768,6 +770,51 @@ when the cursor's line starts with a closing bracket that closes an open
 one, so a line indented by hand never moves. Each open bracket is kept on
 one stack per closing kind, so a closer finds what it closes without a
 walk, and the pass stays linear. Nothing on the run path calls it.
+
+`:complete` requests are answered by `Session::complete`
+(`Ask::Complete`): it finds the script as `indent` does (`script_args`),
+then hands the script and the cursor's offset to `complete::find`
+(`src/complete.rs`). `find` reads the text before the cursor once, with
+the parser's own rules for quotes, comments, stages, `join ( … )` groups
+and `fn … { }` bodies, so a half-typed script still gets a place, then
+looks ahead for the end of the word and a group's file. It returns a
+`complete::Found`: `place` (a `complete::Place` — the start of a stage, a
+command's flag, a column, an expression, or nothing), `word` (the run of
+word bytes around the cursor, any leading `-`/`--` or a name's backticks
+included — every item replaces it), and `group` (a `complete::Group` —
+the script itself, a `join ( … )` group with the file named after it
+when the line has one, or an `fn` body). At the start of a stage the
+items are `help::COMMANDS`'s names, noted with `CmdHelp.summary`, and the
+script's own `fn` names, noted `fn` (`complete::command_items`). In a
+command's flag place they are that command's flags — `CmdHelp.flags`, a
+list of `Flag { names, help }` — one item per spelling, noted with the
+flag's `help` (`complete::flag_items`). In an expression they add the
+built-in functions, `Func::NAMES` plus `prev` and `rownum`, each item its
+bare name, noted `function` (`complete::function_items`). Where a command
+or an expression takes a column, `Session::columns_at` finds them: the
+input's header (`input_header`) carried through the stages before the
+cursor's one, by the same `Plan::resolve` header rules `check_columns`
+runs over the whole script — except inside a `join ( … )` group, where
+the header is that group's own file's, read from `:cwd` by `join_header`
+(so another argument's rawness does not touch it), carried through the
+group's own stages, and inside an `fn` body, where there is no header to
+check a column against, so `columns_at` returns none there.
+`complete::column_item` turns each column name into an item, noted
+`column`: the name itself when it is a plain identifier that does not
+read as a number (`inf`/`NaN` included), else in backticks, so
+`first name`, `a-b`, `2024` and `inf` are all offered quoted; a name
+backticks cannot hold either (empty, or holding a backtick or a line
+break), or whose item text is over `MAX_MESSAGE` (4 KiB), is left out. A
+`raw` argument anywhere on the line makes `input_header` return `None`,
+so the pipeline's columns are left out; the commands, flags, functions
+and a join group's columns still come. A `raw` script gets no items,
+since `script_args` returns none for it. `write_items` writes the reply:
+each item as `:item START END TEXT`, a `:note TEXT` right after it when
+it has one, then `:end ID`; an item whose text is empty once `one_line`
+runs on it, and its note, are left out. It writes at most `MAX_ITEMS`
+(1000) items, and stops before their lines pass `MAX_ITEM_BYTES`
+(900 KiB); when not all fit, `typed_first` has put the items that start
+with the typed part of the word first.
 
 ## Performance
 

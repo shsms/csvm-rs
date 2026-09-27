@@ -49,7 +49,7 @@ The input file is an optional **second positional**, like `awk 'prog' file`:
 | `--no-pager`       | never page (see below)                                      |
 | `--no-progress`    | never show the progress line on stderr (see below)          |
 | `--explain`   | print the compiled plan and exit                            |
-| `--inkline-mode`   | be a mode server for [inkline](https://github.com/shsms/inkline): answer its colouring and indenting requests on stdin (see below); takes no other arguments |
+| `--inkline-mode`   | be a mode server for [inkline](https://github.com/shsms/inkline): answer its colouring, indenting and completion requests on stdin (see below); takes no other arguments |
 | `-h, --help`       | usage overview (`csvm help CMD` for one command's detail)   |
 | `-V, --version`    | print version and exit                                      |
 
@@ -207,6 +207,42 @@ hand, and it is left where it is. csvm reads the brackets with its
 parser's own rules, so a bracket inside a quote or a comment does not
 count, and a script with a mistake in it is still indented. A script that
 bash will still change is not.
+
+csvm also offers completion items for inkline's own menu: the commands,
+with their one-line help, a command's flags after a `-`, the columns
+wherever a command takes them, and, inside an expression, the columns and
+csvm's functions. Each row is marked `m`, with a short note. With the
+cursor at the end of the script:
+
+```
+$ csvm 'select am' data.csv
+m  amount      column
+m  amended_at  column
+
+$ csvm 'sort id | co' data.csv
+m  cols   keep or drop columns
+m  color  colourise output
+```
+
+The columns are the ones at that point in the script: the input file's
+header, carried through the stages before the cursor's one, or, inside a
+`join ( … )` group, that group's own file carried through its stages (an
+`fn` body has no header to check columns against, so none are offered
+there). A name a script cannot write bare, such as `first name` or `2024`,
+is offered in backticks, as the script needs it; a name backticks cannot
+hold either is left out. A backticked name does not work in `color -c`,
+`color -g` or `graph -c=COL` (`--color-by=COL`), and a name with a blank
+in it cannot be one of `graph`'s positional columns (`graph -c COL` takes
+one). The input file's columns need the same readable input file the
+colouring above does: an argument bash will still change anywhere on the
+line, such as `$f` or `-o $out`, leaves them out (the commands, flags
+and functions still come, and so do the columns inside a `join ( … )`
+group, which reads its own file). A reply holds at most 1000 items; when
+a very wide file has more columns than that, the ones that start with
+what is typed come first. A script given with `-f`, or one that is
+itself `raw`, gets no completion items at all: with `-f` the script is
+not on the line to place the cursor in, and a `raw` script is not the
+text csvm would get.
 
 ## The command language
 
