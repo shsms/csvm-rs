@@ -1817,13 +1817,13 @@ fn takes_expression(stage: &str) -> bool {
 /// becomes blanks and its newline is kept, so every offset after it is the
 /// same as in the script. Mainly for multi-line scripts read via `-f`, but
 /// works inline too.
-fn strip_comments(script: &str) -> String {
+pub(crate) fn strip_comments(script: &str) -> String {
     strip_comments_noting(script, |_| {})
 }
 
 /// [`strip_comments`], calling `comment` with each comment's byte range:
 /// from its `#` up to the end of its line, the newline not included.
-fn strip_comments_noting(script: &str, mut comment: impl FnMut(Range<usize>)) -> String {
+pub(crate) fn strip_comments_noting(script: &str, mut comment: impl FnMut(Range<usize>)) -> String {
     let mut out = String::with_capacity(script.len());
     let mut quote: Option<char> = None;
     let mut chars = script.char_indices();
@@ -2077,7 +2077,7 @@ struct OpenStage {
 
 /// What a stage's first word makes of the brackets in it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CommandWord {
+pub(crate) enum CommandWord {
     /// `join`: a `(` opens a group of stages.
     Join,
     /// `fn`: a `{` opens a body of stages.
@@ -2089,7 +2089,7 @@ enum CommandWord {
 /// What the stage text before a bracket, `head`, makes of it: the stage's
 /// first word, when a blank ends it before the bracket. A bracket inside
 /// the first word (`prep(`, `join(`) is not after a command.
-fn command_word(head: &str) -> CommandWord {
+pub(crate) fn command_word(head: &str) -> CommandWord {
     let (word, _) = split_first_word(head);
     if word.len() == head.len() {
         return CommandWord::Other;
@@ -2124,7 +2124,7 @@ struct Nesting<'s> {
 
 /// Which of [`Nesting::open_by_kind`] the bracket `c`, opening or closing,
 /// belongs to.
-fn bracket_kind(c: u8) -> usize {
+pub(crate) fn bracket_kind(c: u8) -> usize {
     match c {
         b'(' | b')' => 0,
         b'[' | b']' => 1,
@@ -2352,7 +2352,7 @@ impl<'s> Nesting<'s> {
 }
 
 /// A bare identifier: ASCII letter or `_` first, then letters/digits/`_`.
-fn is_ident(s: &str) -> bool {
+pub(crate) fn is_ident(s: &str) -> bool {
     !s.is_empty()
         && s.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
@@ -2500,7 +2500,7 @@ fn parse_fn_def<'s>(
 
 /// Split off the first token: a whitespace-delimited word, or a quoted run
 /// (`'…'`/`"…"`/`` `…` ``, surrounding quotes stripped) for paths with spaces.
-fn take_token(s: &str) -> (&str, &str) {
+pub(crate) fn take_token(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     let bytes = s.as_bytes();
     match bytes.first() {
@@ -2579,7 +2579,7 @@ fn fragment_call_then_more<'s>(stage: &'s str, fns: &FnTable) -> Option<&'s str>
 }
 
 /// Split off the first whitespace-delimited word (the command) from the rest.
-fn split_first_word(stage: &str) -> (&str, &str) {
+pub(crate) fn split_first_word(stage: &str) -> (&str, &str) {
     match stage.find(char::is_whitespace) {
         Some(p) => (&stage[..p], stage[p..].trim_start()),
         None => (stage, ""),

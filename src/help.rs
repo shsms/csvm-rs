@@ -142,7 +142,7 @@ fn render_topic(t: &Topic) -> String {
     format!("  {} — {}\n\n{}", t.name, t.summary, t.body)
 }
 
-fn find_command(name: &str) -> Option<&'static CmdHelp> {
+pub(crate) fn find_command(name: &str) -> Option<&'static CmdHelp> {
     COMMANDS
         .iter()
         .find(|c| c.name == name || c.aliases.contains(&name))
