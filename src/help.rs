@@ -15,6 +15,15 @@ pub struct CmdHelp {
     pub synopsis: &'static [&'static str],
     pub detail: &'static str,
     pub examples: &'static [&'static str],
+    pub flags: &'static [Flag],
+}
+
+/// One flag the command's parser accepts. `names` holds every spelling
+/// (short and long); `help` is a few plain words describing it, for a
+/// completion item's note.
+pub struct Flag {
+    pub names: &'static [&'static str],
+    pub help: &'static str,
 }
 
 /// A concept page that isn't a single command (operators, colours, …).
@@ -186,6 +195,10 @@ In `cols -v` an unknown name is ignored, but a bad position or range is an error
             "csvm 'cols -v notes' data.csv",
             "csvm --header - 'cols 2-4 | sort 1=n' data.csv",
         ],
+        flags: &[Flag {
+            names: &["-v"],
+            help: "keep everything except these",
+        }],
     },
     CmdHelp {
         name: "select",
@@ -211,6 +224,10 @@ operands stay lexical.",
             "csvm 'select price * qty >= 1000' data.csv",
             "csvm 'select name =~ \"^A\"' data.csv",
         ],
+        flags: &[Flag {
+            names: &["-v"],
+            help: "drop rows where EXPR is true",
+        }],
     },
     CmdHelp {
         name: "sort",
@@ -227,6 +244,7 @@ and a mixed one never aborts. NaN and inf are numbers, as for num(). =n forces n
 non-number aborts), =s forces lexical; a column typed by add (`add c = num(c)`, `str()`) \
 defaults to the matching mode. See `csvm help types`.",
         examples: &["csvm 'sort region score=nr' data.csv"],
+        flags: &[],
     },
     CmdHelp {
         name: "head",
@@ -238,6 +256,10 @@ defaults to the matching mode. See `csvm help types`.",
         ],
         detail: "Streams and stops early when there is no sort before it.",
         examples: &["csvm 'sort score=nr | head 5' data.csv"],
+        flags: &[Flag {
+            names: &["-n", "--lines"],
+            help: "first N rows",
+        }],
     },
     CmdHelp {
         name: "tail",
@@ -250,6 +272,10 @@ defaults to the matching mode. See `csvm help types`.",
         detail: "tail N is blocking: it buffers the tail, so the plan reads all input. \
 tail +N streams, and stops early with a head after it.",
         examples: &["csvm 'tail 20' data.csv", "csvm 'tail +2' data.csv"],
+        flags: &[Flag {
+            names: &["-n", "--lines"],
+            help: "last N rows",
+        }],
     },
     CmdHelp {
         name: "uniq",
@@ -261,6 +287,7 @@ tail +N streams, and stops early with a head after it.",
         ],
         detail: "Global (not adjacent-only like Unix uniq), so the input need not be pre-sorted.",
         examples: &["csvm 'uniq email' contacts.csv"],
+        flags: &[],
     },
     CmdHelp {
         name: "stats",
@@ -274,6 +301,7 @@ tail +N streams, and stops early with a head after it.",
 mean, stddev. min/max are numeric for numeric columns, lexical for text; sum/mean/stddev are \
 numeric-only. Composes with sort/head/fmt after it.",
         examples: &["csvm 'stats | sort mean=nr | fmt' data.csv"],
+        flags: &[],
     },
     CmdHelp {
         name: "agg",
@@ -292,6 +320,7 @@ by their output text (like a `by` key); sum/mean/stddev are blank for a non-nume
             "csvm 'agg count, mean(amount) by region | fmt' sales.csv",
             "csvm 'agg total=sum(amount) by region,product' sales.csv",
         ],
+        flags: &[],
     },
     CmdHelp {
         name: "graph",
@@ -350,6 +379,68 @@ time axis; any other non-numeric x plots by row order.",
             "csvm 'graph hist amount -D' sales.csv | csvm 'select count > 100'",
             "csvm 'graph hist amount -S' data.csv -o chart.svg",
         ],
+        flags: &[
+            Flag {
+                names: &["-W", "--width"],
+                help: "chart width in cells",
+            },
+            Flag {
+                names: &["-H", "--height"],
+                help: "chart height in cells",
+            },
+            Flag {
+                names: &["-s", "--scale"],
+                help: "multiply the default size",
+            },
+            Flag {
+                names: &["-A", "--ascii"],
+                help: "draw with plain ascii glyphs",
+            },
+            Flag {
+                names: &["-x", "--xrange"],
+                help: "clip and scale the x axis to lo:hi",
+            },
+            Flag {
+                names: &["-y", "--yrange"],
+                help: "clip and scale the y axis to lo:hi",
+            },
+            Flag {
+                names: &["-l", "--log"],
+                help: "log10 scale the value axis",
+            },
+            Flag {
+                names: &["--xlabel"],
+                help: "label the x axis",
+            },
+            Flag {
+                names: &["--ylabel"],
+                help: "label the y axis",
+            },
+            Flag {
+                names: &["-b", "--bins"],
+                help: "set the bin or grid count",
+            },
+            Flag {
+                names: &["-t", "--title"],
+                help: "set the chart title",
+            },
+            Flag {
+                names: &["-r", "--ramp"],
+                help: "colour by value along a ramp",
+            },
+            Flag {
+                names: &["-c", "--color-by"],
+                help: "colour points by a column's value",
+            },
+            Flag {
+                names: &["-D", "--data"],
+                help: "write the chart's data as csv",
+            },
+            Flag {
+                names: &["-S", "--svg"],
+                help: "emit an svg instead of a terminal chart",
+            },
+        ],
     },
     CmdHelp {
         name: "fn",
@@ -367,6 +458,7 @@ a column with add first.",
         examples: &[
             "csvm 'fn prep(n) { rename value=n | cols -v metric }\nprep(pv) | join (prep(q)) r.csv on ts' data.csv",
         ],
+        flags: &[],
     },
     CmdHelp {
         name: "join",
@@ -390,6 +482,32 @@ plus each right's non-key columns; a clashing right name is suffixed _r.",
             "csvm 'join -l (cols sku,price) prices.csv on sku=item' sales.csv",
             "csvm 'join pv.csv, batt.csv on timestamp' grid.csv",
         ],
+        flags: &[
+            Flag {
+                names: &["-l", "--left"],
+                help: "keep every left row, matched or not",
+            },
+            Flag {
+                names: &["-r", "--right"],
+                help: "keep every right row, matched or not",
+            },
+            Flag {
+                names: &["-F", "--full"],
+                help: "keep every row from both sides",
+            },
+            Flag {
+                names: &["--inner"],
+                help: "keep only matching rows (default)",
+            },
+            Flag {
+                names: &["-L", "--lsuffix"],
+                help: "suffix a clashing left column",
+            },
+            Flag {
+                names: &["-R", "--rsuffix"],
+                help: "suffix a clashing right column",
+            },
+        ],
     },
     CmdHelp {
         name: "rename",
@@ -398,6 +516,7 @@ plus each right's non-key columns; a clashing right name is suffixed _r.",
         synopsis: &["rename OLD=NEW ...     rename one or more columns"],
         detail: "A header-only change; row data is untouched.",
         examples: &["csvm 'rename qty=quantity,amt=amount' data.csv"],
+        flags: &[],
     },
     CmdHelp {
         name: "add",
@@ -420,6 +539,7 @@ Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm 
             "csvm 'add rate = amount - prev(amount)' data.csv",
             "csvm 'add total = price * qty | add tier = total > 1000 ? \"big\" : \"small\"' data.csv",
         ],
+        flags: &[],
     },
     CmdHelp {
         name: "color",
@@ -437,6 +557,16 @@ to green:red, and its range defaults to the column's min/max. See `csvm help col
         examples: &[
             "csvm 'color red amount < 0 | fmt' data.csv",
             "csvm 'color -g amount green:red 0 5000 | fmt' data.csv",
+        ],
+        flags: &[
+            Flag {
+                names: &["-c"],
+                help: "paint only one column's cell",
+            },
+            Flag {
+                names: &["-g"],
+                help: "paint a gradient by value",
+            },
         ],
     },
     CmdHelp {
@@ -469,6 +599,24 @@ rounded shows 3 significant digits and a k, M, G, T, P or E suffix, for powers o
         examples: &[
             "csvm 'stats | fmt' data.csv",
             "csvm 'stats | fmt -h -p 2' data.csv",
+        ],
+        flags: &[
+            Flag {
+                names: &["-s", "--stripes"],
+                help: "shade every other row",
+            },
+            Flag {
+                names: &["-p", "--precision"],
+                help: "show at most N decimals, not 6",
+            },
+            Flag {
+                names: &["-f", "--full"],
+                help: "show every digit of a number",
+            },
+            Flag {
+                names: &["-h", "--human"],
+                help: "show 1234567 as 1.23M",
+            },
         ],
     },
 ];
@@ -640,5 +788,49 @@ mod tests {
         let err = render(Some("joen")).unwrap_err();
         assert!(err.contains("no help for `joen`"), "{err}");
         assert!(err.contains("did you mean `join`"), "{err}");
+    }
+
+    #[test]
+    fn every_listed_flag_is_one_the_parser_takes() {
+        // What the parser makes of a script: its error's message, or the
+        // plan.
+        let read = |script: &str| match crate::parse::parse(script) {
+            Ok(plan) => format!("{plan:?}"),
+            Err(e) => e.to_string(),
+        };
+        for cmd in COMMANDS {
+            for flag in cmd.flags {
+                for name in flag.names {
+                    // The parser reads a flag it does not know just as it
+                    // reads a made-up one of the same length, but for the
+                    // text. A listed flag must read differently, with or
+                    // without a value after it.
+                    let unknown = format!("-{}", "Z".repeat(name.len() - 1));
+                    let known = ["", " 1"].iter().any(|value| {
+                        let with = |flag: &str| read(&format!("{} {flag}{value}", cmd.name));
+                        with(name) != with(&unknown).replace(&unknown, name)
+                    });
+                    assert!(known, "{} {name}", cmd.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn flags_have_help() {
+        for cmd in COMMANDS {
+            for flag in cmd.flags {
+                assert!(
+                    !flag.names.is_empty() && !flag.help.is_empty(),
+                    "{}",
+                    cmd.name
+                );
+                assert!(
+                    flag.names.iter().all(|n| n.starts_with('-')),
+                    "{}",
+                    cmd.name
+                );
+            }
+        }
     }
 }
