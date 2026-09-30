@@ -411,6 +411,9 @@ csvm 'graph hist amount -S' sales.csv -o amount.svg
 
 # colour negative amounts red, aligned (a TTY, or --color always)
 csvm 'color red amount < 0 | fmt' input.csv
+
+# colour the rows where amount fell by more than 100 from the row above
+csvm 'color red amount - prev(amount) < -100 | fmt' input.csv
 ```
 
 `--explain` shows the compiled, resolved plan:

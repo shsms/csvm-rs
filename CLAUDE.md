@@ -77,10 +77,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   the affixes still take a plain column on the left. A `select` reading
   `prev()`/`rownum()` is stateful and runs its rows in order, like a stateful
   `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
-  `color` predicates reject stateful expressions at parse time (they render
-  post-run, where a rule whose column is missing from the output, by name or
-  by position, is silently dropped; any other resolve error in a rule still
-  aborts). A parenthesized
+  `color` predicates take them too, but read the *output* rows, wherever the
+  `color` is in the script: `compute_styles` gives each row the output row
+  above it and its 1-based output index (colour rules render post-run, where
+  a rule whose column is missing from the output, by name or by position, is
+  silently dropped; any other resolve error in a rule still aborts). A
+  parenthesized
   expression makes `select (…)` fall out for free, and chaining `select`s ANDs
   them. Comparison mode (numeric / lexical / per-row auto) is covered under
   *Implicit conversions* below.

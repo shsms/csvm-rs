@@ -551,11 +551,14 @@ Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm 
             "color -g COLS [RAMP] [LO HI] gradient each COL by value (RAMP is lo:hi)",
         ],
         detail: "Rules render when output is a terminal (or with --color always); most useful \
-with fmt. The predicate forms take a full colour spec (bg:, attributes, + to combine). A \
-gradient is narrower: RAMP is two plain colour names, it paints the foreground only, defaults \
-to green:red, and its range defaults to the column's min/max. See `csvm help colors`.",
+with fmt. The predicate forms take a full colour spec (bg:, attributes, + to combine). \
+EXPR is a select expression; in it prev(col) and rownum() read the output rows, wherever \
+color is in the script (on the first row prev(col) is the row's own cell). A gradient is \
+narrower: RAMP is two plain colour names, it paints the foreground only, defaults to \
+green:red, and its range defaults to the column's min/max. See `csvm help colors`.",
         examples: &[
             "csvm 'color red amount < 0 | fmt' data.csv",
+            "csvm 'color red amount - prev(amount) < -100 | fmt' data.csv",
             "csvm 'color -g amount green:red 0 5000 | fmt' data.csv",
         ],
         flags: &[
@@ -681,7 +684,8 @@ cross-row:   prev(col)   col in the previous row (current cell on row 1)\n      
 rownum()    1-based row index\n\n\
 The same value grammar works as a comparison operand in select / ternary tests, \
 so `select price * qty >= 30`, `abs(x) > 1`, and `(a >= 0) == (b >= 0)` all parse. \
-prev() / rownum() make the run single-threaded and in input order (also from a select). \
+In add and select, prev() / rownum() make the run single-threaded and in input order; in a \
+color condition they read the output rows and do not change the run. \
 Divide/modulo by zero, or arithmetic on a non-number, aborts the run. \
 If NAME already exists, add replaces it in place; otherwise it is appended (a bare integer \
 NAME is a 1-based position and must be in range, see `csvm help add`).",
