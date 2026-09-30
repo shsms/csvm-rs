@@ -271,7 +271,8 @@ divide-by-zero / non-numeric. Cross-row =prev(col)= and =rownum()= are included
 (chosen over a separate Miller-style =step= verb): an =add= reading them is
 order-dependent, so it routes to the in-memory ordered path (like =tail=/=uniq=),
 keeping output =-n=-independent; a pure =add= still shards. =prev(col)= on the
-first row reads the current cell, so =amount - prev(amount)= is 0 there.
+first row reads the current cell, so =amount - prev(amount)= is 0 there; a
+comparison that reads =prev()= is false on the first row.
 
 Still deferred (follow-ups): =split=, regex =match=, and date functions; grouped
 =prev=/delta (=… by g=) once group-by lands.

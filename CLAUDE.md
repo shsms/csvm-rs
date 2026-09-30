@@ -82,7 +82,11 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   above it and its 1-based output index (colour rules render post-run, where
   a rule whose column is missing from the output, by name or by position, is
   silently dropped; any other resolve error in a rule still aborts). A
-  parenthesized
+  comparison with an operand that can take its value from `prev()`
+  (`ValExpr::reads_prev`: either branch of a ternary counts, a boolean inside
+  the operand does not) is a `BoolExpr::CmpPrev`, picked by the parser: false
+  on a row with no row above it, in `select`, `add` and `color` alike, while
+  `prev()` as a value reads the row's own cell there. A parenthesized
   expression makes `select (…)` fall out for free, and chaining `select`s ANDs
   them. Comparison mode (numeric / lexical / per-row auto) is covered under
   *Implicit conversions* below.

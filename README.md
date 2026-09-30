@@ -313,7 +313,8 @@ A few things worth knowing up front:
   aborts) or `add c = str(c)`. Empty coerces to `0`; a non-numeric value where a
   number is required aborts the run.
 - **`add`** computes columns: `add total = amount * qty`, and
-  `add rate = amount - prev(amount)` for the step-to-step difference. An `add`
+  `add rate = amount - prev(amount)` for the step-to-step difference (0 on
+  the first row, where a comparison that reads `prev()` is false). An `add`
   using `prev()`/`rownum()` runs ordered and single-threaded, so its output is
   identical at any `-n`; a pure `add` shards.
 

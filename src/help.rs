@@ -212,7 +212,8 @@ In `cols -v` an unknown name is ignored, but a bad position or range is an error
 expression). See `csvm help operators` for the full operator set. Comparison operands are full \
 value expressions — arithmetic, functions (see `csvm help expr`), parenthesized booleans \
 (compared as t/f), prev(col), rownum() — not just columns and literals; a stateful comparison \
-(prev/rownum) makes the run single-threaded and in input order. A comparison is numeric \
+(prev/rownum) makes the run single-threaded and in input order, and one that reads prev() \
+is false on the first row. A comparison is numeric \
 against a statically numeric side (a number literal, arithmetic, a numeric function such as \
 num(), a column typed numeric by add), lexical against a statically string side (a string \
 literal, ++ concat, a bool, str(), a column typed text by add); an ordering (< > <= >=) \
@@ -533,7 +534,8 @@ string concat with ++, the functions round/floor/ceil/abs/int/sqrt/pow/exp/log/l
 sign/min/max/len/upper/lower/trim/coalesce/num/str, a ternary TEST ? A : B, and constants. \
 prev(col) is col's value in the previous row \
 (the current cell on the first row, so a delta is 0 there) and rownum() is the 1-based row \
-index — both make the run single-threaded and in input order. A bare comparison yields t/f. \
+index — both make the run single-threaded and in input order. A bare comparison yields t/f \
+(f on the first row when it reads prev()). \
 Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm help expr`.",
         examples: &[
             "csvm 'add rate = amount - prev(amount)' data.csv",
@@ -553,9 +555,9 @@ Arithmetic on a non-number, or divide/modulo by zero, aborts the run. See `csvm 
         detail: "Rules render when output is a terminal (or with --color always); most useful \
 with fmt. The predicate forms take a full colour spec (bg:, attributes, + to combine). \
 EXPR is a select expression; in it prev(col) and rownum() read the output rows, wherever \
-color is in the script (on the first row prev(col) is the row's own cell). A gradient is \
-narrower: RAMP is two plain colour names, it paints the foreground only, defaults to \
-green:red, and its range defaults to the column's min/max. See `csvm help colors`.",
+color is in the script. A gradient is narrower: RAMP is two plain colour names, it paints \
+the foreground only, defaults to green:red, and its range defaults to the column's min/max. \
+See `csvm help colors`.",
         examples: &[
             "csvm 'color red amount < 0 | fmt' data.csv",
             "csvm 'color red amount - prev(amount) < -100 | fmt' data.csv",
@@ -686,6 +688,8 @@ The same value grammar works as a comparison operand in select / ternary tests, 
 so `select price * qty >= 30`, `abs(x) > 1`, and `(a >= 0) == (b >= 0)` all parse. \
 In add and select, prev() / rownum() make the run single-threaded and in input order; in a \
 color condition they read the output rows and do not change the run. \
+Row 1 has no previous row, so a comparison that reads prev() is false there \
+(`select x == prev(x)` drops row 1), while prev() as a value is the current cell. \
 Divide/modulo by zero, or arithmetic on a non-number, aborts the run. \
 If NAME already exists, add replaces it in place; otherwise it is appended (a bare integer \
 NAME is a 1-based position and must be in range, see `csvm help add`).",
