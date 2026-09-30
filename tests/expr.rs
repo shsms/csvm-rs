@@ -364,26 +364,6 @@ fn stateful_select_is_thread_independent_over_a_file() {
 }
 
 #[test]
-fn color_predicate_rejects_stateful_expressions() {
-    // Rejected at parse time — an unresolvable colour rule is silently dropped
-    // at resolve time (cosmetic policy), which would hide the mistake.
-    let e = csvm::parse::parse("color red rownum() > 5")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.contains("not allowed in a color"),
-        "unexpected error: {e}"
-    );
-    let e = csvm::parse::parse("color red x != prev(x)")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.contains("not allowed in a color"),
-        "unexpected error: {e}"
-    );
-}
-
-#[test]
 fn num_casts_and_normalises() {
     // num() reads the cell as a number, so the output is the normalised
     // number (007 -> 7, 1e3 -> 1000, blank -> 0) and a non-number aborts.

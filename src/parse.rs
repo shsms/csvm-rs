@@ -1300,12 +1300,6 @@ impl<'a> Builder<'a> {
             return Err(err("color expects a condition expression"));
         }
         let expr = self.parse_expr(expr_src, ExprParser::parse)?;
-        // Colour rules render from the buffered output rows, where there is no
-        // previous-row/rownum context to read. (Checked here rather than at
-        // resolve time, where an unresolvable rule is silently dropped.)
-        if expr.is_stateful() {
-            return Err(err("prev()/rownum() are not allowed in a color condition"));
-        }
         self.colors
             .push(ColorRule::Predicate { scope, style, expr });
         Ok(())

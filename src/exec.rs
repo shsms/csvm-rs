@@ -2097,20 +2097,30 @@ fn render_graph<W: Write>(
 ///
 /// Best-effort: a predicate that errors on a row (e.g. a non-numeric cell in a
 /// numeric comparison) leaves that row unpainted rather than aborting — colour
-/// is a cosmetic overlay, so one bad cell shouldn't kill the whole output.
+/// is a cosmetic overlay, so one bad cell shouldn't kill the whole output. A
+/// predicate that reads such a cell through `prev()` errors on the row below
+/// it too.
 fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
     for rule in rules {
         match rule {
             ColorRule::Predicate { scope, style, expr } => {
-                // Reuse one row buffer across all rows (cells borrow from `rows`,
-                // so it just holds &str views — one alloc per rule, not per row).
+                // Reuse two row buffers across all rows (cells borrow from `rows`,
+                // so they just hold &str views — two allocs per rule, not per
+                // row). `prev_row` is the output row above, for `prev()`; the
+                // row's index is its `rownum()`, the header being row 0.
                 let mut frow: Vec<Field> = Vec::new();
+                let mut prev_row: Vec<Field> = Vec::new();
                 for (ri, row) in rows.iter().enumerate().skip(1) {
+                    std::mem::swap(&mut frow, &mut prev_row);
                     frow.clear();
                     frow.extend(row.iter().map(|s| Field::Str(s)));
-                    if !matches!(expr.eval(&frow, &EvalCtx::default()), Ok(true)) {
+                    let ctx = EvalCtx {
+                        prev_row: (ri > 1).then_some(prev_row.as_slice()),
+                        rownum: ri as u64,
+                    };
+                    if !matches!(expr.eval(&frow, &ctx), Ok(true)) {
                         continue;
                     }
                     match scope {
@@ -4312,6 +4322,42 @@ mod tests {
         assert_eq!(lines[0], "id,fieldA");
         assert_eq!(lines.len(), 5); // header + 4 rows, no error
         assert!(!out.contains('\x1b')); // nothing painted (the column is gone)
+    }
+
+    /// The data rows of `out` that hold a colour escape, by 0-based index.
+    fn painted_rows(out: &str) -> Vec<usize> {
+        let rows = out.lines().skip(1).enumerate();
+        rows.filter(|(_, l)| l.contains('\x1b'))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn color_predicate_reads_the_previous_output_row() {
+        // `b` falls by more than 100 into the second row and the fourth.
+        let input = "a,b\n1,500\n2,300\n3,290\n4,100\n5,90\n";
+        let out = render_str("color red b - prev(b) < -100", input, true);
+        assert_eq!(painted_rows(&out), [1, 3], "{out}");
+        // The rows are the output's: sorted the other way, `b` rises by more
+        // than 100 into the third row and the fifth.
+        let out = render_str("color red b - prev(b) > 100 | sort a=nr", input, true);
+        assert_eq!(painted_rows(&out), [2, 4], "{out}");
+    }
+
+    #[test]
+    fn color_predicate_reads_its_own_cell_as_prev_on_the_first_row() {
+        let input = "a,b\n1,5\n2,7\n3,7\n";
+        let out = render_str("color red b == prev(b)", input, true);
+        assert_eq!(painted_rows(&out), [0, 2], "{out}");
+    }
+
+    #[test]
+    fn color_predicate_counts_the_output_rows() {
+        // `rownum()` numbers the rows that reach the output, from 1: the
+        // `select` after the rule drops the first input row.
+        let input = "a,b\n1,5\n2,-300\n3,7\n";
+        let out = render_str("color -c b red rownum() == 2 | select a > 1", input, true);
+        assert_eq!(painted_rows(&out), [1], "{out}");
     }
 
     #[test]

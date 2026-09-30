@@ -320,8 +320,8 @@ pub enum ValExpr {
         else_: Box<ValExpr>,
     },
     /// `prev(col)` — the cell of `col` in the *previous* row (the current row's
-    /// own cell on the first row, so a delta is 0 there). Stateful: forces the
-    /// in-memory ordered execution path.
+    /// own cell on the first row, so a delta is 0 there). Stateful: in a
+    /// statement it forces the in-memory ordered execution path.
     Prev(ColRef),
     /// `rownum()` — the 1-based index of the current row. Stateful (as above).
     Rownum,
@@ -799,7 +799,8 @@ pub enum ColorScope {
 }
 
 /// One `color` rule, applied to the output rows at render time (so its column
-/// references resolve against the *output* header).
+/// references resolve against the *output* header, and its `prev()`/`rownum()`
+/// read the output rows).
 #[derive(Clone, Debug)]
 pub enum ColorRule {
     /// Paint `scope` with `style` on rows where `expr` is true.
@@ -1292,7 +1293,7 @@ impl BoolExpr {
 /// Per-row context for the stateful leaves of a value expression (`prev()`,
 /// `rownum()`). [`Default`] is empty — a pure expression never reads it, so the
 /// streaming/sharded paths pass the default; the paths that run a stateful
-/// statement in order fill it.
+/// statement in order fill it, and so does a colour rule, from the output rows.
 #[derive(Default)]
 pub struct EvalCtx<'a> {
     /// The previous row (`None` on the first row, where `prev()` reads the
