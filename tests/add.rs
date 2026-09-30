@@ -191,6 +191,23 @@ fn prev_computes_step_delta() {
 }
 
 #[test]
+fn comparison_reading_prev_is_false_on_the_first_row() {
+    // Row 1 has no row above it: a bare comparison is `f` there, and a
+    // ternary takes its else branch.
+    assert_eq!(
+        run_checked("add up = price >= prev(price) | cols up", NUM),
+        "up\nf\nt\nf\n"
+    );
+    assert_eq!(
+        run_checked(
+            "add dir = price >= prev(price) ? 'up' : 'down' | cols dir",
+            NUM
+        ),
+        "dir\ndown\nup\ndown\n"
+    );
+}
+
+#[test]
 fn rownum_is_one_based() {
     assert_eq!(
         run_checked("add n = rownum() | cols n", NUM),

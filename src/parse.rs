@@ -3457,13 +3457,19 @@ impl ExprParser {
             _ => unreachable!("filtered above"),
         };
         let rhs = self.parse_concat()?;
+        let reads_prev = lhs.reads_prev() || rhs.reads_prev();
         // The mode is decided in `Plan::resolve`, where column types are known.
-        Ok(BV::B(BoolExpr::Cmp(Cmp {
+        let cmp = Cmp {
             op: cmp_op,
             lhs,
             rhs,
             mode: CmpMode::Auto,
-        })))
+        };
+        Ok(BV::B(if reads_prev {
+            BoolExpr::CmpPrev(cmp)
+        } else {
+            BoolExpr::Cmp(cmp)
+        }))
     }
 
     // --- value expressions (for `add`) --------------------------------------

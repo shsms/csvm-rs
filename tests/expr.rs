@@ -330,11 +330,61 @@ fn auto_mode_compound_soft_fallback_is_lexical() {
 // --- stateful select --------------------------------------------------------
 
 #[test]
+fn select_comparison_reading_prev_still_aborts_on_a_bad_first_cell() {
+    let err = run("select val - prev(val) >= 0", "val\nx\n", 1).unwrap_err();
+    assert!(err.to_string().contains("non-numeric"), "{err}");
+}
+
+#[test]
 fn select_prev_keeps_rows_where_value_changed() {
     let input = "val\n1\n1\n2\n2\n2\n3\n";
-    // Row 1: prev() reads the current cell, so `!=` is false and it's dropped —
-    // matching the `add` convention (delta 0 on row 1).
+    // Row 1 has no row above it, so a comparison that reads prev() is false.
     assert_eq!(run_checked("select val != prev(val)", input), "val\n2\n3\n");
+}
+
+#[test]
+fn select_comparison_reading_prev_is_false_on_the_first_row() {
+    let input = "val\n1\n1\n2\n";
+    assert_eq!(run_checked("select val == prev(val)", input), "val\n1\n");
+    assert_eq!(run_checked("select val >= prev(val)", input), "val\n1\n2\n");
+    // The rest of the condition is still read there.
+    assert_eq!(
+        run_checked("select rownum() == 1 || val != prev(val)", input),
+        "val\n1\n2\n"
+    );
+    assert_eq!(
+        run_checked("select !(val != prev(val))", input),
+        "val\n1\n1\n"
+    );
+    // prev() on the left, and inside an operand's value.
+    for cond in [
+        "prev(val) == val",
+        "abs(val - prev(val)) < 1",
+        "prev(val) - val == 0",
+        "-prev(val) == -val",
+        "val ++ prev(val) == val ++ val",
+        "(val > 0 ? prev(val) : 0) == val",
+        "(val < 0 ? 0 : prev(val)) == val",
+    ] {
+        let script = format!("select {cond}");
+        assert_eq!(run_checked(&script, input), "val\n1\n", "{cond}");
+    }
+    // A comparison of a boolean that reads prev() is a plain one: the two
+    // spellings of "not changed" agree.
+    assert_eq!(
+        run_checked("select (val != prev(val)) == 'f'", input),
+        "val\n1\n1\n"
+    );
+    // So is one of a ternary that reads prev() in its test only.
+    assert_eq!(
+        run_checked("select (val != prev(val) ? 1 : 0) == 0", input),
+        "val\n1\n1\n"
+    );
+    // The first row is the first to reach the statement, not the input's.
+    assert_eq!(
+        run_checked("select val > 1 | select val == prev(val)", "val\n1\n2\n2\n"),
+        "val\n2\n"
+    );
 }
 
 #[test]

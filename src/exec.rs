@@ -2726,7 +2726,7 @@ fn fmt_expr(e: &BoolExpr) -> String {
         // operands — numeric coercion, lexical text, or the per-row auto-detect
         // two untyped columns get for an ordering — so the mode is never a
         // surprise.
-        BoolExpr::Cmp(c) => format!(
+        BoolExpr::Cmp(c) | BoolExpr::CmpPrev(c) => format!(
             "({} {} {} :{})",
             cmp_symbol(c.op),
             fmt_valexpr(&c.lhs),
@@ -4345,10 +4345,23 @@ mod tests {
     }
 
     #[test]
-    fn color_predicate_reads_its_own_cell_as_prev_on_the_first_row() {
+    fn color_comparison_reading_prev_is_false_on_the_first_row() {
+        // The first row has no row above it, so there neither comparison holds.
         let input = "a,b\n1,5\n2,7\n3,7\n";
         let out = render_str("color red b == prev(b)", input, true);
+        assert_eq!(painted_rows(&out), [2], "{out}");
+        let out = render_str("color red b != prev(b)", input, true);
+        assert_eq!(painted_rows(&out), [1], "{out}");
+        // The rest of the condition is still read there.
+        let out = render_str("color red a == 1 || b == prev(b)", input, true);
         assert_eq!(painted_rows(&out), [0, 2], "{out}");
+        let out = render_str("color red a == 1 && b == prev(b)", input, true);
+        assert_eq!(painted_rows(&out), [] as [usize; 0], "{out}");
+        let out = render_str("color red !(b == prev(b))", input, true);
+        assert_eq!(painted_rows(&out), [0, 1], "{out}");
+        // A comparison that reads only `rownum()` is a plain one.
+        let out = render_str("color red rownum() == 1", input, true);
+        assert_eq!(painted_rows(&out), [0], "{out}");
     }
 
     #[test]

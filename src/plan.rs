@@ -155,6 +155,9 @@ pub enum BoolExpr {
     Or(Vec<BoolExpr>),
     Not(Box<BoolExpr>),
     Cmp(Cmp),
+    /// A comparison with an operand that can take its value from `prev()`
+    /// ([`ValExpr::reads_prev`]): false on a row with no row above it.
+    CmpPrev(Cmp),
     Match {
         col: ColRef,
         regex: Regex,
@@ -320,8 +323,9 @@ pub enum ValExpr {
         else_: Box<ValExpr>,
     },
     /// `prev(col)` — the cell of `col` in the *previous* row (the current row's
-    /// own cell on the first row, so a delta is 0 there). Stateful: in a
-    /// statement it forces the in-memory ordered execution path.
+    /// own cell on the first row, so a delta is 0 there; a comparison of it is
+    /// a [`BoolExpr::CmpPrev`]). Stateful: in a statement it forces the
+    /// in-memory ordered execution path.
     Prev(ColRef),
     /// `rownum()` — the 1-based index of the current row. Stateful (as above).
     Rownum,
@@ -1242,6 +1246,7 @@ impl BoolExpr {
             }
             BoolExpr::Not(e) => Ok(!e.eval(row, ctx)?),
             BoolExpr::Cmp(c) => c.eval(row, ctx),
+            BoolExpr::CmpPrev(c) => Ok(c.eval(row, ctx)? && ctx.prev_row.is_some()),
             BoolExpr::Match { col, regex, negate } => {
                 Ok(regex.is_match(&cell_str(row, col.pos)) ^ negate)
             }
@@ -1267,7 +1272,7 @@ impl BoolExpr {
                 }
             }
             BoolExpr::Not(e) => e.resolve(header, types)?,
-            BoolExpr::Cmp(c) => {
+            BoolExpr::Cmp(c) | BoolExpr::CmpPrev(c) => {
                 c.lhs.resolve(header, types)?;
                 c.rhs.resolve(header, types)?;
                 c.retype(&|r| types[r.pos])?;
@@ -1284,7 +1289,7 @@ impl BoolExpr {
         match self {
             BoolExpr::And(es) | BoolExpr::Or(es) => es.iter().any(BoolExpr::is_stateful),
             BoolExpr::Not(e) => e.is_stateful(),
-            BoolExpr::Cmp(c) => c.lhs.is_stateful() || c.rhs.is_stateful(),
+            BoolExpr::Cmp(c) | BoolExpr::CmpPrev(c) => c.lhs.is_stateful() || c.rhs.is_stateful(),
             BoolExpr::Match { .. } | BoolExpr::Affix { .. } => false,
         }
     }
@@ -1516,6 +1521,27 @@ impl ValExpr {
             ValExpr::Cond { test, then_, else_ } => {
                 test.is_stateful() || then_.is_stateful() || else_.is_stateful()
             }
+        }
+    }
+
+    /// Whether the value can come from a `prev()` cell (either branch of a
+    /// ternary counts). A boolean inside it (a parenthesized one, a ternary's
+    /// test) is not looked into: its own comparisons answer for themselves.
+    pub fn reads_prev(&self) -> bool {
+        match self {
+            ValExpr::Prev(_) => true,
+            ValExpr::Rownum
+            | ValExpr::Col(_)
+            | ValExpr::Num(_)
+            | ValExpr::Word(..)
+            | ValExpr::Str(_)
+            | ValExpr::Bool(_) => false,
+            ValExpr::Neg(e) => e.reads_prev(),
+            ValExpr::Arith { lhs, rhs, .. } => lhs.reads_prev() || rhs.reads_prev(),
+            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+                parts.iter().any(ValExpr::reads_prev)
+            }
+            ValExpr::Cond { then_, else_, .. } => then_.reads_prev() || else_.reads_prev(),
         }
     }
 }
