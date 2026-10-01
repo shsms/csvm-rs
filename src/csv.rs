@@ -9,7 +9,7 @@
 //! See [`crate::field`] for how values are represented and written back.
 
 use crate::field::Field;
-use memchr::{memchr, memchr_iter};
+use memchr::{memchr, memchr_iter, memchr2, memchr2_iter};
 
 /// Parse every row in `chunk`, calling `on_row` for each. The row buffer is
 /// owned here and reused across the chunk's rows (one allocation per chunk);
@@ -18,15 +18,19 @@ pub fn parse_chunk<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>
     let mut row: Vec<Field<'a>> = Vec::new();
     let bytes = chunk.as_bytes();
     let mut start = 0;
+    // The fields of the line before, counted before `on_row` may change the
+    // row (see `parse_line`).
+    let mut fields_before = 1;
     for nl in memchr_iter(b'\n', bytes) {
-        parse_line(strip_cr(&chunk[start..nl]), &mut row);
+        parse_line(strip_cr(&chunk[start..nl]), &mut row, fields_before);
+        fields_before = row.len();
         on_row(&mut row);
         start = nl + 1;
     }
     // Trailing content not terminated by a newline is still a row; a trailing
     // newline (start == len) leaves nothing and emits no spurious empty row.
     if start < chunk.len() {
-        parse_line(strip_cr(&chunk[start..]), &mut row);
+        parse_line(strip_cr(&chunk[start..]), &mut row, fields_before);
         on_row(&mut row);
     }
 }
@@ -34,7 +38,7 @@ pub fn parse_chunk<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>
 /// Parse a CSV header line into owned column names.
 pub fn parse_header(line: &str) -> Vec<String> {
     let mut row: Vec<Field> = Vec::new();
-    parse_line(strip_cr(line), &mut row);
+    parse_line(strip_cr(line), &mut row, 1);
     row.iter().map(|f| f.as_str().into_owned()).collect()
 }
 
@@ -44,11 +48,89 @@ fn strip_cr(line: &str) -> &str {
 }
 
 /// Split one line into fields. `line` must not contain `\n`.
-fn parse_line<'a>(line: &'a str, row: &mut Vec<Field<'a>>) {
+///
+/// One scan finds the commas of a line with no quote, nearly every line, and
+/// stops at the first quote, whose field and those after it are read field by
+/// field. Which scan depends on how long the fields run: over 16 bytes each
+/// when the line is longer than that for each of the `fields_before`, the
+/// fields of the line before, as lines of a file are alike.
+fn parse_line<'a>(line: &'a str, row: &mut Vec<Field<'a>>, fields_before: usize) {
     row.clear();
+    if line.len() > 16 * fields_before {
+        split_long(line, row);
+    } else {
+        split_short(line, row);
+    }
+}
+
+/// [`parse_line`]'s scan for long fields: memchr's iterator, whose wide scan
+/// pays for its start on a long field.
+fn split_long<'a>(line: &'a str, row: &mut Vec<Field<'a>>) {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    for at in memchr2_iter(b',', b'"', bytes) {
+        if bytes[at] == b'"' {
+            return parse_fields(line, start, row);
+        }
+        row.push(Field::Str(&line[start..at]));
+        start = at + 1;
+    }
+    row.push(Field::Str(&line[start..]));
+}
+
+/// [`parse_line`]'s scan for short fields: eight bytes at a time, with memchr's
+/// wider scan for a field that runs on.
+fn split_short<'a>(line: &'a str, row: &mut Vec<Field<'a>>) {
+    let bytes = line.as_bytes();
+    let mut start = 0;
+    let mut at = 0;
+    while let Some(word) = bytes.get(at..at + 8) {
+        let word = u64::from_le_bytes(word.try_into().expect("8 bytes"));
+        let mut hits = bytes_eq(word, b',') | bytes_eq(word, b'"');
+        if hits == 0 {
+            // A field that runs on: memchr's wider scan finds its end.
+            at += 8;
+            at = memchr2(b',', b'"', &bytes[at..]).map_or(bytes.len(), |r| at + r);
+            continue;
+        }
+        while hits != 0 {
+            let hit = at + (hits.trailing_zeros() / 8) as usize;
+            if bytes[hit] == b'"' {
+                return parse_fields(line, start, row);
+            }
+            row.push(Field::Str(&line[start..hit]));
+            start = hit + 1;
+            hits &= hits - 1;
+        }
+        at += 8;
+    }
+    for hit in at..bytes.len() {
+        match bytes[hit] {
+            b',' => {
+                row.push(Field::Str(&line[start..hit]));
+                start = hit + 1;
+            }
+            b'"' => return parse_fields(line, start, row),
+            _ => {}
+        }
+    }
+    row.push(Field::Str(&line[start..]));
+}
+
+/// The high bit of each byte of `word` that is `byte`, and no other bit.
+#[inline]
+fn bytes_eq(word: u64, byte: u8) -> u64 {
+    const SEVEN: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    // A byte of `x` is zero where `word`'s matched. Adding seven bits to its
+    // low seven never carries into the next byte.
+    let x = word ^ (0x0101_0101_0101_0101 * u64::from(byte));
+    !(((x & SEVEN) + SEVEN) | x | SEVEN)
+}
+
+/// Push the fields of `line` from the one starting at `i` onto `row`.
+fn parse_fields<'a>(line: &'a str, mut i: usize, row: &mut Vec<Field<'a>>) {
     let bytes = line.as_bytes();
     let len = bytes.len();
-    let mut i = 0;
     loop {
         let (field, next) = if bytes.get(i) == Some(&b'"') {
             parse_quoted(line, i)
@@ -219,6 +301,55 @@ mod tests {
             parse_header(r#""first,name",age"#),
             vec!["first,name", "age"]
         );
+    }
+
+    #[test]
+    fn both_scans_split_as_field_by_field_reading_does() {
+        let long = "x".repeat(40);
+        let lines = [
+            String::new(),
+            ",".into(),
+            "a,,b,".into(),
+            "1,22,333,4444,55555,666666,7777777,88888888,999999999".into(),
+            format!("{long},{long},b"),
+            format!("{long}\"x,y"),
+            r#"a,"b,c",d"#.into(),
+            r#"0123456789,"q ""x"" q",z"#.into(),
+            format!(r#"a,{long},"{long},",z"#),
+            "abcdefg\",h".into(),
+            "日本,語,🙂x".into(),
+        ];
+        for line in &lines {
+            let mut expect = Vec::new();
+            parse_fields(line, 0, &mut expect);
+            for split in [split_short, split_long] {
+                let mut row = Vec::new();
+                split(line, &mut row);
+                assert_eq!(format!("{row:?}"), format!("{expect:?}"), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_eq_marks_exactly_the_matching_bytes() {
+        // A match in one byte, and every value in each byte above it, where a
+        // carry or borrow from the match could show.
+        for byte in [b',', b'"', 0, 0x7f, 0x80, 0xff] {
+            for other in 0..=255u8 {
+                for (at, above) in (0..8).flat_map(|a| (a + 1..8).map(move |b| (a, b))) {
+                    let mut word = [byte ^ 0x5a; 8];
+                    word[at] = byte;
+                    word[above] = other;
+                    let hits = bytes_eq(u64::from_le_bytes(word), byte);
+                    let expect = word
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, b)| **b == byte)
+                        .fold(0u64, |m, (i, _)| m | 0x80 << (8 * i));
+                    assert_eq!(hits, expect, "{word:x?} for {byte:#x}");
+                }
+            }
+        }
     }
 
     #[test]

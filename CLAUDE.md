@@ -585,7 +585,12 @@ for that row instead of aborting.
 
 ## CSV spec (the "input spec")
 
-Hand-rolled zero-copy, quote-aware scanner over each chunk (uses `memchr`):
+Hand-rolled zero-copy, quote-aware scanner over each chunk (uses `memchr`).
+`csv::parse_line` finds the commas of a line with no quote in one scan: eight
+bytes at a time (`bytes_eq`) for short fields, `memchr2_iter` when the line is
+longer than 16 bytes for each field the line before had (`parse_chunk` counts
+them before handing the row on). From a line's first quote on it reads field
+by field (`parse_fields`).
 - `,`-separated, `"`-quoted fields; `""` is an escaped quote inside quotes;
   quoted fields may contain commas.
 - **No embedded newlines in fields** — a row is a line. This is required for the
