@@ -1281,7 +1281,7 @@ impl<'a> Builder<'a> {
                     return Err(err("color -c expects a column name"));
                 }
                 self.note(col, SpanKind::Variable);
-                self.parse_color_predicate(ColorScope::Cell(ColRef::new(col.to_string())), tail)
+                self.parse_color_predicate(ColorScope::Cell(ColRef::new(col)), tail)
             }
             // Colour-first: the rest (colour + expression) is the predicate form.
             _ => self.parse_color_predicate(ColorScope::Row, rest.trim()),
@@ -4329,7 +4329,7 @@ mod tests {
         let g = plan.graph.expect("graph metadata");
         assert_eq!(g.kind, GraphKind::Hist);
         assert_eq!(g.cols.len(), 1);
-        assert_eq!(g.cols[0].name, "amount");
+        assert_eq!(&*g.cols[0].name, "amount");
         assert_eq!(g.opts.bins, Some(12));
         assert_eq!(g.opts.title.as_deref(), Some("Spread"));
         // Every flag has a short spelling too.
@@ -4496,7 +4496,7 @@ mod tests {
             .unwrap()
             .graph
             .unwrap();
-        assert_eq!(g.opts.color_by.as_ref().map(|c| c.name.as_str()), Some("z"));
+        assert_eq!(g.opts.color_by.as_ref().map(|c| &*c.name), Some("z"));
         assert!(parse("graph scatter x y1,y2 -c z").is_err());
         assert!(parse("graph hist x -c z").is_err());
         assert!(parse("graph line x y1,y2 -r blue:red").is_err());
@@ -4600,7 +4600,7 @@ mod tests {
             panic!()
         };
         let ValExpr::Col(col) = &c.lhs else { panic!() };
-        assert_eq!(col.name, "frequenz-app-edge");
+        assert_eq!(&*col.name, "frequenz-app-edge");
         assert_eq!(c.mode, CmpMode::String); // RHS is a string literal (decided at resolve)
         assert!(matches!(&c.rhs, ValExpr::Str(s) if s.is_empty()));
     }
@@ -5169,7 +5169,7 @@ mod tests {
             let ColorRule::Gradient { col, bounds, .. } = rule else {
                 panic!("expected a gradient");
             };
-            assert_eq!(col.name, name);
+            assert_eq!(&*col.name, name);
             assert_eq!(*bounds, Some((0.0, 10.0)));
         }
     }

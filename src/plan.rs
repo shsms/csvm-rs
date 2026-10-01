@@ -20,19 +20,22 @@ use std::ops::Range;
 /// A reference to a column: a name, resolved to a position.
 #[derive(Clone, Debug)]
 pub struct ColRef {
-    pub name: String,
+    pub name: Box<str>,
     pub pos: usize,
 }
 
 impl ColRef {
-    pub fn new(name: String) -> Self {
-        ColRef { name, pos: 0 }
+    pub fn new(name: impl Into<Box<str>>) -> Self {
+        ColRef {
+            name: name.into(),
+            pos: 0,
+        }
     }
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
         self.pos = resolve_col(&self.name, header)?;
         // Carry the header name, so a chart title or `--explain` shows
         // `qty` for a column given by position.
-        self.name = header[self.pos].clone();
+        self.name = header[self.pos].as_str().into();
         Ok(())
     }
 }
@@ -1971,7 +1974,7 @@ mod tests {
     }
 
     fn col(name: &str) -> ColRef {
-        ColRef::new(name.into())
+        ColRef::new(name)
     }
 
     #[test]

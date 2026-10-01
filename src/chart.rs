@@ -916,13 +916,13 @@ fn color_drops(xy: &XyData) -> u64 {
 /// The default chart title: the value column, or `y vs x` for one series.
 pub fn default_title(g: &GraphSpec) -> String {
     match g.kind {
-        GraphKind::Bar => g.cols[1].name.clone(),
+        GraphKind::Bar => g.cols[1].name.to_string(),
         GraphKind::Heatmap => format!("{} vs {}", g.cols[1].name, g.cols[0].name),
         GraphKind::Scatter | GraphKind::Line if g.cols.len() == 2 => {
             format!("{} vs {}", g.cols[1].name, g.cols[0].name)
         }
         GraphKind::Scatter | GraphKind::Line => format!("vs {}", g.cols[0].name),
-        GraphKind::Hist | GraphKind::Spark => g.cols[0].name.clone(),
+        GraphKind::Hist | GraphKind::Spark => g.cols[0].name.to_string(),
     }
 }
 
@@ -978,7 +978,7 @@ pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
             let (values, d) = numeric_values(text, g.cols[0].pos, g.opts.yrange, g.opts.log);
             drops = d;
             ChartData::Spark(SparkData {
-                name: g.cols[0].name.clone(),
+                name: g.cols[0].name.to_string(),
                 values: bucket(&values, f.width),
                 range: g.opts.yrange,
             })
@@ -994,15 +994,15 @@ pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
             let (rows, skipped, truncated) = collect_bars(text, g.cols[0].pos, &value_pos, cap);
             (drops.skipped, drops.truncated) = (skipped, truncated);
             ChartData::Bar(BarData {
-                label_name: g.cols[0].name.clone(),
-                value_names: g.cols[1..].iter().map(|c| c.name.clone()).collect(),
+                label_name: g.cols[0].name.to_string(),
+                value_names: g.cols[1..].iter().map(|c| c.name.to_string()).collect(),
                 rows,
                 axis: g.opts.yrange,
             })
         }
         GraphKind::Scatter | GraphKind::Line => {
             let ypos: Vec<usize> = g.cols[1..].iter().map(|c| c.pos).collect();
-            let names: Vec<String> = g.cols[1..].iter().map(|c| c.name.clone()).collect();
+            let names: Vec<String> = g.cols[1..].iter().map(|c| c.name.to_string()).collect();
             let (mut xy, skipped) = collect_xy(
                 text,
                 &g.cols[0].name,
@@ -1011,7 +1011,7 @@ pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
                 &ypos,
                 g.opts.color_by.as_ref().map(|c| c.pos),
             );
-            xy.color_by = g.opts.color_by.as_ref().map(|c| c.name.clone());
+            xy.color_by = g.opts.color_by.as_ref().map(|c| c.name.to_string());
             xy.connect = g.kind == GraphKind::Line;
             (xy.xrange, xy.yrange) = (g.opts.xrange, g.opts.yrange);
             // The ranges are in real values, so they clip before the log.
@@ -1028,7 +1028,7 @@ pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
         GraphKind::Heatmap => {
             // One y series and no colour column, so the x column goes through
             // the same three modes a scatter's does.
-            let names = vec![g.cols[1].name.clone()];
+            let names = vec![g.cols[1].name.to_string()];
             let (mut xy, skipped) = collect_xy(
                 text,
                 &g.cols[0].name,
@@ -1077,8 +1077,8 @@ pub fn collect(text: &str, g: &GraphSpec, f: &Frame) -> Collected {
                 drops.grid_capped = Some((cols, rows));
             }
             ChartData::Heat(HeatData {
-                xname: g.cols[0].name.clone(),
-                yname: g.cols[1].name.clone(),
+                xname: g.cols[0].name.to_string(),
+                yname: g.cols[1].name.to_string(),
                 xlo: b.xlo,
                 xhi: b.xhi,
                 ylo: b.ylo,

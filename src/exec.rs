@@ -2584,7 +2584,7 @@ pub fn describe(plan: &Plan) -> String {
     }
     if let Some(g) = &plan.graph {
         let kind = g.kind.name();
-        let cols: Vec<&str> = g.cols.iter().map(|c| c.name.as_str()).collect();
+        let cols: Vec<&str> = g.cols.iter().map(|c| &*c.name).collect();
         out.push_str(&format!("graph: {kind} {cols:?}"));
         out.push_str(&describe_graph_opts(&g.opts));
         out.push('\n');
