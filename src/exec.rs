@@ -35,10 +35,15 @@ use unicode_width::UnicodeWidthStr;
 /// Visible (terminal) width of `s` in columns: CJK/wide glyphs count as 2,
 /// zero-width/combining marks as 0. Used so `fmt` aligns by what's displayed,
 /// not by `chars().count()`. (ANSI escapes never reach here — alignment is
-/// computed on the uncoloured text.)
+/// computed on the uncoloured text.) Printable ASCII, one column a byte, is
+/// counted without the Unicode tables.
 #[inline]
 fn vis_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    if s.bytes().all(|b| matches!(b, b' '..=b'~')) {
+        s.len()
+    } else {
+        UnicodeWidthStr::width(s)
+    }
 }
 
 /// An owned row, detached from any chunk buffer (used by the in-memory
@@ -4584,6 +4589,20 @@ mod tests {
         };
         let out = render_on("fmt", LONG_NOTE, &screen);
         assert!(out.contains("a long piece of text here"), "{out}");
+    }
+
+    #[test]
+    fn vis_width_counts_printable_ascii_by_byte() {
+        let printable: String = (b' '..=b'~').map(char::from).collect();
+        assert_eq!(
+            vis_width(&printable),
+            UnicodeWidthStr::width(printable.as_str())
+        );
+        // Anything else is measured by its glyphs.
+        for s in ["a\tb", "\x1b[1m", "日本", "e\u{301}", "a\u{200b}b"] {
+            assert_eq!(vis_width(s), UnicodeWidthStr::width(s), "{s:?}");
+        }
+        assert_eq!(vis_width("日本"), 4);
     }
 
     #[test]
