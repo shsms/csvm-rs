@@ -2285,8 +2285,16 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 push_gap(&mut line, 2, shade_start.as_deref());
             }
-            let text = cut(field, widths[i]);
-            let pad = widths[i].saturating_sub(vis_width(&text));
+            // Measured once: most cells fit, and only a wider one is cut.
+            let w = vis_width(field);
+            let (text, shown) = if w <= widths[i] {
+                (Cow::Borrowed(&**field), w)
+            } else {
+                let text = cut(field, widths[i]);
+                let w = vis_width(&text);
+                (text, w)
+            };
+            let pad = widths[i].saturating_sub(shown);
             let has_content = !text.is_empty();
             if numeric[i] {
                 // Right-justify: pad on the left.
