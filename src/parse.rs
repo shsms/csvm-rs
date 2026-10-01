@@ -3735,6 +3735,8 @@ fn check_arity(func: Func, n: usize) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::field::Field;
+    use crate::plan::{EvalCtx, apply_stmts};
 
     #[test]
     fn errors_are_placed_in_the_script() {
@@ -3766,6 +3768,37 @@ mod tests {
             parse("select a >> 1").unwrap_err().to_string(),
             "expected a column, number, string, or function, found '>'"
         );
+    }
+
+    #[test]
+    fn errors_met_running_rows_are_placed_in_the_script() {
+        // What an error met on the row `a=x, b=0, c=1` marks in the script.
+        let mark = |script: &str| {
+            let header = ["a", "b", "c"].map(String::from);
+            let mut plan = parse(script).unwrap();
+            plan.resolve(&header).unwrap();
+            let Stage::Transform(stmts) = &plan.stages[0] else {
+                panic!("expected a transform");
+            };
+            let mut row = vec![Field::Str("x"), Field::Str("0"), Field::Str("1")];
+            let ctx = EvalCtx::default();
+            let e = apply_stmts(stmts, &mut row, &mut Vec::new(), &ctx).unwrap_err();
+            script[e.span().unwrap()].to_string()
+        };
+        // A divisor that is zero; an operand that is not a number.
+        assert_eq!(mark("add d = c / b"), "b");
+        assert_eq!(mark("add d = c % (b * 2)"), "(b * 2)");
+        assert_eq!(mark("add d = c + a"), "a");
+        assert_eq!(mark("add d = a - 1"), "a");
+        assert_eq!(mark("add d = (a ++ c) * 2"), "(a ++ c)");
+        assert_eq!(mark("add d = -a"), "a");
+        // A function's argument: the call.
+        assert_eq!(mark("add d = round(a)"), "round(a)");
+        // An error inside a comparison keeps its own place.
+        assert_eq!(mark("select c / b > 1"), "b");
+        assert_eq!(mark("select round(c / b) > 1"), "b");
+        // A fragment's body is not in the script: its call.
+        assert_eq!(mark("fn f(x) { add d = c / x }\nf(b)"), "f(b)");
     }
 
     #[test]

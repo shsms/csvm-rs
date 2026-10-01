@@ -40,6 +40,24 @@ impl Span {
             _ => Span::NONE,
         }
     }
+
+    /// The byte range of the script, unless this is [`Span::NONE`].
+    fn range(self) -> Option<Range<usize>> {
+        (self.start <= self.end).then_some(self.start as usize..self.end as usize)
+    }
+
+    /// `e` placed here, unless it has a place already: the part it was met in
+    /// is a more precise place than this one. Out of line and by reference, so
+    /// a hot path that may fail reads the span only when it does.
+    #[cold]
+    #[inline(never)]
+    fn place(&self, e: impl Into<Error>) -> Error {
+        let e = e.into();
+        match self.range() {
+            Some(at) => e.at(at),
+            None => e,
+        }
+    }
 }
 
 /// A reference to a column: a name, resolved to a position.
@@ -1365,23 +1383,36 @@ impl ValExpr {
             ValExpr::Col(c) => cell_field(row, c.pos),
             ValExpr::Num(n) | ValExpr::Word(_, n) => Field::Num(*n),
             ValExpr::Str(s) => Field::Owned(s.clone()),
-            ValExpr::Neg(e, _) => Field::Num(-e.eval(row, ctx)?.coerce_num()?),
-            ValExpr::Arith { op, lhs, rhs, .. } => {
-                let l = lhs.eval(row, ctx)?.coerce_num()?;
-                let r = rhs.eval(row, ctx)?.coerce_num()?;
+            // Each coercion is matched in place: a helper returning
+            // `Result<f64, Error>` costs each operand a copy.
+            ValExpr::Neg(e, at) => match e.eval(row, ctx)?.coerce_num() {
+                Ok(n) => Field::Num(-n),
+                Err(err) => return Err(at.place(err)),
+            },
+            ValExpr::Arith { op, lhs, rhs, at } => {
+                let l = match lhs.eval(row, ctx)?.coerce_num() {
+                    Ok(l) => l,
+                    Err(e) => return Err(at[0].place(e)),
+                };
+                let r = match rhs.eval(row, ctx)?.coerce_num() {
+                    Ok(r) => r,
+                    Err(e) => return Err(at[1].place(e)),
+                };
                 let v = match op {
                     ArithOp::Add => l + r,
                     ArithOp::Sub => l - r,
                     ArithOp::Mul => l * r,
                     ArithOp::Div => {
                         if r == 0.0 {
-                            return Err(Error::Other("division by zero in expression".into()));
+                            let e = Error::Other("division by zero in expression".into());
+                            return Err(at[1].place(e));
                         }
                         l / r
                     }
                     ArithOp::Mod => {
                         if r == 0.0 {
-                            return Err(Error::Other("modulo by zero in expression".into()));
+                            let e = Error::Other("modulo by zero in expression".into());
+                            return Err(at[1].place(e));
                         }
                         l % r
                     }
@@ -1395,7 +1426,10 @@ impl ValExpr {
                 }
                 Field::Owned(s)
             }
-            ValExpr::Func(f, args, _) => eval_func(*f, args, row, ctx)?,
+            ValExpr::Func(f, args, at) => match eval_func(*f, args, row, ctx) {
+                Ok(v) => v,
+                Err(e) => return Err(at.place(e)),
+            },
             ValExpr::Bool(b, _) => Field::Str(if b.eval(row, ctx)? { "t" } else { "f" }),
             ValExpr::Cond {
                 test, then_, else_, ..
