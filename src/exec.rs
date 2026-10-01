@@ -2288,27 +2288,26 @@ fn align_and_write<W: Write>(
             let text = cut(field, widths[i]);
             let pad = widths[i].saturating_sub(vis_width(&text));
             let has_content = !text.is_empty();
-            let painted: Cow<str> = match color {
+            if numeric[i] {
+                // Right-justify: pad on the left.
+                push_gap(&mut line, pad, shade_start.as_deref());
+            }
+            let link = screen.links && ri > 0 && is_web_address(field);
+            if link {
+                push_link_start(&mut line, field);
+            }
+            match color {
                 Some(depth) if has_content => {
                     let mut style = shade.over(style_at(styles, ri, i));
                     if ri == 0 {
                         style = style.over(bold);
                     }
-                    style.paint(&text, depth).into()
+                    style.paint_into(&text, depth, &mut line);
                 }
-                Some(_) | None => text,
-            };
-            let painted = if screen.links && ri > 0 && is_web_address(field) {
-                hyperlink(field, &painted).into()
-            } else {
-                painted
-            };
-            if numeric[i] {
-                // Right-justify: pad on the left.
-                push_gap(&mut line, pad, shade_start.as_deref());
-                line.push_str(&painted);
-            } else {
-                line.push_str(&painted);
+                Some(_) | None => line.push_str(&text),
+            }
+            if link {
+                line.push_str(LINK_END);
             }
             if has_content {
                 end = line.len();
@@ -2358,11 +2357,17 @@ fn is_web_address(cell: &str) -> bool {
         && !cell.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-/// `text` as a link to `url`: an OSC 8 hyperlink, which a terminal that knows
-/// them shows as `text` and opens on a click, and one that does not ignores.
-fn hyperlink(url: &str, text: &str) -> String {
-    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+/// Push the start of a link to `url` onto `line`: what follows, up to
+/// [`LINK_END`], is an OSC 8 hyperlink, which a terminal that knows them shows
+/// as that text and opens on a click, and one that does not ignores.
+fn push_link_start(line: &mut String, url: &str) {
+    line.push_str("\x1b]8;;");
+    line.push_str(url);
+    line.push_str("\x1b\\");
 }
+
+/// The end of a link [`push_link_start`] began.
+const LINK_END: &str = "\x1b]8;;\x1b\\";
 
 /// The narrowest a text column is cut to when fitting a table: past this a cut
 /// cell says too little to be worth it, so the lines are left to wrap instead.
@@ -2459,14 +2464,16 @@ fn write_csv_colored<W: Write>(
     output: &mut W,
 ) -> Result<(), Error> {
     let mut line = String::new();
+    let mut encoded = String::new();
     for (ri, row) in rows.iter().enumerate() {
         line.clear();
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
                 line.push(',');
             }
-            let encoded = csv::encode_field(cell);
-            line.push_str(&style_at(styles, ri, i).paint(&encoded, depth));
+            encoded.clear();
+            csv::write_text(&mut encoded, cell);
+            style_at(styles, ri, i).paint_into(&encoded, depth, &mut line);
         }
         line.push('\n');
         output.write_all(line.as_bytes())?;
@@ -4387,6 +4394,16 @@ mod tests {
         let input = "a,b\n1,5\n2,-300\n3,7\n";
         let out = render_str("color -c b red rownum() == 2 | select a > 1", input, true);
         assert_eq!(painted_rows(&out), [1], "{out}");
+    }
+
+    #[test]
+    fn coloured_csv_quotes_a_cell_as_plain_csv_does() {
+        let input = "a,b\n\"say \"\"hi\"\"\",\"x,y\"\n";
+        let red = |s: &str| format!("\x1b[31m{s}\x1b[0m");
+        assert_eq!(
+            render_str("color red a != ''", input, true),
+            format!("a,b\n{},{}\n", red(r#""say ""hi""""#), red(r#""x,y""#))
+        );
     }
 
     #[test]

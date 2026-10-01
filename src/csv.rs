@@ -141,17 +141,10 @@ pub fn write_cells<'f, 'a: 'f>(buf: &mut String, cells: impl IntoIterator<Item =
     buf.push('\n');
 }
 
-/// CSV-encode one field's text (quoting only if needed), returned as a String.
-/// Used when colouring plain CSV output, where each cell is encoded then wrapped
-/// in ANSI separately.
-pub fn encode_field(s: &str) -> String {
-    let mut buf = String::new();
-    write_text(&mut buf, s);
-    buf
-}
-
+/// CSV-encode one field's text onto `buf`, quoting it only if it holds a
+/// comma, a quote or a line break.
 #[inline]
-fn write_text(buf: &mut String, s: &str) {
+pub fn write_text(buf: &mut String, s: &str) {
     if s.bytes().any(|b| matches!(b, b',' | b'"' | b'\n' | b'\r')) {
         buf.push('"');
         // Wrap in quotes and double every interior `"`: join the `"`-split
