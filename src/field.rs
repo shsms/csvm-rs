@@ -209,18 +209,27 @@ pub fn format_num_into(n: f64, buf: &mut String) {
 /// `1234567` shows `1.23M`, and one too big for E shows an exponent,
 /// `1.23e300`. A cell that is not a finite number shows as written.
 pub fn table_num(cell: &str, decimals: Option<u8>, human: bool) -> Option<String> {
-    let n = Field::Str(cell).num_opt().filter(|n| n.is_finite())?;
     let text = trim_cell(cell);
+    let exponent = text.contains(['e', 'E']);
+    let written_decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
+    // The decimals to round to, when the cell has more or an exponent.
+    let round_to = decimals.filter(|&d| exponent || written_decimals > usize::from(d));
+    // A plain number with at most three whole digits, and few enough digits
+    // that its float keeps them all, is below 1000, so takes no suffix.
+    let below_1000 = || {
+        let whole = text.split_once('.').map_or(text, |(whole, _)| whole);
+        !exponent && text.len() <= 15 && whole.trim_start_matches(['-', '+']).len() <= 3
+    };
+    // The text alone tells most cells that stay as written, so they are never
+    // read as a number.
+    if round_to.is_none() && (!human || below_1000()) {
+        return None;
+    }
+    let n = text.parse::<f64>().ok().filter(|n| n.is_finite())?;
     if human && rounds_to_1000_or_more(text, n, decimals) {
         return Some(human_num(text, n));
     }
-    let decimals = usize::from(decimals?);
-    let exponent = text.contains(['e', 'E']);
-    let written_decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
-    if !exponent && written_decimals <= decimals {
-        return None;
-    }
-    let s = round_cell(text, n, decimals);
+    let s = round_cell(text, n, usize::from(round_to?));
     (!exponent || s.parse::<f64>() != Ok(n)).then_some(s)
 }
 
@@ -540,6 +549,15 @@ mod tests {
         assert_eq!(human("-1.2345e300").as_deref(), Some("-1.23e300"));
         // Rounding up to the next suffix, and to a fourth digit.
         assert_eq!(human("999600").as_deref(), Some("1M"));
+        // Three whole digits, but more than a float keeps: read as a number,
+        // even when every decimal is kept.
+        assert_eq!(human("999.999999999999999").as_deref(), Some("1k"));
+        let keep_all = |c| table_num(c, None, true);
+        assert_eq!(keep_all("999.999999999999999").as_deref(), Some("1k"));
+        assert_eq!(keep_all("999.4").as_deref(), None);
+        // An exponent can hide a big number, so it is read as one.
+        assert_eq!(keep_all("1e5").as_deref(), Some("100k"));
+        assert_eq!(keep_all("-2E3").as_deref(), Some("-2k"));
         assert_eq!(human("-999999").as_deref(), Some("-1M"));
         assert_eq!(human("9996").as_deref(), Some("10k"));
         assert_eq!(human("9995").as_deref(), Some("10k"));
