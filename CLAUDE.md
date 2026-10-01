@@ -617,8 +617,9 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   by name in `validate_schema`. Numbers join the `f64` model, so an int64/uint64
   magnitude above 2^53 loses integer precision on read (the same limit CSV hits).
 - `exec::run_parquet` drives it: each arrow `RecordBatch` is transposed columnar
-  ⇒ rows of owned `Field`. A lone non-stateful transform **streams** batch by
-  batch (O(batch) memory) and, with `-n>1`, **shards across row groups**
+  ⇒ rows of owned `Field`. A lone non-stateful transform, or no stage at
+  all (`exec::row_statements`), **streams** batch by batch (O(batch)
+  memory) and, with `-n>1`, **shards across row groups**
   (`run_parquet_sharded`/`process_row_groups`): the row-group indices are split
   into contiguous per-worker blocks (`partition_row_groups`), each worker decodes
   its block via `ParquetReader::open_row_groups`, and the serialized outputs
@@ -644,11 +645,11 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
-  (`head`, `tail +N`, `uniq`, a stateful statement and a lone transform
-  through `RowChain`'s `scan`, a lone transform with `-n>1` through
-  `stream_transform_parallel`) read via `next_chunk_available` (a single
-  `read` completed to a line boundary, into a `ChunkSpace` kept from chunk
-  to chunk) and
+  (`head`, `tail +N`, `uniq` and a stateful statement through `RowChain`'s
+  `scan`; a lone transform or no stage at all through `scan` at `-n1`, or
+  through `stream_transform_parallel` with `-n>1`) read via
+  `next_chunk_available` (a single `read` completed to a line boundary, into
+  a `ChunkSpace` kept from chunk to chunk) and
   flush output per chunk, so a slow or unbounded stream emits promptly
   instead of stalling until a 1 MB buffer fills (which made `head` hang and
   `select` withhold output). `sort` and the

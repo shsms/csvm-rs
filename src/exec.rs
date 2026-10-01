@@ -219,12 +219,24 @@ fn run_body<R: BufRead, W: Write + Send>(
     if let Some((pre, g, post)) = group_shape(plan) {
         return run_group_streaming(pre, g, post, opts, input, output);
     }
-    match plan.stages.as_slice() {
-        [Stage::Transform(stmts)] if opts.threads > 1 => {
+    match row_statements(&plan.stages) {
+        Some(stmts) if opts.threads > 1 => {
             stream_transform_parallel(stmts, opts.threads, opts.chunk_size, input, output)
         }
-        [Stage::Transform(_)] => stream_rows(&mut chain, opts.chunk_size, input, output),
-        _ => run_staged(plan, opts, input, output),
+        Some(_) => stream_rows(&mut chain, opts.chunk_size, input, output),
+        None => run_staged(plan, opts, input, output),
+    }
+}
+
+/// The statements of a plan whose stages are at most one transform with no
+/// stateful statement, which each row passes through on its own, whatever
+/// the rows before it: an empty list for a plan with no stages, such as
+/// `fmt` alone.
+fn row_statements(stages: &[Stage]) -> Option<&[Stmt]> {
+    match stages {
+        [] => Some(&[]),
+        [Stage::Transform(stmts)] if !stmts.iter().any(Stmt::is_stateful) => Some(stmts),
+        _ => None,
     }
 }
 
@@ -592,11 +604,7 @@ fn stats_shape(plan: &Plan) -> Option<(&[Stmt], &StatsStmt, &[Stage])> {
         .map(|(i, _)| i)
         .collect();
     let [si] = idxs[..] else { return None };
-    let pre: &[Stmt] = match &plan.stages[..si] {
-        [] => &[],
-        [Stage::Transform(stmts)] if !stmts.iter().any(Stmt::is_stateful) => stmts,
-        _ => return None,
-    };
+    let pre = row_statements(&plan.stages[..si])?;
     let Stage::Stats(stats) = &plan.stages[si] else {
         return None;
     };
@@ -617,11 +625,7 @@ fn group_shape(plan: &Plan) -> Option<(&[Stmt], &GroupStmt, &[Stage])> {
         .map(|(i, _)| i)
         .collect();
     let [gi] = idxs[..] else { return None };
-    let pre: &[Stmt] = match &plan.stages[..gi] {
-        [] => &[],
-        [Stage::Transform(stmts)] if !stmts.iter().any(Stmt::is_stateful) => stmts,
-        _ => return None,
-    };
+    let pre = row_statements(&plan.stages[..gi])?;
     let Stage::Group(g) = &plan.stages[gi] else {
         return None;
     };
@@ -995,9 +999,8 @@ pub fn run_file<W: Write + Send>(
 
     // A stateful statement must see the rows in order, so it never shards:
     // the reader path runs it (see `run_body`).
-    if let [Stage::Transform(stmts)] = plan.stages.as_slice()
+    if let Some(stmts) = row_statements(&plan.stages)
         && opts.threads > 1
-        && !stmts.iter().any(Stmt::is_stateful)
     {
         return run_sharded(stmts, input, opts.threads, progress, output);
     }
@@ -1061,11 +1064,10 @@ pub fn run_parquet<W: Write + Send>(
 ) -> Result<(), Error> {
     write_header(output, out_header)?;
 
-    // A lone transform with no stateful `add` is order-independent: stream it,
-    // sharded across row groups when `-n>1` (the parquet mirror of `run_sharded`).
-    if let [Stage::Transform(stmts)] = plan.stages.as_slice()
-        && !stmts.iter().any(Stmt::is_stateful)
-    {
+    // A lone transform with no stateful statement, or no stage, is
+    // order-independent: stream it, sharded across row groups when `-n>1`
+    // (the parquet mirror of `run_sharded`).
+    if let Some(stmts) = row_statements(&plan.stages) {
         if opts.threads > 1 {
             return run_parquet_sharded(stmts, opts.threads, path, progress, output);
         }
