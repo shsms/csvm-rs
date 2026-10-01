@@ -333,27 +333,33 @@ pub enum ValExpr {
     /// `Num`, or fails when a column has that name.
     Word(String, f64),
     Str(String),
-    /// Unary minus.
-    Neg(Box<ValExpr>),
-    /// Binary arithmetic (numeric; div/mod by zero aborts the run).
+    /// Unary minus, and where its operand is written.
+    Neg(Box<ValExpr>, Span),
+    /// Binary arithmetic (numeric; div/mod by zero aborts the run). `at` is
+    /// where `lhs` and `rhs` are written: an operand that is not a number, or a
+    /// divisor that is zero, is shown there.
     Arith {
         op: ArithOp,
         lhs: Box<ValExpr>,
         rhs: Box<ValExpr>,
+        at: [Span; 2],
     },
     /// `a ++ b ++ …` — string concatenation (deliberately not `+`, so `+` is
-    /// always numeric and unambiguous).
-    Concat(Vec<ValExpr>),
-    /// A built-in function call.
-    Func(Func, Vec<ValExpr>),
+    /// always numeric and unambiguous), and where it is written.
+    Concat(Vec<ValExpr>, Span),
+    /// A built-in function call, and where the call is written: an argument
+    /// that is not a number, where one is wanted, is shown on the call.
+    Func(Func, Vec<ValExpr>, Span),
     /// A boolean expression used as a value (`add ok = amount > 0`); renders
-    /// csvm-style `t`/`f`.
-    Bool(Box<BoolExpr>),
+    /// csvm-style `t`/`f`. The span is where it is written.
+    Bool(Box<BoolExpr>, Span),
     /// `test ? then : else` — reuses the `select` boolean expression for `test`.
+    /// `at` is where the whole `?:` is written.
     Cond {
         test: Box<BoolExpr>,
         then_: Box<ValExpr>,
         else_: Box<ValExpr>,
+        at: Span,
     },
     /// `prev(col)` — the cell of `col` in the *previous* row (the current row's
     /// own cell on the first row, so a delta is 0 there; a comparison of it is
@@ -1359,8 +1365,8 @@ impl ValExpr {
             ValExpr::Col(c) => cell_field(row, c.pos),
             ValExpr::Num(n) | ValExpr::Word(_, n) => Field::Num(*n),
             ValExpr::Str(s) => Field::Owned(s.clone()),
-            ValExpr::Neg(e) => Field::Num(-e.eval(row, ctx)?.coerce_num()?),
-            ValExpr::Arith { op, lhs, rhs } => {
+            ValExpr::Neg(e, _) => Field::Num(-e.eval(row, ctx)?.coerce_num()?),
+            ValExpr::Arith { op, lhs, rhs, .. } => {
                 let l = lhs.eval(row, ctx)?.coerce_num()?;
                 let r = rhs.eval(row, ctx)?.coerce_num()?;
                 let v = match op {
@@ -1382,16 +1388,18 @@ impl ValExpr {
                 };
                 Field::Num(v)
             }
-            ValExpr::Concat(parts) => {
+            ValExpr::Concat(parts, _) => {
                 let mut s = String::new();
                 for p in parts {
                     s.push_str(&p.eval(row, ctx)?.as_str());
                 }
                 Field::Owned(s)
             }
-            ValExpr::Func(f, args) => eval_func(*f, args, row, ctx)?,
-            ValExpr::Bool(b) => Field::Str(if b.eval(row, ctx)? { "t" } else { "f" }),
-            ValExpr::Cond { test, then_, else_ } => {
+            ValExpr::Func(f, args, _) => eval_func(*f, args, row, ctx)?,
+            ValExpr::Bool(b, _) => Field::Str(if b.eval(row, ctx)? { "t" } else { "f" }),
+            ValExpr::Cond {
+                test, then_, else_, ..
+            } => {
                 if test.eval(row, ctx)? {
                     then_.eval(row, ctx)?
                 } else {
@@ -1482,14 +1490,14 @@ impl ValExpr {
         match self {
             ValExpr::Num(_)
             | ValExpr::Word(..)
-            | ValExpr::Neg(_)
+            | ValExpr::Neg(..)
             | ValExpr::Arith { .. }
             | ValExpr::Rownum => Some(ColType::Num),
-            ValExpr::Str(_) | ValExpr::Concat(_) | ValExpr::Bool(_) => Some(ColType::Str),
+            ValExpr::Str(_) | ValExpr::Concat(..) | ValExpr::Bool(..) => Some(ColType::Str),
             // `coalesce` passes its arguments through, so its type depends on
             // the data; every other function returns a fixed type.
-            ValExpr::Func(Func::Coalesce, _) => None,
-            ValExpr::Func(f, _) => Some(
+            ValExpr::Func(Func::Coalesce, ..) => None,
+            ValExpr::Func(f, ..) => Some(
                 if matches!(f, Func::Upper | Func::Lower | Func::Trim | Func::Str) {
                     ColType::Str
                 } else {
@@ -1519,18 +1527,20 @@ impl ValExpr {
                 }
                 *self = ValExpr::Num(*n);
             }
-            ValExpr::Neg(e) => e.resolve(header, types)?,
+            ValExpr::Neg(e, _) => e.resolve(header, types)?,
             ValExpr::Arith { lhs, rhs, .. } => {
                 lhs.resolve(header, types)?;
                 rhs.resolve(header, types)?;
             }
-            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+            ValExpr::Concat(parts, _) | ValExpr::Func(_, parts, _) => {
                 for p in parts {
                     p.resolve(header, types)?;
                 }
             }
-            ValExpr::Bool(b) => b.resolve(header, types)?,
-            ValExpr::Cond { test, then_, else_ } => {
+            ValExpr::Bool(b, _) => b.resolve(header, types)?,
+            ValExpr::Cond {
+                test, then_, else_, ..
+            } => {
                 test.resolve(header, types)?;
                 then_.resolve(header, types)?;
                 else_.resolve(header, types)?;
@@ -1545,15 +1555,15 @@ impl ValExpr {
         match self {
             ValExpr::Prev(_) | ValExpr::Rownum => true,
             ValExpr::Col(_) | ValExpr::Num(_) | ValExpr::Word(..) | ValExpr::Str(_) => false,
-            ValExpr::Bool(b) => b.is_stateful(),
-            ValExpr::Neg(e) => e.is_stateful(),
+            ValExpr::Bool(b, _) => b.is_stateful(),
+            ValExpr::Neg(e, _) => e.is_stateful(),
             ValExpr::Arith { lhs, rhs, .. } => lhs.is_stateful() || rhs.is_stateful(),
-            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+            ValExpr::Concat(parts, _) | ValExpr::Func(_, parts, _) => {
                 parts.iter().any(ValExpr::is_stateful)
             }
-            ValExpr::Cond { test, then_, else_ } => {
-                test.is_stateful() || then_.is_stateful() || else_.is_stateful()
-            }
+            ValExpr::Cond {
+                test, then_, else_, ..
+            } => test.is_stateful() || then_.is_stateful() || else_.is_stateful(),
         }
     }
 
@@ -1568,10 +1578,10 @@ impl ValExpr {
             | ValExpr::Num(_)
             | ValExpr::Word(..)
             | ValExpr::Str(_)
-            | ValExpr::Bool(_) => false,
-            ValExpr::Neg(e) => e.reads_prev(),
+            | ValExpr::Bool(..) => false,
+            ValExpr::Neg(e, _) => e.reads_prev(),
             ValExpr::Arith { lhs, rhs, .. } => lhs.reads_prev() || rhs.reads_prev(),
-            ValExpr::Concat(parts) | ValExpr::Func(_, parts) => {
+            ValExpr::Concat(parts, _) | ValExpr::Func(_, parts, _) => {
                 parts.iter().any(ValExpr::reads_prev)
             }
             ValExpr::Cond { then_, else_, .. } => then_.reads_prev() || else_.reads_prev(),

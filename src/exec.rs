@@ -2670,8 +2670,8 @@ fn fmt_valexpr(e: &ValExpr) -> String {
         ValExpr::Num(n) => n.to_string(),
         ValExpr::Word(w, _) => w.clone(),
         ValExpr::Str(s) => format!("{s:?}"),
-        ValExpr::Neg(e) => format!("(neg {})", fmt_valexpr(e)),
-        ValExpr::Arith { op, lhs, rhs } => {
+        ValExpr::Neg(e, _) => format!("(neg {})", fmt_valexpr(e)),
+        ValExpr::Arith { op, lhs, rhs, .. } => {
             format!(
                 "({} {} {})",
                 op.symbol(),
@@ -2679,10 +2679,12 @@ fn fmt_valexpr(e: &ValExpr) -> String {
                 fmt_valexpr(rhs)
             )
         }
-        ValExpr::Concat(parts) => format!("(++ {})", fmt_valexpr_list(parts)),
-        ValExpr::Func(f, args) => format!("({} {})", f.name(), fmt_valexpr_list(args)),
-        ValExpr::Bool(b) => format!("(bool {})", fmt_expr(b)),
-        ValExpr::Cond { test, then_, else_ } => format!(
+        ValExpr::Concat(parts, _) => format!("(++ {})", fmt_valexpr_list(parts)),
+        ValExpr::Func(f, args, _) => format!("({} {})", f.name(), fmt_valexpr_list(args)),
+        ValExpr::Bool(b, _) => format!("(bool {})", fmt_expr(b)),
+        ValExpr::Cond {
+            test, then_, else_, ..
+        } => format!(
             "(if {} {} {})",
             fmt_expr(test),
             fmt_valexpr(then_),

@@ -3371,7 +3371,7 @@ impl ExprParser {
     fn need_bool(&self, e: BV) -> Result<BoolExpr, Error> {
         match e {
             BV::B(b) => Ok(b),
-            BV::V(ValExpr::Bool(b)) => Ok(*b),
+            BV::V(ValExpr::Bool(b, _)) => Ok(*b),
             BV::V(_) => Err(err(format!(
                 "expected a comparison operator (==, !=, <, >, <=, >=, =~, ^=, *=, $=), found {}",
                 self.here()
@@ -3529,6 +3529,7 @@ impl ExprParser {
     /// atoms. A boolean subexpression used as a value (`add ok = amount > 0`,
     /// `(a > 0) ++ '!'`) renders csvm-style `t`/`f`.
     fn parse_value(&mut self) -> Result<ValExpr, Error> {
+        let start = self.pos;
         let e = self.parse_bv()?;
         if self.at("?") {
             let test = self.need_bool(e)?;
@@ -3542,15 +3543,17 @@ impl ExprParser {
                 test: Box::new(test),
                 then_: Box::new(then_),
                 else_: Box::new(else_),
+                at: self.span_of(start..self.pos),
             });
         }
         Ok(match e {
-            BV::B(b) => ValExpr::Bool(Box::new(b)),
+            BV::B(b) => ValExpr::Bool(Box::new(b), self.span_of(start..self.pos)),
             BV::V(v) => v,
         })
     }
 
     fn parse_concat(&mut self) -> Result<ValExpr, Error> {
+        let start = self.pos;
         let mut parts = vec![self.parse_additive()?];
         while self.eat("++") {
             parts.push(self.parse_additive()?);
@@ -3558,13 +3561,15 @@ impl ExprParser {
         Ok(if parts.len() == 1 {
             parts.pop().unwrap()
         } else {
-            ValExpr::Concat(parts)
+            ValExpr::Concat(parts, self.span_of(start..self.pos))
         })
     }
 
     fn parse_additive(&mut self) -> Result<ValExpr, Error> {
+        let start = self.pos;
         let mut e = self.parse_mul()?;
         loop {
+            let lhs_end = self.pos;
             let op = if self.eat("+") {
                 ArithOp::Add
             } else if self.eat("-") {
@@ -3572,19 +3577,23 @@ impl ExprParser {
             } else {
                 break;
             };
+            let rhs_at = self.pos;
             let rhs = self.parse_mul()?;
             e = ValExpr::Arith {
                 op,
                 lhs: Box::new(e),
                 rhs: Box::new(rhs),
+                at: [self.span_of(start..lhs_end), self.span_of(rhs_at..self.pos)],
             };
         }
         Ok(e)
     }
 
     fn parse_mul(&mut self) -> Result<ValExpr, Error> {
+        let start = self.pos;
         let mut e = self.parse_unary()?;
         loop {
+            let lhs_end = self.pos;
             let op = if self.eat("*") {
                 ArithOp::Mul
             } else if self.eat("/") {
@@ -3594,11 +3603,13 @@ impl ExprParser {
             } else {
                 break;
             };
+            let rhs_at = self.pos;
             let rhs = self.parse_unary()?;
             e = ValExpr::Arith {
                 op,
                 lhs: Box::new(e),
                 rhs: Box::new(rhs),
+                at: [self.span_of(start..lhs_end), self.span_of(rhs_at..self.pos)],
             };
         }
         Ok(e)
@@ -3606,7 +3617,9 @@ impl ExprParser {
 
     fn parse_unary(&mut self) -> Result<ValExpr, Error> {
         if self.eat("-") {
-            Ok(ValExpr::Neg(Box::new(self.parse_unary()?)))
+            let at = self.pos;
+            let operand = self.parse_unary()?;
+            Ok(ValExpr::Neg(Box::new(operand), self.span_of(at..self.pos)))
         } else if self.eat("+") {
             self.parse_unary()
         } else {
@@ -3682,7 +3695,7 @@ impl ExprParser {
             return Err(self.fail_on(name_at..self.pos, e));
         };
         check_arity(func, args.len()).map_err(|e| self.fail_on(name_at..self.pos, e))?;
-        Ok(ValExpr::Func(func, args))
+        Ok(ValExpr::Func(func, args, self.span_of(name_at..self.pos)))
     }
 
     /// Parse a comma-separated argument list up to and including the closing `)`.
@@ -5139,7 +5152,7 @@ mod tests {
         ));
         assert!(matches!(
             add_expr("add full = a ++ ' ' ++ b"),
-            ValExpr::Concat(parts) if parts.len() == 3
+            ValExpr::Concat(parts, _) if parts.len() == 3
         ));
     }
 
