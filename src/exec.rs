@@ -2151,7 +2151,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<Cow<str>>]) -> Vec<Vec<Style>
             ColorRule::Gradient { col, ramp, bounds } => {
                 let (lo, hi) = (*bounds).unwrap_or_else(|| column_minmax(rows, col.pos));
                 for (ri, row) in rows.iter().enumerate().skip(1) {
-                    if let Some(v) = row.get(col.pos).and_then(|c| c.trim().parse::<f64>().ok())
+                    if let Some(v) = row.get(col.pos).and_then(|c| Field::Str(c).num_opt())
                         && let Some(cell) = styles[ri].get_mut(col.pos)
                     {
                         *cell = cell.over(ramp.at(v, lo, hi));
@@ -2173,7 +2173,7 @@ fn column_minmax(rows: &[Vec<Cow<str>>], pos: usize) -> (f64, f64) {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for row in rows.iter().skip(1) {
-        if let Some(v) = row.get(pos).and_then(|c| c.trim().parse::<f64>().ok()) {
+        if let Some(v) = row.get(pos).and_then(|c| Field::Str(c).num_opt()) {
             lo = lo.min(v);
             hi = hi.max(v);
         }
@@ -2199,11 +2199,14 @@ fn numeric_columns(rows: &[Vec<Cow<str>>]) -> Vec<bool> {
         .map(|i| {
             let mut saw_number = false;
             for row in rows.iter().skip(1) {
-                let cell = row.get(i).map_or("", |c| c.as_ref());
-                if Field::Str(cell).coerce_num().is_err() {
+                let cell = field::trim_cell(row.get(i).map_or("", |c| c.as_ref()));
+                if cell.is_empty() {
+                    continue;
+                }
+                if cell.parse::<f64>().is_err() {
                     return false;
                 }
-                saw_number |= !cell.trim().is_empty();
+                saw_number = true;
             }
             saw_number
         })

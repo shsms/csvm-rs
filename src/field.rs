@@ -74,8 +74,8 @@ impl<'a> Field<'a> {
     pub fn num_opt(&self) -> Option<f64> {
         match self {
             Field::Num(n) => Some(*n),
-            Field::Str(s) => s.trim().parse().ok(),
-            Field::Owned(s) => s.trim().parse().ok(),
+            Field::Str(s) => trim_cell(s).parse().ok(),
+            Field::Owned(s) => trim_cell(s).parse().ok(),
         }
     }
 
@@ -101,6 +101,21 @@ impl<'a> Field<'a> {
     }
 }
 
+/// `s` without the whitespace around it, as [`str::trim`] gives it. Most cells
+/// start and end with a printable ASCII character that is not a space, so have
+/// none to cut; that is checked first.
+#[inline]
+pub(crate) fn trim_cell(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.first().is_some_and(u8::is_ascii_graphic)
+        && bytes.last().is_some_and(u8::is_ascii_graphic)
+    {
+        s
+    } else {
+        s.trim()
+    }
+}
+
 #[inline]
 fn parse_num(s: &str) -> Result<f64, NumError> {
     parse_num_soft(s).ok_or_else(|| NumError(s.to_owned()))
@@ -109,7 +124,7 @@ fn parse_num(s: &str) -> Result<f64, NumError> {
 /// [`parse_num`] without the error value: empty is `0.0`, text is `None`.
 #[inline]
 fn parse_num_soft(s: &str) -> Option<f64> {
-    let t = s.trim();
+    let t = trim_cell(s);
     if t.is_empty() {
         Some(0.0)
     } else {
@@ -195,7 +210,7 @@ pub fn format_num_into(n: f64, buf: &mut String) {
 /// `1.23e300`. A cell that is not a finite number shows as written.
 pub fn table_num(cell: &str, decimals: Option<u8>, human: bool) -> Option<String> {
     let n = Field::Str(cell).num_opt().filter(|n| n.is_finite())?;
-    let text = cell.trim();
+    let text = trim_cell(cell);
     if human && rounds_to_1000_or_more(text, n, decimals) {
         return Some(human_num(text, n));
     }
@@ -399,6 +414,28 @@ fn trim_decimals(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trim_cell_trims_as_str_trim_does() {
+        for s in [
+            "",
+            "1",
+            "12",
+            " 1",
+            "1 ",
+            "\t1\n",
+            "\u{a0}1",
+            "1\u{3000}",
+            "\u{7f}1\u{7f}",
+            "a b",
+            " ",
+            "\u{a0}",
+            "日本",
+            " 日本 ",
+        ] {
+            assert_eq!(trim_cell(s), s.trim(), "{s:?}");
+        }
+    }
 
     #[test]
     fn format_num_matches_csvm() {
