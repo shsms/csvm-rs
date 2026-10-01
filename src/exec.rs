@@ -369,6 +369,7 @@ impl Stateful {
                 let ctx = EvalCtx {
                     prev_row: self.prev_rows[k].as_deref(),
                     rownum: self.rownum,
+                    errors_dropped: false,
                 };
                 let survived = stmt.apply(row, scratch, &ctx)?;
                 self.prev_rows[k] = Some(seen);
@@ -2119,6 +2120,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> 
                     let ctx = EvalCtx {
                         prev_row: (ri > 1).then_some(prev_row.as_slice()),
                         rownum: ri as u64,
+                        errors_dropped: true,
                     };
                     if !matches!(expr.eval(&frow, &ctx), Ok(true)) {
                         continue;

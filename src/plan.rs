@@ -1237,6 +1237,38 @@ impl Cmp {
         Ok(())
     }
 
+    /// `e`, met comparing `row`, placed on the side that is not a number. Only
+    /// a numeric comparison fails reading a side as a number; any other error
+    /// comes from inside a side, which has placed it already. Which side failed
+    /// is found again here, off the hot path: the left side is read first, so
+    /// when it reads as a number, the right side failed. A caller that drops
+    /// its errors (`EvalCtx::errors_dropped`) gets `e` as it is.
+    #[cold]
+    #[inline(never)]
+    fn place(&self, e: Error, row: &[Field], ctx: &EvalCtx) -> Error {
+        if self.mode != CmpMode::Numeric || ctx.errors_dropped {
+            return e;
+        }
+        let side = match self.lhs.cmp_num(row, ctx) {
+            Err(_) => &self.lhs,
+            Ok(_) => &self.rhs,
+        };
+        match side {
+            ValExpr::Col(c) | ValExpr::Prev(c) => c.at.place(e),
+            ValExpr::Func(_, _, at)
+            | ValExpr::Concat(_, at)
+            | ValExpr::Bool(_, at)
+            | ValExpr::Cond { at, .. } => at.place(e),
+            // Always numbers, or a literal the comparison made one.
+            ValExpr::Num(_)
+            | ValExpr::Word(..)
+            | ValExpr::Str(_)
+            | ValExpr::Neg(..)
+            | ValExpr::Arith { .. }
+            | ValExpr::Rownum => e,
+        }
+    }
+
     #[inline]
     fn eval(&self, row: &[Field], ctx: &EvalCtx) -> Result<bool, Error> {
         let ord = match self.mode {
@@ -1302,8 +1334,14 @@ impl BoolExpr {
                 Ok(false)
             }
             BoolExpr::Not(e) => Ok(!e.eval(row, ctx)?),
-            BoolExpr::Cmp(c) => c.eval(row, ctx),
-            BoolExpr::CmpPrev(c) => Ok(c.eval(row, ctx)? && ctx.prev_row.is_some()),
+            BoolExpr::Cmp(c) => match c.eval(row, ctx) {
+                Ok(b) => Ok(b),
+                Err(e) => Err(c.place(e, row, ctx)),
+            },
+            BoolExpr::CmpPrev(c) => match c.eval(row, ctx) {
+                Ok(b) => Ok(b && ctx.prev_row.is_some()),
+                Err(e) => Err(c.place(e, row, ctx)),
+            },
             BoolExpr::Match { col, regex, negate } => {
                 Ok(regex.is_match(&cell_str(row, col.pos)) ^ negate)
             }
@@ -1352,10 +1390,12 @@ impl BoolExpr {
     }
 }
 
-/// Per-row context for the stateful leaves of a value expression (`prev()`,
-/// `rownum()`). [`Default`] is empty — a pure expression never reads it, so the
-/// streaming/sharded paths pass the default; the paths that run a stateful
-/// statement in order fill it, and so does a colour rule, from the output rows.
+/// Context for evaluating an expression: the state of its stateful leaves
+/// (`prev()`, `rownum()`), per row, and whether the caller keeps an error.
+/// [`Default`] is empty and keeps errors — a pure expression never reads the
+/// state, so the streaming/sharded paths pass the default; the paths that run a
+/// stateful statement in order fill it, and so does a colour rule, from the
+/// output rows.
 #[derive(Default)]
 pub struct EvalCtx<'a> {
     /// The previous row (`None` on the first row, where `prev()` reads the
@@ -1363,6 +1403,9 @@ pub struct EvalCtx<'a> {
     pub prev_row: Option<&'a [Field<'a>]>,
     /// The 1-based index of the current row.
     pub rownum: u64,
+    /// The caller drops an error instead of reporting it, as a `color` rule
+    /// does, so a failed comparison does not look for the side that failed.
+    pub errors_dropped: bool,
 }
 
 /// A cell's value, detached so it can be appended to a row (`add` produces new

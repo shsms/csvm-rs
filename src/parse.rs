@@ -3799,6 +3799,17 @@ mod tests {
         assert_eq!(mark("select round(c / b) > 1"), "b");
         // A fragment's body is not in the script: its call.
         assert_eq!(mark("fn f(x) { add d = c / x }\nf(b)"), "f(b)");
+        // A side of a numeric comparison that is not a number: a column, a
+        // call or a compound value.
+        assert_eq!(mark("select c > 0 && 1 < a"), "a");
+        assert_eq!(mark("select c > 0\n  && a > 1"), "a");
+        assert_eq!(mark("select prev(a) > 1"), "a");
+        assert_eq!(mark("select upper(a) > 1"), "upper(a)");
+        assert_eq!(mark("select (a ++ c) > 1"), "a ++ c");
+        assert_eq!(mark("select (c > 0 ? a : c) > 1"), "c > 0 ? a : c");
+        assert_eq!(mark("select (a == 'x') > 1"), "a == 'x'");
+        // An error inside a side of a string comparison keeps its place.
+        assert_eq!(mark("select a == ((a ++ c) > 1 ? 'y' : 'n')"), "a ++ c");
     }
 
     #[test]
