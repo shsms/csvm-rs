@@ -215,7 +215,7 @@ pub fn write_cells<'f, 'a: 'f>(buf: &mut String, cells: impl IntoIterator<Item =
             buf.push(',');
         }
         match f {
-            Field::Num(n) => buf.push_str(&crate::field::format_num(*n)),
+            Field::Num(n) => crate::field::format_num_into(*n, buf),
             Field::Str(s) => write_text(buf, s),
             Field::Owned(s) => write_text(buf, s),
         }
