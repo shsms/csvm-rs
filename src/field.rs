@@ -89,6 +89,16 @@ impl<'a> Field<'a> {
             Field::Num(n) => Field::Num(n),
         }
     }
+
+    /// The field's text, borrowing what the field borrows.
+    #[inline]
+    pub fn into_text(self) -> Cow<'a, str> {
+        match self {
+            Field::Str(s) => Cow::Borrowed(s),
+            Field::Owned(s) => Cow::Owned(s),
+            Field::Num(n) => Cow::Owned(format_num(n)),
+        }
+    }
 }
 
 #[inline]

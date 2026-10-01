@@ -2042,9 +2042,11 @@ pub fn render<W: Write>(
     }
     let text = std::str::from_utf8(bytes)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
-    let mut rows: Vec<Vec<String>> = Vec::new();
+    // The cells borrow from `text`; only a cell the parser had to rewrite
+    // (an escaped quote) has its own copy.
+    let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
     csv::parse_chunk(text, |r| {
-        rows.push(r.iter().map(|f| f.as_str().into_owned()).collect());
+        rows.push(r.drain(..).map(Field::into_text).collect());
     });
 
     let styles = if want_color {
@@ -2106,7 +2108,7 @@ fn render_graph<W: Write>(
 /// is a cosmetic overlay, so one bad cell shouldn't kill the whole output. A
 /// predicate that reads such a cell through `prev()` errors on the row below
 /// it too.
-fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> {
+fn compute_styles(rules: &[ColorRule], rows: &[Vec<Cow<str>>]) -> Vec<Vec<Style>> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
     for rule in rules {
@@ -2165,7 +2167,7 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<String>]) -> Vec<Vec<Style>> 
 /// numeric range is `None` for a column with any non-numeric cell; that would
 /// collapse the bounds to `0..1` and clamp every real value to the hi colour.
 /// Falls back to `0..1` when no cell parses (then nothing is painted anyway).
-fn column_minmax(rows: &[Vec<String>], pos: usize) -> (f64, f64) {
+fn column_minmax(rows: &[Vec<Cow<str>>], pos: usize) -> (f64, f64) {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for row in rows.iter().skip(1) {
@@ -2189,13 +2191,13 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
 
 /// Which columns are numeric: every data cell reads as a number (blanks
 /// allowed, but at least one must be a real number).
-fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
+fn numeric_columns(rows: &[Vec<Cow<str>>]) -> Vec<bool> {
     let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
     (0..ncols)
         .map(|i| {
             let mut saw_number = false;
             for row in rows.iter().skip(1) {
-                let cell = row.get(i).map_or("", String::as_str);
+                let cell = row.get(i).map_or("", |c| c.as_ref());
                 if Field::Str(cell).coerce_num().is_err() {
                     return false;
                 }
@@ -2208,14 +2210,14 @@ fn numeric_columns(rows: &[Vec<String>]) -> Vec<bool> {
 
 /// Rewrite the data cells of the `numeric` columns as `table` shows them (see
 /// [`field::table_num`]).
-fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts) {
+fn shorten_numbers(rows: &mut [Vec<Cow<str>>], numeric: &[bool], table: TableOpts) {
     if table.decimals.is_none() && !table.human {
         return;
     }
     for row in rows.iter_mut().skip(1) {
         for (cell, _) in row.iter_mut().zip(numeric).filter(|(_, n)| **n) {
             if let Some(short) = field::table_num(cell, table.decimals, table.human) {
-                *cell = short;
+                *cell = Cow::Owned(short);
             }
         }
     }
@@ -2232,7 +2234,7 @@ fn shorten_numbers(rows: &mut [Vec<String>], numeric: &[bool], table: TableOpts)
 /// shaded with it from its first cell to the table's right edge, under whatever
 /// the rules paint there.
 fn align_and_write<W: Write>(
-    rows: &[Vec<String>],
+    rows: &[Vec<Cow<str>>],
     numeric: &[bool],
     styles: Option<&[Vec<Style>]>,
     screen: &Screen,
@@ -2446,7 +2448,7 @@ fn cut(text: &str, width: usize) -> Cow<'_, str> {
 /// Write CSV rows with each cell painted by its style (for colouring plain,
 /// non-aligned output).
 fn write_csv_colored<W: Write>(
-    rows: &[Vec<String>],
+    rows: &[Vec<Cow<str>>],
     styles: Option<&[Vec<Style>]>,
     depth: Depth,
     output: &mut W,
@@ -4664,6 +4666,15 @@ mod tests {
         assert!(err.is_err_and(|e| e.to_string() == "stop"));
         assert_eq!((rows, progress.get()), (1, 0));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn fmt_shows_a_cell_the_parser_unescaped() {
+        let input = "a,b\n\"say \"\"hi\"\"\",\"x,y\"\n";
+        assert_eq!(
+            render_str("fmt", input, false),
+            "a         b\nsay \"hi\"  x,y\n"
+        );
     }
 
     #[test]
