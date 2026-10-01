@@ -170,18 +170,21 @@ pub enum Color {
 
 impl Color {
     /// The SGR parameters for this colour, as a foreground (`bg` false) or a
-    /// background, at `depth`.
-    fn sgr(self, bg: bool, depth: Depth) -> String {
-        match self {
-            Color::Base(base) => (base.code() + if bg { 40 } else { 30 }).to_string(),
+    /// background, at `depth`, appended to `out`.
+    fn sgr_into(self, bg: bool, depth: Depth, out: &mut String) {
+        use fmt::Write;
+        // Writing to a String cannot fail, and an unwrap here costs each
+        // coloured cell a check.
+        let _ = match self {
+            Color::Base(base) => write!(out, "{}", base.code() + if bg { 40 } else { 30 }),
             Color::Rgb(c) => {
                 let lead = if bg { 48 } else { 38 };
                 match depth {
-                    Depth::Truecolor => format!("{lead};2;{};{};{}", c.0, c.1, c.2),
-                    Depth::Ansi256 => format!("{lead};5;{}", ansi256(c)),
+                    Depth::Truecolor => write!(out, "{lead};2;{};{};{}", c.0, c.1, c.2),
+                    Depth::Ansi256 => write!(out, "{lead};5;{}", ansi256(c)),
                 }
             }
-        }
+        };
     }
 }
 
@@ -252,10 +255,20 @@ impl Style {
     /// Wrap `text` in SGR escapes for this style at `depth` (returns it
     /// unchanged when the style is empty, so no stray resets are emitted).
     pub fn paint(&self, text: &str, depth: Depth) -> String {
-        match self.start(depth) {
-            Some(start) => format!("{start}{text}\x1b[0m"),
-            None => text.to_string(),
+        let mut out = String::new();
+        self.paint_into(text, depth, &mut out);
+        out
+    }
+
+    /// [`Style::paint`] appended to `out`.
+    pub fn paint_into(&self, text: &str, depth: Depth, out: &mut String) {
+        if self.is_empty() {
+            out.push_str(text);
+            return;
         }
+        self.start_into(depth, out);
+        out.push_str(text);
+        out.push_str("\x1b[0m");
     }
 
     /// The SGR escape that turns this style on at `depth` (`\x1b[0m` turns it
@@ -264,23 +277,29 @@ impl Style {
         if self.is_empty() {
             return None;
         }
-        let mut codes: Vec<String> = Vec::new();
-        if self.bold {
-            codes.push("1".into());
+        let mut out = String::new();
+        self.start_into(depth, &mut out);
+        Some(out)
+    }
+
+    /// [`Style::start`] appended to `out`, for a style that is not empty.
+    fn start_into(&self, depth: Depth, out: &mut String) {
+        debug_assert!(!self.is_empty(), "an empty style has no escape");
+        out.push_str("\x1b[");
+        for (on, code) in [(self.bold, "1;"), (self.dim, "2;"), (self.underline, "4;")] {
+            if on {
+                out.push_str(code);
+            }
         }
-        if self.dim {
-            codes.push("2".into());
+        for (color, bg) in [(self.fg, false), (self.bg, true)] {
+            if let Some(color) = color {
+                color.sgr_into(bg, depth, out);
+                out.push(';');
+            }
         }
-        if self.underline {
-            codes.push("4".into());
-        }
-        if let Some(fg) = self.fg {
-            codes.push(fg.sgr(false, depth));
-        }
-        if let Some(bg) = self.bg {
-            codes.push(bg.sgr(true, depth));
-        }
-        Some(format!("\x1b[{}m", codes.join(";")))
+        // The style is not empty, so a code and its `;` came last.
+        out.pop();
+        out.push('m');
     }
 }
 
