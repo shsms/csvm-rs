@@ -270,6 +270,51 @@ fn an_unknown_column_is_marked_where_it_is_named() {
 }
 
 #[test]
+fn an_error_met_running_rows_is_marked_where_it_is() {
+    // The divisor that is zero, on its line of a script over several lines.
+    let (ok, _, err) = csvm(&["select a > 0\n  | add c = a / b - 1"], "a,b\n1,2\n3,0\n");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "csvm: division by zero in expression\n\
+         2 |   | add c = a / b - 1\n  |                 ^\n"
+    );
+    // The same, when the output is a table, which is drawn after the run.
+    let (ok, _, err) = csvm(&["add c = a / b | fmt"], "a,b\n1,0\n");
+    assert!(!ok);
+    assert!(
+        err.ends_with("  add c = a / b | fmt\n              ^\n"),
+        "{err}"
+    );
+    // A side of a comparison that is not a number, in a file's run.
+    let input = temp_csv("a,b\n1,2\n3,x\n");
+    let script = "select a > 0 && b < 5";
+    let (ok, _, err) = csvm(&[script, input.to_str().unwrap()], "");
+    assert!(!ok);
+    assert_eq!(
+        err,
+        "csvm: non-numeric value 'x'\n  select a > 0 && b < 5\n                  ^\n"
+    );
+    // A run that reads its rows in order, for `rownum()`.
+    let script = "select rownum() > 0 && a > 1";
+    let (ok, _, err) = csvm(&[script], "a\nx\n");
+    assert!(!ok);
+    assert!(
+        err.ends_with(&format!("  {script}\n{}^\n", " ".repeat(2 + 23))),
+        "{err}"
+    );
+    // A join's sub-pipeline in a fragment's body: the fragment's call.
+    let right = temp_csv("k,v\n1,0\n");
+    let script = format!(
+        "fn f() {{ join (add z = 1 / v) {} on k }}\nf()",
+        right.display()
+    );
+    let (ok, _, err) = csvm(&[&script], "k\n1\n");
+    assert!(!ok);
+    assert!(err.ends_with("2 | f()\n  | ^^^\n"), "{err}");
+}
+
+#[test]
 fn a_script_file_splits_stages_only_at_a_pipe() {
     // One stage over several lines, comments, blank lines, and `|`s at the
     // start of the lines that start a stage.

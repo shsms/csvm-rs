@@ -162,7 +162,8 @@ fn run() -> Result<(), Failure> {
     };
     if buffered {
         let mut buf: Vec<u8> = Vec::new();
-        run_into(&mut source, &plan, &out_header, &opts, &progress, &mut buf)?;
+        run_into(&mut source, &plan, &out_header, &opts, &progress, &mut buf)
+            .map_err(|e| run_error(&script, e, &console))?;
         // A table or a chart is read on screen, so a long one is paged. The
         // pager starts only now, with the run done, so it never sits waiting
         // on a slow pipeline. A table prints a line for each line of the
@@ -193,7 +194,8 @@ fn run() -> Result<(), Failure> {
             &opts,
             &progress,
             &mut output,
-        )?;
+        )
+        .map_err(|e| run_error(&script, e, &console))?;
     }
     output.flush()?;
     Ok(())
@@ -204,7 +206,22 @@ fn run() -> Result<(), Failure> {
 /// for an unknown column, where the column is named. The message notes a `|`
 /// that may be missing (`parse::note_missing_pipe`).
 fn script_error(script: &str, e: csvm::error::Error, console: &Console) -> String {
-    let e = parse::note_missing_pipe(script, e);
+    marked(script, &parse::note_missing_pipe(script, e), console)
+}
+
+/// Why a run failed. An error met in an expression shows where in the script,
+/// as a script error does: the operand that is not a number, or the divisor
+/// that is zero.
+fn run_error(script: &str, e: csvm::error::Error, console: &Console) -> Failure {
+    match e.span() {
+        Some(_) => Failure::Message(marked(script, &e, console)),
+        None => e.into(),
+    }
+}
+
+/// `e`'s message and, when it has a place in the script, the line it is on with
+/// the place marked (in colour when the console colours errors).
+fn marked(script: &str, e: &csvm::error::Error, console: &Console) -> String {
     let Some(span) = e.span() else {
         return e.to_string();
     };

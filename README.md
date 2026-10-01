@@ -105,6 +105,15 @@ csvm: expected a column, number, string, or function, found '>'
                      ^
 ```
 
+So does an error an expression meets while the rows run: the divisor that
+is zero, or the operand that is not a number.
+
+```
+csvm: division by zero in expression
+  select qty < 10 | add per = amount / qty
+                                       ^^^
+```
+
 The first input line is the header; columns are referenced by name. For a
 seekable file, the work is sharded across `-n` threads (the core count by
 default; `-n 1` runs serially). A streaming input

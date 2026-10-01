@@ -500,6 +500,27 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   columns and `-c`). `Written::place` puts an unknown column on the first
   place the part names it, any other error on the whole part; a join's
   right key, looked up in the right file, goes on the whole join.
+  An error an expression meets while rows run is placed too, with
+  `plan::Span` (two `u32`s, a byte range of the script) on the nodes that
+  can fail or give a value that is not a number — `ValExpr::Arith` (each
+  operand; a zero divisor goes on the right one), `Neg` (its operand),
+  `Func`, `Concat`, `Bool`, `Cond` (the whole part) and each `ColRef`
+  (where an expression names it) — and `main` prints a placed run error
+  with the same excerpt. Other run errors, such as a `sort KEY=n` cell
+  that is not a number, have no place. `ExprParser::span_of` records the
+  spans; an expression that is not a slice of the script (a fragment's
+  expansion, or a join's sub-pipeline inside one) takes its stage's span
+  (`Builder::stage_at`, the call). The spans cost the hot path nothing:
+  they sit in room the nodes already had (`ColRef::name` is a `Box<str>`
+  for that), `Cmp` stays its size (it has no spans; for a numeric
+  comparison `Cmp::place` finds the failing side again off the hot path,
+  and any other error comes from inside a side, placed already), and each
+  placing call is `#[cold]`/`#[inline(never)]`. A `color` rule drops its
+  errors, so it sets `EvalCtx::errors_dropped` and `Cmp::place` leaves
+  them as they are.
+  Check a change here with callgrind instruction counts: a bigger `Cmp`
+  turns `Stmt`'s tag into a niche, and a helper returning
+  `Result<f64, Error>` costs each operand a copy.
 
 ## Implicit conversions (there are no conversion commands)
 
