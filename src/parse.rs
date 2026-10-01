@@ -23,7 +23,7 @@ use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
     ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
-    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Stage,
+    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Span, Stage,
     StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
 use std::cell::OnceCell;
@@ -36,7 +36,7 @@ use std::ops::Range;
 pub fn parse(script: &str) -> Result<Plan, Error> {
     let script = strip_comments(script);
     let (fns, rest) = parse_prologue(&script)?;
-    parse_stages(rest, &fns, 0, &script, None)
+    parse_stages(rest, &fns, 0, &script, Span::NONE, None)
 }
 
 /// [`parse`], noting in `rec` what each part of the script is, for
@@ -47,18 +47,21 @@ pub fn parse(script: &str) -> Result<Plan, Error> {
 pub fn parse_recorded(script: &str, rec: &mut Recorder) -> Result<Plan, Error> {
     let script = strip_comments_noting(script, |at| rec.push(at, SpanKind::Comment));
     let (fns, rest) = parse_prologue_noting(&script, Some(&mut *rec))?;
-    parse_stages(rest, &fns, 0, &script, Some(rec))
+    parse_stages(rest, &fns, 0, &script, Span::NONE, Some(rec))
 }
 
 /// Parse stage text into a plan. Sub-pipelines and fragment bodies re-enter
 /// here with the shared fn table and their expansion depth; `top` is the
-/// whole script, which error spans are offsets into. `rec`, when given,
-/// notes what each part of `top` is (see [`parse_recorded`]).
+/// whole script, which error spans are offsets into. `outer_at` is where the
+/// stage holding a sub-pipeline is written, the place of its stages when they
+/// are not in `top`. `rec`, when given, notes what each part of `top` is (see
+/// [`parse_recorded`]).
 fn parse_stages(
     script: &str,
     fns: &FnTable,
     depth: usize,
     top: &str,
+    outer_at: Span,
     rec: Option<&mut Recorder>,
 ) -> Result<Plan, Error> {
     let mut builder = Builder::new(fns, depth, top, rec);
@@ -71,11 +74,13 @@ fn parse_stages(
         if stage.is_empty() {
             continue;
         }
+        let at = offset_in(top, stage).map(|at| at..at + stage.len());
+        builder.stage_at = at.clone().map_or(outer_at, Span::new);
         if let Err(e) = builder.parse_stage(stage) {
             builder.note_commands(&stages[i + 1..]);
             return Err(place_on(top, stage, e));
         }
-        builder.written_at(offset_in(top, stage).map(|at| at..at + stage.len()));
+        builder.written_at(at);
     }
     if builder.items.is_empty()
         && builder.output == OutputFormat::Csv
@@ -354,6 +359,9 @@ struct Builder<'a> {
     depth: usize,
     /// The whole script, for placing an error in it.
     script: &'a str,
+    /// Where the stage being parsed is written: the place of an expression that
+    /// is not a slice of the script, such as a fragment's expansion.
+    stage_at: Span,
     items: Vec<Item>,
     output: OutputFormat,
     /// Colour rules from `color` commands (plan metadata, not stages).
@@ -379,6 +387,7 @@ impl<'a> Builder<'a> {
             fns,
             depth,
             script,
+            stage_at: Span::NONE,
             items: Vec::new(),
             output: OutputFormat::Csv,
             colors: Vec::new(),
@@ -788,6 +797,8 @@ impl<'a> Builder<'a> {
         let mut parser = ExprParser {
             toks,
             spans,
+            base: offset_in(self.script, src),
+            stage_at: self.stage_at,
             end: src.len(),
             pos: 0,
             fail_span: None,
@@ -983,6 +994,7 @@ impl<'a> Builder<'a> {
                         self.fns,
                         self.depth,
                         self.script,
+                        self.stage_at,
                         self.rec.as_deref_mut(),
                     )?)
                 }
@@ -2418,7 +2430,14 @@ fn parse_prologue_noting<'s>(
             // not parse on its own: what parses is noted, and its errors
             // are dropped. At the depth limit a fragment call in it is
             // noted but not expanded.
-            let _ = parse_stages(body, &fns, MAX_FN_DEPTH, script, Some(&mut *rec));
+            let _ = parse_stages(
+                body,
+                &fns,
+                MAX_FN_DEPTH,
+                script,
+                Span::NONE,
+                Some(&mut *rec),
+            );
         }
         if first_error.is_some() {
             let stages = split_stages(rest);
@@ -3250,6 +3269,11 @@ struct ExprParser {
     toks: Vec<ETok>,
     /// Each token's byte range in the expression.
     spans: Vec<Range<usize>>,
+    /// Where the expression starts in the script, when it is a slice of it.
+    base: Option<usize>,
+    /// Where the stage is written, the place of each part of an expression that
+    /// is not in the script.
+    stage_at: Span,
     /// The expression's length, where "end of expression" is.
     end: usize,
     pos: usize,
@@ -3286,9 +3310,23 @@ impl ExprParser {
     /// `e`, about the part of the expression made of the tokens at `tokens`
     /// (indices, the end one past the last), placed on that part.
     fn fail_on(&mut self, tokens: Range<usize>, e: Error) -> Error {
-        let last = tokens.end.saturating_sub(1).max(tokens.start);
-        self.fail_span = Some(self.spans[tokens.start].start..self.spans[last].end);
+        self.fail_span = self.bytes_of(tokens);
         e
+    }
+
+    /// The byte range of the expression the tokens at `tokens` are written on.
+    fn bytes_of(&self, tokens: Range<usize>) -> Option<Range<usize>> {
+        let last = tokens.end.saturating_sub(1).max(tokens.start);
+        Some(self.spans.get(tokens.start)?.start..self.spans.get(last)?.end)
+    }
+
+    /// Where the part of the expression made of the tokens at `tokens` is
+    /// written in the script, for an error met while rows run.
+    fn span_of(&self, tokens: Range<usize>) -> Span {
+        match (self.base, self.bytes_of(tokens)) {
+            (Some(base), Some(at)) => Span::new(base + at.start..base + at.end),
+            _ => self.stage_at,
+        }
     }
 
     /// The token at the cursor, quoted, for an error message — or "end of
@@ -3606,7 +3644,10 @@ impl ExprParser {
                 } else {
                     self.columns
                         .push((name.clone(), self.spans[self.pos - 1].clone()));
-                    Ok(ValExpr::Col(ColRef::new(name)))
+                    Ok(ValExpr::Col(ColRef {
+                        at: self.span_of(self.pos - 1..self.pos),
+                        ..ColRef::new(name)
+                    }))
                 }
             }
             _ => Err(err(format!(
@@ -5174,14 +5215,16 @@ mod tests {
         }
     }
 
-    /// The statements of `script`'s one transform stage, as `{:?}` shows
-    /// them, to compare two scripts by.
+    /// The statements of `script`'s one transform stage, as `{:?}` shows them,
+    /// to compare two scripts by: without where each part is written, which two
+    /// layouts of one script do not share.
     fn one_transform(script: &str) -> String {
         let plan = parse(script).unwrap();
         let [Stage::Transform(stmts)] = plan.stages.as_slice() else {
             panic!("expected one transform stage, got {:?}", plan.stages);
         };
-        format!("{stmts:?}")
+        let span = regex::Regex::new(r"Span \{ start: \d+, end: \d+ \}").unwrap();
+        span.replace_all(&format!("{stmts:?}"), "Span").into_owned()
     }
 
     #[test]

@@ -17,11 +17,40 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::ops::Range;
 
+/// Where a part of an expression is written: a byte range of the script, so an
+/// error the part meets while rows run is shown there. It is two `u32`s, small
+/// enough to fit in room the nodes that carry one have to spare.
+/// [`Span::NONE`] is a part with no place to show.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    start: u32,
+    end: u32,
+}
+
+impl Span {
+    pub const NONE: Span = Span {
+        start: u32::MAX,
+        end: 0,
+    };
+
+    /// The bytes `at` of the script; [`Span::NONE`] past what a `u32` holds.
+    pub fn new(at: Range<usize>) -> Span {
+        match (u32::try_from(at.start), u32::try_from(at.end)) {
+            (Ok(start), Ok(end)) if start <= end => Span { start, end },
+            _ => Span::NONE,
+        }
+    }
+}
+
 /// A reference to a column: a name, resolved to a position.
 #[derive(Clone, Debug)]
 pub struct ColRef {
+    /// A `Box<str>` leaves room for `at` without making a [`ValExpr`] bigger.
     pub name: Box<str>,
     pub pos: usize,
+    /// Where an expression names the column: a cell that is not a number, where
+    /// one is wanted, is shown there.
+    pub at: Span,
 }
 
 impl ColRef {
@@ -29,6 +58,7 @@ impl ColRef {
         ColRef {
             name: name.into(),
             pos: 0,
+            at: Span::NONE,
         }
     }
     fn resolve(&mut self, header: &[String]) -> Result<(), Error> {
@@ -1985,6 +2015,7 @@ mod tests {
             lhs: ValExpr::Col(ColRef {
                 name: "b".into(),
                 pos: 1,
+                at: Span::NONE,
             }),
             rhs: ValExpr::Num(0.0),
             mode: CmpMode::Numeric,
@@ -1998,6 +2029,7 @@ mod tests {
             lhs: ValExpr::Col(ColRef {
                 name: "a".into(),
                 pos: 0,
+                at: Span::NONE,
             }),
             rhs: ValExpr::Str("t".into()),
             mode: CmpMode::String,
@@ -2015,10 +2047,12 @@ mod tests {
             lhs: ValExpr::Col(ColRef {
                 name: "a".into(),
                 pos: 0,
+                at: Span::NONE,
             }),
             rhs: ValExpr::Col(ColRef {
                 name: "b".into(),
                 pos: 1,
+                at: Span::NONE,
             }),
             mode: CmpMode::Auto,
         };
@@ -2046,6 +2080,7 @@ mod tests {
                 lhs: ValExpr::Col(ColRef {
                     name: "a".into(),
                     pos: 0,
+                    at: Span::NONE,
                 }),
                 rhs: ValExpr::Str("t".into()),
                 mode: CmpMode::String,
@@ -2056,6 +2091,7 @@ mod tests {
                     lhs: ValExpr::Col(ColRef {
                         name: "b".into(),
                         pos: 1,
+                        at: Span::NONE,
                     }),
                     rhs: ValExpr::Num(0.0),
                     mode: CmpMode::Numeric,
@@ -2065,6 +2101,7 @@ mod tests {
                     lhs: ValExpr::Col(ColRef {
                         name: "c".into(),
                         pos: 2,
+                        at: Span::NONE,
                     }),
                     rhs: ValExpr::Num(0.0),
                     mode: CmpMode::Numeric,
