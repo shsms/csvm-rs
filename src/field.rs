@@ -365,50 +365,62 @@ fn round_num(n: f64, decimals: usize) -> String {
 /// and an exponent: `1.23e300`.
 fn human_num(text: &str, n: f64) -> String {
     const SUFFIXES: [char; 6] = ['k', 'M', 'G', 'T', 'P', 'E'];
-    let sign = if n < 0.0 { "-" } else { "" };
-    let (mut out, exponent) = three_digits(text, n);
-    let power = exponent.div_euclid(3);
-    let suffix = usize::try_from(power - 1)
+    let (digits, exponent) = three_digits(text, n);
+    let suffix = usize::try_from(exponent.div_euclid(3) - 1)
         .ok()
         .and_then(|i| SUFFIXES.get(i));
-    let Some(suffix) = suffix else {
-        out.insert(1, '.');
-        trim_decimals(&mut out);
-        return format!("{sign}{out}e{exponent}");
+    // `123` with its point after the first digit, or for a suffix after the
+    // first, second or third.
+    let point = match suffix {
+        Some(_) => 1 + exponent.rem_euclid(3) as usize,
+        None => 1,
     };
-    // `123` with its point after the first, second or third digit.
-    out.insert(1 + exponent.rem_euclid(3) as usize, '.');
+    let mut out = String::with_capacity(16);
+    if n < 0.0 {
+        out.push('-');
+    }
+    let (whole, fraction) = digits.split_at(point);
+    out.extend(whole.iter().map(|&b| char::from(b)));
+    out.push('.');
+    out.extend(fraction.iter().map(|&b| char::from(b)));
     trim_decimals(&mut out);
-    format!("{sign}{out}{suffix}")
+    match suffix {
+        Some(&suffix) => out.push(suffix),
+        None => {
+            use std::fmt::Write;
+            write!(out, "e{exponent}").unwrap();
+        }
+    }
+    out
 }
 
 /// The absolute value of `text`, whose value is `n`, to three significant
 /// digits: the digits, and the power of ten of the first. A plain decimal
 /// rounds on its own digits, a half away from zero (see [`Decimal`]);
 /// anything else rounds through `n`.
-fn three_digits(text: &str, n: f64) -> (String, i32) {
+fn three_digits(text: &str, n: f64) -> ([u8; 3], i32) {
+    let mut out = [b'0'; 3];
     if let Some(mut d) = Decimal::parse(text)
         && let Some(first) = d.digits.iter().position(|&b| b != b'0')
     {
         d.round_at(first + 3);
         let first = d.digits.iter().position(|&b| b != b'0').unwrap_or(0);
-        let mut digits: String = d
-            .digits
-            .iter()
-            .skip(first)
-            .take(3)
-            .map(|&b| char::from(b))
-            .collect();
-        while digits.len() < 3 {
-            digits.push('0');
+        for (o, &digit) in out.iter_mut().zip(&d.digits[first..]) {
+            *o = digit;
         }
         let exponent = d.point as i32 - 1 - first as i32;
-        return (digits, exponent);
+        return (out, exponent);
     }
     let s = format!("{:.2e}", n.abs());
     let (mantissa, exponent) = s.split_once('e').expect("`{:e}` writes an `e`");
     let exponent = exponent.parse().expect("`{:e}` writes a whole exponent");
-    (mantissa.replace('.', ""), exponent)
+    for (o, digit) in out
+        .iter_mut()
+        .zip(mantissa.bytes().filter(u8::is_ascii_digit))
+    {
+        *o = digit;
+    }
+    (out, exponent)
 }
 
 /// Drop the zeros at the end of a number's decimals, and then its decimal
