@@ -2229,7 +2229,7 @@ fn numeric_columns(rows: &[Vec<Cow<str>>]) -> Vec<bool> {
                 if cell.is_empty() {
                     continue;
                 }
-                if cell.parse::<f64>().is_err() {
+                if !is_plain_decimal(cell) && cell.parse::<f64>().is_err() {
                     return false;
                 }
                 saw_number = true;
@@ -2237,6 +2237,22 @@ fn numeric_columns(rows: &[Vec<Cow<str>>]) -> Vec<bool> {
             saw_number
         })
         .collect()
+}
+
+/// Whether `s` is a sign, if any, then digits with at most one `.` among
+/// them: text that always reads as a number, told without reading it.
+fn is_plain_decimal(s: &str) -> bool {
+    let digits = s.strip_prefix(['-', '+']).unwrap_or(s).as_bytes();
+    let mut point = false;
+    let mut digit = false;
+    for &b in digits {
+        match b {
+            b'0'..=b'9' => digit = true,
+            b'.' if !point => point = true,
+            _ => return false,
+        }
+    }
+    digit
 }
 
 /// Rewrite the data cells of the `numeric` columns as `table` shows them (see
@@ -4757,6 +4773,19 @@ mod tests {
             render_str("fmt", input, false),
             "a         b\nsay \"hi\"  x,y\n"
         );
+    }
+
+    #[test]
+    fn is_plain_decimal_tells_text_that_reads_as_a_number() {
+        for s in ["0", "12", "-3", "+4", "1.5", "-.5", "7.", "007"] {
+            assert!(is_plain_decimal(s), "{s}");
+            assert!(s.parse::<f64>().is_ok(), "{s}");
+        }
+        for s in [
+            "", "-", ".", "+.", "1.2.3", "1e5", "1,5", " 1", "inf", "--1", "1-",
+        ] {
+            assert!(!is_plain_decimal(s), "{s}");
+        }
     }
 
     #[test]
