@@ -259,6 +259,9 @@ fn a_row_kept_as_read_is_written_as_any_row_is() {
     let (ok, out, err) = csvm(&["tail +2"], input);
     assert!(ok, "{err}");
     assert_eq!(out, "a,b\n2,\"y\rz\"\n3,w\n");
+    let (ok, out, err) = csvm(&["sort a"], input);
+    assert!(ok, "{err}");
+    assert_eq!(out, "a,b\n2,\"y\rz\"\n3,w\nx,1\n");
     let file = temp_csv(input);
     let (ok, out, err) = csvm(&["-n", "4", "select a != ''", file.to_str().unwrap()], "");
     assert!(ok, "{err}");

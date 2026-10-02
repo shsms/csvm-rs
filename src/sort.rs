@@ -450,7 +450,8 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
     let mut key_buf: Vec<u8> = Vec::new();
     let mut err: Option<Error> = None;
 
-    csv::parse_chunk(block, |row| {
+    let keeps_cells = plan::stmts_keep_cells(&ctx.pre);
+    csv::parse_chunk_lines(block, |row, text| {
         if err.is_some() {
             return;
         }
@@ -468,6 +469,10 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
                 }
                 let start = blob.len() as u32;
                 match ctx.format {
+                    LineFormat::Csv if keeps_cells && csv::is_verbatim(text) => {
+                        blob.extend_from_slice(text.as_bytes());
+                        blob.push(b'\n');
+                    }
                     LineFormat::Csv => {
                         line.clear();
                         csv::write_row(&mut line, row);
