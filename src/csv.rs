@@ -35,6 +35,25 @@ pub fn parse_chunk<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>
     }
 }
 
+/// [`parse_chunk`], calling `on_row` with each row's line too, without its
+/// line break: for [`write_unchanged`].
+pub fn parse_chunk_lines<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>>, &'a str)) {
+    let mut row: Vec<Field<'a>> = Vec::new();
+    let bytes = chunk.as_bytes();
+    let mut start = 0;
+    let mut fields_before = 1;
+    // Each line's end: every newline, and the chunk's end after content with
+    // none.
+    let tail = (!chunk.ends_with('\n') && !chunk.is_empty()).then_some(chunk.len());
+    for end in memchr_iter(b'\n', bytes).chain(tail) {
+        let line = strip_cr(&chunk[start..end]);
+        parse_line(line, &mut row, fields_before);
+        fields_before = row.len();
+        on_row(&mut row, line);
+        start = end + 1;
+    }
+}
+
 /// Parse a CSV header line into owned column names.
 pub fn parse_header(line: &str) -> Vec<String> {
     let mut row: Vec<Field> = Vec::new();
@@ -223,6 +242,26 @@ pub fn write_cells<'f, 'a: 'f>(buf: &mut String, cells: impl IntoIterator<Item =
     buf.push('\n');
 }
 
+/// Whether writing the fields of `line` gives `line` itself: when it holds no
+/// quote and no carriage return.
+#[inline]
+pub fn is_verbatim(line: &str) -> bool {
+    memchr2(b'"', b'\r', line.as_bytes()).is_none()
+}
+
+/// Write `row`, the fields of `line` as parsed and not changed since, onto
+/// `buf`: `line` itself when that is what writing them gives
+/// ([`is_verbatim`]).
+#[inline]
+pub fn write_unchanged(buf: &mut String, line: &str, row: &[Field]) {
+    if is_verbatim(line) {
+        buf.push_str(line);
+        buf.push('\n');
+    } else {
+        write_row(buf, row);
+    }
+}
+
 /// CSV-encode one field's text onto `buf`, quoting it only if it holds a
 /// comma, a quote or a line break.
 #[inline]
@@ -349,6 +388,18 @@ mod tests {
                     assert_eq!(hits, expect, "{word:x?} for {byte:#x}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn write_unchanged_gives_what_writing_the_fields_gives() {
+        for line in ["a,b,,c", r#""x",1"#, r#"a,"b,c""#, "y\rz,1", "", ","] {
+            let mut row = Vec::new();
+            parse_fields(line, 0, &mut row);
+            let (mut got, mut expect) = (String::new(), String::new());
+            write_unchanged(&mut got, line, &row);
+            write_row(&mut expect, &row);
+            assert_eq!(got, expect, "{line:?}");
         }
     }
 
