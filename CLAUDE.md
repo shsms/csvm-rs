@@ -690,14 +690,15 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   (`RowChain::only_windows`), else the typed cell codec (`encode_row` /
   `decode_row`), which keeps a `Field::Num` exact for the statements after the
   sort instead of handing them its rounded output text.
-- When all of the input can be read, a run without a sort that fails on a bad
-  row names the first bad row at every `-n`: shards are read back in file
-  order, and the parallel stream's writer takes the workers' results in chunk
-  order too. Input that is not UTF-8 fails the whole chunk or shard piece it is
-  read in, so a bad row in it is not reached, and where those pieces start can
-  depend on `-n`. A stream still reports a bad row in an earlier chunk first.
-  The in-memory path reads all of its input before it reports a row's error,
-  so there the read error comes first.
+- When all of the input can be read, a run that fails on a bad row names the
+  first bad row at every `-n`: shards are read back in file order, and the
+  parallel stream's writer and `Sorter::finish` take the workers' results in
+  chunk or block order too. Input that is not UTF-8 fails the whole chunk or
+  shard piece it is read in, so a bad row in it is not reached, and where those
+  pieces start can depend on `-n`. A stream still reports a bad row in an
+  earlier chunk first. The external sort, whose workers run the statements
+  before it and make its keys, and the in-memory path read all of their input
+  before they report a row's error, so there the read error comes first.
 
 `Field<'a>` (`Str(&'a str) | Owned(String) | Num(f64)`) serves both paths: the
 streaming path uses `Field<'chunk>` borrows; crossing a stage boundary calls

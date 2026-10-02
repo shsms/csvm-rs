@@ -224,7 +224,7 @@ pub struct Sorter {
     fanout: usize,
     seq: u64,
     work_tx: Option<Sender<(u64, String)>>,
-    results: Receiver<Result<Run, Error>>,
+    results: Receiver<(u64, Result<Run, Error>)>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -281,7 +281,7 @@ impl Sorter {
         });
 
         let (work_tx, work_rx) = bounded::<(u64, String)>(threads);
-        let (res_tx, res_rx) = unbounded::<Result<Run, Error>>();
+        let (res_tx, res_rx) = unbounded::<(u64, Result<Run, Error>)>();
 
         let mut workers = Vec::with_capacity(threads);
         for _ in 0..threads {
@@ -290,7 +290,7 @@ impl Sorter {
             let ctx = Arc::clone(&ctx);
             workers.push(thread::spawn(move || {
                 while let Ok((seq, block)) = work_rx.recv() {
-                    if res_tx.send(make_run(&ctx, seq, &block)).is_err() {
+                    if res_tx.send((seq, make_run(&ctx, seq, &block))).is_err() {
                         break;
                     }
                 }
@@ -337,21 +337,17 @@ impl Sorter {
     /// Join the workers and return the merge over their runs.
     pub fn finish(mut self) -> Result<Merge, Error> {
         drop(self.work_tx.take());
-        let mut runs = Vec::new();
-        let mut first_err = None;
-        for result in self.results.iter() {
-            match result {
-                Ok(run) => runs.push(run),
-                Err(e) if first_err.is_none() => first_err = Some(e),
-                Err(_) => {}
-            }
-        }
+        // In block order, so the first error is the earliest block's, which
+        // holds the first bad row, whatever order the workers finish in.
+        let mut results: Vec<_> = self.results.iter().collect();
+        results.sort_unstable_by_key(|&(seq, _)| seq);
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
-        if let Some(e) = first_err {
-            return Err(e);
-        }
+        let runs = results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Result<Vec<_>, _>>()?;
         // Multi-level merge: with more than `fanout` runs, merge groups of them
         // into larger runs first (in parallel) so the final merge is bounded.
         let runs = consolidate(runs, self.threads, &self.temp_dir, self.fanout)?;
@@ -806,6 +802,23 @@ mod tests {
             })
             .unwrap();
         out
+    }
+
+    #[test]
+    fn finish_reports_the_earliest_blocks_error() {
+        // Block 0's bad row comes after many good ones, while block 1 is bad
+        // from its first row, so block 1's worker usually fails first.
+        let s = SortStmt {
+            keys: vec![key(0, false, SortMode::Numeric)],
+        };
+        let temp = std::env::temp_dir();
+        let mut sorter = Sorter::with_params(&s, &[], LineFormat::Csv, 2, temp, 1 << 30, 1 << 20);
+        sorter.push_block(["1\n".repeat(200_000), "first\n".into()].concat());
+        sorter.push_block("later\n".repeat(10));
+        let Err(e) = sorter.finish() else {
+            panic!("the sort succeeded");
+        };
+        assert_eq!(e.to_string(), "non-numeric value 'first'");
     }
 
     #[test]
