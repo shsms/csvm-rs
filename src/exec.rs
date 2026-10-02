@@ -823,9 +823,8 @@ struct Grouper<'a> {
     agg_slot: Vec<Slot>,
     index: HashMap<String, usize>,
     groups: Vec<GroupAcc>,
-    /// Per-row scratch reused across rows (cleared, not reallocated) — the key
-    /// cells and their CSV encoding; only cloned into a group on first sight.
-    keysel: OwnedRow,
+    /// The current row's key cells, CSV-encoded, reused across rows; the cells
+    /// are copied into a group only on first sight.
     keybuf: String,
     /// A numeric cell's text for the `count_distinct` sets.
     numbuf: String,
@@ -860,29 +859,27 @@ impl<'a> Grouper<'a> {
             agg_slot,
             index: HashMap::new(),
             groups: Vec::new(),
-            keysel: Vec::new(),
             keybuf: String::new(),
             numbuf: String::new(),
         }
     }
 
     fn update(&mut self, row: &[Field]) {
-        // Build the key cells + their encoding in the reused scratch buffers.
-        self.keysel.clear();
-        self.keybuf.clear();
-        for &p in &self.g.key_positions {
-            self.keysel
-                .push(row.get(p).cloned().unwrap_or(Field::Str("")).into_owned());
-        }
-        csv::write_row(&mut self.keybuf, &self.keysel);
+        encode_key(&mut self.keybuf, row, &self.g.key_positions);
         let idx = match self.index.get(&self.keybuf) {
             Some(&i) => i,
             None => {
                 let i = self.groups.len();
-                // First sight of this key: take ownership of the scratch copies.
+                // First sight of this key: copy it in, with room for the
+                // aggregates, which `into_rows` appends.
                 self.index.insert(self.keybuf.clone(), i);
+                let mut key = Vec::with_capacity(self.g.key_positions.len() + self.g.aggs.len());
+                key.extend(self.g.key_positions.iter().map(|&p| {
+                    row.get(p)
+                        .map_or(Field::Str(""), |f| f.clone().into_owned())
+                }));
                 self.groups.push(GroupAcc {
-                    key: self.keysel.clone(),
+                    key,
                     rows: 0,
                     stats: self
                         .stat_positions
@@ -3595,6 +3592,13 @@ mod tests {
         // fieldA: 't' first (row 1), then 'f' (row 2). count = rows per group.
         let out = run_str("agg count by fieldA", INPUT).unwrap();
         assert_eq!(out, "fieldA,count\nt,3\nf,1\n");
+    }
+
+    #[test]
+    fn agg_key_cell_past_the_row_end_groups_as_empty() {
+        // Row `y` has no `v`: it groups with row `y,`, whose `v` is empty.
+        let out = run_str("agg count by g,v", "g,v\nx,1\ny\nx,2\ny,\n").unwrap();
+        assert_eq!(out, "g,v,count\nx,1,1\ny,,2\nx,2,1\n");
     }
 
     #[test]
