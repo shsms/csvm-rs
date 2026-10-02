@@ -210,14 +210,23 @@ pub fn format_num_into(n: f64, buf: &mut String) {
 /// `1.23e300`. A cell that is not a finite number shows as written.
 pub fn table_num(cell: &str, decimals: Option<u8>, human: bool) -> Option<String> {
     let text = trim_cell(cell);
-    let exponent = text.contains(['e', 'E']);
-    let written_decimals = text.split_once('.').map_or(0, |(_, f)| f.len());
+    // Where the first point is, and whether there is an exponent.
+    let mut point = None;
+    let mut exponent = false;
+    for (at, b) in text.bytes().enumerate() {
+        match b {
+            b'.' if point.is_none() => point = Some(at),
+            b'e' | b'E' => exponent = true,
+            _ => {}
+        }
+    }
+    let written_decimals = point.map_or(0, |at| text.len() - at - 1);
     // The decimals to round to, when the cell has more or an exponent.
     let round_to = decimals.filter(|&d| exponent || written_decimals > usize::from(d));
     // A plain number with at most three whole digits, and few enough digits
     // that its float keeps them all, is below 1000, so takes no suffix.
     let below_1000 = || {
-        let whole = text.split_once('.').map_or(text, |(whole, _)| whole);
+        let whole = point.map_or(text, |at| &text[..at]);
         !exponent && text.len() <= 15 && whole.trim_start_matches(['-', '+']).len() <= 3
     };
     // The text alone tells most cells that stay as written, so they are never
