@@ -336,6 +336,24 @@ fn select_comparison_reading_prev_still_aborts_on_a_bad_first_cell() {
 }
 
 #[test]
+fn select_numeric_comparison_reads_the_row_above_through_prev() {
+    let input = "val\n1\n2\n3\n";
+    assert_eq!(
+        run_checked("select round(prev(val)) < val", input),
+        "val\n2\n3\n"
+    );
+}
+
+#[test]
+fn select_auto_comparison_reads_a_text_prev_cell_as_text() {
+    // `b` is not a number, so `5 > b` compares the two as text.
+    assert_eq!(
+        run_checked("select val > prev(val)", "val\nb\n5\n"),
+        "val\n"
+    );
+}
+
+#[test]
 fn select_prev_keeps_rows_where_value_changed() {
     let input = "val\n1\n1\n2\n2\n2\n3\n";
     // Row 1 has no row above it, so a comparison that reads prev() is false.

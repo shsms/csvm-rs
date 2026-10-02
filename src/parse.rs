@@ -3790,6 +3790,7 @@ mod tests {
         assert_eq!(mark("add d = c % (b * 2)"), "(b * 2)");
         assert_eq!(mark("add d = c + a"), "a");
         assert_eq!(mark("add d = a - 1"), "a");
+        assert_eq!(mark("add d = prev(a) - 1"), "prev(a)");
         assert_eq!(mark("add d = (a ++ c) * 2"), "(a ++ c)");
         assert_eq!(mark("add d = -a"), "a");
         // A function's argument: the call.

@@ -11,7 +11,7 @@
 
 use crate::color::{Ramp, Style};
 use crate::error::Error;
-use crate::field::{Field, format_num};
+use crate::field::{Field, NumError, format_num};
 use crate::stats::STATS_SCHEMA;
 use regex::Regex;
 use std::cmp::Ordering;
@@ -1213,11 +1213,8 @@ fn cell_str<'r>(row: &'r [Field], pos: usize) -> std::borrow::Cow<'r, str> {
 
 /// Coerce a row cell to a number, treating an out-of-range index as `0.0`.
 #[inline]
-pub(crate) fn cell_num(row: &[Field], pos: usize) -> Result<f64, Error> {
-    match row.get(pos) {
-        Some(f) => Ok(f.coerce_num()?),
-        None => Ok(0.0),
-    }
+pub(crate) fn cell_num(row: &[Field], pos: usize) -> Result<f64, NumError> {
+    row.get(pos).map_or(Ok(0.0), Field::coerce_num)
 }
 
 impl Cmp {
@@ -1439,18 +1436,16 @@ impl ValExpr {
             ValExpr::Col(c) => cell_field(row, c.pos),
             ValExpr::Num(n) | ValExpr::Word(_, n) => Field::Num(*n),
             ValExpr::Str(s) => Field::Owned(s.clone()),
-            // Each coercion is matched in place: a helper returning
-            // `Result<f64, Error>` costs each operand a copy.
-            ValExpr::Neg(e, at) => match e.eval(row, ctx)?.coerce_num() {
+            ValExpr::Neg(e, at) => match e.arith_num(row, ctx)? {
                 Ok(n) => Field::Num(-n),
                 Err(err) => return Err(at.place(err)),
             },
             ValExpr::Arith { op, lhs, rhs, at } => {
-                let l = match lhs.eval(row, ctx)?.coerce_num() {
+                let l = match lhs.arith_num(row, ctx)? {
                     Ok(l) => l,
                     Err(e) => return Err(at[0].place(e)),
                 };
-                let r = match rhs.eval(row, ctx)?.coerce_num() {
+                let r = match rhs.arith_num(row, ctx)? {
                     Ok(r) => r,
                     Err(e) => return Err(at[1].place(e)),
                 };
@@ -1506,14 +1501,34 @@ impl ValExpr {
         })
     }
 
+    /// An arithmetic operand as a number: `Err` when evaluating it fails,
+    /// `Ok(Err)` when its value is not a number. A leaf (a column, `prev()`, a
+    /// literal, `rownum()`) is read without copying its text.
+    #[inline]
+    fn arith_num(&self, row: &[Field], ctx: &EvalCtx) -> Result<Result<f64, NumError>, Error> {
+        Ok(match self {
+            ValExpr::Col(c) => cell_num(row, c.pos),
+            ValExpr::Prev(c) => cell_num(ctx.prev_row.unwrap_or(row), c.pos),
+            ValExpr::Num(n) | ValExpr::Word(_, n) => Ok(*n),
+            ValExpr::Str(s) => Field::Str(s).coerce_num(),
+            ValExpr::Rownum => Ok(ctx.rownum as f64),
+            ValExpr::Neg(..)
+            | ValExpr::Arith { .. }
+            | ValExpr::Concat(..)
+            | ValExpr::Func(..)
+            | ValExpr::Bool(..)
+            | ValExpr::Cond { .. } => self.eval(row, ctx)?.coerce_num(),
+        })
+    }
+
     /// A comparison operand (or a numeric function's argument) as a number.
-    /// Leaf shortcuts keep the hot path allocation-free (a bare column or
-    /// literal never builds a `Field`); the compound fallback is outlined so
-    /// these stay small enough to inline.
+    /// A bare column or literal is read here without copying its text; any
+    /// other operand goes to an outlined fallback, which reads `prev()` and
+    /// `rownum()` without copying too, so this stays small enough to inline.
     #[inline]
     fn cmp_num(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
         match self {
-            ValExpr::Col(c) => cell_num(row, c.pos),
+            ValExpr::Col(c) => Ok(cell_num(row, c.pos)?),
             ValExpr::Num(n) | ValExpr::Word(_, n) => Ok(*n),
             // A numeric comparison never carries a `Str` operand (compile-time
             // normalization parses string literals), but coerce defensively.
@@ -1524,7 +1539,11 @@ impl ValExpr {
 
     #[inline(never)]
     fn cmp_num_compound(&self, row: &[Field], ctx: &EvalCtx) -> Result<f64, Error> {
-        Ok(self.eval(row, ctx)?.coerce_num()?)
+        Ok(match self {
+            ValExpr::Prev(c) => cell_num(ctx.prev_row.unwrap_or(row), c.pos)?,
+            ValExpr::Rownum => ctx.rownum as f64,
+            e => e.eval(row, ctx)?.coerce_num()?,
+        })
     }
 
     /// A comparison operand as text (borrowed for the leaf cases).
@@ -1569,7 +1588,10 @@ impl ValExpr {
     fn cmp_num_soft_compound(&self, row: &[Field], ctx: &EvalCtx) -> Result<Option<f64>, Error> {
         // `?` on eval: a hard error (bad arithmetic, div by zero) still aborts;
         // only the final coercion is soft.
-        Ok(self.eval(row, ctx)?.coerce_num().ok())
+        Ok(match self {
+            ValExpr::Prev(c) => auto_num(ctx.prev_row.unwrap_or(row), c.pos),
+            e => e.eval(row, ctx)?.coerce_num().ok(),
+        })
     }
 
     /// The static type of a value expression, for the comparison-mode decision
@@ -1967,7 +1989,7 @@ impl SortStmt {
         self.keys
             .iter()
             .map(|k| match k.mode {
-                SortMode::Numeric => cell_num(row, k.pos).map(Some),
+                SortMode::Numeric => Ok(Some(cell_num(row, k.pos)?)),
                 SortMode::Auto => Ok(auto_num(row, k.pos)),
                 SortMode::Lexical => Ok(None),
             })

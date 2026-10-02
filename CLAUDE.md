@@ -72,8 +72,10 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `'…'`/`"…"` are string literals, and arithmetic
   (`select price * qty >= 30`), functions (`abs(x) > 1`), and parenthesized
   boolean subexpressions compared as `t`/`f` (`(a >= 0) == (b >= 0)`) all work
-  (`Cmp` holds two `ValExpr`s; leaf operands take allocation-free fast paths,
-  compound ones outlined `#[inline(never)]` fallbacks). `=~`/`!~` and
+  (`Cmp` holds two `ValExpr`s; a column or literal operand takes an inlined
+  allocation-free fast path, and any other operand an outlined
+  `#[inline(never)]` fallback, which reads `prev()` and `rownum()` as numbers
+  without allocating too). `=~`/`!~` and
   the affixes still take a plain column on the left. A `select` reading
   `prev()`/`rownum()` is stateful and runs its rows in order, like a stateful
   `add` (`select val != prev(val)`, `select rownum() % 2 == 1`);
