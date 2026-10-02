@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -328,8 +328,9 @@ fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     Err("parquet input requires building csvm with --features parquet".to_string())
 }
 
-/// The CSV a buffered run renders: what the run writes, counting the input
-/// read into `progress`.
+/// The CSV a buffered run renders: with no stage, a CSV input's rows as they
+/// are (see [`exec::copy_rows`]), counted into `progress`; else what the run
+/// writes.
 fn buffered_text(
     source: &mut Source,
     plan: &csvm::plan::Plan,
@@ -337,6 +338,43 @@ fn buffered_text(
     opts: &exec::RunOpts,
     progress: &Progress,
 ) -> Result<String, csvm::error::Error> {
+    let meter = |total| {
+        progress
+            .is_counting()
+            .then(|| Meter::start(progress.clone(), total, Unit::Bytes))
+    };
+    if plan.stages.is_empty() {
+        match source {
+            Source::File {
+                path,
+                data_start,
+                file_len,
+            } => {
+                let size = file_len.saturating_sub(*data_start);
+                let _meter = meter(Some(size));
+                // With -n above 1 a run reads a file up to the size it had
+                // when opened, as its shards do.
+                let limit = if opts.threads > 1 { size } else { u64::MAX };
+                if limit == 0 {
+                    return exec::copy_rows(&mut io::empty(), Some(0), out_header);
+                }
+                let mut file = File::open(path)?;
+                file.seek(SeekFrom::Start(*data_start))?;
+                let mut file = Counted::new(file.take(limit), progress.clone());
+                return exec::copy_rows(&mut file, Some(size), out_header);
+            }
+            Source::Stream(reader) => {
+                let _meter = meter(None);
+                return exec::copy_rows(
+                    &mut Counted::new(reader, progress.clone()),
+                    None,
+                    out_header,
+                );
+            }
+            #[cfg(feature = "parquet")]
+            Source::Parquet { .. } => {}
+        }
+    }
     let mut buf = Vec::new();
     run_into(source, plan, out_header, opts, progress, &mut buf)?;
     String::from_utf8(buf).map_err(|e| {

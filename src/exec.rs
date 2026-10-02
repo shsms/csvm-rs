@@ -1203,6 +1203,35 @@ fn partition_row_groups(n: usize, threads: usize) -> Vec<Vec<usize>> {
     blocks
 }
 
+/// `header`, then the rows `input` holds (about `size` bytes, when known) as
+/// they are, ending in a line break as a run's rows do: what a plan with no
+/// stage passes on, for a renderer that reads the rows back as CSV and so
+/// sees the cells a run would have written. Rows that are not UTF-8 fail with
+/// the error a run gives, the place of the bad bytes counted from the start of
+/// the rows.
+pub fn copy_rows<R: Read>(
+    input: &mut R,
+    size: Option<u64>,
+    header: &[String],
+) -> Result<String, Error> {
+    let mut head = String::new();
+    let header: Vec<Field> = header.iter().map(|s| Field::Str(s.as_str())).collect();
+    csv::write_row(&mut head, &header);
+    let mut text = Vec::with_capacity(head.len() + size.map_or(0, |n| n as usize) + 1);
+    text.extend_from_slice(head.as_bytes());
+    input.read_to_end(&mut text)?;
+    let mut text = String::from_utf8(text).map_err(|e| {
+        // Where the bad bytes are, from the start of the rows.
+        let rows = std::str::from_utf8(&e.as_bytes()[head.len()..]);
+        let e = rows.expect_err("the header is UTF-8");
+        Error::Other(format!("input is not valid UTF-8: {e}"))
+    })?;
+    if text.len() > head.len() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
 fn write_header<W: Write>(output: &mut W, header: &[String]) -> Result<(), Error> {
     let row: Vec<Field> = header.iter().map(|s| Field::Str(s.as_str())).collect();
     let mut buf = String::new();
@@ -2017,10 +2046,11 @@ pub struct Screen {
     pub stripe: Option<Rgb>,
 }
 
-/// Render `text`, the CSV a run wrote, to `output`, applying the plan's
-/// colour rules (when the screen has colour) and aligning columns when the
-/// plan's output is `Aligned`. Width is measured by *visible* characters, so
-/// ANSI escapes never throw off alignment.
+/// Render `text`, the CSV a run wrote or the input copied as it is (see
+/// [`copy_rows`]), to `output`, applying the plan's colour rules (when the
+/// screen has colour) and aligning columns when the plan's output is
+/// `Aligned`. Width is measured by *visible* characters, so ANSI escapes never
+/// throw off alignment.
 pub fn render<W: Write>(
     text: &str,
     plan: &Plan,
@@ -4656,6 +4686,21 @@ mod tests {
             assert!(short.ends_with('…'), "{short:?}");
             assert_eq!(cut(text, 80), text);
         }
+    }
+
+    #[test]
+    fn copy_rows_ends_the_rows_in_a_line_break() {
+        let header = ["a".to_string(), "b".to_string()];
+        let copy = |rows: &[u8]| copy_rows(&mut &rows[..], None, &header);
+        assert_eq!(copy(b"1,2").unwrap(), "a,b\n1,2\n");
+        assert_eq!(copy(b"1,2\r\n").unwrap(), "a,b\n1,2\r\n");
+        assert_eq!(copy(b"").unwrap(), "a,b\n");
+        // Where bad bytes are counts from the start of the rows.
+        let e = copy(b"1,2\n\xc3(").unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "input is not valid UTF-8: invalid utf-8 sequence of 1 bytes from index 4"
+        );
     }
 
     #[test]

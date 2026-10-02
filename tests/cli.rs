@@ -228,6 +228,21 @@ fn forced_colour_into_a_pipe_writes_no_links() {
 }
 
 #[test]
+fn a_table_of_the_input_alone_shows_its_cells() {
+    // Quotes and CRLF line ends are read as a run's input would be.
+    let (ok, out, err) = csvm(&["fmt"], "a,b\r\n\"x,\"\"y\"\"\",1\r\n");
+    assert!(ok, "{err}");
+    assert_eq!(out, "a      b\nx,\"y\"  1\n");
+    // Input that is not UTF-8 fails as a run's input does.
+    let bad = std::env::temp_dir().join(format!("csvm_bad_utf8_{}.csv", std::process::id()));
+    std::fs::write(&bad, b"a,b\n1,2\n\xc3(,x\n").unwrap();
+    let (ok, _, err) = csvm(&["fmt", bad.to_str().unwrap()], "");
+    std::fs::remove_file(&bad).unwrap();
+    assert!(!ok);
+    assert!(err.starts_with("csvm: input is not valid UTF-8"), "{err}");
+}
+
+#[test]
 fn a_script_error_shows_where_it_is() {
     let (ok, _, err) = csvm(&["cols a | select a >> 1"], "a\n1\n");
     assert!(!ok);

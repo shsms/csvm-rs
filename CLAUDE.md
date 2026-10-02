@@ -286,9 +286,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   `add c = num(c)` is how a column is pinned), so later comparisons against it
   are typed the same as against the expression itself.
 - **`fmt`** sets the output mode to whitespace-aligned (`column -t`); it's a
-  `Plan.output` flag, applied by `exec::format_aligned` after the run produces
-  CSV (so the executor itself is unchanged). Columns whose data cells are all
-  numeric are right-justified (digits line up); text columns are left-justified.
+  `Plan.output` flag, applied by `exec::render` (`align_and_write`) after the
+  run produces CSV (so the executor itself is unchanged). With no stage, a CSV
+  input is copied as it is into the text `exec::render` reads
+  (`exec::copy_rows`, called from `main.rs`), with a line break added after a
+  last row that has none. Columns whose data cells are all numeric are
+  right-justified (digits line up); text columns are left-justified.
   With colour on, the header row is bold; only a stripe colours an empty cell.
   `exec::render` takes an `exec::Screen` (colour depth, terminal width, and
   `fit`); with `fit` — a terminal and no pager, which would scroll sideways
