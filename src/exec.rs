@@ -2073,21 +2073,25 @@ pub fn render<W: Write>(
         return Ok(());
     }
     // The cells borrow from `text`; only a cell the parser had to rewrite
-    // (an escaped quote) has its own copy.
-    let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
+    // (an escaped quote) has its own copy. They are kept in one list, row
+    // after row, with where each row ends.
+    let mut cells: Vec<Cow<str>> = Vec::new();
+    let mut ends: Vec<usize> = Vec::new();
     csv::parse_chunk(text, |r| {
-        rows.push(r.drain(..).map(Field::into_text).collect());
+        cells.extend(r.drain(..).map(Field::into_text));
+        ends.push(cells.len());
     });
 
     let styles = if want_color {
-        Some(compute_styles(&plan.colors, &rows))
+        Some(compute_styles(&plan.colors, &row_slices(&cells, &ends)))
     } else {
         None
     };
     match plan.output {
         OutputFormat::Aligned(table) => {
-            let numeric = numeric_columns(&rows);
-            shorten_numbers(&mut rows, &numeric, table);
+            let numeric = numeric_columns(&row_slices(&cells, &ends));
+            shorten_numbers(&mut cells, &ends, &numeric, table);
+            let rows = row_slices(&cells, &ends);
             // Only a table that asked for stripes (`fmt -s`) gets them.
             let screen = Screen {
                 stripe: screen.stripe.filter(|_| table.stripes),
@@ -2095,7 +2099,9 @@ pub fn render<W: Write>(
             };
             align_and_write(&rows, &numeric, styles.as_deref(), &screen, output)
         }
-        OutputFormat::Csv => write_csv_colored(&rows, styles.as_deref(), depth, output),
+        OutputFormat::Csv => {
+            write_csv_colored(&row_slices(&cells, &ends), styles.as_deref(), depth, output)
+        }
     }
 }
 
@@ -2136,8 +2142,8 @@ fn render_graph<W: Write>(
 /// is a cosmetic overlay, so one bad cell shouldn't kill the whole output. A
 /// predicate that reads such a cell through `prev()` errors on the row below
 /// it too.
-fn compute_styles(rules: &[ColorRule], rows: &[Vec<Cow<str>>]) -> Vec<Vec<Style>> {
-    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+fn compute_styles(rules: &[ColorRule], rows: &[&[Cow<str>]]) -> Vec<Vec<Style>> {
+    let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
     for rule in rules {
         match rule {
@@ -2189,13 +2195,25 @@ fn compute_styles(rules: &[ColorRule], rows: &[Vec<Cow<str>>]) -> Vec<Vec<Style>
     styles
 }
 
+/// The rows of `cells`, each ending where `ends` says.
+fn row_slices<'c, 'a>(cells: &'c [Cow<'a, str>], ends: &[usize]) -> Vec<&'c [Cow<'a, str>]> {
+    let mut start = 0;
+    ends.iter()
+        .map(|&end| {
+            let row = &cells[start..end];
+            start = end;
+            row
+        })
+        .collect()
+}
+
 /// Default gradient bounds: the min/max over the column's *parseable* cells —
 /// exactly the cells the gradient will paint (same `trim().parse` test as
 /// `compute_styles`). Computed directly rather than via `ColStats`, whose
 /// numeric range is `None` for a column with any non-numeric cell; that would
 /// collapse the bounds to `0..1` and clamp every real value to the hi colour.
 /// Falls back to `0..1` when no cell parses (then nothing is painted anyway).
-fn column_minmax(rows: &[Vec<Cow<str>>], pos: usize) -> (f64, f64) {
+fn column_minmax(rows: &[&[Cow<str>]], pos: usize) -> (f64, f64) {
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for row in rows.iter().skip(1) {
@@ -2219,8 +2237,8 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
 
 /// Which columns are numeric: every data cell reads as a number (blanks
 /// allowed, but at least one must be a real number).
-fn numeric_columns(rows: &[Vec<Cow<str>>]) -> Vec<bool> {
-    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+fn numeric_columns(rows: &[&[Cow<str>]]) -> Vec<bool> {
+    let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     (0..ncols)
         .map(|i| {
             let mut saw_number = false;
@@ -2257,12 +2275,17 @@ fn is_plain_decimal(s: &str) -> bool {
 
 /// Rewrite the data cells of the `numeric` columns as `table` shows them (see
 /// [`field::table_num`]).
-fn shorten_numbers(rows: &mut [Vec<Cow<str>>], numeric: &[bool], table: TableOpts) {
+fn shorten_numbers(cells: &mut [Cow<str>], ends: &[usize], numeric: &[bool], table: TableOpts) {
     if table.decimals.is_none() && !table.human {
         return;
     }
-    for row in rows.iter_mut().skip(1) {
-        for (cell, _) in row.iter_mut().zip(numeric).filter(|(_, n)| **n) {
+    // Every row after the header.
+    for (&start, &end) in ends.iter().zip(ends.iter().skip(1)) {
+        for (cell, _) in cells[start..end]
+            .iter_mut()
+            .zip(numeric)
+            .filter(|(_, n)| **n)
+        {
             if let Some(short) = field::table_num(cell, table.decimals, table.human) {
                 *cell = Cow::Owned(short);
             }
@@ -2281,7 +2304,7 @@ fn shorten_numbers(rows: &mut [Vec<Cow<str>>], numeric: &[bool], table: TableOpt
 /// shaded with it from its first cell to the table's right edge, under whatever
 /// the rules paint there.
 fn align_and_write<W: Write>(
-    rows: &[Vec<Cow<str>>],
+    rows: &[&[Cow<str>]],
     numeric: &[bool],
     styles: Option<&[Vec<Style>]>,
     screen: &Screen,
@@ -2289,7 +2312,7 @@ fn align_and_write<W: Write>(
 ) -> Result<(), Error> {
     let color = screen.color;
     let fit_to = screen.width.filter(|_| screen.fit);
-    let ncols = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
     for row in rows {
         for (i, field) in row.iter().enumerate() {
@@ -2508,7 +2531,7 @@ fn cut(text: &str, width: usize) -> Cow<'_, str> {
 /// Write CSV rows with each cell painted by its style (for colouring plain,
 /// non-aligned output).
 fn write_csv_colored<W: Write>(
-    rows: &[Vec<Cow<str>>],
+    rows: &[&[Cow<str>]],
     styles: Option<&[Vec<Style>]>,
     depth: Depth,
     output: &mut W,
