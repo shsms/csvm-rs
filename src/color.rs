@@ -172,20 +172,37 @@ impl Color {
     /// The SGR parameters for this colour, as a foreground (`bg` false) or a
     /// background, at `depth`, appended to `out`.
     fn sgr_into(self, bg: bool, depth: Depth, out: &mut String) {
-        use fmt::Write;
-        // Writing to a String cannot fail, and an unwrap here costs each
-        // coloured cell a check.
-        let _ = match self {
-            Color::Base(base) => write!(out, "{}", base.code() + if bg { 40 } else { 30 }),
+        match self {
+            Color::Base(base) => push_u8(out, base.code() + if bg { 40 } else { 30 }),
             Color::Rgb(c) => {
-                let lead = if bg { 48 } else { 38 };
+                out.push_str(if bg { "48" } else { "38" });
                 match depth {
-                    Depth::Truecolor => write!(out, "{lead};2;{};{};{}", c.0, c.1, c.2),
-                    Depth::Ansi256 => write!(out, "{lead};5;{}", ansi256(c)),
+                    Depth::Truecolor => {
+                        out.push_str(";2");
+                        for v in [c.0, c.1, c.2] {
+                            out.push(';');
+                            push_u8(out, v);
+                        }
+                    }
+                    Depth::Ansi256 => {
+                        out.push_str(";5;");
+                        push_u8(out, ansi256(c));
+                    }
                 }
             }
-        };
+        }
     }
+}
+
+/// `n` in decimal, appended to `out`.
+fn push_u8(out: &mut String, n: u8) {
+    if n >= 100 {
+        out.push(char::from(b'0' + n / 100));
+    }
+    if n >= 10 {
+        out.push(char::from(b'0' + n / 10 % 10));
+    }
+    out.push(char::from(b'0' + n % 10));
 }
 
 impl fmt::Display for Color {
@@ -492,6 +509,15 @@ mod tests {
             Rgb(255, 255, 255),
         ] {
             assert_ne!(ansi256(stripe(bg)), ansi256(bg), "{bg:?}");
+        }
+    }
+
+    #[test]
+    fn push_u8_writes_every_byte_in_decimal() {
+        for n in 0..=255u8 {
+            let mut out = String::from("x");
+            push_u8(&mut out, n);
+            assert_eq!(out, format!("x{n}"));
         }
     }
 
