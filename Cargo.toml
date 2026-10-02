@@ -41,6 +41,8 @@ parquet = { version = "59", optional = true }
 arrow = { version = "59", optional = true, default-features = false }
 # Terminal size (TIOCGWINSZ) for the default chart width.
 libc = "0.2"
+# A fast hasher for every hash table in exec.rs.
+foldhash = "0.2"
 
 [dev-dependencies]
 # Reference RFC-4180 parser, used only to confirm our scanner's conformance.

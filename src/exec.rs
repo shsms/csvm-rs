@@ -7,7 +7,6 @@
 //! later modules.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
@@ -15,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 
 use crossbeam_channel::bounded;
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use memchr::memchr;
 
 use crate::chart;
