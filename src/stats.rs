@@ -6,6 +6,8 @@
 //! same accumulator serves both. Keeping computation and presentation apart is
 //! what makes it reusable.
 
+use std::cmp::Ordering;
+
 use crate::field::Field;
 
 /// The profile columns emitted per input column, in order. After a `stats`
@@ -30,8 +32,67 @@ pub struct ColStats {
     mean: f64,
     m2: f64,
     // Lexical min/max, used to report text columns.
-    smin: Option<String>,
-    smax: Option<String>,
+    smin: Option<Bound>,
+    smax: Option<Bound>,
+}
+
+/// A lexical min or max, with its first eight bytes as a number, which settles
+/// most comparisons without comparing the texts.
+#[derive(Clone, Debug)]
+struct Bound {
+    prefix: u64,
+    text: String,
+}
+
+impl Bound {
+    /// How `text`, whose [`prefix`] is `prefix`, orders against this bound.
+    fn cmp_text(&self, prefix: u64, text: &str) -> Ordering {
+        prefix.cmp(&self.prefix).then_with(|| text.cmp(&self.text))
+    }
+
+    /// Make `bound` the text `text`, whose [`prefix`] is `prefix`, when it has
+    /// none yet or `text` orders on `side` of it, reusing its string.
+    #[inline(always)]
+    fn replace_if(bound: &mut Option<Bound>, prefix: u64, text: &str, side: Ordering) {
+        match bound {
+            Some(b) if b.cmp_text(prefix, text) != side => {}
+            Some(b) => {
+                b.prefix = prefix;
+                b.text.clear();
+                b.text.push_str(text);
+            }
+            None => {
+                *bound = Some(Bound {
+                    prefix,
+                    text: text.to_owned(),
+                })
+            }
+        }
+    }
+}
+
+/// The first eight bytes of `bytes` as a big-endian number, padded with zeros:
+/// two byte strings whose prefixes differ order as their prefixes do.
+fn prefix(bytes: &[u8]) -> u64 {
+    let n = bytes.len();
+    if let Some(head) = bytes.first_chunk() {
+        return u64::from_be_bytes(*head);
+    }
+    // Fewer bytes are two loads that overlap, the first and the last bytes,
+    // each shifted to where its bytes go.
+    let (first, last) = if let (Some(first), Some(last)) = (bytes.first_chunk(), bytes.last_chunk())
+    {
+        let load = |four| u64::from(u32::from_be_bytes(four));
+        (load(*first) << 32, load(*last))
+    } else if let (Some(first), Some(last)) = (bytes.first_chunk(), bytes.last_chunk()) {
+        let load = |two| u64::from(u16::from_be_bytes(two));
+        (load(*first) << 48, load(*last))
+    } else if let Some(&first) = bytes.first() {
+        (u64::from(first) << 56, 0)
+    } else {
+        return 0;
+    };
+    first | last << (8 * (8 - n))
 }
 
 impl Default for ColStats {
@@ -67,12 +128,9 @@ impl ColStats {
         self.count += 1;
 
         // Lexical min/max — cheap and valid for any column type.
-        if self.smin.as_deref().is_none_or(|m| s.as_ref() < m) {
-            self.smin = Some(s.as_ref().to_owned());
-        }
-        if self.smax.as_deref().is_none_or(|m| s.as_ref() > m) {
-            self.smax = Some(s.as_ref().to_owned());
-        }
+        let p = prefix(s.as_bytes());
+        Bound::replace_if(&mut self.smin, p, &s, Ordering::Less);
+        Bound::replace_if(&mut self.smax, p, &s, Ordering::Greater);
 
         if self.numeric {
             match f.num_opt() {
@@ -104,15 +162,11 @@ impl ColStats {
         // Numeric only if every shard saw the column as numeric.
         self.numeric = self.numeric && other.numeric;
         // Lexical min/max.
-        if let Some(o) = &other.smin
-            && self.smin.as_deref().is_none_or(|m| o.as_str() < m)
-        {
-            self.smin = Some(o.clone());
+        if let Some(o) = &other.smin {
+            Bound::replace_if(&mut self.smin, o.prefix, &o.text, Ordering::Less);
         }
-        if let Some(o) = &other.smax
-            && self.smax.as_deref().is_none_or(|m| o.as_str() > m)
-        {
-            self.smax = Some(o.clone());
+        if let Some(o) = &other.smax {
+            Bound::replace_if(&mut self.smax, o.prefix, &o.text, Ordering::Greater);
         }
         // Numeric min/max — the ±∞ identities make an empty partner a no-op.
         self.nmin = self.nmin.min(other.nmin);
@@ -202,9 +256,9 @@ impl ColStats {
     }
 }
 
-fn opt_str(s: &Option<String>) -> Field<'static> {
+fn opt_str(s: &Option<Bound>) -> Field<'static> {
     match s {
-        Some(s) => Field::Owned(s.clone()),
+        Some(s) => Field::Owned(s.text.clone()),
         None => Field::Str(""),
     }
 }
@@ -239,6 +293,37 @@ mod tests {
     fn text_column_blanks_numeric_stats() {
         let cells = profile(&["banana", "apple", "cherry"]);
         assert_eq!(cells, ["x", "3", "0", "apple", "cherry", "", "", ""]);
+    }
+
+    #[test]
+    fn prefix_is_the_first_eight_bytes_padded() {
+        for text in ["", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg"]
+            .into_iter()
+            .chain(["abcdefgh", "abcdefghi", "\0", "a\0", "\u{e9}t\u{e9}"])
+        {
+            let mut bytes = [0; 8];
+            let n = text.len().min(8);
+            bytes[..n].copy_from_slice(&text.as_bytes()[..n]);
+            assert_eq!(
+                prefix(text.as_bytes()),
+                u64::from_be_bytes(bytes),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_min_max_past_a_shared_prefix() {
+        // The first eight bytes tie between the last two, and between "ab" and
+        // "ab\0".
+        let cells = profile(&["ab\0", "ab", "zzzzzzzz10", "zzzzzzzz9"]);
+        assert_eq!(cells[3..5], ["ab", "zzzzzzzz9"]);
+    }
+
+    #[test]
+    fn text_min_max_replaced_several_times() {
+        let cells = profile(&["b", "a", "aa", "c", "d", "cc"]);
+        assert_eq!(cells[3..5], ["a", "d"]);
     }
 
     #[test]
