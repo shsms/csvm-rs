@@ -1388,6 +1388,19 @@ impl BoolExpr {
             BoolExpr::Match { .. } | BoolExpr::Affix { .. } => false,
         }
     }
+
+    /// Add the position of every column a `prev()` in the expression reads.
+    pub fn prev_positions(&self, out: &mut Vec<usize>) {
+        match self {
+            BoolExpr::And(es) | BoolExpr::Or(es) => es.iter().for_each(|e| e.prev_positions(out)),
+            BoolExpr::Not(e) => e.prev_positions(out),
+            BoolExpr::Cmp(c) | BoolExpr::CmpPrev(c) => {
+                c.lhs.prev_positions(out);
+                c.rhs.prev_positions(out);
+            }
+            BoolExpr::Match { .. } | BoolExpr::Affix { .. } => {}
+        }
+    }
 }
 
 /// Context for evaluating an expression: the state of its stateful leaves
@@ -1664,6 +1677,35 @@ impl ValExpr {
             ValExpr::Cond { then_, else_, .. } => then_.reads_prev() || else_.reads_prev(),
         }
     }
+
+    /// Add the position of every column a `prev()` in the expression reads,
+    /// booleans inside it included.
+    pub fn prev_positions(&self, out: &mut Vec<usize>) {
+        match self {
+            ValExpr::Prev(c) => out.push(c.pos),
+            ValExpr::Rownum
+            | ValExpr::Col(_)
+            | ValExpr::Num(_)
+            | ValExpr::Word(..)
+            | ValExpr::Str(_) => {}
+            ValExpr::Bool(b, _) => b.prev_positions(out),
+            ValExpr::Neg(e, _) => e.prev_positions(out),
+            ValExpr::Arith { lhs, rhs, .. } => {
+                lhs.prev_positions(out);
+                rhs.prev_positions(out);
+            }
+            ValExpr::Concat(parts, _) | ValExpr::Func(_, parts, _) => {
+                parts.iter().for_each(|p| p.prev_positions(out));
+            }
+            ValExpr::Cond {
+                test, then_, else_, ..
+            } => {
+                test.prev_positions(out);
+                then_.prev_positions(out);
+                else_.prev_positions(out);
+            }
+        }
+    }
 }
 
 /// Evaluate a built-in function call.
@@ -1821,6 +1863,20 @@ impl Stmt {
             Stmt::Select(e) => e.is_stateful(),
             _ => false,
         }
+    }
+
+    /// The positions of the columns a `prev()` in this statement reads, in the
+    /// row as the statement sees it, sorted, each once.
+    pub fn prev_positions(&self) -> Vec<usize> {
+        let mut positions = Vec::new();
+        match self {
+            Stmt::Add(a) => a.expr.prev_positions(&mut positions),
+            Stmt::Select(e) => e.prev_positions(&mut positions),
+            Stmt::Cols(_) | Stmt::Rename(_) => {}
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        positions
     }
 }
 
