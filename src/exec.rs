@@ -1319,31 +1319,38 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
         drop(chunk_rx);
         drop(out_tx);
 
+        // The results are taken in chunk order, so the first error met is the
+        // earliest chunk's, which holds the first bad row, whatever order the
+        // workers finish in. Returning on it closes `out_rx`, so a worker stops
+        // when it next has a result to send.
         let writer = scope.spawn(move || -> Result<(), Error> {
             let mut next = 0u64;
-            let mut pending: HashMap<u64, String> = HashMap::new();
-            let mut first_err: Option<Error> = None;
+            let mut pending: HashMap<u64, Result<String, Error>> = HashMap::new();
             while let Ok((id, res)) = out_rx.recv() {
-                match res {
-                    Ok(buf) => {
-                        pending.insert(id, buf);
-                        let mut wrote = false;
-                        while let Some(buf) = pending.remove(&next) {
-                            output.write_all(buf.as_bytes())?;
-                            next += 1;
-                            wrote = true;
-                        }
-                        // Flush once the in-order prefix advanced, so a live
-                        // stream sees output without waiting for the BufWriter.
-                        if wrote {
-                            output.flush()?;
+                pending.insert(id, res);
+                let start = next;
+                let mut failed = None;
+                while let Some(res) = pending.remove(&next) {
+                    match res {
+                        Ok(buf) => output.write_all(buf.as_bytes())?,
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
                         }
                     }
-                    Err(e) if first_err.is_none() => first_err = Some(e),
-                    Err(_) => {}
+                    next += 1;
+                }
+                // Flush once the in-order prefix advanced, so a live stream
+                // sees output without waiting for the BufWriter, and before
+                // the first error ends the run.
+                if next != start {
+                    output.flush()?;
+                }
+                if let Some(e) = failed {
+                    return Err(e);
                 }
             }
-            first_err.map_or(Ok(()), Err)
+            Ok(())
         });
 
         // Reader: feed chunks as input arrives (a single read each, not a full
@@ -1369,8 +1376,10 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
         }
         drop(chunk_tx);
 
-        let writer_result = writer.join().expect("writer thread panicked");
-        read_err.map_or(Ok(()), Err).and(writer_result)
+        // The writer's error, from a bad row in a chunk read before any read
+        // error or from writing the output, comes first.
+        writer.join().expect("writer thread panicked")?;
+        read_err.map_or(Ok(()), Err)
     })
 }
 
@@ -2949,13 +2958,31 @@ mod tests {
         }
     }
 
-    fn run_with(script: &str, input: &str, threads: usize, chunk: usize) -> Result<String, Error> {
+    fn run_with(
+        script: &str,
+        input: impl AsRef<[u8]>,
+        threads: usize,
+        chunk: usize,
+    ) -> Result<String, Error> {
+        let mut out = Vec::new();
+        run_with_into(script, input, threads, chunk, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// [`run_with`], writing to `out`.
+    fn run_with_into<W: Write + Send>(
+        script: &str,
+        input: impl AsRef<[u8]>,
+        threads: usize,
+        chunk: usize,
+        out: &mut W,
+    ) -> Result<(), Error> {
         let mut plan = parse(script)?;
         prepare_joins(&mut plan)?;
-        let mut reader = io::BufReader::new(input.as_bytes());
+        // Big enough for a whole chunk, so one read can fill it.
+        let mut reader = io::BufReader::with_capacity(chunk.max(8 << 10), input.as_ref());
         let header = read_header(&mut reader)?;
         let out_header = plan.resolve(&header)?;
-        let mut out = Vec::new();
         let opts = RunOpts {
             chunk_size: chunk,
             threads,
@@ -2963,8 +2990,7 @@ mod tests {
             sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
             shard_bytes: DEFAULT_SHARD_BYTES,
         };
-        run(&plan, &out_header, &opts, &mut reader, &mut out)?;
-        Ok(String::from_utf8(out).unwrap())
+        run(&plan, &out_header, &opts, &mut reader, out)
     }
 
     /// Run a sort plan with a tiny sort buffer so the external merge (temp-file
@@ -3128,6 +3154,42 @@ mod tests {
         assert_eq!(serial, parallel);
         // Spot-check ordering: first data rows are 1, 3, 5, ...
         assert!(parallel.starts_with("id,keep\n1,1\n3,1\n5,1\n"));
+    }
+
+    #[test]
+    fn a_parallel_stream_reports_the_first_bad_row() {
+        let error_at_n4 = |input: &[u8]| {
+            let err = run_with("select a < 0", input, 4, 1 << 20).unwrap_err();
+            err.to_string()
+        };
+        let good = ["a,b\n", &"1,2\n".repeat(262_000)].concat();
+        // `first` is near the end of the first 1 MiB chunk. A later chunk is
+        // bad from its first row, so it fails before the first chunk is done.
+        let head = [good.as_str(), "first,1\n"].concat();
+        let later = "later,1\n".repeat(100_000);
+        let input = [head.as_str(), &later].concat();
+        assert_eq!(error_at_n4(input.as_bytes()), "non-numeric value 'first'");
+        // Nor does the reader's error on a later chunk come first.
+        let not_utf8 = ["1,2\n".repeat(1000).as_bytes(), b"\xc3(,1\n"].concat();
+        let input = [head.as_bytes(), &not_utf8].concat();
+        assert_eq!(error_at_n4(&input), "non-numeric value 'first'");
+        // Without a bad row, the read error is the one reported.
+        let input = [good.as_bytes(), &not_utf8].concat();
+        assert!(error_at_n4(&input).starts_with("input is not valid UTF-8"));
+    }
+
+    #[test]
+    fn a_parallel_stream_flushes_the_chunks_before_a_bad_one() {
+        // The first 1 MiB chunk is all good rows and the next is bad from its
+        // first row, so the writer usually meets the error in the pass that
+        // writes the first.
+        let good = ["a,b\n", &"1,2\n".repeat(262_143)].concat();
+        let input = [good, "first,1\n".repeat(100_000)].concat();
+        let mut out = io::BufWriter::with_capacity(4 << 20, Vec::new());
+        let err = run_with_into("select a > 0", input, 4, 1 << 20, &mut out).unwrap_err();
+        assert_eq!(err.to_string(), "non-numeric value 'first'");
+        assert!(out.buffer().is_empty(), "{} bytes left", out.buffer().len());
+        assert!(out.get_ref().len() > 1_000_000);
     }
 
     #[test]

@@ -5,17 +5,16 @@ mod common;
 use common::temp_csv;
 
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 
 /// Run the binary with `args`, feeding `stdin`; returns (exit ok, stdout, stderr).
 fn csvm(args: &[&str], stdin: &str) -> (bool, String, String) {
     csvm_env(args, stdin, &[])
 }
 
-/// [`csvm`], with environment variables set (`Some`) or removed (`None`). The
-/// colour variables of the caller's environment are removed first, so they
-/// cannot colour the output.
-fn csvm_env(args: &[&str], stdin: &str, env: &[(&str, Option<&str>)]) -> (bool, String, String) {
+/// The binary with `args` and its stdio piped. The colour variables of the
+/// caller's environment are removed, so they cannot colour the output.
+fn csvm_command(args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_csvm"));
     command
         .args(args)
@@ -25,6 +24,12 @@ fn csvm_env(args: &[&str], stdin: &str, env: &[(&str, Option<&str>)]) -> (bool, 
         .env_remove("CLICOLOR_FORCE")
         .env_remove("NO_COLOR")
         .env_remove("COLORTERM");
+    command
+}
+
+/// [`csvm`], with environment variables set (`Some`) or removed (`None`).
+fn csvm_env(args: &[&str], stdin: &str, env: &[(&str, Option<&str>)]) -> (bool, String, String) {
+    let mut command = csvm_command(args);
     for (name, value) in env {
         match value {
             Some(v) => command.env(name, v),
@@ -43,6 +48,18 @@ fn csvm_env(args: &[&str], stdin: &str, env: &[(&str, Option<&str>)]) -> (bool, 
         String::from_utf8(out.stdout).unwrap(),
         String::from_utf8(out.stderr).unwrap(),
     )
+}
+
+/// Run the binary with `args`, handing its stdin to `feed` to write as it
+/// likes; returns (exit ok, stderr).
+fn csvm_feeding(args: &[&str], feed: impl FnOnce(&mut ChildStdin)) -> (bool, String) {
+    let mut child = csvm_command(args)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn csvm");
+    feed(&mut child.stdin.take().unwrap());
+    let out = child.wait_with_output().unwrap();
+    (out.status.success(), String::from_utf8(out.stderr).unwrap())
 }
 
 const HEADERLESS: &str = "1,alice\n2,bob\n";
@@ -266,6 +283,40 @@ fn a_row_kept_as_read_is_written_as_any_row_is() {
     let (ok, out, err) = csvm(&["-n", "4", "select a != ''", file.to_str().unwrap()], "");
     assert!(ok, "{err}");
     assert_eq!(out, expect);
+}
+
+#[test]
+fn a_parallel_stream_does_not_read_all_input_after_a_bad_row() {
+    // Good rows keep coming after the bad one, up to a cap the run should stop
+    // well before.
+    const CAP: usize = 64 << 20;
+    let rows = "1,2\n".repeat(16 << 10);
+    let mut sent = 0;
+    let (ok, err) = csvm_feeding(&["-n", "4", "select a < 0"], |stdin| {
+        if stdin.write_all(b"a,b\nfirst,1\n").is_ok() {
+            while sent < CAP && stdin.write_all(rows.as_bytes()).is_ok() {
+                sent += rows.len();
+            }
+        }
+    });
+    assert!(!ok);
+    assert!(err.starts_with("csvm: non-numeric value 'first'"), "{err}");
+    assert!(sent < CAP, "read all {sent} bytes");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn a_parallel_streams_bad_row_comes_before_a_failed_write() {
+    for n in ["1", "4"] {
+        let args = ["-n", n, "-o", "/dev/full", "select a < 0"];
+        let (ok, _, err) = csvm(&args, "a,b\nfirst,1\n");
+        assert!(!ok);
+        assert_eq!(
+            err.lines().next(),
+            Some("csvm: non-numeric value 'first'"),
+            "-n {n}"
+        );
+    }
 }
 
 #[test]
