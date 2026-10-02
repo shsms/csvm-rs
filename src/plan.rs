@@ -1803,6 +1803,15 @@ impl Stmt {
         Ok(())
     }
 
+    /// Whether this statement leaves a row's cells as they are; it may still
+    /// drop the row.
+    pub fn keeps_cells(&self) -> bool {
+        match self {
+            Stmt::Select(_) | Stmt::Rename(_) => true,
+            Stmt::Cols(_) | Stmt::Add(_) => false,
+        }
+    }
+
     /// Whether this statement reads cross-row state (a stateful `add` or a
     /// `select` comparing against `prev()`/`rownum()`), so it must see the
     /// rows in order.
@@ -1947,6 +1956,12 @@ impl SortStmt {
 #[inline]
 pub(crate) fn auto_num(row: &[Field], pos: usize) -> Option<f64> {
     row.get(pos).map_or(Some(0.0), Field::num_soft)
+}
+
+/// Whether every one of `stmts` leaves a row's cells as they are (see
+/// [`Stmt::keeps_cells`]).
+pub fn stmts_keep_cells(stmts: &[Stmt]) -> bool {
+    stmts.iter().all(Stmt::keeps_cells)
 }
 
 /// Apply a sequence of statements to a row, returning whether it survives (only

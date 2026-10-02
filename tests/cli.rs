@@ -241,6 +241,18 @@ fn forced_colour_into_a_pipe_writes_no_links() {
 }
 
 #[test]
+fn a_row_kept_as_read_is_written_as_any_row_is() {
+    // A needless quote goes, and a carriage return in a cell is quoted,
+    // on every path a row kept as read takes.
+    let input = "a,b\n\"x\",1\n2,y\rz\n3,w\n";
+    let expect = "a,b\nx,1\n2,\"y\rz\"\n3,w\n";
+    let file = temp_csv(input);
+    let (ok, out, err) = csvm(&["-n", "4", "select a != ''", file.to_str().unwrap()], "");
+    assert!(ok, "{err}");
+    assert_eq!(out, expect);
+}
+
+#[test]
 fn a_table_of_the_input_alone_shows_its_cells() {
     // Quotes and CRLF line ends are read as a run's input would be.
     let (ok, out, err) = csvm(&["fmt"], "a,b\r\n\"x,\"\"y\"\"\",1\r\n");

@@ -25,7 +25,7 @@ use crate::field::{self, Field};
 use crate::plan::{
     AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphOpts, GraphSpec,
     GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, TableOpts,
-    ValExpr, apply_stmts,
+    ValExpr, apply_stmts, stmts_keep_cells,
 };
 use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
@@ -1428,26 +1428,41 @@ fn process_range(
     progress: &Progress,
 ) -> Result<String, Error> {
     let mut out = String::new();
-    parse_range(path, start, end, progress, |row, scratch| {
-        if apply_stmts(stmts, row, scratch, &EvalCtx::default())? {
-            csv::write_row(&mut out, row);
-        }
-        Ok(())
-    })?;
+    // A row is written as its line only when no statement changes its
+    // cells.
+    if stmts_keep_cells(stmts) {
+        parse_range(path, start, end, progress, |row, line, scratch| {
+            if apply_stmts(stmts, row, scratch, &EvalCtx::default())? {
+                csv::write_unchanged(&mut out, line, row);
+            }
+            Ok(())
+        })?;
+    } else {
+        parse_range(path, start, end, progress, |row, _, scratch| {
+            if apply_stmts(stmts, row, scratch, &EvalCtx::default())? {
+                csv::write_row(&mut out, row);
+            }
+            Ok(())
+        })?;
+    }
     Ok(out)
 }
 
-/// Parse bytes `start..end` of `path` a piece of about [`PROGRESS_PIECE`] at
-/// a time, read into one buffer, handing `on_row` each row and a scratch row
-/// for the statements, and counting each piece into `progress` once its rows
-/// are done. The range starts and ends on a line boundary. The first error
-/// `on_row` returns stops the reading.
+/// Parse bytes `start..end` of `path` a piece of about [`PROGRESS_PIECE`] at a
+/// time, read into one buffer, handing `on_row` each row, its line and a
+/// scratch row for the statements, and counting each piece into `progress` once
+/// its rows are done. The range starts and ends on a line boundary. The first
+/// error `on_row` returns stops the reading.
 fn parse_range(
     path: &Path,
     start: u64,
     end: u64,
     progress: &Progress,
-    mut on_row: impl for<'r> FnMut(&mut Vec<Field<'r>>, &mut Vec<Field<'r>>) -> Result<(), Error>,
+    mut on_row: impl for<'r> FnMut(
+        &mut Vec<Field<'r>>,
+        &'r str,
+        &mut Vec<Field<'r>>,
+    ) -> Result<(), Error>,
 ) -> Result<(), Error> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
@@ -1468,9 +1483,9 @@ fn parse_range(
             .map_err(|e| Error::Other(format!("input is not valid UTF-8: {e}")))?;
         let mut scratch = Vec::new();
         let mut err = None;
-        csv::parse_chunk(piece, |row| {
+        csv::parse_chunk_lines(piece, |row, line| {
             if err.is_none() {
-                err = on_row(row, &mut scratch).err();
+                err = on_row(row, line, &mut scratch).err();
             }
         });
         if let Some(e) = err {
@@ -1492,7 +1507,7 @@ fn stats_over_range(
     progress: &Progress,
 ) -> Result<Vec<ColStats>, Error> {
     let mut accs: Vec<ColStats> = positions.iter().map(|_| ColStats::new()).collect();
-    parse_range(path, start, end, progress, |row, scratch| {
+    parse_range(path, start, end, progress, |row, _, scratch| {
         if apply_stmts(pre, row, scratch, &EvalCtx::default())? {
             accumulate(&mut accs, positions, row);
         }
@@ -1599,7 +1614,7 @@ fn group_over_range<'a>(
     progress: &Progress,
 ) -> Result<Grouper<'a>, Error> {
     let mut grouper = Grouper::new(g);
-    parse_range(path, start, end, progress, |row, scratch| {
+    parse_range(path, start, end, progress, |row, _, scratch| {
         if apply_stmts(pre, row, scratch, &EvalCtx::default())? {
             grouper.update(row);
         }
@@ -4773,7 +4788,7 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let progress = Progress::counting();
         let (mut rows, mut counted_midway) = (0usize, Vec::new());
-        parse_range(&path, 2, text.len() as u64, &progress, |row, _| {
+        parse_range(&path, 2, text.len() as u64, &progress, |row, _, _| {
             assert_eq!(row.len(), 2);
             rows += 1;
             counted_midway.push(progress.get());
@@ -4789,7 +4804,7 @@ mod tests {
         // The first error stops the reading, within its piece.
         let progress = Progress::counting();
         let mut rows = 0;
-        let err = parse_range(&path, 2, text.len() as u64, &progress, |_, _| {
+        let err = parse_range(&path, 2, text.len() as u64, &progress, |_, _, _| {
             rows += 1;
             Err(Error::Other("stop".into()))
         });
