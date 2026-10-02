@@ -197,7 +197,9 @@ pub fn format_num_into(n: f64, buf: &mut String) {
         push_digits(buf, n.abs() as u64, 0);
         return;
     }
-    format_num_general(n, buf);
+    if !push_decimal(n, buf) {
+        format_num_general(n, buf);
+    }
 }
 
 /// Digits a double holds for certain.
@@ -206,6 +208,67 @@ const SIGNIFICANT: i32 = 15;
 const MIN_DECIMALS: i32 = 6;
 /// Digits that tell every double apart.
 const MAX_SIGNIFICANT: i32 = 17;
+
+/// The powers of ten [`push_decimal`] takes a number between, by exponent less
+/// [`MIN_FAST_EXPONENT`]. Up to 1e9, so that the decimals keep a number to
+/// `SIGNIFICANT` digits (an exponent up to `SIGNIFICANT - 1 - MIN_DECIMALS`).
+const POWERS: [f64; 15] = [
+    1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+];
+/// The exponent of `POWERS[0]`.
+const MIN_FAST_EXPONENT: i32 = -5;
+
+/// 10 to the power of each number of decimals [`push_decimal`] writes, exactly
+/// as doubles hold them.
+const SCALES: [f64; 20] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19,
+];
+
+/// [`format_num_into`] for a number between `POWERS`' first and last, without
+/// std's float formatting: the number scaled to its 15 significant digits,
+/// rounded to a whole number, gives the digits. Returns false, writing nothing,
+/// for a number out of that range, and for one whose scaled number is exactly
+/// halfway between two whole ones, which [`format_num_general`] rounds.
+fn push_decimal(n: f64, buf: &mut String) -> bool {
+    let a = n.abs();
+    // NaN is not in the range either.
+    if !(POWERS[0]..POWERS[POWERS.len() - 1]).contains(&a) {
+        return false;
+    }
+    // The last power at or below `a`.
+    let i = POWERS.partition_point(|&p| p <= a) - 1;
+    let decimals = (SIGNIFICANT - 1 - (i as i32 + MIN_FAST_EXPONENT)) as usize;
+    let scaled = a * SCALES[decimals];
+    let whole = scaled.floor();
+    // How far past a half the fraction is, exactly. The scaled number is below
+    // 1e15, so below 2^50, where every half is a double: the rounded product is
+    // on the same side of a half as the exact one, unless it is the half.
+    let mut past_half = scaled - whole - 0.5;
+    if past_half == 0.0 {
+        // The product's rounding error, which `mul_add` gives exactly.
+        past_half = a.mul_add(SCALES[decimals], -scaled);
+        if past_half == 0.0 {
+            return false;
+        }
+    }
+    let digits = whole as u64 + u64::from(past_half > 0.0);
+    let unit = 10u64.pow(decimals as u32);
+    if n < 0.0 {
+        buf.push('-');
+    }
+    push_digits(buf, digits / unit, 0);
+    let (mut frac, mut width) = (digits % unit, decimals);
+    if frac != 0 {
+        while frac % 10 == 0 {
+            frac /= 10;
+            width -= 1;
+        }
+        buf.push('.');
+        push_digits(buf, frac, width);
+    }
+    true
+}
 
 /// Whether `n` prints as an integer: a whole number below 1e15, but not `-0.0`,
 /// which keeps its sign.
