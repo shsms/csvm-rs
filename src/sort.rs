@@ -51,8 +51,8 @@ const DEFAULT_FANOUT: usize = 32;
 const MIN_BLOCK: usize = 256 << 10;
 
 /// Blocks' worth of memory each worker may hold at once: two raw blocks (one
-/// queued, one being read) and a block's working copy, which for rows of a
-/// few bytes is about six blocks (a key and its bookkeeping per row).
+/// queued, one being read), and six for a block's working copy, which takes
+/// several blocks for rows of a few bytes (a key and its bookkeeping per row).
 const BLOCKS_PER_WORKER: usize = 8;
 
 /// Process-global run-file counter so concurrent sorters never collide on a
@@ -78,11 +78,13 @@ struct Run {
 
 enum RunData {
     /// Sorted line bytes (`blob`) with `lines[i]` the byte range of the i-th
-    /// row in sorted order, and `keys[i]` its encoded sort key.
+    /// row in sorted order, and `keys[i]` the byte range of its encoded
+    /// sort key in `key_blob`.
     Mem {
         blob: Vec<u8>,
         lines: Vec<(u32, u32)>,
-        keys: Vec<Box<[u8]>>,
+        key_blob: Vec<u8>,
+        keys: Vec<(u32, u32)>,
     },
     /// Sorted rows spilled to a temp file, one [`write_record`] each, so the
     /// merge reads the key back instead of re-deriving it from the line.
@@ -440,10 +442,10 @@ fn merge_group(group: Vec<Run>, temp_dir: &Path) -> Result<Run, Error> {
 fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
     let mut blob: Vec<u8> = Vec::with_capacity(block.len());
     let mut lines: Vec<(u32, u32)> = Vec::new();
-    let mut keys: Vec<Box<[u8]>> = Vec::new();
+    let mut key_blob: Vec<u8> = Vec::new();
+    let mut keys: Vec<(u32, u32)> = Vec::new();
     let mut scratch: Vec<Field> = Vec::new();
     let mut line = String::new();
-    let mut key_buf: Vec<u8> = Vec::new();
     let mut err: Option<Error> = None;
 
     let keeps_cells = plan::stmts_keep_cells(&ctx.pre);
@@ -458,8 +460,8 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
             &crate::plan::EvalCtx::default(),
         ) {
             Ok(true) => {
-                key_buf.clear();
-                if let Err(e) = encode_key(row, &ctx.sort, &mut key_buf) {
+                let key_start = key_blob.len() as u32;
+                if let Err(e) = encode_key(row, &ctx.sort, &mut key_blob) {
                     err = Some(e);
                     return;
                 }
@@ -477,7 +479,7 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
                     LineFormat::Typed => encode_row(row, &mut blob),
                 }
                 lines.push((start, blob.len() as u32));
-                keys.push(key_buf.as_slice().into());
+                keys.push((key_start, key_blob.len() as u32));
             }
             Ok(false) => {}
             Err(e) => err = Some(e),
@@ -486,26 +488,28 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
     if let Some(e) = err {
         return Err(e);
     }
+    // The ranges into `key_blob` are u32s.
+    if u32::try_from(key_blob.len()).is_err() {
+        return Err(Error::Other(
+            "a sort block's keys pass 4 GiB; give the sort a smaller --sort-buffer".into(),
+        ));
+    }
 
     // Stable sort an index by key (ties keep input order within the block).
-    let mut order: Vec<u32> = (0..lines.len() as u32).collect();
-    order.sort_by(|&a, &b| keys[a as usize].cmp(&keys[b as usize]));
+    let key = |i: u32| {
+        let (start, end) = keys[i as usize];
+        &key_blob[start as usize..end as usize]
+    };
+    let mut order: Vec<u32> = (0..keys.len() as u32).collect();
+    order.sort_by(|&a, &b| key(a).cmp(key(b)));
 
     // Materialize the sorted order so the merge can stream sequentially.
     let lines_sorted: Vec<(u32, u32)> = order.iter().map(|&i| lines[i as usize]).collect();
-    let keys_sorted: Vec<Box<[u8]>> = order
-        .iter()
-        .map(|&i| std::mem::take(&mut keys[i as usize]))
-        .collect();
-    // What the run holds, allocations as they are: each key is one of its
-    // own, which the allocator rounds up and heads.
+    let keys_sorted: Vec<(u32, u32)> = order.iter().map(|&i| keys[i as usize]).collect();
     let bytes = blob.capacity()
         + lines_sorted.capacity() * std::mem::size_of::<(u32, u32)>()
-        + keys_sorted.capacity() * std::mem::size_of::<Box<[u8]>>()
-        + keys_sorted
-            .iter()
-            .map(|k| k.len().next_multiple_of(16) + 16)
-            .sum::<usize>();
+        + key_blob.capacity()
+        + keys_sorted.capacity() * std::mem::size_of::<(u32, u32)>();
 
     let prev = ctx.in_mem.fetch_add(bytes, AtomicOrdering::Relaxed);
     if prev + bytes <= ctx.budget {
@@ -514,12 +518,13 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
             data: RunData::Mem {
                 blob,
                 lines: lines_sorted,
+                key_blob,
                 keys: keys_sorted,
             },
         })
     } else {
         ctx.in_mem.fetch_sub(bytes, AtomicOrdering::Relaxed);
-        let file = spill(&blob, &lines_sorted, &keys_sorted, &ctx.temp_dir)?;
+        let file = spill(&blob, &lines_sorted, &key_blob, &keys_sorted, &ctx.temp_dir)?;
         Ok(Run {
             seq,
             data: RunData::File(file),
@@ -531,12 +536,17 @@ fn make_run(ctx: &WorkerCtx, seq: u64, block: &str) -> Result<Run, Error> {
 fn spill(
     blob: &[u8],
     lines: &[(u32, u32)],
-    keys: &[Box<[u8]>],
+    key_blob: &[u8],
+    keys: &[(u32, u32)],
     temp_dir: &Path,
 ) -> Result<TempRun, Error> {
     write_run(temp_dir, |w| {
-        for (&(start, end), key) in lines.iter().zip(keys) {
-            write_record(w, key, &blob[start as usize..end as usize])?;
+        for (&(start, end), &(key_start, key_end)) in lines.iter().zip(keys) {
+            write_record(
+                w,
+                &key_blob[key_start as usize..key_end as usize],
+                &blob[start as usize..end as usize],
+            )?;
         }
         Ok(())
     })
@@ -688,7 +698,8 @@ enum SourceKind {
     Mem {
         blob: Vec<u8>,
         lines: Vec<(u32, u32)>,
-        keys: Vec<Box<[u8]>>,
+        key_blob: Vec<u8>,
+        keys: Vec<(u32, u32)>,
         /// Index of the next row to step to; the current row is `next - 1`.
         next: usize,
     },
@@ -703,9 +714,15 @@ enum SourceKind {
 impl Source {
     fn new(run: Run) -> Result<Self, Error> {
         let kind = match run.data {
-            RunData::Mem { blob, lines, keys } => SourceKind::Mem {
+            RunData::Mem {
                 blob,
                 lines,
+                key_blob,
+                keys,
+            } => SourceKind::Mem {
+                blob,
+                lines,
+                key_blob,
                 keys,
                 next: 0,
             },
@@ -718,18 +735,24 @@ impl Source {
         Ok(Source { seq: run.seq, kind })
     }
 
-    /// Step to the next row and return its encoded key, or `None` once the
-    /// run is exhausted. `spent` is the key buffer the merge just emitted; a
-    /// file run reads the next key into it, so the merge allocates nothing
-    /// per row.
+    /// Step to the next row and return its encoded key, or `None` once the run
+    /// is exhausted. `spent` is the key buffer the merge just emitted; the next
+    /// key is read into it, so the merge allocates nothing per row.
     fn next_key(&mut self, mut spent: Vec<u8>) -> Result<Option<Vec<u8>>, Error> {
         match &mut self.kind {
             SourceKind::Mem {
-                keys, next, lines, ..
+                key_blob,
+                keys,
+                next,
+                ..
             } => {
-                let key = keys.get_mut(*next).map(|k| std::mem::take(k).into_vec());
-                *next = (*next + 1).min(lines.len());
-                Ok(key)
+                let Some(&(start, end)) = keys.get(*next) else {
+                    return Ok(None);
+                };
+                *next += 1;
+                spent.clear();
+                spent.extend_from_slice(&key_blob[start as usize..end as usize]);
+                Ok(Some(spent))
             }
             SourceKind::File { reader, line, .. } => {
                 Ok(read_record(reader, &mut spent, line)?.then_some(spent))
@@ -882,6 +905,23 @@ mod tests {
     }
 
     #[test]
+    fn runs_of_several_rows_keep_each_line_with_its_key() {
+        // Two blocks of three rows: two runs, each kept in memory, then each
+        // spilled.
+        let s = SortStmt {
+            keys: vec![key(0, false, SortMode::Numeric)],
+        };
+        let blocks = ["30,a\n10,b\n20,c", "25,d\n5,e\n40,f"];
+        for budget in [1 << 30, 1] {
+            assert_eq!(
+                sort_lines_with(&s, &[], &blocks, 4, budget),
+                ["5,e", "10,b", "20,c", "25,d", "30,a", "40,f"],
+                "budget {budget}"
+            );
+        }
+    }
+
+    #[test]
     fn a_run_counts_its_allocations_against_the_budget() {
         let s = SortStmt {
             keys: vec![key(0, false, SortMode::Numeric)],
@@ -894,14 +934,14 @@ mod tests {
             budget,
             temp_dir: std::env::temp_dir(),
         };
-        // Two bytes of text a row, but each row's key is an allocation of
-        // its own, and each row has an entry in two tables.
+        // Two bytes of text a row, but each row's key takes eight bytes, and
+        // each row has an entry in two tables.
         let block: String = (0..1000).map(|i| format!("{}\n", i % 10)).collect();
         let roomy = ctx(1 << 20);
         let run = make_run(&roomy, 0, &block).unwrap();
         assert!(matches!(run.data, RunData::Mem { .. }));
         let held = roomy.in_mem.load(AtomicOrdering::Relaxed);
-        assert!(held >= 1000 * (8 + 16 + 32), "{held}");
+        assert!(held >= 1000 * (8 + 8 + 8), "{held}");
         // A budget the text fits in but the allocations do not: it spills.
         let tight = ctx(4 * block.len());
         let run = make_run(&tight, 0, &block).unwrap();
