@@ -1359,7 +1359,8 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
         let mut id = 0u64;
         let mut read_err = None;
         let mut space = ChunkSpace::default();
-        loop {
+        // The writer returns early only on an error: read no more then.
+        while !writer.is_finished() {
             match next_chunk_available(input, chunk_size, &mut space) {
                 Ok(Some(chunk)) => {
                     if chunk_tx.send((id, chunk.to_owned())).is_err() {

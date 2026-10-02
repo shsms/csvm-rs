@@ -320,6 +320,27 @@ fn a_parallel_streams_bad_row_comes_before_a_failed_write() {
 }
 
 #[test]
+fn a_parallel_stream_reports_a_bad_row_at_the_next_read() {
+    // A live stream: one good row at a time after the bad one. The run ends
+    // after the next read, not once each worker has had a chunk.
+    let mut lines_sent = 0;
+    let (ok, err) = csvm_feeding(&["-n", "16", "select a < 0"], |stdin| {
+        if stdin.write_all(b"a,b\nfirst,1\n").is_ok() {
+            while lines_sent < 40 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if stdin.write_all(b"1,2\n").is_err() {
+                    break;
+                }
+                lines_sent += 1;
+            }
+        }
+    });
+    assert!(!ok);
+    assert!(err.starts_with("csvm: non-numeric value 'first'"), "{err}");
+    assert!(lines_sent < 8, "read {lines_sent} lines after the bad one");
+}
+
+#[test]
 fn a_table_of_the_input_alone_shows_its_cells() {
     // Quotes and CRLF line ends are read as a run's input would be.
     let (ok, out, err) = csvm(&["fmt"], "a,b\r\n\"x,\"\"y\"\"\",1\r\n");
