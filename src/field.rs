@@ -90,6 +90,26 @@ impl<'a> Field<'a> {
         }
     }
 
+    /// Make this field an owned copy of `src`, reusing this field's string when
+    /// it holds one.
+    pub fn copy_from(&mut self, src: &Field) {
+        let text = match src {
+            Field::Num(n) => {
+                *self = Field::Num(*n);
+                return;
+            }
+            Field::Str(s) => s,
+            Field::Owned(s) => s.as_str(),
+        };
+        match self {
+            Field::Owned(s) => {
+                s.clear();
+                s.push_str(text);
+            }
+            Field::Str(_) | Field::Num(_) => *self = Field::Owned(text.to_owned()),
+        }
+    }
+
     /// The field's text, borrowing what the field borrows.
     #[inline]
     pub fn into_text(self) -> Cow<'a, str> {

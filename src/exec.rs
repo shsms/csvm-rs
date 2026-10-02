@@ -350,19 +350,29 @@ impl JoinStep<'_> {
 struct Stateful {
     /// Rows seen so far.
     rownum: u64,
-    /// Whether the statement at each index is stateful.
-    stateful: Vec<bool>,
-    /// The row before the current one as the statement at each index saw
-    /// it (see [`Stateful::apply`]).
+    /// For the statement at each index, `None` when it is not stateful, else
+    /// the positions of the columns its `prev()` reads (none for a statement
+    /// that reads only `rownum()`).
+    prev_positions: Vec<Option<Vec<usize>>>,
+    /// The row before the current one as the statement at each index saw it
+    /// (see [`Stateful::apply`]). Only the cells its `prev()` reads are kept up
+    /// to date.
     prev_rows: Vec<Option<OwnedRow>>,
+    /// The current row's saved cells, before they become the previous row.
+    /// Swapped with `prev_rows`, so the cells' strings are reused.
+    saved: OwnedRow,
 }
 
 impl Stateful {
     fn new(stmts: &[Stmt]) -> Stateful {
         Stateful {
             rownum: 0,
-            stateful: stmts.iter().map(Stmt::is_stateful).collect(),
+            prev_positions: stmts
+                .iter()
+                .map(|s| s.is_stateful().then(|| s.prev_positions()))
+                .collect(),
             prev_rows: vec![None; stmts.len()],
+            saved: Vec::new(),
         }
     }
 
@@ -381,15 +391,18 @@ impl Stateful {
     ) -> Result<bool, Error> {
         self.rownum += 1;
         for (k, stmt) in stmts.iter().enumerate() {
-            let survived = if self.stateful[k] {
-                let seen = owned_row(row);
+            let survived = if let Some(positions) = &self.prev_positions[k] {
+                save_cells(&mut self.saved, row, positions);
                 let ctx = EvalCtx {
                     prev_row: self.prev_rows[k].as_deref(),
                     rownum: self.rownum,
                     errors_dropped: false,
                 };
                 let survived = stmt.apply(row, scratch, &ctx)?;
-                self.prev_rows[k] = Some(seen);
+                std::mem::swap(
+                    self.prev_rows[k].get_or_insert_with(Vec::new),
+                    &mut self.saved,
+                );
                 survived
             } else {
                 stmt.apply(row, scratch, &EvalCtx::default())?
@@ -399,6 +412,20 @@ impl Stateful {
             }
         }
         Ok(true)
+    }
+}
+
+/// Copy the cells of `row` at `positions`, sorted, into `saved`, reusing the
+/// strings `saved` holds there. A cell past the row's end is saved empty, as
+/// `prev()` reads it. The cells at other positions are left as they were.
+fn save_cells(saved: &mut OwnedRow, row: &[Field], positions: &[usize]) {
+    if let Some(&last) = positions.last()
+        && saved.len() <= last
+    {
+        saved.resize(last + 1, Field::Str(""));
+    }
+    for &p in positions {
+        saved[p].copy_from(row.get(p).unwrap_or(&Field::Str("")));
     }
 }
 
@@ -2957,6 +2984,41 @@ mod tests {
             let flat: Vec<usize> = blocks.into_iter().flatten().collect();
             assert_eq!(flat, (0..n).collect::<Vec<_>>(), "n={n} t={threads}");
         }
+    }
+
+    #[test]
+    fn save_cells_copies_only_the_named_cells() {
+        let mut saved: OwnedRow = Vec::new();
+        save_cells(&mut saved, &[Field::Str("a"), Field::Num(2.0)], &[1, 3]);
+        assert_eq!(
+            format!("{saved:?}"),
+            r#"[Str(""), Num(2.0), Str(""), Owned("")]"#
+        );
+        // A second row overwrites the named cells, and only those.
+        save_cells(
+            &mut saved,
+            &[
+                Field::Str("b"),
+                Field::Str("x"),
+                Field::Str("y"),
+                Field::Str("z"),
+            ],
+            &[1, 3],
+        );
+        assert_eq!(
+            format!("{saved:?}"),
+            r#"[Str(""), Owned("x"), Str(""), Owned("z")]"#
+        );
+    }
+
+    #[test]
+    fn prev_reads_the_row_above_after_a_rownum_only_statement() {
+        let out = run_str(
+            "add r = rownum() | add d = r - prev(r) | add p = prev(a)",
+            "a\nx\ny\nz\n",
+        )
+        .unwrap();
+        assert_eq!(out, "a,r,d,p\nx,1,0,x\ny,2,1,x\nz,3,1,y\n");
     }
 
     fn run_with(
