@@ -74,8 +74,8 @@ impl<'a> Field<'a> {
     pub fn num_opt(&self) -> Option<f64> {
         match self {
             Field::Num(n) => Some(*n),
-            Field::Str(s) => trim_cell(s).parse().ok(),
-            Field::Owned(s) => trim_cell(s).parse().ok(),
+            Field::Str(s) => read_num(trim_cell(s)),
+            Field::Owned(s) => read_num(trim_cell(s)),
         }
     }
 
@@ -125,11 +125,32 @@ fn parse_num(s: &str) -> Result<f64, NumError> {
 #[inline]
 fn parse_num_soft(s: &str) -> Option<f64> {
     let t = trim_cell(s);
-    if t.is_empty() {
-        Some(0.0)
-    } else {
-        t.parse::<f64>().ok()
+    if t.is_empty() { Some(0.0) } else { read_num(t) }
+}
+
+/// `t` read as a number, as [`str::parse`] reads it. An integer of up to 15
+/// digits, most number cells, is read from its digits: a float holds it
+/// exactly.
+#[inline]
+fn read_num(t: &str) -> Option<f64> {
+    let (negative, digits) = match t.as_bytes() {
+        [b'-', rest @ ..] => (true, rest),
+        [b'+', rest @ ..] => (false, rest),
+        all => (false, all),
+    };
+    if digits.is_empty() || digits.len() > 15 {
+        return t.parse().ok();
     }
+    let mut n: u64 = 0;
+    for &b in digits {
+        let digit = b.wrapping_sub(b'0');
+        if digit > 9 {
+            return t.parse().ok();
+        }
+        n = n * 10 + u64::from(digit);
+    }
+    let n = n as f64;
+    Some(if negative { -n } else { n })
 }
 
 /// Format a number the way csvm does: in plain notation, to 15 significant
@@ -444,6 +465,22 @@ fn trim_decimals(s: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_num_reads_as_str_parse_does() {
+        let words = "0 -0 +0 7 007 -12 +34 999999999999999 -999999999999999 \
+            1234567890123456 12345678901234567890 1.5 -2.25 1e3 - + abc 1a a1 --1 \
+            inf NaN 75.35 0.1 -0.0 1. .5 -.5 +.25 . 1.2.3 123456789.012345 \
+            0.000000000000001 1234567890.1234567 9007199254740993 3.14159265358979";
+        for t in words.split_whitespace().chain(["", " 1"]) {
+            let expect = t.parse::<f64>().ok();
+            assert_eq!(
+                read_num(t).map(f64::to_bits),
+                expect.map(f64::to_bits),
+                "{t:?}"
+            );
+        }
+    }
 
     #[test]
     fn trim_cell_trims_as_str_trim_does() {
