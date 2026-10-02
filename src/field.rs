@@ -190,16 +190,49 @@ pub fn format_num(n: f64) -> String {
 
 /// [`format_num`] appended to `buf` (no allocation once `buf` has room).
 pub fn format_num_into(n: f64, buf: &mut String) {
+    if prints_whole(n) {
+        if n < 0.0 {
+            buf.push('-');
+        }
+        push_digits(buf, n.abs() as u64, 0);
+        return;
+    }
+    format_num_general(n, buf);
+}
+
+/// Digits a double holds for certain.
+const SIGNIFICANT: i32 = 15;
+/// Decimals a number keeps, up to `MAX_SIGNIFICANT` digits.
+const MIN_DECIMALS: i32 = 6;
+/// Digits that tell every double apart.
+const MAX_SIGNIFICANT: i32 = 17;
+
+/// Whether `n` prints as an integer: a whole number below 1e15, but not `-0.0`,
+/// which keeps its sign.
+fn prints_whole(n: f64) -> bool {
+    n.fract() == 0.0 && n.abs() < 1e15 && (n != 0.0 || n.is_sign_positive())
+}
+
+/// Append `v` in decimal, padded with leading zeros to `width` digits.
+fn push_digits(buf: &mut String, mut v: u64, width: usize) {
+    let mut digits = [b'0'; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let start = start.min(digits.len() - width);
+    buf.push_str(std::str::from_utf8(&digits[start..]).expect("ASCII digits"));
+}
+
+/// [`format_num_into`] for any number, through std's float formatting.
+fn format_num_general(n: f64, buf: &mut String) {
     use std::fmt::Write;
-    /// Digits a double holds for certain.
-    const SIGNIFICANT: i32 = 15;
-    /// Decimals a number keeps, up to `MAX_SIGNIFICANT` digits.
-    const MIN_DECIMALS: i32 = 6;
-    /// Digits that tell every double apart.
-    const MAX_SIGNIFICANT: i32 = 17;
-    // A whole number that small prints as an integer (and fast); `-0.0`
-    // keeps its sign below.
-    if n.fract() == 0.0 && n.abs() < 1e15 && (n != 0.0 || n.is_sign_positive()) {
+    if prints_whole(n) {
         write!(buf, "{}", n as i64).unwrap();
         return;
     }
@@ -655,6 +688,55 @@ mod tests {
         assert_eq!(human("0.00123456789").as_deref(), Some("0.001235"));
         assert_eq!(table_num("1234", None, true).as_deref(), Some("1.23k"));
         assert_eq!(table_num("0.00123456789", None, true), None);
+    }
+
+    #[test]
+    fn format_num_into_writes_what_the_general_path_writes() {
+        fn splitmix(x: u64) -> u64 {
+            let mut z = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        let mut values: Vec<f64> = vec![0.0, -0.0, f64::NAN, f64::INFINITY, 1e15, 1e17];
+        for k in 0..200_000u64 {
+            let h = splitmix(k);
+            // Any mantissa, over the exponents around the fast path's.
+            let exp = (h % 60) as i32 - 30;
+            values.push(f64::from_bits((h >> 12) | 0x3FF0_0000_0000_0000) * 2f64.powi(exp));
+            // Prices and their products, as data holds them.
+            let price = (h % 100_000) as f64 / 100.0;
+            values.push(price);
+            values.push(price * ((h >> 20) % 500) as f64);
+            values.push(price / 7.0);
+            values.push((h % 1000) as f64 * 0.1 + (h >> 40) as f64 * 0.01);
+            // Halfway between two 15-digit numbers, and the doubles beside.
+            let d = (h >> 32) % 20;
+            let tie = ((h >> 8) % 1_000_000_000_000_000) as f64 + 0.5;
+            let half = tie / 10f64.powi(d as i32);
+            values.extend([half, half.next_up(), half.next_down()]);
+        }
+        for e in -8..=12 {
+            let p = 10f64.powi(e);
+            let mut above = p;
+            let mut below = p;
+            for _ in 0..50 {
+                above = above.next_up();
+                below = below.next_down();
+                values.extend([above, below]);
+            }
+            values.push(p * 1.5);
+        }
+        let negated: Vec<f64> = values.iter().map(|v| -v).collect();
+        values.extend(negated);
+        let (mut fast, mut general) = (String::new(), String::new());
+        for v in values {
+            fast.clear();
+            general.clear();
+            format_num_into(v, &mut fast);
+            format_num_general(v, &mut general);
+            assert_eq!(fast, general, "{v:e}");
+        }
     }
 
     #[test]
