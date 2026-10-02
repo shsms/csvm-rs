@@ -18,7 +18,7 @@ use crossbeam_channel::bounded;
 use memchr::memchr;
 
 use crate::chart;
-use crate::color::{Color, Depth, Rgb, Style};
+use crate::color::{self, Color, Depth, Rgb, Style};
 use crate::csv;
 use crate::error::Error;
 use crate::field::{self, Field};
@@ -2376,7 +2376,7 @@ fn push_gap(line: &mut String, n: usize, shade: Option<&str>) {
     }
     line.extend(std::iter::repeat_n(' ', n));
     if shade.is_some() {
-        line.push_str("\x1b[0m");
+        line.push_str(color::RESET);
     }
 }
 
@@ -2498,16 +2498,27 @@ fn write_csv_colored<W: Write>(
     output: &mut W,
 ) -> Result<(), Error> {
     let mut line = String::new();
-    let mut encoded = String::new();
+    // The style painted last and its escape, for the next cell in that style.
+    let (mut last, mut start) = (None, String::new());
     for (ri, row) in rows.iter().enumerate() {
         line.clear();
         for (i, cell) in row.iter().enumerate() {
             if i > 0 {
                 line.push(',');
             }
-            encoded.clear();
-            csv::write_text(&mut encoded, cell);
-            style_at(styles, ri, i).paint_into(&encoded, depth, &mut line);
+            let style = style_at(styles, ri, i);
+            if style.is_empty() {
+                csv::write_text(&mut line, cell);
+                continue;
+            }
+            if last != Some(style) {
+                last = Some(style);
+                start.clear();
+                style.start_into(depth, &mut start);
+            }
+            line.push_str(&start);
+            csv::write_text(&mut line, cell);
+            line.push_str(color::RESET);
         }
         line.push('\n');
         output.write_all(line.as_bytes())?;

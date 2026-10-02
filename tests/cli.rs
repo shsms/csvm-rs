@@ -219,6 +219,19 @@ fn gradients_are_24_bit_only_where_colorterm_says_so() {
 }
 
 #[test]
+fn each_cell_of_a_gradient_gets_its_own_colour_in_csv() {
+    let env = [
+        ("CLICOLOR_FORCE", Some("1")),
+        ("COLORTERM", Some("truecolor")),
+    ];
+    let (ok, out, err) = csvm_env(&["color -g n"], "n\n1\n5\n9\n", &env);
+    assert!(ok, "{err}");
+    let expect = "n\n\x1b[38;2;0;205;0m1\x1b[0m\n\x1b[38;2;103;103;0m5\x1b[0m\n\
+                  \x1b[38;2;205;0;0m9\x1b[0m\n";
+    assert_eq!(out, expect);
+}
+
+#[test]
 fn forced_colour_into_a_pipe_writes_no_links() {
     // Colour may be forced into a pipe, but a link only works on a terminal.
     let (ok, out, err) = csvm(&["--color", "always", "fmt"], "site\nhttps://example.org\n");

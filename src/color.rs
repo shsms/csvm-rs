@@ -242,6 +242,9 @@ fn ansi256(c: Rgb) -> u8 {
     }
 }
 
+/// The SGR escape that turns every style off.
+pub const RESET: &str = "\x1b[0m";
+
 /// A foreground/background/attribute set.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Style {
@@ -285,10 +288,10 @@ impl Style {
         }
         self.start_into(depth, out);
         out.push_str(text);
-        out.push_str("\x1b[0m");
+        out.push_str(RESET);
     }
 
-    /// The SGR escape that turns this style on at `depth` (`\x1b[0m` turns it
+    /// The SGR escape that turns this style on at `depth` ([`RESET`] turns it
     /// off), or `None` when the style is empty.
     pub fn start(&self, depth: Depth) -> Option<String> {
         if self.is_empty() {
@@ -300,7 +303,7 @@ impl Style {
     }
 
     /// [`Style::start`] appended to `out`, for a style that is not empty.
-    fn start_into(&self, depth: Depth, out: &mut String) {
+    pub(crate) fn start_into(&self, depth: Depth, out: &mut String) {
         debug_assert!(!self.is_empty(), "an empty style has no escape");
         out.push_str("\x1b[");
         for (on, code) in [(self.bold, "1;"), (self.dim, "2;"), (self.underline, "4;")] {
