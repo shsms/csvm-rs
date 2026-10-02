@@ -2314,11 +2314,17 @@ fn align_and_write<W: Write>(
     let fit_to = screen.width.filter(|_| screen.fit);
     let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut widths = vec![0usize; ncols];
+    // Each cell's width, row after row, for writing it.
+    // `u32::MAX` for a cell too wide to keep, measured again.
+    let mut cell_widths: Vec<u32> = Vec::with_capacity(rows.iter().map(|row| row.len()).sum());
     for row in rows {
         for (i, field) in row.iter().enumerate() {
-            widths[i] = widths[i].max(vis_width(field));
+            let w = vis_width(field);
+            widths[i] = widths[i].max(w);
+            cell_widths.push(u32::try_from(w).unwrap_or(u32::MAX));
         }
     }
+    let mut cell_widths = cell_widths.into_iter();
     let bold = Style {
         bold: true,
         ..Style::default()
@@ -2350,8 +2356,11 @@ fn align_and_write<W: Write>(
             if i > 0 {
                 push_gap(&mut line, 2, shade_start.as_deref());
             }
-            // Measured once: most cells fit, and only a wider one is cut.
-            let w = vis_width(field);
+            let w = match cell_widths.next().expect("a width for every cell") {
+                u32::MAX => vis_width(field),
+                w => w as usize,
+            };
+            // Most cells fit, and only a wider one is cut.
             let (text, shown) = if w <= widths[i] {
                 (Cow::Borrowed(&**field), w)
             } else {
