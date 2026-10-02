@@ -152,6 +152,7 @@ fn align(c: &mut Criterion) {
     let mut reader = Cursor::new(body.as_slice());
     let mut csv_out = Vec::new();
     exec::run(&plan, &out_header, &opts, &mut reader, &mut csv_out).expect("run failed");
+    let csv_out = String::from_utf8(csv_out).expect("the run writes UTF-8");
 
     let mut group = c.benchmark_group("fmt");
     group.throughput(Throughput::Bytes(csv_out.len() as u64));

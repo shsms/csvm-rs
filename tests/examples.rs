@@ -50,8 +50,13 @@ fn run_with_header(
     // mirror it here). Colour off.
     if matches!(plan.output, csvm::plan::OutputFormat::Aligned(_)) || plan.graph.is_some() {
         let mut aligned = Vec::new();
-        exec::render(&out, &plan, &exec::Screen::default(), &mut aligned)
-            .map_err(|e| e.to_string())?;
+        exec::render(
+            std::str::from_utf8(&out).unwrap(),
+            &plan,
+            &exec::Screen::default(),
+            &mut aligned,
+        )
+        .map_err(|e| e.to_string())?;
         out = aligned;
     }
     String::from_utf8(out).map_err(|e| e.to_string())

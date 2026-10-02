@@ -2017,12 +2017,12 @@ pub struct Screen {
     pub stripe: Option<Rgb>,
 }
 
-/// Render buffered output `bytes` to `output`, applying the plan's colour rules
-/// (when the screen has colour) and aligning columns when the plan's output is
-/// `Aligned`. Width is measured by *visible* characters, so ANSI escapes never
-/// throw off alignment.
+/// Render `text`, the CSV a run wrote, to `output`, applying the plan's
+/// colour rules (when the screen has colour) and aligning columns when the
+/// plan's output is `Aligned`. Width is measured by *visible* characters, so
+/// ANSI escapes never throw off alignment.
 pub fn render<W: Write>(
-    bytes: &[u8],
+    text: &str,
     plan: &Plan,
     screen: &Screen,
     output: &mut W,
@@ -2031,7 +2031,7 @@ pub fn render<W: Write>(
     // The graph sink draws a chart from the buffered output instead of emitting
     // rows; it takes precedence over alignment/colour (which become no-ops).
     if let Some(g) = &plan.graph {
-        return render_graph(bytes, g, color, screen.width, output);
+        return render_graph(text, g, color, screen.width, output);
     }
     let aligned = matches!(plan.output, OutputFormat::Aligned(_));
     let depth = color.unwrap_or(Depth::Truecolor);
@@ -2039,11 +2039,9 @@ pub fn render<W: Write>(
     if !aligned && !want_color {
         // Nothing to do but copy the bytes through (the caller only buffers when
         // there is something to render, so this is just a safety net).
-        output.write_all(bytes)?;
+        output.write_all(text.as_bytes())?;
         return Ok(());
     }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
     // The cells borrow from `text`; only a cell the parser had to rewrite
     // (an escaped quote) has its own copy.
     let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
@@ -2079,14 +2077,12 @@ pub fn render<W: Write>(
 /// document ([`crate::svg::render`]), and otherwise the chart is drawn in the
 /// terminal ([`crate::graph::render`]).
 fn render_graph<W: Write>(
-    bytes: &[u8],
+    text: &str,
     g: &GraphSpec,
     color: Option<Depth>,
     term_width: Option<usize>,
     output: &mut W,
 ) -> Result<(), Error> {
-    let text = std::str::from_utf8(bytes)
-        .map_err(|e| Error::Other(format!("output is not valid UTF-8: {e}")))?;
     let mut frame = chart::frame(g, term_width, color);
     let collected = chart::collect(text, g, &frame);
     // What the collector could not use, said out loud under the chart: one
@@ -2894,7 +2890,7 @@ mod tests {
         let mut buf = Vec::new();
         run(&plan, &out_header, &opts, &mut reader, &mut buf).unwrap();
         let mut out = Vec::new();
-        render(&buf, &plan, screen, &mut out).unwrap();
+        render(std::str::from_utf8(&buf).unwrap(), &plan, screen, &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 

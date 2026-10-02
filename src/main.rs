@@ -161,13 +161,12 @@ fn run() -> Result<(), Failure> {
         Progress::default()
     };
     if buffered {
-        let mut buf: Vec<u8> = Vec::new();
-        run_into(&mut source, &plan, &out_header, &opts, &progress, &mut buf)
+        let text = buffered_text(&mut source, &plan, &out_header, &opts, &progress)
             .map_err(|e| run_error(&script, e, &console))?;
         // A table or a chart is read on screen, so a long one is paged. The
         // pager starts only now, with the run done, so it never sits waiting
-        // on a slow pipeline. A table prints a line for each line of the
-        // run's output, so that says whether it fills the window.
+        // on a slow pipeline. A table prints a line for each line of the CSV
+        // it renders, so that says whether it fills the window.
         let table = matches!(plan.output, OutputFormat::Aligned(_));
         // Asked of the terminal before a pager takes it over, and while no
         // other thread runs (see `term::background`).
@@ -177,7 +176,7 @@ fn run() -> Result<(), Failure> {
             None
         };
         let pager = if table || plan.graph.is_some() {
-            console.pager(table, table && console.fills(&buf))
+            console.pager(table, table && console.fills(text.as_bytes()))
         } else {
             None
         };
@@ -185,7 +184,7 @@ fn run() -> Result<(), Failure> {
         if let Some(p) = pager {
             output = Box::new(p);
         }
-        exec::render(&buf, &plan, &screen, &mut output)?;
+        exec::render(&text, &plan, &screen, &mut output)?;
     } else {
         run_into(
             &mut source,
@@ -327,6 +326,22 @@ fn open_parquet(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
 #[cfg(not(feature = "parquet"))]
 fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
     Err("parquet input requires building csvm with --features parquet".to_string())
+}
+
+/// The CSV a buffered run renders: what the run writes, counting the input
+/// read into `progress`.
+fn buffered_text(
+    source: &mut Source,
+    plan: &csvm::plan::Plan,
+    out_header: &[String],
+    opts: &exec::RunOpts,
+    progress: &Progress,
+) -> Result<String, csvm::error::Error> {
+    let mut buf = Vec::new();
+    run_into(source, plan, out_header, opts, progress, &mut buf)?;
+    String::from_utf8(buf).map_err(|e| {
+        csvm::error::Error::Other(format!("output is not valid UTF-8: {}", e.utf8_error()))
+    })
 }
 
 /// Run the plan over `source` into `output`, counting the input read into
