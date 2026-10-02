@@ -246,6 +246,19 @@ fn a_row_kept_as_read_is_written_as_any_row_is() {
     // on every path a row kept as read takes.
     let input = "a,b\n\"x\",1\n2,y\rz\n3,w\n";
     let expect = "a,b\nx,1\n2,\"y\rz\"\n3,w\n";
+    for args in [
+        &["-n", "1", "select a != ''"][..],
+        &["-n", "4", "select a != ''"],
+        &["head 5"],
+        &["uniq"],
+    ] {
+        let (ok, out, err) = csvm(args, input);
+        assert!(ok, "{args:?}: {err}");
+        assert_eq!(out, expect, "{args:?}");
+    }
+    let (ok, out, err) = csvm(&["tail +2"], input);
+    assert!(ok, "{err}");
+    assert_eq!(out, "a,b\n2,\"y\rz\"\n3,w\n");
     let file = temp_csv(input);
     let (ok, out, err) = csvm(&["-n", "4", "select a != ''", file.to_str().unwrap()], "");
     assert!(ok, "{err}");

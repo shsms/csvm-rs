@@ -472,6 +472,16 @@ impl<'p> RowChain<'p> {
             .any(|s| matches!(s, RowStep::Window(w) if w.done()))
     }
 
+    /// Whether every step leaves a row's cells as they are, so a row that
+    /// comes out is its line as read.
+    fn keeps_cells(&self) -> bool {
+        self.steps.iter().all(|step| match step {
+            RowStep::Transform(stmts, _) => stmts_keep_cells(stmts),
+            RowStep::Window(_) | RowStep::Uniq(..) => true,
+            RowStep::Join(_) => false,
+        })
+    }
+
     /// Run `row` through every step, handing `emit` each row that comes out
     /// of the last (a join may make it several).
     fn pass<'a>(
@@ -500,6 +510,10 @@ impl<'p> RowChain<'p> {
 /// Where [`scan`] puts the rows that make it through.
 trait RowSink {
     fn row(&mut self, row: &[Field<'_>]);
+    /// [`RowSink::row`] for a row whose cells are those of `line`, as read.
+    fn unchanged_row(&mut self, row: &[Field<'_>], _line: &str) {
+        self.row(row);
+    }
     /// [`RowSink::row`] for a row already owned, which a sink may keep.
     #[cfg(feature = "parquet")]
     fn take_row(&mut self, row: OwnedRow) {
@@ -521,6 +535,10 @@ struct LinesTo<'w, W> {
 impl<W: Write> RowSink for LinesTo<'_, W> {
     fn row(&mut self, row: &[Field<'_>]) {
         csv::write_row(&mut self.buf, row);
+    }
+
+    fn unchanged_row(&mut self, row: &[Field<'_>], line: &str) {
+        csv::write_unchanged(&mut self.buf, line, row);
     }
 
     fn chunk_end(&mut self) -> Result<(), Error> {
@@ -568,20 +586,30 @@ fn scan<R: BufRead>(
     sink: &mut impl RowSink,
 ) -> Result<(), Error> {
     let mut space = ChunkSpace::default();
+    let keeps_cells = chain.keeps_cells();
     while !chain.done() {
         let Some(chunk) = next_chunk_available(input, chunk_size, &mut space)? else {
             break;
         };
         let mut scratch: Vec<Field> = Vec::new();
         let mut err: Option<Error> = None;
-        csv::parse_chunk(chunk, |row| {
-            if err.is_some() || chain.done() {
-                return;
-            }
-            if let Err(e) = chain.pass(row, &mut scratch, |row| sink.row(row)) {
-                err = Some(e);
-            }
-        });
+        // A row's line is passed on only when the chain leaves its cells
+        // as read.
+        if keeps_cells {
+            csv::parse_chunk_lines(chunk, |row, line| {
+                if err.is_none() && !chain.done() {
+                    err = chain
+                        .pass(row, &mut scratch, |row| sink.unchanged_row(row, line))
+                        .err();
+                }
+            });
+        } else {
+            csv::parse_chunk(chunk, |row| {
+                if err.is_none() && !chain.done() {
+                    err = chain.pass(row, &mut scratch, |row| sink.row(row)).err();
+                }
+            });
+        }
         if let Some(e) = err {
             return Err(e);
         }
@@ -1254,6 +1282,7 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
     let cap = threads * 2 + 1;
     let (chunk_tx, chunk_rx) = bounded::<(u64, String)>(cap);
     let (out_tx, out_rx) = bounded::<(u64, Result<String, Error>)>(cap);
+    let keeps_cells = stmts_keep_cells(stmts);
 
     thread::scope(|scope| {
         for _ in 0..threads {
@@ -1264,11 +1293,14 @@ fn stream_transform_parallel<R: BufRead, W: Write + Send>(
                     let mut out_buf = String::new();
                     let mut scratch: Vec<Field> = Vec::new();
                     let mut err: Option<Error> = None;
-                    csv::parse_chunk(&chunk, |row| {
+                    csv::parse_chunk_lines(&chunk, |row, line| {
                         if err.is_some() {
                             return;
                         }
                         match apply_stmts(stmts, row, &mut scratch, &EvalCtx::default()) {
+                            Ok(true) if keeps_cells => {
+                                csv::write_unchanged(&mut out_buf, line, row)
+                            }
                             Ok(true) => csv::write_row(&mut out_buf, row),
                             Ok(false) => {}
                             Err(e) => err = Some(e),

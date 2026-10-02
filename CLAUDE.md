@@ -602,9 +602,11 @@ by field (`parse_fields`).
 - UTF-8 in, UTF-8 out. First line is the header.
 - Unchanged borrowed fields are written back verbatim (zero re-encoding); only
   fields that needed unescaping or were converted to numbers allocate. A row
-  every statement left as read (`Stmt::keeps_cells`: `select`, `rename`) is
-  written as its line (`csv::write_unchanged`) when the line holds no quote
-  and no carriage return, the only bytes writing its cells could change.
+  every statement left as read (`Stmt::keeps_cells`: `select`, `rename`),
+  and that went through only stages that move rows but not cells (`head`,
+  `tail +N`, `uniq`), is written as its line (`csv::write_unchanged`) when
+  the line holds no quote and no carriage return, the only bytes writing its
+  cells could change.
 
 `csv` / `csv-core` were evaluated; the hand-rolled scanner was chosen because the
 parallel-chunk + zero-copy-borrow design needs to slice fields directly out of
