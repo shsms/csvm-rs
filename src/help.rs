@@ -205,8 +205,9 @@ In `cols -v` an unknown name is ignored, but a bad position or range is an error
         aliases: &[],
         summary: "keep or drop matching rows",
         synopsis: &[
-            "select EXPR     keep rows where EXPR is true",
-            "select -v EXPR  drop rows where EXPR is true",
+            "select EXPR            keep rows where EXPR is true",
+            "select -v EXPR         drop rows where EXPR is true",
+            "select -B N -A M EXPR  also keep N rows before and M after each match",
         ],
         detail: "EXPR is a bare infix expression (quote only string literals, not the whole \
 expression). See `csvm help operators` for the full operator set. Comparison operands are full \
@@ -219,16 +220,31 @@ num(), a column typed numeric by add), lexical against a statically string side 
 literal, ++ concat, a bool, str(), a column typed text by add); an ordering (< > <= >=) \
 between two untyped operands auto-detects per row \
 (numeric when both sides parse as numbers, else lexical), while == / != between untyped \
-operands stay lexical.",
+operands stay lexical. With -B N / -A M (also written -BN / -AM), like grep's, each match \
+also keeps up to N rows before it and M after it, as they reach the select; windows that \
+overlap keep each row once, in order, and with -v the rows kept are those around the rows \
+that do not match. It runs single-threaded, in the order rows reach it, and prev() inside it reads \
+every row reaching the select, shown or not.",
         examples: &[
             "csvm 'select amount > 1000 && flag == \"t\"' data.csv",
             "csvm 'select price * qty >= 1000' data.csv",
             "csvm 'select name =~ \"^A\"' data.csv",
+            "csvm 'add d = value - prev(value) | select -B1 d > 10000 | fmt' data.csv",
         ],
-        flags: &[Flag {
-            names: &["-v"],
-            help: "drop rows where EXPR is true",
-        }],
+        flags: &[
+            Flag {
+                names: &["-v"],
+                help: "drop rows where EXPR is true",
+            },
+            Flag {
+                names: &["-B"],
+                help: "also keep N rows before each match",
+            },
+            Flag {
+                names: &["-A"],
+                help: "also keep M rows after each match",
+            },
+        ],
     },
     CmdHelp {
         name: "sort",

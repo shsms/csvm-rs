@@ -637,6 +637,7 @@ fn value_flags(command: &str) -> &'static [&'static str] {
     match command {
         "head" | "tail" => &["-n", "--lines"],
         "fmt" => &["-p", "--precision"],
+        "select" => &["-A", "-B"],
         "join" => &["-L", "--lsuffix", "-R", "--rsuffix"],
         "graph" => &[
             "-W",
@@ -714,6 +715,8 @@ fn place_of(head: &Head, in_bracket: bool, number: bool) -> Place {
     }
     let args = head.args();
     match command {
+        // A `-B`/`-A` waiting for its count.
+        "select" if read_flags(command, args).1.is_some() => Place::Nothing,
         "select" => Place::Expression,
         "add" if has_eq(args, head.glued) => Place::Expression,
         "cols" | "uniq" | "stats" => Place::Column,
@@ -981,6 +984,9 @@ mod tests {
         assert_eq!(at("fmt -p 2 -@").place, Place::Flag("fmt".into()));
         assert_eq!(at("join -L _x -@").place, Place::Flag("join".into()));
         assert_eq!(at("join -L -@").place, Place::Nothing);
+        assert_eq!(at("select -B 2 -@").place, Place::Flag("select".into()));
+        assert_eq!(at("select -B2 -@").place, Place::Flag("select".into()));
+        assert_eq!(at("select -B @").place, Place::Nothing);
         // graph takes flags after its columns too.
         assert_eq!(at("graph hist a -@").place, Place::Flag("graph".into()));
         assert_eq!(at("graph hist a -@").word, 13..14);
