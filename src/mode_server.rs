@@ -243,7 +243,8 @@ impl Session {
     /// what fits where the cursor is in the script (see [`complete::find`]),
     /// each replacing the word the cursor is in. Commands and the script's
     /// `fn` names at the start of a stage, a command's flags, the columns at
-    /// the cursor's stage, and the functions in an expression. None when
+    /// the cursor's stage, the functions in an expression, and the file
+    /// names where a `join` or `from` item takes its file. None when
     /// `at` is not in the script argument, or csvm finds no script on the
     /// line (an argument is not UTF-8, the line is a usage error, help, or
     /// has `-f`), or the script is `raw`. When the columns cannot be known
@@ -277,9 +278,56 @@ impl Session {
                 items.extend(complete::function_items(word));
                 items
             }
-            Place::File | Place::Nothing => Vec::new(),
+            Place::File => {
+                // A closing quote, after an opening one.
+                let closed =
+                    typed.starts_with('"') && args.script.as_bytes().get(word.end) == Some(&b'"');
+                self.file_items(request, word, typed, closed)
+            }
+            Place::Nothing => Vec::new(),
         };
         typed_first(items, typed)
+    }
+
+    /// The items for a file whose path starts `typed`, replacing the bytes
+    /// `at`: the entries of the directory `typed` names up to its last `/`
+    /// (from the shell's directory), that start with the rest, in natural
+    /// order. Hidden entries only when the rest starts with `.`; nothing
+    /// for an unquoted pattern, which names its own files. After an opening
+    /// `"`, every item is quoted; a quoted item is left open when `closed`:
+    /// a closing quote already follows the word.
+    fn file_items(
+        &mut self,
+        request: &Request,
+        at: &Range<usize>,
+        typed: &str,
+        closed: bool,
+    ) -> Vec<Item> {
+        // A quoted path is taken literally; an unquoted pattern names its
+        // own files.
+        let (quoted, typed) = match typed.strip_prefix('"') {
+            Some(rest) => (true, rest),
+            None if pattern::is_pattern(typed) => return Vec::new(),
+            None => (false, typed),
+        };
+        let (dir, prefix) = match typed.rfind('/') {
+            Some(i) => typed.split_at(i + 1),
+            None => ("", typed),
+        };
+        let listed = if dir.is_empty() { "." } else { dir };
+        let Some(path) = from_dir(shell_dir(&request.cwd), Path::new(listed)) else {
+            return Vec::new();
+        };
+        let Some(mut names) = self.headers.list(&path) else {
+            return Vec::new();
+        };
+        names.retain(|n| n.starts_with(prefix) && (!n.starts_with('.') || prefix.starts_with('.')));
+        // At most what a reply holds, before a look at each entry's type.
+        names
+            .iter()
+            .filter_map(|n| complete::file_item(at, dir, n, path.join(n).is_dir(), quoted, closed))
+            .take(MAX_ITEMS)
+            .collect()
     }
 
     /// The columns at the cursor's stage, as `found` places it in the
@@ -578,8 +626,9 @@ impl Headers {
         columns
     }
 
-    /// The names in directory `dir`, listed again only when its time
-    /// changes. `None` when it is relative or cannot be listed.
+    /// The names in directory `dir`, in natural order, listed again only
+    /// when its time changes. `None` when it is relative or cannot be
+    /// listed.
     fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
         if dir.is_relative() {
             return None;
@@ -590,7 +639,8 @@ impl Headers {
         {
             return Some(names.clone());
         }
-        let names = pattern::Fs::list(&mut pattern::RealFs, dir)?;
+        let mut names = pattern::Fs::list(&mut pattern::RealFs, dir)?;
+        names.sort_by(|a, b| pattern::natural_cmp(a, b));
         if self.dirs.len() >= MAX_FILES {
             self.dirs.clear();
         }
@@ -757,7 +807,7 @@ fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
         return items;
     }
     fn unquoted(text: &str) -> &str {
-        text.strip_prefix('`').unwrap_or(text)
+        text.strip_prefix(['`', '"']).unwrap_or(text)
     }
     let typed = unquoted(typed);
     let (mut first, rest): (Vec<Item>, Vec<Item>) = items
@@ -2409,6 +2459,79 @@ mod tests {
         // In a group whose file is a pattern, its first file's columns.
         let items = complete_in(&dir, &["SCRIPT"], "from (sort @) pv.*.csv");
         assert_eq!(texts(&items), ["ts", "v"]);
+    }
+
+    #[test]
+    fn a_file_slot_completes_file_names() {
+        let dir = TempDir::new("complete-files");
+        for name in [
+            "pv.1.csv",
+            "pv.10.csv",
+            "pv.9.csv",
+            ".hidden.csv",
+            "my file.csv",
+        ] {
+            dir.write(name, "");
+        }
+        std::fs::create_dir(Path::new(dir.path()).join("sub")).unwrap();
+        dir.write("sub/a.csv", "");
+        let items = complete_in(&dir, &["SCRIPT"], "join pv.@");
+        assert_eq!(texts(&items), ["pv.1.csv", "pv.9.csv", "pv.10.csv"]);
+        assert_eq!(items[0].1.as_deref(), Some("file"));
+        // Quoted when it needs to be; a directory ends in `/`; no hidden.
+        let items = complete_in(&dir, &["SCRIPT"], "from @");
+        assert_eq!(
+            texts(&items),
+            [
+                "\"my file.csv\"",
+                "pv.1.csv",
+                "pv.9.csv",
+                "pv.10.csv",
+                "sub/"
+            ]
+        );
+        assert_eq!(items[4].1.as_deref(), Some("directory"));
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join sub/@")),
+            ["sub/a.csv"]
+        );
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join .h@")),
+            [".hidden.csv"]
+        );
+        // A pattern is left as it is.
+        dir.write("pv.{1}.csv", "");
+        assert!(complete_in(&dir, &["SCRIPT"], "join pv.{@").is_empty());
+        // Inside a quoted path, and on into a directory that needs quotes.
+        std::fs::create_dir(Path::new(dir.path()).join("my dir")).unwrap();
+        dir.write("my dir/a.csv", "");
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join \"my f@")),
+            ["\"my file.csv\""]
+        );
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join \"my dir/@")),
+            ["\"my dir/a.csv\""]
+        );
+        // A plain name is quoted too after an opening quote, and a closing
+        // quote already there is not written again.
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join \"pv.1@")),
+            ["\"pv.1.csv\"", "\"pv.10.csv\""]
+        );
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join \"my d@\" on k")),
+            ["\"my dir/"]
+        );
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join \"my dir/@\" on k")),
+            ["\"my dir/a.csv"]
+        );
+        // A quote glued after an unquoted word does not close it.
+        assert_eq!(
+            texts(&complete_in(&dir, &["SCRIPT"], "join my@\"x\" on k")),
+            ["\"my dir/", "\"my file.csv\""]
+        );
     }
 
     #[test]

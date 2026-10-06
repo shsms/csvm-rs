@@ -229,6 +229,44 @@ pub fn column_item(at: &Range<usize>, name: &str) -> Option<Item> {
     })
 }
 
+/// The item for the entry `name` of directory `dir`, as typed, noted `file`
+/// or `directory`; a directory's ends in `/`. The path is bare when it is
+/// plainly one (letters, digits and `_./-+~`, not starting with a `-`, which
+/// would read as a flag) and not `quoted` (typed after an opening `"`), else
+/// double-quoted, which the parser takes literally. A directory's quote is
+/// left open, to go on into it, and so is any quote when `closed`: a closing
+/// quote already follows the word. `None` for a path a double-quoted one
+/// cannot hold (with a `"` or a line break), or longer than [`MAX_MESSAGE`].
+pub fn file_item(
+    at: &Range<usize>,
+    dir: &str,
+    name: &str,
+    is_dir: bool,
+    quoted: bool,
+    closed: bool,
+) -> Option<Item> {
+    let path = format!("{dir}{name}{}", if is_dir { "/" } else { "" });
+    if path.contains(['"', '\n', '\r']) {
+        return None;
+    }
+    let plain = !path.starts_with('-')
+        && path
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_./-+~".contains(c));
+    let text = if plain && !quoted {
+        path
+    } else if is_dir || closed {
+        format!("\"{path}")
+    } else {
+        format!("\"{path}\"")
+    };
+    if text.len() > MAX_MESSAGE {
+        return None;
+    }
+    let note = if is_dir { "directory" } else { "file" };
+    Some(item(at, &text, note))
+}
+
 fn item(at: &Range<usize>, text: &str, note: &str) -> Item {
     Item {
         at: at.clone(),
@@ -1119,6 +1157,60 @@ mod tests {
         ] {
             assert_eq!(find(s, at_).word, word, "{s}");
         }
+    }
+
+    #[test]
+    fn a_file_item_is_quoted_unless_it_is_plainly_a_path() {
+        let text = |name: &str| {
+            file_item(&(0..0), "d/", name, false, false, false)
+                .unwrap()
+                .text
+        };
+        assert_eq!(text("pv.1_a-b+c~.csv"), "d/pv.1_a-b+c~.csv");
+        for (name, quoted) in [
+            ("my file.csv", "\"d/my file.csv\""),
+            ("a{1}.csv", "\"d/a{1}.csv\""),
+        ] {
+            assert_eq!(text(name), quoted);
+        }
+        // Letters beyond ASCII are read as they are.
+        assert_eq!(text("ä.csv"), "d/ä.csv");
+        // A quoted directory is left open, to go on into it.
+        assert_eq!(
+            file_item(&(0..0), "", "my dir", true, false, false)
+                .unwrap()
+                .text,
+            "\"my dir/"
+        );
+        assert!(file_item(&(0..0), "", "a\"b.csv", false, false, false).is_none());
+        assert!(file_item(&(0..0), "", "a\nb.csv", false, false, false).is_none());
+        assert!(
+            file_item(
+                &(0..0),
+                "",
+                &"a".repeat(MAX_MESSAGE + 1),
+                false,
+                false,
+                false
+            )
+            .is_none()
+        );
+        // After an opening quote, every item is quoted; a closing quote
+        // already there is not written again.
+        let quoted = |closed| {
+            file_item(&(0..0), "", "a.csv", false, true, closed)
+                .unwrap()
+                .text
+        };
+        assert_eq!(quoted(false), "\"a.csv\"");
+        assert_eq!(quoted(true), "\"a.csv");
+        // A leading `-` would read as a flag.
+        assert_eq!(
+            file_item(&(0..0), "", "-x.csv", false, false, false)
+                .unwrap()
+                .text,
+            "\"-x.csv\""
+        );
     }
 
     #[test]

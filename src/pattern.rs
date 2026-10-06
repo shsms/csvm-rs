@@ -261,7 +261,7 @@ fn glob_at(p: &[char], n: &[char], caps: &mut Vec<String>) -> bool {
 
 /// Order names with each run of digits compared as a number, so `9`
 /// comes before `10`; equal numbers put the shorter run first (`9` < `09`).
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
     let (mut a, mut b) = (a, b);
     while !a.is_empty() && !b.is_empty() {
         let da = a.bytes().take_while(u8::is_ascii_digit).count();
