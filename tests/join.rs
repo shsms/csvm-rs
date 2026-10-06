@@ -283,3 +283,58 @@ fn join_keeps_the_left_columns_types() {
     .unwrap();
     assert_eq!(out, "id,qty,tag\n1,10,a\n3,100,c\n2,9,b\n");
 }
+
+#[test]
+fn a_join_pattern_joins_each_file_with_its_part() {
+    let dir = common::TempDir::new();
+    dir.write("pv.1.csv", "ts,v\n1,10\n2,20\n");
+    dir.write("pv.2.csv", "ts,v\n1,11\n2,21\n");
+    let script = format!("join {} on ts", dir.at("pv.{1,2}.csv"));
+    assert_eq!(
+        run(&script, "ts,load\n1,5\n2,6\n").unwrap(),
+        "ts,load,v_1,v_2\n1,5,10,11\n2,6,20,21\n"
+    );
+}
+
+#[test]
+fn a_join_star_takes_files_in_natural_order() {
+    let dir = common::TempDir::new();
+    dir.write("pv.10.csv", "ts,v\n1,100\n");
+    dir.write("pv.9.csv", "ts,v\n1,9\n");
+    let script = format!("join {} on ts", dir.at("pv.*.csv"));
+    assert_eq!(run(&script, "ts\n1\n").unwrap(), "ts,v_9,v_10\n1,9,100\n");
+}
+
+#[test]
+fn a_join_pattern_runs_its_sub_pipeline_on_each_file() {
+    let dir = common::TempDir::new();
+    dir.write("a.x.csv", "ts,v\n1,1\n2,4\n");
+    dir.write("a.y.csv", "ts,v\n1,2\n2,8\n");
+    let script = format!("join (add d = v - prev(v)) {} on ts", dir.at("a.{x,y}.csv"));
+    assert_eq!(
+        run(&script, "ts\n1\n2\n").unwrap(),
+        "ts,v_x,d_x,v_y,d_y\n1,1,0,2,0\n2,4,3,8,6\n"
+    );
+}
+
+#[test]
+fn a_join_pattern_error_is_reported() {
+    let dir = common::TempDir::new();
+    dir.write("pv.1.csv", "ts,v\n1,10\n");
+    let e = run(&format!("join {} on ts", dir.at("pv.{1,2}.csv")), "ts\n1\n").unwrap_err();
+    assert!(e.contains("no such file") && e.contains("pv.2.csv"), "{e}");
+    let e = run(&format!("join {} on ts", dir.at("q.*.csv")), "ts\n1\n").unwrap_err();
+    assert!(e.contains("no file matches"), "{e}");
+}
+
+#[test]
+fn per_item_suffixes_apply_to_their_own_file() {
+    let dir = common::TempDir::new();
+    let b = dir.write("b.csv", "k,v\n1,2\n");
+    let c = dir.write("c.csv", "k,v\n1,3\n");
+    let script = format!("join -R _b {b} on k, -R _c {c} on k");
+    assert_eq!(
+        run(&script, "k,v\n1,1\n").unwrap(),
+        "k,v,v_b,v_c\n1,1,2,3\n"
+    );
+}

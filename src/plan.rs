@@ -1080,7 +1080,7 @@ impl Sources {
     }
 
     /// `e`, placed on the whole of stage `stage`, a stage of one part.
-    fn place_on_part(&self, stage: usize, e: Error) -> Error {
+    pub(crate) fn place_on_part(&self, stage: usize, e: Error) -> Error {
         match self.stages.get(stage).and_then(|s| s.first()) {
             Some(written) => written.place_whole(e),
             None => e,
@@ -1114,7 +1114,7 @@ impl Written {
     }
 
     /// `e` placed on the whole part, when its span is known.
-    fn place_whole(&self, e: Error) -> Error {
+    pub(crate) fn place_whole(&self, e: Error) -> Error {
         match &self.span {
             Some(span) => e.at(span.clone()),
             None => e,

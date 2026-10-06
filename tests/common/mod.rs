@@ -34,3 +34,39 @@ pub fn temp_csv(content: &str) -> TempCsv {
     std::fs::write(&path, content).unwrap();
     TempCsv(path)
 }
+
+/// A directory in the system temp directory, removed when dropped. Not
+/// every test crate uses it.
+#[allow(dead_code)]
+pub struct TempDir(PathBuf);
+
+#[allow(dead_code)]
+impl TempDir {
+    pub fn new() -> TempDir {
+        let path = std::env::temp_dir().join(format!(
+            "csvm_test_dir_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        TempDir(path)
+    }
+
+    /// Write `content` to `name` inside it; returns the full path.
+    pub fn write(&self, name: &str, content: &str) -> String {
+        let path = self.0.join(name);
+        std::fs::write(&path, content).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    /// `name` inside it, as a string.
+    pub fn at(&self, name: &str) -> String {
+        self.0.join(name).to_str().unwrap().to_string()
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}

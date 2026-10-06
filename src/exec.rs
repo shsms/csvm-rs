@@ -23,6 +23,7 @@ use crate::color::{self, Color, Depth, Rgb, Style};
 use crate::csv;
 use crate::error::Error;
 use crate::field::{self, Field};
+use crate::pattern;
 use crate::plan::{
     AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, ContextStmt, EvalCtx, GraphOpts,
     GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
@@ -1958,19 +1959,78 @@ fn apply_stages_over_rows(
     Ok(rows)
 }
 
-/// Read each `join`'s right-side file header and resolve its sub-plan, recording
+/// Expand each `join`'s file pattern ([`expand_joins`]), then read each
+/// right-side file header and resolve its sub-plan, recording
 /// the right output header on the `JoinStmt`. Must run before [`Plan::resolve`]
 /// (which needs the right header) — it's separate because it does IO. Recurses
 /// so a join nested inside a right sub-pipeline is prepared too.
 pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
+    expand_joins(plan, None, &mut pattern::RealFs)?;
+    read_join_headers(plan)
+}
+
+/// Read each join's right file header and resolve its sub-plan.
+fn read_join_headers(plan: &mut Plan) -> Result<(), Error> {
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
-            prepare_joins(&mut j.right_plan)?;
+            read_join_headers(&mut j.right_plan)?;
             let in_header = read_header_from_path(Path::new(&j.file))?.0;
             j.right_header = j.right_plan.resolve(&in_header)?;
         }
     }
     Ok(())
+}
+
+/// Expand each join's file pattern into one join per file, in place, its
+/// sub-pipeline's joins too; every copy keeps the item's place in the
+/// script, and its file's part. `base` is the directory a
+/// relative path is read from (`None`: the process's own).
+pub fn expand_joins(
+    plan: &mut Plan,
+    base: Option<&Path>,
+    fs: &mut dyn pattern::Fs,
+) -> Result<(), Error> {
+    let stages = std::mem::take(&mut plan.stages);
+    let mut sources = std::mem::take(&mut plan.sources.stages).into_iter();
+    for stage in stages {
+        let written = sources.next();
+        let Stage::Join(mut j) = stage else {
+            plan.stages.push(stage);
+            plan.sources.stages.extend(written);
+            continue;
+        };
+        expand_joins(&mut j.right_plan, base, fs)?;
+        let place = |e: Error| match written.as_ref().and_then(|w| w.first()) {
+            Some(w) => w.place_whole(e),
+            None => e,
+        };
+        for copy in expand_item(j, base, fs).map_err(place)? {
+            plan.stages.push(Stage::Join(copy));
+            plan.sources.stages.extend(written.clone());
+        }
+    }
+    Ok(())
+}
+
+/// The joins `j` stands for: itself, or, when its file is a pattern, one
+/// per file the pattern matches, with that file's part.
+fn expand_item(
+    j: JoinStmt,
+    base: Option<&Path>,
+    fs: &mut dyn pattern::Fs,
+) -> Result<Vec<JoinStmt>, Error> {
+    if !j.pattern {
+        return Ok(vec![j]);
+    }
+    Ok(pattern::expand(&j.file, base, fs)?
+        .into_iter()
+        .map(|f| JoinStmt {
+            file: f.path,
+            pattern: false,
+            part: f.part,
+            ..j.clone()
+        })
+        .collect())
 }
 
 /// Run a join's right sub-plan over its file and collect the result as owned
