@@ -45,6 +45,7 @@ use crate::complete::{self, Found, Group, Place};
 use crate::error::Error;
 use crate::exec;
 use crate::parse::{self, Depths, Recorder, SpanKind};
+use crate::pattern;
 use crate::plan::{Plan, Stage};
 use std::collections::HashMap;
 use std::fs::File;
@@ -296,15 +297,25 @@ impl Session {
         found: &Found,
     ) -> Option<Vec<String>> {
         let cwd = shell_dir(&request.cwd);
+        let mut plan = if found.stages_before.is_empty() {
+            None
+        } else {
+            Some(parse::parse(&found.stages_before).ok()?)
+        };
         let header = match &found.group {
-            Group::Top => self.input_header(request, args)?,
+            Group::Top => match plan
+                .as_mut()
+                .and_then(|p| self.named_input_header(p, request, args))
+            {
+                Some(header) => header?,
+                None => self.input_header(request, args)?,
+            },
             Group::Join { file: Some(file) } => join_header(&mut self.headers, cwd, file)?,
             Group::Join { file: None } | Group::FnBody => return None,
         };
-        if found.stages_before.is_empty() {
+        let Some(mut plan) = plan else {
             return Some(header);
-        }
-        let mut plan = parse::parse(&found.stages_before).ok()?;
+        };
         resolve_joins(&mut plan, cwd, &mut self.headers).ok()?;
         plan.resolve(&header).ok()
     }
@@ -319,11 +330,39 @@ impl Session {
         args: &cli::Args,
         plan: &mut Plan,
     ) -> Option<Error> {
-        let header = self.input_header(request, args)?;
-        if let Err(e) = resolve_joins(plan, shell_dir(&request.cwd), &mut self.headers) {
+        let cwd = shell_dir(&request.cwd);
+        let header = match self.named_input_header(plan, request, args) {
+            Some(header) => header?,
+            None => self.input_header(request, args)?,
+        };
+        if let Err(e) = resolve_joins(plan, cwd, &mut self.headers) {
             return e;
         }
         plan.resolve(&header).err()
+    }
+
+    /// When `plan` begins with `from`, turn it into its stages as csvm
+    /// does and give the header csvm reads for its first file, with the
+    /// other arguments as given (`Some(None)`: it cannot be known here).
+    /// `None` when the plan has no `from`.
+    fn named_input_header(
+        &mut self,
+        plan: &mut Plan,
+        request: &Request,
+        args: &cli::Args,
+    ) -> Option<Option<Vec<String>>> {
+        plan.from.as_ref()?;
+        let mut fs = SessionFs {
+            headers: &mut self.headers,
+        };
+        let Ok(Some(from)) = exec::prepare_from(plan, shell_dir(&request.cwd), &mut fs) else {
+            return Some(None);
+        };
+        // Arguments csvm refuses to run have no header to check against.
+        let Ok(args) = args.clone().with_from_input(from.path, from.several) else {
+            return Some(None);
+        };
+        Some(self.input_header(request, &args))
     }
 
     /// The input's header, as csvm would read it for `args`: the file's
@@ -440,10 +479,12 @@ fn resolve_joins(
     cwd: Option<&Path>,
     headers: &mut Headers,
 ) -> Result<(), Option<Error>> {
+    exec::expand_joins(plan, cwd, &mut SessionFs { headers }).map_err(|_| None)?;
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
             resolve_joins(&mut j.right_plan, cwd, headers)?;
-            let header = join_header(headers, cwd, &j.file).ok_or(None)?;
+            // Expanded above: the file is the one named, never a pattern.
+            let header = file_header(headers, cwd, &j.file).ok_or(None)?;
             j.right_header = j.right_plan.resolve(&header).map_err(Some)?;
         }
     }
@@ -453,6 +494,13 @@ fn resolve_joins(
 /// The header of a join's right file, `file` from `cwd`. `None` when it
 /// cannot be known (see [`from_dir`] and [`Headers::first_line`]).
 fn join_header(headers: &mut Headers, cwd: Option<&Path>, file: &str) -> Option<Vec<String>> {
+    // A pattern's columns are taken from its first file.
+    let files = pattern::expand(file, cwd, &mut SessionFs { headers }).ok()?;
+    file_header(headers, cwd, &files.into_iter().next()?.path)
+}
+
+/// The header of the CSV file `file`, from `cwd`.
+fn file_header(headers: &mut Headers, cwd: Option<&Path>, file: &str) -> Option<Vec<String>> {
     // A join's right file is always CSV.
     headers.first_line(&from_dir(cwd, Path::new(file))?, InputFormat::Csv)
 }
@@ -471,6 +519,26 @@ const MAX_HEADER_BYTES: u64 = 1 << 20;
 #[derive(Default)]
 struct Headers {
     files: HashMap<(PathBuf, InputFormat), Seen>,
+    /// Each directory a pattern was matched in: its names, and its time
+    /// when they were listed.
+    dirs: HashMap<PathBuf, (Option<SystemTime>, Vec<String>)>,
+}
+
+/// The filesystem as the mode server sees it: listings cached in
+/// [`Headers`], and no relative path (with no shell directory to take it
+/// from, it cannot be known here).
+struct SessionFs<'a> {
+    headers: &'a mut Headers,
+}
+
+impl pattern::Fs for SessionFs<'_> {
+    fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
+        self.headers.list(dir)
+    }
+
+    fn is_file(&mut self, path: &Path) -> bool {
+        path.is_absolute() && std::fs::metadata(path).is_ok_and(|m| m.is_file())
+    }
 }
 
 /// One file's first line, or `None` when it could not be read, and the
@@ -508,6 +576,27 @@ impl Headers {
             },
         );
         columns
+    }
+
+    /// The names in directory `dir`, listed again only when its time
+    /// changes. `None` when it is relative or cannot be listed.
+    fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
+        if dir.is_relative() {
+            return None;
+        }
+        let modified = std::fs::metadata(dir).ok()?.modified().ok();
+        if let Some((seen, names)) = self.dirs.get(dir)
+            && *seen == modified
+        {
+            return Some(names.clone());
+        }
+        let names = pattern::Fs::list(&mut pattern::RealFs, dir)?;
+        if self.dirs.len() >= MAX_FILES {
+            self.dirs.clear();
+        }
+        self.dirs
+            .insert(dir.to_path_buf(), (modified, names.clone()));
+        Some(names)
     }
 }
 
@@ -1643,6 +1732,71 @@ mod tests {
     }
 
     #[test]
+    fn a_from_script_is_checked_against_its_files() {
+        let dir = TempDir::new("from");
+        dir.write("pv.1.csv", "ts,v\n1,2\n");
+        dir.write("pv.2.csv", "ts,v\n1,3\n");
+        let ask_in = |script: &str| {
+            reply_lines(&Session::default().answer(&request(dir.path(), &["csvm", script])))
+        };
+        assert!(no_error(&ask_in("from pv.{1,2}.csv on ts | cols v_1, v_2")));
+        let last = ask_in("from pv.{1,2}.csv on ts | cols zz")
+            .last()
+            .unwrap()
+            .clone();
+        assert!(
+            last.contains("column not found: zz — have: ts, v_1, v_2"),
+            "{last}"
+        );
+        // A pattern that matches nothing is not a column error here.
+        assert!(no_error(&ask_in("from q.*.csv on ts | cols zz")));
+        // `--header` names the first file's columns, as for an input file.
+        let named = reply_lines(&Session::default().answer(&request(
+            dir.path(),
+            &["csvm", "--header", "x,y", "from pv.1.csv | cols x"],
+        )));
+        assert!(no_error(&named), "{named:?}");
+        // csvm refuses `--header` when from joins several files, so there is
+        // no header to check against.
+        let refused = reply_lines(&Session::default().answer(&request(
+            dir.path(),
+            &[
+                "csvm",
+                "--header",
+                "x,y",
+                "from pv.{1,2}.csv on x | cols zz",
+            ],
+        )));
+        assert!(no_error(&refused), "{refused:?}");
+    }
+
+    #[test]
+    fn a_join_pattern_is_checked_against_its_files() {
+        let dir = TempDir::new("joinpat");
+        dir.write("left.csv", "ts,a\n1,2\n");
+        dir.write("r.x.csv", "ts,b\n1,3\n");
+        dir.write("r.y.csv", "ts,b\n1,4\n");
+        let ask_in = |script: &str| {
+            reply_lines(
+                &Session::default().answer(&request(dir.path(), &["csvm", script, "left.csv"])),
+            )
+        };
+        assert!(no_error(&ask_in("join r.*.csv on ts | cols b_x, b_y")));
+        // A quoted path is that one file, `?` and all.
+        dir.write("r1.csv", "ts,b\n1,5\n");
+        dir.write("r?.csv", "ts,q\n1,6\n");
+        assert!(no_error(&ask_in("join \"r?.csv\" on ts | cols q")));
+        let last = ask_in("join r.*.csv on ts | cols zz")
+            .last()
+            .unwrap()
+            .clone();
+        assert!(
+            last.contains("column not found: zz — have: ts, a, b_x, b_y"),
+            "{last}"
+        );
+    }
+
+    #[test]
     fn a_join_file_is_read_again_only_when_it_changes() {
         let dir = TempDir::new("joincache");
         dir.write("left.csv", "k,a\n1,2\n");
@@ -2243,6 +2397,18 @@ mod tests {
         // No file after the group yet: no columns.
         let items = complete_in(&dir, &["SCRIPT", "left.csv"], "join (sort @");
         assert!(items.is_empty(), "{items:?}");
+    }
+
+    #[test]
+    fn a_from_script_completes_its_files_columns() {
+        let dir = TempDir::new("complete-from");
+        dir.write("pv.1.csv", "ts,v\n");
+        dir.write("pv.2.csv", "ts,v\n");
+        let items = complete_in(&dir, &["SCRIPT"], "from pv.{1,2}.csv on ts | sort @");
+        assert_eq!(texts(&items), ["ts", "v_1", "v_2"]);
+        // In a group whose file is a pattern, its first file's columns.
+        let items = complete_in(&dir, &["SCRIPT"], "from (sort @) pv.*.csv");
+        assert_eq!(texts(&items), ["ts", "v"]);
     }
 
     #[test]

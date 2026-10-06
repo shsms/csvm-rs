@@ -638,7 +638,7 @@ fn value_flags(command: &str) -> &'static [&'static str] {
         "head" | "tail" => &["-n", "--lines"],
         "fmt" => &["-p", "--precision"],
         "select" => &["-A", "-B"],
-        "join" => &["-L", "--lsuffix", "-R", "--rsuffix"],
+        "join" | "from" => &["-L", "--lsuffix", "-R", "--rsuffix"],
         "graph" => &[
             "-W",
             "--width",
@@ -727,8 +727,8 @@ fn place_of(head: &Head, in_bracket: bool, number: bool) -> Place {
         "graph" => graph_place(head),
         // The name after a key's `=` is a column of the file joined, not of
         // the stream.
-        "join" if after_eq(head) => Place::Nothing,
-        "join" => join_place(head),
+        "join" | "from" if after_eq(head) => Place::Nothing,
+        "join" | "from" => join_place(head),
         _ => Place::Nothing,
     }
 }
@@ -984,6 +984,8 @@ mod tests {
         assert_eq!(at("fmt -p 2 -@").place, Place::Flag("fmt".into()));
         assert_eq!(at("join -L _x -@").place, Place::Flag("join".into()));
         assert_eq!(at("join -L -@").place, Place::Nothing);
+        assert_eq!(at("from -R _x -@").place, Place::Flag("from".into()));
+        assert_eq!(at("from -R @").place, Place::Nothing);
         assert_eq!(at("select -B 2 -@").place, Place::Flag("select".into()));
         assert_eq!(at("select -B2 -@").place, Place::Flag("select".into()));
         assert_eq!(at("select -B @").place, Place::Nothing);

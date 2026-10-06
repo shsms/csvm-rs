@@ -489,7 +489,32 @@ a column with add first.",
 pattern: * and ? in its name, {a,b} and {x..y} anywhere; each matched file's non-key columns \
 are suffixed _PART, PART being what the pattern matched. Items and flags are as for join.",
         examples: &["csvm 'from (select v != \"nan\") pv.{572..575}.csv on timestamp | fmt'"],
-        flags: &[],
+        flags: &[
+            Flag {
+                names: &["-l", "--left"],
+                help: "keep every left row, matched or not",
+            },
+            Flag {
+                names: &["-r", "--right"],
+                help: "keep every right row, matched or not",
+            },
+            Flag {
+                names: &["-F", "--full"],
+                help: "keep every row from both sides",
+            },
+            Flag {
+                names: &["--inner"],
+                help: "keep only matching rows (default)",
+            },
+            Flag {
+                names: &["-L", "--lsuffix"],
+                help: "suffix a clashing left column",
+            },
+            Flag {
+                names: &["-R", "--rsuffix"],
+                help: "suffix a clashing right column",
+            },
+        ],
     },
     CmdHelp {
         name: "join",
