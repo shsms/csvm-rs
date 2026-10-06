@@ -52,6 +52,28 @@ impl Args {
         self.out_file.as_deref().filter(|p| *p != "-")
     }
 
+    /// These arguments with `path`, a `from` stage's first file, as the
+    /// input; `several` when `from` joins more files onto it. `Err` when
+    /// csvm cannot run them so: an input file is given too, or an input
+    /// setting (`--header`, Parquet input) would read one of several files.
+    pub fn with_from_input(self, path: String, several: bool) -> Result<Args, String> {
+        if self.in_file.is_some() {
+            return Err("from names the input; drop the input file".to_string());
+        }
+        let args = Args {
+            in_file: Some(path),
+            ..self
+        };
+        // The files joined onto the first are CSV with their own header line.
+        if several && args.header.is_some() {
+            return Err("--header names one input's columns; from joins several files".to_string());
+        }
+        if several && args.input_format() == InputFormat::Parquet {
+            return Err("from joins several files, so they must be CSV".to_string());
+        }
+        Ok(args)
+    }
+
     /// The input format: `--format` when given, else `.parquet` files are
     /// Parquet and everything else is CSV.
     pub fn input_format(&self) -> InputFormat {
@@ -434,6 +456,21 @@ mod tests {
             Parsed::Version => Err("version".into()),
             Parsed::ModeServer => Err("mode server".into()),
         }
+    }
+
+    #[test]
+    fn a_from_input_takes_parquet_or_header_only_alone() {
+        let from = |extra: &[&str], path: &str, several: bool| {
+            let mut parts = extra.to_vec();
+            parts.push("from x");
+            args(&parts).unwrap().with_from_input(path.into(), several)
+        };
+        assert!(from(&[], "x.parquet", false).is_ok());
+        let e = from(&[], "x.parquet", true).unwrap_err();
+        assert!(e.contains("must be CSV"), "{e}");
+        assert!(from(&["--format", "csv"], "x.parquet", true).is_ok());
+        let e = from(&["--header", "a,b"], "x.csv", true).unwrap_err();
+        assert!(e.contains("--header names one input's columns"), "{e}");
     }
 
     #[test]

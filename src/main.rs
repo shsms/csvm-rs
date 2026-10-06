@@ -117,6 +117,17 @@ fn run() -> Result<(), Failure> {
     };
     // Parse the pipe script into a plan here, once.
     let mut plan = parse::parse(&script).map_err(|e| script_error(&script, e, &console))?;
+    // `from` names the input itself: its first file replaces the input file.
+    let input = exec::prepare_from(&mut plan, None, &mut csvm::pattern::RealFs)
+        .map_err(|e| script_error(&script, e, &console))?;
+    let args = match input {
+        Some(from) => args
+            .with_from_input(from.path, from.several)
+            .map_err(Failure::Message)?,
+        None => args,
+    };
+    // Whether the input is typed at the terminal follows the input chosen.
+    let console = Console::read(&args);
     let opts = exec::RunOpts {
         chunk_size: args.chunk_size,
         threads: args.threads,

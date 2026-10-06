@@ -473,3 +473,93 @@ fn a_missing_pipe_in_a_script_file_is_noted() {
          2 | head 5\n  | ^^^^\n"
     );
 }
+
+#[test]
+fn from_reads_its_own_files() {
+    let dir = common::TempDir::new();
+    dir.write("pv.1.csv", "ts,v\n1,10\n");
+    dir.write("pv.2.csv", "ts,v\n1,11\n");
+    let script = format!("from {} on ts", dir.at("pv.{1,2}.csv"));
+    let (ok, out, err) = csvm(&[&script], "");
+    assert!(ok, "{err}");
+    assert_eq!(out, "ts,v_1,v_2\n1,10,11\n");
+}
+
+#[test]
+fn from_and_an_input_file_is_an_error() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "k\n1\n");
+    let (ok, _, err) = csvm(&[&format!("from {a}"), &a], "");
+    assert!(!ok);
+    assert!(err.contains("from names the input"), "{err}");
+}
+
+#[test]
+fn explain_with_from_does_not_wait_on_stdin() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "k,v\n1,2\n");
+    // stdin is left open and empty-but-unclosed would hang; the helper
+    // closes it, so a read would see no header and fail instead.
+    let (ok, out, err) = csvm(&["--explain", &format!("from {a} | cols v")], "");
+    assert!(ok, "{err}");
+    assert!(out.contains("cols"), "{out}");
+}
+
+#[test]
+fn from_one_file_matches_the_positional_run_at_any_thread_count() {
+    let mut content = String::from("id,val\n");
+    for i in 0..5000u32 {
+        content.push_str(&format!("{i},{}\n", (i * 7) % 13));
+    }
+    let dir = common::TempDir::new();
+    let a = dir.write("big.csv", &content);
+    let (_, positional, _) = csvm(&["-n", "1", "select val > 5 | add w = val * 2", &a], "");
+    for n in ["1", "8"] {
+        let (ok, out, err) = csvm(
+            &[
+                "-n",
+                n,
+                &format!("from {a} | select val > 5 | add w = val * 2"),
+            ],
+            "",
+        );
+        assert!(ok, "{err}");
+        assert_eq!(out, positional, "-n {n}");
+    }
+}
+
+#[test]
+fn from_several_files_take_no_header_names_or_parquet() {
+    let dir = common::TempDir::new();
+    dir.write("h1.csv", "1,a\n2,b\n");
+    dir.write("h2.csv", "1,x\n2,y\n");
+    let script = format!("from {} on ts", dir.at("h*.csv"));
+    let (ok, _, err) = csvm(&["--header", "ts,v", &script], "");
+    assert!(!ok);
+    assert!(err.contains("--header names one input's columns"), "{err}");
+    let (ok, _, err) = csvm(&["--format", "parquet", &script], "");
+    assert!(!ok);
+    assert!(
+        err.contains("from joins several files, so they must be CSV"),
+        "{err}"
+    );
+}
+
+#[test]
+fn from_sub_pipeline_and_the_first_stages_run_as_one_transform() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "k,v\n1,2\n");
+    let script = format!("from (select v > 1) {a} | add w = v * 2");
+    let (ok, out, err) = csvm(&["--explain", &script], "");
+    assert!(ok, "{err}");
+    assert_eq!(out.matches("(transform)").count(), 1, "{out}");
+}
+
+#[test]
+fn from_one_file_takes_header_names() {
+    let dir = common::TempDir::new();
+    let h = dir.write("h.csv", "1,a\n2,b\n");
+    let (ok, out, err) = csvm(&["--header", "ts,v", &format!("from {h}")], "");
+    assert!(ok, "{err}");
+    assert_eq!(out, "ts,v\n1,a\n2,b\n");
+}
