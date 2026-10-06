@@ -7,6 +7,7 @@
 //! later modules.
 
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
@@ -23,9 +24,9 @@ use crate::csv;
 use crate::error::Error;
 use crate::field::{self, Field};
 use crate::plan::{
-    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, EvalCtx, GraphOpts, GraphSpec,
-    GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt, TableOpts,
-    ValExpr, apply_stmts, stmts_keep_cells,
+    AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, ContextStmt, EvalCtx, GraphOpts,
+    GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
+    TableOpts, ValExpr, apply_stmts, stmts_keep_cells,
 };
 use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
@@ -283,6 +284,8 @@ enum RowStep<'p> {
     Uniq(&'p [usize], HashSet<String>, String),
     /// An inner or left `join`.
     Join(Box<JoinStep<'p>>),
+    /// `select -B N -A M`.
+    Context(Box<Context<'p>>),
 }
 
 /// Run `row` through `steps`, handing `emit` each row that comes out of the
@@ -308,6 +311,10 @@ fn pass_through<'a, F: FnMut(&mut Vec<Field<'a>>)>(
         RowStep::Join(join) => {
             return join.probe(row, |joined| pass_through(rest, joined, scratch, emit));
         }
+        RowStep::Context(context) => context.offer(row, scratch, |held, scratch| {
+            let mut held: Vec<Field<'a>> = held;
+            pass_through(rest, &mut held, scratch, emit)
+        })?,
     };
     if kept {
         pass_through(rest, row, scratch, emit)
@@ -429,6 +436,66 @@ fn save_cells(saved: &mut OwnedRow, row: &[Field], positions: &[usize]) {
     }
 }
 
+/// What a `select -B N -A M` keeps between rows, which it must see in order:
+/// the last rows that did not match (up to `before` of them), and how many
+/// more rows to let through after the last match.
+struct Context<'p> {
+    stmt: &'p ContextStmt,
+    /// The select's state when it reads `prev()`/`rownum()`.
+    state: Option<Stateful>,
+    held: VecDeque<OwnedRow>,
+    after_left: usize,
+}
+
+impl<'p> Context<'p> {
+    fn new(stmt: &'p ContextStmt) -> Self {
+        Context {
+            stmt,
+            state: stmt
+                .select
+                .is_stateful()
+                .then(|| Stateful::new(std::slice::from_ref(&stmt.select))),
+            held: VecDeque::new(),
+            after_left: 0,
+        }
+    }
+
+    /// Offer the next row: whether it is let through. A match first hands
+    /// `release` the rows held above it, oldest first, with `scratch`; a row
+    /// not let through is held in their place, the oldest dropped once
+    /// `before` are held.
+    fn offer<'a>(
+        &mut self,
+        row: &mut Vec<Field<'a>>,
+        scratch: &mut Vec<Field<'a>>,
+        mut release: impl FnMut(OwnedRow, &mut Vec<Field<'a>>) -> Result<(), Error>,
+    ) -> Result<bool, Error> {
+        let select = std::slice::from_ref(&self.stmt.select);
+        let hit = match &mut self.state {
+            Some(state) => state.apply(select, row, scratch)?,
+            None => apply_stmts(select, row, scratch, &EvalCtx::default())?,
+        };
+        if hit {
+            for held in self.held.drain(..) {
+                release(held, scratch)?;
+            }
+            self.after_left = self.stmt.after;
+            return Ok(true);
+        }
+        if self.after_left > 0 {
+            self.after_left -= 1;
+            return Ok(true);
+        }
+        if self.stmt.before > 0 {
+            if self.held.len() == self.stmt.before {
+                self.held.pop_front();
+            }
+            self.held.push_back(owned_row(row));
+        }
+        Ok(false)
+    }
+}
+
 /// The stages at the front of a plan, or after its single `sort`, that pass
 /// rows on one at a time, run together over the input or the sort's merge.
 struct RowChain<'p> {
@@ -452,6 +519,7 @@ impl<'p> RowChain<'p> {
                 Stage::Skip(n) => RowStep::Window(Window::new(*n, usize::MAX)),
                 Stage::Head(n) => RowStep::Window(Window::new(0, *n)),
                 Stage::Uniq(u) => RowStep::Uniq(&u.positions, HashSet::new(), String::new()),
+                Stage::Context(c) => RowStep::Context(Box::new(Context::new(c))),
                 // Those add the right side's unmatched rows after every left
                 // one.
                 Stage::Join(j) if j.join_type.keeps_right_unmatched() => {
@@ -476,11 +544,12 @@ impl<'p> RowChain<'p> {
     /// Whether the chain is the way to run its stages: it holds more than
     /// stateless statements (which other paths run in parallel), namely a
     /// step that must see the rows one at a time and in order (a `head` or
-    /// `tail +N`, a `uniq`, a stateful statement), or a join.
+    /// `tail +N`, a `uniq`, a stateful statement, a `select -B`/`-A`), or a
+    /// join.
     fn preferred(&self) -> bool {
         self.steps.iter().any(|step| match step {
             RowStep::Transform(_, state) => state.is_some(),
-            RowStep::Window(_) | RowStep::Uniq(..) | RowStep::Join(_) => true,
+            RowStep::Window(_) | RowStep::Uniq(..) | RowStep::Join(_) | RowStep::Context(_) => true,
         })
     }
 
@@ -488,7 +557,9 @@ impl<'p> RowChain<'p> {
     fn only_windows(&self) -> bool {
         self.steps.iter().all(|step| match step {
             RowStep::Window(_) => true,
-            RowStep::Transform(..) | RowStep::Uniq(..) | RowStep::Join(_) => false,
+            RowStep::Transform(..) | RowStep::Uniq(..) | RowStep::Join(_) | RowStep::Context(_) => {
+                false
+            }
         })
     }
 
@@ -505,7 +576,8 @@ impl<'p> RowChain<'p> {
         self.steps.iter().all(|step| match step {
             RowStep::Transform(stmts, _) => stmts_keep_cells(stmts),
             RowStep::Window(_) | RowStep::Uniq(..) => true,
-            RowStep::Join(_) => false,
+            // A released row is not the line just read.
+            RowStep::Join(_) | RowStep::Context(_) => false,
         })
     }
 
@@ -1860,6 +1932,21 @@ fn apply_stages_over_rows(
                 rows.drain(..(*n).min(rows.len()));
             }
             Stage::Uniq(u) => dedup_rows(&mut rows, &u.positions),
+            Stage::Context(c) => {
+                let mut context = Context::new(c);
+                let mut kept = Vec::new();
+                let mut scratch: Vec<Field> = Vec::new();
+                for mut row in rows.drain(..) {
+                    let through = context.offer(&mut row, &mut scratch, |held, _| {
+                        kept.push(held);
+                        Ok(())
+                    })?;
+                    if through {
+                        kept.push(row);
+                    }
+                }
+                rows = kept;
+            }
             Stage::Stats(s) => {
                 let accs = build_colstats(&s.positions, &rows);
                 rows = profile_rows(s, &accs);
@@ -2687,6 +2774,15 @@ pub fn describe(plan: &Plan) -> String {
                 out.push_str(&format!(
                     "stage {n} (skip):\n  {n}.1 skip {count} (tail -n +{})\n",
                     count + 1
+                ));
+            }
+            Stage::Context(c) => {
+                out.push_str(&format!("stage {n} (select with context):\n"));
+                out.push_str(&format!(
+                    "  {n}.1 {} (-B {} -A {})\n",
+                    describe_stmt(&c.select),
+                    c.before,
+                    c.after
                 ));
             }
             Stage::Uniq(u) => {

@@ -815,6 +815,20 @@ pub enum Stage {
     /// Merge a second (right) source in by key. Blocking: the right side is
     /// materialized into a hash table that the left rows probe.
     Join(JoinStmt),
+    /// A `select` that also keeps rows around each match (`-B N`/`-A M`).
+    /// It sees the rows in order, holding the last `before` of them.
+    Context(ContextStmt),
+}
+
+/// `select -B N -A M EXPR`: keep the rows where `expr` holds, and with each
+/// the up to `before` rows above it and `after` rows below it, once each and
+/// in order.
+#[derive(Clone, Debug)]
+pub struct ContextStmt {
+    /// The `select` itself, a [`Stmt::Select`].
+    pub select: Stmt,
+    pub before: usize,
+    pub after: usize,
 }
 
 /// How the final output is rendered.
@@ -2090,6 +2104,7 @@ impl Plan {
                     types = STATS_TYPES.to_vec();
                 }
                 Stage::Uniq(u) => u.resolve(&header).map_err(placed)?, // keeps the row shape
+                Stage::Context(c) => c.select.resolve(&mut header, &mut types).map_err(placed)?,
                 Stage::Group(g) => {
                     let old = std::mem::take(&mut types);
                     g.resolve(&mut header).map_err(placed)?;
