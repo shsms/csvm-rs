@@ -277,7 +277,7 @@ impl Session {
                 items.extend(complete::function_items(word));
                 items
             }
-            Place::Nothing => Vec::new(),
+            Place::File | Place::Nothing => Vec::new(),
         };
         typed_first(items, typed)
     }

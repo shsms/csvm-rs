@@ -2098,7 +2098,7 @@ fn identity_plan() -> Plan {
 
 /// Given `s` starting with `(`, return the contents of the balanced,
 /// quote-aware parenthesized group and the remainder after the closing `)`.
-fn take_paren_group(s: &str) -> Result<(&str, &str), Error> {
+pub(crate) fn take_paren_group(s: &str) -> Result<(&str, &str), Error> {
     let bytes = s.as_bytes();
     debug_assert_eq!(bytes.first(), Some(&b'('));
     let mut depth = 0usize;

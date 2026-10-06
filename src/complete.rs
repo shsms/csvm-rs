@@ -27,6 +27,8 @@ pub enum Place {
     Column,
     /// An expression: columns and functions.
     Expression,
+    /// A file: the file of a `join` or `from` item.
+    File,
     /// Nothing fits: a string, a number, a comment, a count, a colour, a
     /// new name, or no word yet right after a closing backtick, quote or
     /// bracket.
@@ -51,7 +53,8 @@ pub struct Found {
     /// What kind of word fits there.
     pub place: Place,
     /// The byte range of the word the cursor is in (maybe empty), with any
-    /// `-`/`--` before a flag and the backticks of a quoted name.
+    /// `-`/`--` before a flag and the backticks of a quoted name; at a
+    /// file, its whole path, from an opening quote to before a closing one.
     pub word: Range<usize>,
     /// The run of stages the cursor is in.
     pub group: Group,
@@ -83,6 +86,9 @@ pub fn find(script: &str, at: usize) -> Found {
 
     let (mut word, head_end) = match scan.quote {
         Some((b'`', open)) => (open..backtick_end(script, at), open),
+        // A double-quoted file's path, from its opening quote to before its
+        // closing one.
+        Some((b'"', open)) => (open..quoted_end(script, at), open),
         _ => {
             let core = core_word(script, at);
             (core.clone(), core.start)
@@ -100,6 +106,15 @@ pub fn find(script: &str, at: usize) -> Found {
                 None => Place::Nothing,
             }
         }
+        // A file's path may be double-quoted, after nothing or a group.
+        Some((b'"', _)) => {
+            let glued = Head::read(head).glued;
+            // The text before the quote as words of their own.
+            let spaced = format!("{head} ");
+            let file = (glued.is_empty() || group_only(glued))
+                && place_of(&Head::read(&spaced), in_bracket, false) == Place::File;
+            if file { Place::File } else { Place::Nothing }
+        }
         Some(_) => Place::Nothing,
         // An item here would be glued onto the name, string or bracket
         // that just closed.
@@ -116,7 +131,18 @@ pub fn find(script: &str, at: usize) -> Found {
                         .as_bytes()
                         .get(word.start)
                         .is_some_and(u8::is_ascii_digit);
-                    place_of(&head, in_bracket, number)
+                    let mut place = place_of(&head, in_bracket, number);
+                    if place == Place::File {
+                        // A path runs over `.`, `/` and `-` too.
+                        word = word.start - head.glued.len()..path_end(script, at);
+                        // An item before a group, a flag or a quote would
+                        // glue onto it.
+                        let next = script.as_bytes().get(at);
+                        if word.start == at && next.is_some_and(|b| b"(-\"'`".contains(b)) {
+                            place = Place::Nothing;
+                        }
+                    }
+                    place
                 }
             }
         }
@@ -237,6 +263,30 @@ fn core_word(script: &str, at: usize) -> Range<usize> {
         .position(|&b| !is_word_byte(b))
         .map_or(bytes.len(), |i| at + i);
     start..end
+}
+
+/// The end of the path the cursor is in: the first blank, `,`, bracket,
+/// `|`, `#` or quote mark at or after `at`.
+fn path_end(script: &str, at: usize) -> usize {
+    let rest = &script.as_bytes()[at..];
+    rest.iter()
+        .position(|&b| b.is_ascii_whitespace() || b"(),|#\"'`".contains(&b))
+        .map_or(script.len(), |i| at + i)
+}
+
+/// The end of the double-quoted path the cursor is in: the next `"` on the
+/// line, before any `|`, when a blank, `)`, `,`, `|` or `#` follows it or it
+/// ends the script; else the end of the path at `at`.
+fn quoted_end(script: &str, at: usize) -> usize {
+    let rest = &script.as_bytes()[at..];
+    let closes = |i: usize| {
+        rest.get(i + 1)
+            .is_none_or(|b| b.is_ascii_whitespace() || b"),|#".contains(b))
+    };
+    match rest.iter().position(|&b| b"\"\n|".contains(&b)) {
+        Some(i) if rest[i] == b'"' && closes(i) => at + i,
+        _ => path_end(script, at),
+    }
 }
 
 /// The end of a backticked name the cursor is in: just past its closing
@@ -701,7 +751,7 @@ fn flag_place(head: &Head) -> bool {
 }
 
 /// What fits for a word that is not a flag. `number`: the word starts with
-/// a digit, outside backticks.
+/// a digit, outside backticks; only a file may.
 fn place_of(head: &Head, in_bracket: bool, number: bool) -> Place {
     let Some(command) = head.command() else {
         return if head.glued.is_empty() {
@@ -710,11 +760,8 @@ fn place_of(head: &Head, in_bracket: bool, number: bool) -> Place {
             Place::Nothing
         };
     };
-    if number {
-        return Place::Nothing;
-    }
     let args = head.args();
-    match command {
+    let place = match command {
         // A `-B`/`-A` waiting for its count.
         "select" if read_flags(command, args).1.is_some() => Place::Nothing,
         "select" => Place::Expression,
@@ -730,6 +777,11 @@ fn place_of(head: &Head, in_bracket: bool, number: bool) -> Place {
         "join" | "from" if after_eq(head) => Place::Nothing,
         "join" | "from" => join_place(head),
         _ => Place::Nothing,
+    };
+    if number && place != Place::File {
+        Place::Nothing
+    } else {
+        place
     }
 }
 
@@ -808,32 +860,39 @@ fn graph_place(head: &Head) -> Place {
     }
 }
 
-/// `join [FLAGS] ITEM[, ITEM...]`, each `ITEM` being `[(SUB)] FILE [on
-/// KEYS]`: a column after an `on`, and in a later item with no group and
-/// no `on`, which the parser reads as more keys.
+/// Whether `word` is a `( … )` group with nothing glued after it, read as
+/// the parser reads it.
+fn group_only(word: &str) -> bool {
+    word.starts_with('(')
+        && crate::parse::take_paren_group(word).is_ok_and(|(_, after)| after.is_empty())
+}
+
+/// `join`/`from [FLAGS] ITEM[, ITEM...]`, each `ITEM` being `[-L S] [-R S]
+/// [(SUB)] FILE [on KEYS]`: a column after an `on`, and in a later item
+/// with no group, flag or `on`, which the parser reads as more keys; the
+/// item's file before that.
 fn join_place(head: &Head) -> Place {
     let args = head.args();
-    let (flags, _) = read_flags("join", args);
-    let mut on_before = false;
-    let mut on = false;
-    let mut first: Option<&str> = None;
-    for word in &args[flags..] {
-        if word.after_comma {
-            on_before |= on;
-            on = false;
-            first = None;
-        }
-        first.get_or_insert(word.text);
-        on |= word.text == "on";
-    }
-    if head.after_comma {
-        on_before |= on;
-        on = false;
-        first = None;
-    }
-    let group = first.unwrap_or(head.glued).starts_with('(');
-    if on || (on_before && !group) {
+    // The cursor's item: the words after the last comma.
+    let start = if head.after_comma {
+        args.len()
+    } else {
+        args.iter().rposition(|w| w.after_comma).unwrap_or(0)
+    };
+    let (before, item) = args.split_at(start);
+    let has_on = |words: &[Word]| words.iter().any(|w| w.text == "on");
+    // An item that starts with a group or a flag is a new item, never more
+    // keys of the one before.
+    let starts_item = |text: &str| text.starts_with(['(', '-']);
+    let first = item.first().map_or(head.glued, |w| w.text);
+    let (flags, waiting) = read_flags("join", item);
+    if has_on(item) || (has_on(before) && !starts_item(first)) {
         Place::Column
+    } else if waiting.is_none()
+        && !starts_item(head.glued)
+        && item[flags..].iter().all(|w| group_only(w.text))
+    {
+        Place::File
     } else {
         Place::Nothing
     }
@@ -979,6 +1038,97 @@ mod tests {
     }
 
     #[test]
+    fn a_join_or_from_file_slot_takes_a_file() {
+        for s in [
+            "join @",
+            "join (cols a) d@",
+            "from pv.@",
+            "from a.csv, b@",
+            "join -l @",
+            "from -R _x @",
+            "join a.csv on k, -R _x @",
+            "join a.csv on k, (cols k) @",
+        ] {
+            assert_eq!(at(s).place, Place::File, "{s}");
+        }
+        for s in [
+            "join a.csv @",
+            "join a.csv on @",
+            "join a.csv on k, b@",
+            "join -R @",
+            "join a.csv on k, -R @",
+            "join (cols @",
+            "join a=1@",
+            "join -x.@",
+            // A group with its file glued on has its file.
+            "join (sort x)a.csv @",
+            // Before a group, a flag or a quoted path: an item would glue on.
+            "join @(cols a) b.csv on k",
+            "join @-l b.csv on k",
+            "join @\"a.csv\" on k",
+        ] {
+            assert_ne!(at(s).place, Place::File, "{s}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_file_is_completed_inside_its_quotes() {
+        let found = at("join \"my f@ on k");
+        assert_eq!(found.place, Place::File);
+        assert_eq!(found.word, 5..10);
+        // The word stops before a closing quote, and never runs on to
+        // another quote later on the line.
+        assert_eq!(at("from \"my f@x.csv\" on k").word, 5..15);
+        assert_eq!(at("join \"my dir/@ on k | select x == \"y\"").word, 5..13);
+        assert_eq!(at("join \"my dir/@\nselect x == \"y\"").word, 5..13);
+        // A closing quote further on the same path ends the word, past any
+        // `(`, `,`, `#` or `'` in the name.
+        for (s, word) in [
+            ("join \"my f@ile x.csv\" on k", 5..19),
+            ("join \"report @(1).csv\" on k", 5..20),
+            ("join \"a@,b.csv\" on k", 5..13),
+            ("join \"x@ y #c\" on k", 5..12),
+            ("join \"Bob@'s file.csv\" on k", 5..20),
+            // A closing quote is one a blank, `)`, `,`, `|` or `#` follows,
+            // or that ends the script; a `|` or a line break comes first.
+            ("join (join \"a@ b\") q.csv on k", 11..15),
+            ("join \"a@ b\", q.csv on k", 5..9),
+            ("join \"a@ b\"| cols k", 5..9),
+            ("join \"a@ b\"# c", 5..9),
+            ("join \"a@ b\"", 5..9),
+            ("join \"a@ on k, \"q.csv\" on k", 5..7),
+            ("join \"a@ on k | select s != \" \"", 5..7),
+            ("join \"a@ on k\nselect s != \" \"", 5..7),
+        ] {
+            assert_eq!(at(s).word, word, "{s}");
+        }
+        // Only a group may be glued before the quote.
+        assert_eq!(at("join (sort x)\"a@").place, Place::File);
+        assert_ne!(at("join x\"ab@").place, Place::File);
+        assert_ne!(at("join a.csv\"b@").place, Place::File);
+        assert_ne!(at("from -s\"a@").place, Place::File);
+    }
+
+    #[test]
+    fn a_file_word_stops_where_the_path_does() {
+        for (s, at_, word) in [
+            ("join a.csv,b.csv on k", 7, 5..10),
+            ("join a.csv) on k", 7, 5..10),
+            ("join a.csv|cols k", 7, 5..10),
+            ("join a.csv#note", 7, 5..10),
+        ] {
+            assert_eq!(find(s, at_).word, word, "{s}");
+        }
+    }
+
+    #[test]
+    fn a_file_word_is_the_whole_path() {
+        let found = at("join data/pv.@1 on k");
+        assert_eq!(found.place, Place::File);
+        assert_eq!(found.word, 5..14);
+    }
+
+    #[test]
     fn flags_follow_each_commands_grammar() {
         // A flag's value is not a flag place.
         assert_eq!(at("fmt -p 2 -@").place, Place::Flag("fmt".into()));
@@ -1009,8 +1159,9 @@ mod tests {
         assert_eq!(at("color -g a green:r@").place, Place::Nothing);
         assert_eq!(at("color -g a green:red x@").place, Place::Nothing);
         assert_eq!(at("join a.csv on k, j@").place, Place::Column);
-        assert_eq!(at("join a.csv, b@").place, Place::Nothing);
-        assert_eq!(at("join a.csv on k, (sort x) b@").place, Place::Nothing);
+        // An item's file.
+        assert_eq!(at("join a.csv, b@").place, Place::File);
+        assert_eq!(at("join a.csv on k, (sort x) b@").place, Place::File);
         assert_eq!(at("join (sort x) b.csv on k@").place, Place::Column);
         // The right key after `=` names a column of the joined file.
         assert_eq!(at("join b.csv on id=cu@").place, Place::Nothing);
