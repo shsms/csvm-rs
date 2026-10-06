@@ -221,9 +221,11 @@ bash will still change is not.
 
 csvm also offers completion items for inkline's own menu: the commands,
 with their one-line help, a command's flags after a `-`, the columns
-wherever a command takes them, and, inside an expression, the columns and
-csvm's functions. Each row is marked `m`, with a short note. With the
-cursor at the end of the script:
+wherever a command takes them, inside an expression the columns and
+csvm's functions, and the file names (from the shell's directory, or the
+one typed before a `/`) where a `join` or `from` item takes its file.
+Each row is marked `m`, with a short note. With the cursor at the end of
+the script:
 
 ```
 $ csvm 'select am' data.csv

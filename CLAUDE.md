@@ -868,9 +868,10 @@ the parser's own rules for quotes, comments, stages, `join ( … )` groups
 and `fn … { }` bodies, so a half-typed script still gets a place, then
 looks ahead for the end of the word and a group's file. It returns a
 `complete::Found`: `place` (a `complete::Place` — the start of a stage, a
-command's flag, a column, an expression, or nothing), `word` (the run of
-word bytes around the cursor, any leading `-`/`--` or a name's backticks
-included — every item replaces it), and `group` (a `complete::Group` —
+command's flag, a column, an expression, a `join`/`from` item's file, or
+nothing), `word` (the run of word bytes around the cursor, any leading
+`-`/`--` or a name's backticks included, or a file's whole path — every
+item replaces it), and `group` (a `complete::Group` —
 the script itself, a `join ( … )` group with the file named after it
 when the line has one, or an `fn` body). At the start of a stage the
 items are `help::COMMANDS`'s names, noted with `CmdHelp.summary`, and the
@@ -879,7 +880,19 @@ command's flag place they are that command's flags — `CmdHelp.flags`, a
 list of `Flag { names, help }` — one item per spelling, noted with the
 flag's `help` (`complete::flag_items`). In an expression they add the
 built-in functions, `Func::NAMES` plus `prev` and `rownum`, each item its
-bare name, noted `function` (`complete::function_items`). Where a command
+bare name, noted `function` (`complete::function_items`). In a file's
+place, `Session::file_items` lists the directory typed before the last
+`/` (from `:cwd`, through the cached `Headers::list`), the entries that
+start with the rest in natural order, hidden ones only after a typed `.`,
+none for an unquoted pattern; `complete::file_item` notes each `file` or
+`directory` (ending in `/`) and double-quotes a path that is not plainly
+one (letters, digits, `_./-+~`, no leading `-`, which would read as a
+flag), leaving a directory's quote open, and a file's too when a closing
+quote already follows the word. A word after an opening `"` in a file's
+place (after nothing or a group) is a file too, running to before the
+next `"` on the line, before any `|`, when a blank, `)`, `,`, `|` or `#`
+follows it or it ends the script, else to the end of the path; its items
+are all quoted, so a quoted directory can be gone on into. Where a command
 or an expression takes a column, `Session::columns_at` finds them: the
 input's header (`named_input_header`, else `input_header`) carried
 through the stages before the cursor's one, by the same `Plan::resolve`
