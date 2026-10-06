@@ -525,6 +525,61 @@ fn select_context_with_v_surrounds_the_rows_that_do_not_match() {
 }
 
 #[test]
+fn select_context_prev_reads_every_row_entering_the_select() {
+    // Rows 2 and 3 are not shown, but the 2 still compares against them.
+    assert_eq!(
+        run_checked("select -B 1 v != prev(v)", "v\n1\n1\n1\n2\n"),
+        "v\n1\n2\n"
+    );
+}
+
+#[test]
+fn select_context_then_head_stops_after_n_rows() {
+    let input = "v\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n";
+    assert_eq!(
+        run_checked("select -A 1 v % 2 == 0 | head 3", input),
+        "v\n2\n3\n4\n"
+    );
+    // The bad cell after them would abort the run if it were read.
+    assert_eq!(
+        run_checked("select -A 1 v >= 2 | head 2", "v\n1\n2\n3\nx\n"),
+        "v\n2\n3\n"
+    );
+}
+
+#[test]
+fn select_context_after_a_sort_reads_the_sorted_order() {
+    assert_eq!(
+        run_checked("sort v=nr | select -B 1 v == 3", "v\n3\n1\n5\n2\n4\n"),
+        "v\n4\n3\n"
+    );
+}
+
+#[test]
+fn select_context_after_a_blocking_stage_runs_in_memory() {
+    // A `tail` first makes the whole plan run over materialized rows.
+    assert_eq!(
+        run_checked("tail 6 | select -B 1 -A 1 v == 5", ONE_TO_EIGHT),
+        "v\n4\n5\n6\n"
+    );
+}
+
+#[test]
+fn select_context_is_thread_independent_over_a_file() {
+    let mut content = String::from("id,val\n");
+    for i in 0..3000u32 {
+        content.push_str(&format!("{i},{}\n", (i * 7) % 11));
+    }
+    let path = temp_csv(&content);
+    let script = "add d = val - prev(val) | select -B 2 -A 1 d > 5";
+    let serial = run(script, &content, 1).unwrap();
+    assert!(serial.lines().count() > 100, "too few rows to mean much");
+    for n in [1usize, 2, 4, 8, 16] {
+        assert_eq!(run_file_str(script, &path, n), serial, "threads={n}");
+    }
+}
+
+#[test]
 fn select_context_errors_name_the_flag() {
     for (script, want) in [
         ("select -B 1 -B 2 v > 1", "select takes -B only once"),
