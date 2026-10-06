@@ -926,27 +926,31 @@ impl<'a> Builder<'a> {
     /// not here (with a sub-pipeline it still errors at parse time). A file
     /// path containing a comma must be quoted.
     fn parse_join(&mut self, rest: &str) -> Result<(), Error> {
+        let stmts = self.parse_join_items("join", rest)?;
+        self.items
+            .extend(stmts.into_iter().map(|j| Item::Stage(Stage::Join(j))));
+        Ok(())
+    }
+
+    /// A join-like command's own flags: its join type and the default
+    /// `-L`/`-R` for its items, and the text after them.
+    fn parse_join_flags<'r>(
+        &mut self,
+        verb: &str,
+        rest: &'r str,
+    ) -> Result<(JoinFlags, &'r str), Error> {
         let mut s = rest.trim_start();
         let mut join_type = JoinType::Inner;
         let mut lsuffix = None;
         let mut rsuffix = None;
         loop {
+            if let Some(rest_after) = self.take_suffix_flag(s, &mut lsuffix, &mut rsuffix)? {
+                s = rest_after;
+                continue;
+            }
             let (word, after) = split_first_word(s);
             if word.starts_with('-') && word != "-" {
                 self.note_flag(word);
-            }
-            // `-L S` / `-R S` (or `=S`) set per-side clash suffixes.
-            if let Some(v) = flag_value(word, after, &["-L", "--lsuffix"]) {
-                let (val, rest_after) = v?;
-                lsuffix = Some(val);
-                s = rest_after;
-                continue;
-            }
-            if let Some(v) = flag_value(word, after, &["-R", "--rsuffix"]) {
-                let (val, rest_after) = v?;
-                rsuffix = Some(val);
-                s = rest_after;
-                continue;
             }
             match word {
                 "-l" | "--left" => join_type = JoinType::Left,
@@ -954,26 +958,86 @@ impl<'a> Builder<'a> {
                 "-F" | "--full" => join_type = JoinType::Full,
                 "--inner" => join_type = JoinType::Inner,
                 w if w.starts_with('-') && w != "-" => {
-                    return Err(err(format!("join: unknown flag '{w}'")));
+                    return Err(err(format!("{verb}: unknown flag '{w}'")));
                 }
                 _ => break,
             }
             s = after;
         }
 
-        // Comma-separated items: `[(SUBPIPELINE)] FILE [on KEYS]`.
+        Ok((
+            JoinFlags {
+                join_type,
+                lsuffix,
+                rsuffix,
+            },
+            s,
+        ))
+    }
+
+    /// A `-L S` / `-R S` (or `=S`) clash-suffix flag at the start of `s`:
+    /// it sets `lsuffix` / `rsuffix`, and gives the text after it. `None`
+    /// when `s` does not start with one.
+    fn take_suffix_flag<'r>(
+        &mut self,
+        s: &'r str,
+        lsuffix: &mut Option<String>,
+        rsuffix: &mut Option<String>,
+    ) -> Result<Option<&'r str>, Error> {
+        let (word, after) = split_first_word(s);
+        let (slot, value) = if let Some(v) = flag_value(word, after, &["-L", "--lsuffix"]) {
+            (lsuffix, v)
+        } else if let Some(v) = flag_value(word, after, &["-R", "--rsuffix"]) {
+            (rsuffix, v)
+        } else {
+            return Ok(None);
+        };
+        self.note_flag(word);
+        let (val, rest_after) = value?;
+        *slot = Some(val);
+        Ok(Some(rest_after.trim_start()))
+    }
+
+    /// `[FLAGS] ITEM[, ITEM…]`, shared by `join` and `from`: the command's
+    /// flags, then each item's own `-L`/`-R`, optional `(SUB)`, source and
+    /// `on`. `join`'s last item must have an `on`; `from`'s need not.
+    fn parse_join_items(&mut self, verb: &str, rest: &str) -> Result<Vec<JoinStmt>, Error> {
+        let (
+            JoinFlags {
+                join_type,
+                lsuffix,
+                rsuffix,
+            },
+            s,
+        ) = self.parse_join_flags(verb, rest)?;
+        // `join` reads right-side files; `from` reads its own.
+        let (keys_required, expects_file, not_stdin) = match verb {
+            "join" => (
+                true,
+                "join expects a right-side file".to_string(),
+                "join's right side must be a file, not stdin".to_string(),
+            ),
+            "from" => (
+                false,
+                "from expects a file".to_string(),
+                "from reads files, not stdin".to_string(),
+            ),
+            other => unreachable!("only join and from read items, not {other}"),
+        };
+        let expects_file = || err(expects_file.clone());
         if s.is_empty() {
-            return Err(err("join expects a right-side file"));
+            return Err(expects_file());
         }
         let mut stmts: Vec<JoinStmt> = Vec::new();
         for frag in split_top_commas(s) {
             let frag = frag.trim();
             if frag.is_empty() {
-                return Err(err("join: empty item (stray comma?)"));
+                return Err(err(format!("{verb}: empty item (stray comma?)")));
             }
-            // Composite keys are comma-separated too: a fragment with no `on`
-            // and no sub-pipeline extends the previous item's key list.
+            // Composite keys are comma-separated too: a fragment with no `on`,
+            // no flag and no sub-pipeline extends the previous item's keys.
             if !frag.starts_with('(')
+                && !frag.starts_with('-')
                 && !has_bare_word(frag, "on")
                 && let Some(prev) = stmts.last_mut().filter(|j| !j.keys.is_empty())
             {
@@ -981,8 +1045,14 @@ impl<'a> Builder<'a> {
                 continue;
             }
 
-            // Optional `(SUBPIPELINE)` — a full csvm script over the right file.
+            // This item's own `-L S` / `-R S`.
             let mut f = frag;
+            let (mut item_l, mut item_r) = (lsuffix.clone(), rsuffix.clone());
+            while let Some(rest_after) = self.take_suffix_flag(f, &mut item_l, &mut item_r)? {
+                f = rest_after;
+            }
+
+            // Optional `(SUBPIPELINE)` — a full csvm script over the file.
             let right_plan = if f.starts_with('(') {
                 let (inner, after) = take_paren_group(f)?;
                 f = after.trim_start();
@@ -1002,13 +1072,14 @@ impl<'a> Builder<'a> {
                 Box::new(identity_plan())
             };
 
-            // The right-side file path.
+            // The file path, or a pattern unless it is quoted.
+            let quoted = matches!(f.as_bytes().first(), Some(b'"' | b'\'' | b'`'));
             let (file, after) = take_token(f);
             if file.is_empty() {
-                return Err(err("join expects a right-side file"));
+                return Err(expects_file());
             }
             if file == "-" {
-                return Err(err("join's right side must be a file, not stdin"));
+                return Err(err(not_stdin));
             }
             // The path as written, quotes included.
             let typed = f.trim_start();
@@ -1023,12 +1094,14 @@ impl<'a> Builder<'a> {
             if !f.is_empty() {
                 let (kw, key_str) = split_first_word(f);
                 if kw != "on" {
-                    return Err(err("join expects `on KEY[,KEY...]` after the file"));
+                    return Err(err(format!(
+                        "{verb} expects `on KEY[,KEY...]` after the file"
+                    )));
                 }
                 self.note(kw, SpanKind::Keyword);
                 self.parse_join_keys(key_str, &mut keys)?;
                 if keys.is_empty() {
-                    return Err(err("join `on` expects at least one key column"));
+                    return Err(err(format!("{verb} `on` expects at least one key column")));
                 }
             }
 
@@ -1036,10 +1109,12 @@ impl<'a> Builder<'a> {
                 join_type,
                 right_plan,
                 file: file.to_string(),
+                pattern: !quoted && crate::pattern::is_pattern(file),
+                part: None,
                 own_keys: keys.len(),
                 keys,
-                lsuffix: lsuffix.clone(),
-                rsuffix: rsuffix.clone(),
+                lsuffix: item_l,
+                rsuffix: item_r,
                 right_header: Vec::new(),
                 left_key_pos: Vec::new(),
                 right_key_pos: Vec::new(),
@@ -1052,14 +1127,27 @@ impl<'a> Builder<'a> {
         // its keys are shared by all — mixing the two forms is an error.
         // (`stmts` can't be empty: the first fragment either errors or pushes.)
         let (last, init) = stmts.split_last_mut().expect("non-empty");
+        let mixed = || {
+            err(format!(
+                "{verb}: give every file its own `on`, or one trailing `on` shared by all"
+            ))
+        };
         if last.keys.is_empty() {
-            return Err(err("join expects `on KEY[,KEY...]` after the file"));
+            if keys_required {
+                return Err(err(format!(
+                    "{verb} expects `on KEY[,KEY...]` after the file"
+                )));
+            }
+            // With no `on` at all, `from` reads one file (`prepare_from`
+            // refuses several); an item after one with keys must have its own.
+            if init.iter().any(|j| !j.keys.is_empty()) {
+                return Err(mixed());
+            }
+            return Ok(stmts);
         }
         let missing = init.iter().filter(|j| j.keys.is_empty()).count();
         if missing > 0 && missing != init.len() {
-            return Err(err(
-                "join: give every file its own `on`, or one trailing `on` shared by all",
-            ));
+            return Err(mixed());
         }
         if missing > 0 {
             let shared = last.keys.clone();
@@ -1068,10 +1156,7 @@ impl<'a> Builder<'a> {
                 j.own_keys = last.own_keys;
             }
         }
-
-        self.items
-            .extend(stmts.into_iter().map(|j| Item::Stage(Stage::Join(j))));
-        Ok(())
+        Ok(stmts)
     }
 
     /// Parse `KEY[,KEY...]` specs (`name` or `lname=rname`) onto `keys`.
@@ -1637,6 +1722,14 @@ impl<'a> Builder<'a> {
         });
         Ok(())
     }
+}
+
+/// A join-like command's own flags: its join type, and the `-L`/`-R` its
+/// items take unless they give their own.
+struct JoinFlags {
+    join_type: JoinType,
+    lsuffix: Option<String>,
+    rsuffix: Option<String>,
 }
 
 /// Rows kept by `head`/`tail` when no count is given (bash defaults to 10).
@@ -2664,10 +2757,11 @@ fn split_name_eq(rest: &str) -> Result<(String, &str, Option<&str>), Error> {
     Ok((name, after, assigned))
 }
 
-/// Split `s` on commas outside quotes and parens — `join`'s item separator.
-/// Only quoted and parenthesized (sub-pipeline) commas are protected; a
-/// composite key list's commas split here too, and the key-continuation step
-/// in `parse_join` stitches those fragments back onto their `on` clause.
+/// Split `s` on commas outside quotes, parens and braces — `join`'s item
+/// separator. Quoted, parenthesized (sub-pipeline) and braced (file
+/// pattern) commas are protected; a composite key list's commas split here
+/// too, and the key-continuation step in `parse_join_items` stitches those
+/// fragments back onto their `on` clause.
 fn split_top_commas(s: &str) -> Vec<&str> {
     let bytes = s.as_bytes();
     let mut out = Vec::new();
@@ -2679,8 +2773,8 @@ fn split_top_commas(s: &str) -> Vec<&str> {
             Some(q) if c == q => quote = None,
             Some(_) => {}
             None if c == b'"' || c == b'\'' || c == b'`' => quote = Some(c),
-            None if c == b'(' => depth += 1,
-            None if c == b')' => depth = depth.saturating_sub(1),
+            None if c == b'(' || c == b'{' => depth += 1,
+            None if c == b')' || c == b'}' => depth = depth.saturating_sub(1),
             None if c == b',' && depth == 0 => {
                 out.push(&s[start..i]);
                 start = i + 1;
@@ -6064,6 +6158,54 @@ mod tests {
             let recorded = format!("{:?}", parse_recorded(script, &mut Recorder::default()));
             assert_eq!(plain, recorded, "{script}");
         }
+    }
+
+    #[test]
+    fn join_items_take_their_own_suffix_flags() {
+        let plan = parse("join -R _d a.csv on k, -R _b -L _l b.csv on k, c.csv on k").unwrap();
+        let joins: Vec<&JoinStmt> = plan
+            .stages
+            .iter()
+            .map(|s| match s {
+                Stage::Join(j) => j,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(joins[0].rsuffix.as_deref(), Some("_d"));
+        assert_eq!(joins[1].rsuffix.as_deref(), Some("_b"));
+        assert_eq!(joins[1].lsuffix.as_deref(), Some("_l"));
+        assert_eq!(joins[2].rsuffix.as_deref(), Some("_d"));
+        assert_eq!(joins[2].lsuffix, None);
+    }
+
+    #[test]
+    fn a_join_pattern_stays_one_item_unexpanded() {
+        let plan = parse("join (cols a) pv.{1..3,7}.csv on ts").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("{:?}", plan.stages)
+        };
+        assert_eq!(j.file, "pv.{1..3,7}.csv");
+        assert!(j.pattern);
+        assert_eq!(j.part, None);
+    }
+
+    #[test]
+    fn a_quoted_join_path_is_not_a_pattern() {
+        let plan = parse("join \"odd{1,2}.csv\" on k").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("{:?}", plan.stages)
+        };
+        assert_eq!(j.file, "odd{1,2}.csv");
+        assert!(!j.pattern);
+    }
+
+    #[test]
+    fn braces_in_a_fragment_argument_stay_one_argument() {
+        let plan = parse("fn j(f) { join f on k }\nj(pv.{1,2}.csv)").unwrap();
+        let [Stage::Join(j)] = plan.stages.as_slice() else {
+            panic!("{:?}", plan.stages)
+        };
+        assert_eq!(j.file, "pv.{1,2}.csv");
     }
 
     #[test]

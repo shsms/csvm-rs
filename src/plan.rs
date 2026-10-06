@@ -663,6 +663,13 @@ pub struct JoinStmt {
     pub right_plan: Box<Plan>,
     /// Path to the right CSV file (never stdin).
     pub file: String,
+    /// Whether `file` is a pattern to expand into files (written unquoted,
+    /// with `*`, `?` or `{`); `exec::expand_joins` replaces the join with
+    /// one per file.
+    pub pattern: bool,
+    /// The part this file's pattern matched: each emitted right column is
+    /// named `<col>_<part>`, before any clash suffix.
+    pub part: Option<String>,
     /// Key column name pairs `(left_name, right_name)`; equal names when the
     /// `on` entry was a bare column.
     pub keys: Vec<(String, String)>,
@@ -739,16 +746,19 @@ impl JoinStmt {
         let lsuf = self.lsuffix.as_deref().unwrap_or("");
         let rsuf = self.rsuffix.as_deref().unwrap_or("_r");
         let left_orig = header.clone();
-        let right_names: Vec<&String> = self
+        let right_names: Vec<String> = self
             .right_emit_pos
             .iter()
-            .map(|&p| &self.right_header[p])
+            .map(|&p| match &self.part {
+                Some(part) => format!("{}_{part}", self.right_header[p]),
+                None => self.right_header[p].clone(),
+            })
             .collect();
 
         // Suffix clashing left columns (only when a left suffix is configured).
         if !lsuf.is_empty() {
             for h in header.iter_mut() {
-                if right_names.iter().any(|r| *r == h) {
+                if right_names.iter().any(|r| r == h) {
                     h.push_str(lsuf);
                 }
             }
@@ -756,10 +766,10 @@ impl JoinStmt {
         // Append right columns: clashing names get `rsuffix`; `disambiguate`
         // resolves any residual collision so the header is never ambiguous.
         for base in right_names {
-            let candidate = if left_orig.iter().any(|l| l == base) {
+            let candidate = if left_orig.contains(&base) {
                 format!("{base}{rsuf}")
             } else {
-                base.clone()
+                base
             };
             let name = disambiguate(&candidate, header);
             header.push(name);
@@ -2362,6 +2372,18 @@ mod tests {
             unreachable!()
         };
         assert_eq!(cref.pos, 1);
+    }
+
+    #[test]
+    fn a_join_part_suffixes_every_right_column_but_the_keys() {
+        let mut plan = crate::parse::parse("join r.csv on ts").unwrap();
+        let Stage::Join(j) = &mut plan.stages[0] else {
+            unreachable!()
+        };
+        j.right_header = vec!["ts".into(), "value".into(), "diff".into()];
+        j.part = Some("2".into());
+        let header = plan.resolve(&["ts".into(), "value".into()]).unwrap();
+        assert_eq!(header, ["ts", "value", "value_2", "diff_2"]);
     }
 
     #[test]
