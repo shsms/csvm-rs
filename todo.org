@@ -608,9 +608,11 @@ keys — because a missed ref ⇒ wrong column or panic.
 * Parking lot
 Bigger or vaguer ideas, not yet scoped.
 - Remaining pluggable formats via a =Source=/=Sink= trait: JSON-lines (parquet
-  read shipped; see above). Not TSV / a delimiter flag, not multiple input
-  files, not join naming sugar — all three were considered and rejected for
-  good (2026-09-05).
+  read shipped; see above). Not TSV / a delimiter flag, not concatenating
+  several inputs, not naming a file's columns by hand (=as NAME=) or by its
+  whole stem — all considered and rejected for good (2026-09-05). Taken up
+  instead (2026-10-06): =from= and file patterns, which join on keys and
+  suffix columns only with what a pattern varied (=value_1=).
 - =join= follow-ups (core implemented — =Stage::Join=, sub-pipeline right side):
   stream / shard-probe the left side with a shared =Arc= build table instead of
   forcing the in-memory path; numeric-key normalization; auto-pick the smaller

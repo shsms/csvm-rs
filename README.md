@@ -32,7 +32,8 @@ csvm --inkline-mode
 ```
 
 The input file is an optional **second positional**, like `awk 'prog' file`:
-`csvm 'select x > 1' data.csv`. Omit it (or pass `-`) to read stdin.
+`csvm 'select x > 1' data.csv`. Omit it (or pass `-`) to read stdin, or
+name the input in the script itself with a first `from` stage.
 
 | Argument / flag    | Meaning                                                     |
 |--------------------|-------------------------------------------------------------|
@@ -145,7 +146,8 @@ An alias needs its own entry: for `alias c=csvm`, use
 `'(("csvm" . csvm-mode) ("c" . csvm-mode))`. Both commands then share one
 csvm process.
 
-Column errors need an input file named on the line, and no argument that
+Column errors need an input file named on the line (or a `from` stage
+naming one), and no argument that
 bash will still change, such as `$f`, `*.csv` or `-o $out`: it may become
 other words, or none. When such an argument comes before the script, as in
 `csvm -o $out 'cols a' data.csv`, no error in the script is shown either,
@@ -234,8 +236,9 @@ m  color  colourise output
 ```
 
 The columns are the ones at that point in the script: the input file's
-header, carried through the stages before the cursor's one, or, inside a
-`join ( … )` group, that group's own file carried through its stages (an
+header (or a `from` stage's first file's), carried through the stages
+before the cursor's one, or, inside a `join ( … )` or `from ( … )` group,
+that group's own file carried through its stages (an
 `fn` body has no header to check columns against, so none are offered
 there). A name a script cannot write bare, such as `first name` or `2024`,
 is offered in backticks, as the script needs it; a name backticks cannot
@@ -272,6 +275,7 @@ comma- or space-separated arguments:
 | `uniq [cols]`      | drop duplicate rows, keeping the first (whole row or by key; global) |
 | `stats [cols]`     | summary stats per column (count/empty/min/max/sum/mean/stddev) |
 | `agg [NAME=]FN(col)… [by cols]` | aggregate per group (count/count_distinct/sum/min/max/mean/stddev); `NAME=` names the output |
+| `from [(SUB)] FILE[, …] [on KEYS]` | read the named files as the input (first stage), joined on keys when several |
 | `join [(SUB)] FILE on KEYS, …` | merge right-side files in by key (inner/left/right/full) |
 | `fn name(a,b) { … }` | define a reusable pipeline fragment; call as `name(x,y)` |
 | `color …`          | colour output by condition or value gradient (rendered with `fmt`) |
@@ -331,6 +335,25 @@ A few things worth knowing up front:
   the first row, where a comparison that reads `prev()` is false). An `add`
   using `prev()`/`rownum()` runs ordered and single-threaded, so its output is
   identical at any `-n`; a pure `add` shards.
+- **File patterns.** A `join` or `from` file may be a pattern: `*` and `?`
+  in its name, `{a,b}` and `{x..y}` (or a mix like `{1..3,7}`)
+  anywhere. Each matched file is joined in, its non-key columns suffixed
+  with what the pattern matched (none when its wildcards and braces matched
+  empty text, as `pv*.csv` over `pv.csv`), so one stage does what a
+  fragment per file did:
+
+  ```sh
+  csvm 'fn prep() { select value != "nan" | add diff = value - prev(value) }
+        from (prep()) pv.{1..4}.csv on timestamp | fmt'
+  # timestamp, value_1, diff_1, value_2, diff_2, ...
+  ```
+
+  `from` must be the first stage and names the input itself, so no input
+  file is given; when it joins several files, `--header` and Parquet are
+  refused (the files are CSV, each with its own header line). `-L`/`-R`
+  written after a comma, before an item, apply to that item only; before
+  the first item they are the command's own, for every item. Quote a path
+  to take `{`, `*` or `?` literally.
 
 ### Long pipelines: script files
 
@@ -395,6 +418,9 @@ csvm 'join prices.csv on sku | sort price=nr | head' sales.csv
 
 # several files in one join — a trailing `on` is shared by every file
 csvm 'join pv.csv, batt.csv on timestamp' grid.csv
+
+# the same sub-pipeline over several files, columns suffixed by inverter
+csvm 'from (cols timestamp,value) pv.{1..4}.csv on timestamp'
 
 # a fragment factors repeated stages; called like name(args)
 csvm 'fn prep(n) { rename value=n | cols -v metric }

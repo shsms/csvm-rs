@@ -237,6 +237,29 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   after a blocking stage. The right side must be a file (never stdin). Paren
   groups make `split_stages` paren-aware so the sub-pipeline's `|` doesn't split
   the outer pipeline.
+  A file may be a **pattern** (`src/pattern.rs`): `*`/`?` in its file name,
+  `{a,b}`/`{x..y}` anywhere, a quoted path never; each brace group and each
+  run of adjacent wildcards (`???`) is one part of the suffix. `parse` keeps it
+  unexpanded (`JoinStmt.pattern`; the mode server parses on every key, so
+  parsing never touches the filesystem); `exec::expand_joins`, called by
+  `prepare_joins` and by the mode server's `resolve_joins`, splices one
+  `JoinStmt` per matched file with `part` set to what its pattern matched,
+  and `JoinStmt::resolve` names each emitted right column `<col>_<part>`
+  before clash handling. `split_top_commas` protects braced commas.
+  `-L`/`-R` written before an item (after a comma) set that item's
+  `lsuffix`/`rsuffix`; the command's own are the defaults.
+- **`from [FLAGS] ITEM[, ITEM…] [on KEYS]`** names the script's input:
+  the first stage only (`parse_from`; `Plan.from`, never inside a `( … )`
+  group), and never with an input file. Items parse as `join`'s
+  (`parse_join_items`). `exec::prepare_from`, run in `main` before the
+  input is opened (and by the mode server for its header), expands the
+  items, returns the first file as the input path, and puts its `(SUB)`
+  stages, then a header-only `Stmt::Suffix` for its part (every column but
+  the keys), then a `Stage::Join` per other file at the front of the plan;
+  `merge_transforms` folds adjacent transforms, so a one-file `from` runs
+  exactly as that file given positionally (sharding included). Items after
+  one with an `on` must have their own (else a keyless join would cross
+  the files), and a part that matched nothing is no part.
 - **`fn NAME(PARAM, …) { STAGES }`** defines a pipeline fragment in the script
   prologue (before the first stage); a stage that is exactly `NAME(ARGS)`
   expands it in place. Purely front-end textual macros (`parse_prologue` /
@@ -725,7 +748,10 @@ first positional; the input
 file is an optional **second positional** (awk-style; default stdin, a bare `-`
 is stdin). With `-f FILE` the pipeline is read from a file (awk-style) and the
 single positional is the input. At most one input is accepted (a second
-positional is an error). Long options take `--flag VALUE` or `--flag=VALUE`.
+positional is an error); a script whose first stage is `from` names its
+own input (`exec::prepare_from`), and `main` swaps its first file in as
+the input (`--header`/`--format` then apply to it, and are refused when
+`from` joins several files). Long options take `--flag VALUE` or `--flag=VALUE`.
 `--chunk-size`/`--sort-buffer` accept K/M/G (binary)
 suffixes. `--header a,b,c` treats the input as headerless with those column
 names, so the whole input is data (file shards start at byte 0); `--header -`
@@ -783,8 +809,10 @@ parser reads it (`Builder::note`; a `|` between stages is a `separator`, a
 `||` an `operator`); a plain `parse` passes no recorder and
 builds the same plan. The first error is sent on its place: a usage error on
 its argument, a parse error on its span, or, when a readable regular input
-file is named, a `Plan::resolve` error against its header. A `raw` argument
-(one bash will still change) may become other words or none, so no usage
+file is named (on the line, or as a `from` stage's first file:
+`named_input_header`), a `Plan::resolve` error against its header. A
+`raw` argument (one bash will still change) may become other words or
+none, so no usage
 error is sent when one is at or before the error's argument (anywhere on the
 line, for an error about the whole line: `Usage::whole_line`), no parse
 error when one is at or before the script (one after it is taken to stay
@@ -853,9 +881,10 @@ flag's `help` (`complete::flag_items`). In an expression they add the
 built-in functions, `Func::NAMES` plus `prev` and `rownum`, each item its
 bare name, noted `function` (`complete::function_items`). Where a command
 or an expression takes a column, `Session::columns_at` finds them: the
-input's header (`input_header`) carried through the stages before the
-cursor's one, by the same `Plan::resolve` header rules `check_columns`
-runs over the whole script — except inside a `join ( … )` group, where
+input's header (`named_input_header`, else `input_header`) carried
+through the stages before the cursor's one, by the same `Plan::resolve`
+header rules `check_columns` runs over the whole script — except inside a
+`join ( … )` group, where
 the header is that group's own file's, read from `:cwd` by `join_header`
 (so another argument's rawness does not touch it), carried through the
 group's own stages, and inside an `fn` body, where there is no header to
@@ -912,8 +941,12 @@ begun: **parquet read** ships behind
 the optional `parquet` feature (`src/parquet.rs`, see above). Planned (see
 `todo.org` for design notes): parquet projection push-down and *write*,
 JSON-lines output, and PNG chart export. TSV / a delimiter flag,
-multiple input files, and join naming sugar were considered and rejected for
-good.
+concatenating several inputs, and naming a file's columns by hand (`as
+NAME`) or by its whole file stem were considered and rejected for good.
+`from` and file patterns (2026-10-06) are the narrow form that was taken
+up instead: they join on keys rather than concatenate, and name columns
+only by what a pattern varied, as a suffix, so a numeric part stays a bare
+identifier (`value_1`, where a prefix would need backticks).
 
 ## Conventions
 

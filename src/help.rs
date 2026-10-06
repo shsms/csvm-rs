@@ -40,7 +40,8 @@ pub fn usage_line() -> &'static str {
 
 const HEADER: &str = "  SCRIPT   pipe-syntax pipeline; quote it so the shell keeps | > and spaces.
            A stage ends only at |; a newline counts as a space
-  INPUT    input CSV (default: stdin; '-' is stdin); first line is the header
+  INPUT    input CSV (default: stdin; '-' is stdin, none with a `from` stage);
+           first line is the header
 
 options (--flag VALUE or --flag=VALUE):
   -o, --output FILE    write to FILE (default: stdout)
@@ -482,13 +483,23 @@ a column with add first.",
         aliases: &[],
         summary: "read the named files as the input, joined on keys",
         synopsis: &[
-            "from [(SUB)] FILE              the input is FILE, run through SUB",
+            "from [(SUB)] FILE                 the input is FILE, run through SUB",
             "from [FLAGS] ITEM[, ITEM...] on KEYS   join the files; the first is the left",
+            "  ITEM: [-L S] [-R S] [(SUB)] FILE    (FLAGS and KEYS as for join)",
         ],
-        detail: "from must be the first stage, and replaces the input file. A FILE may be a \
-pattern: * and ? in its name, {a,b} and {x..y} anywhere; each matched file's non-key columns \
-are suffixed _PART, PART being what the pattern matched. Items and flags are as for join.",
-        examples: &["csvm 'from (select v != \"nan\") pv.{572..575}.csv on timestamp | fmt'"],
+        detail: "from names the script's input, so it must be the first stage and no input file \
+may be given. One FILE with no `on` is that file as the input, as if given on the command line, \
+run through its (SUB). Several files are joined on KEYS, left to right, the first being the left \
+side; `on` is then required. A FILE may be a pattern: * and ? in its name, {a,b} and {x..y} (or \
+a mix like {1..3,7}) anywhere. Each matched file's non-key columns are suffixed _PART, PART being \
+what the pattern matched (several parts joined with _; none when its wildcards and braces matched \
+empty text, as pv*.csv over pv.csv), even when it matches one file; a (SUB) \
+runs on every file its pattern matches. * takes files in natural order (9 before 10), braces in \
+the order written, and each brace file must exist. Quote a path to take it literally.",
+        examples: &[
+            "csvm 'from (select v != \"nan\") pv.{1..4}.csv on timestamp | fmt'",
+            "csvm 'from data.csv | stats'",
+        ],
         flags: &[
             Flag {
                 names: &["-l", "--left"],
@@ -521,7 +532,7 @@ are suffixed _PART, PART being what the pattern matched. Items and flags are as 
         aliases: &[],
         summary: "merge one or more CSVs by key",
         synopsis: &[
-            "join [FLAGS] ITEM[, ITEM...]      ITEM: [(SUB)] FILE [on KEYS]",
+            "join [FLAGS] ITEM[, ITEM...]      ITEM: [-L S] [-R S] [(SUB)] FILE [on KEYS]",
             "  FLAGS: -l/--left  -r/--right  -F/--full   (inner by default)",
             "         -L/--lsuffix S  -R/--rsuffix S   (suffix clashing columns)",
             "  KEYS:  name  or  lname=rname,  comma-separated for composite keys",
@@ -532,9 +543,15 @@ make it the smaller one. (SUB) is an optional csvm sub-pipeline run over its FIL
 items join left to right, exactly like chaining one join per file. Quote a file path that \
 contains a comma. After an `on`, a keyless entry reads as another key column — so a file \
 missing its own `on` fails at resolve, with a hint. Output is the left columns \
-plus each right's non-key columns; a clashing right name is suffixed _r.",
+plus each right's non-key columns; a clashing right name is suffixed _r. -L/-R after a comma, \
+before an item, apply to it alone; before the first item they are the command's own. FILE \
+may be a pattern — * and ? in its name, {a,b} and {x..y} anywhere — joining each matched \
+file, its non-key columns suffixed _PART, PART being what the pattern matched (several parts \
+joined with _; none when its wildcards and braces matched empty text). Quote a path to take \
+it literally.",
         examples: &[
             "csvm 'join prices.csv on sku' sales.csv",
+            "csvm 'join (cols ts,v) pv.{1..3}.csv on ts' load.csv",
             "csvm 'join -l (cols sku,price) prices.csv on sku=item' sales.csv",
             "csvm 'join pv.csv, batt.csv on timestamp' grid.csv",
         ],
