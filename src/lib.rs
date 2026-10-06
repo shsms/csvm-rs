@@ -22,6 +22,7 @@ pub mod pager;
 #[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod parse;
+pub mod pattern;
 pub mod plan;
 pub mod progress;
 pub mod sort;
