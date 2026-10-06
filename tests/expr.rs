@@ -431,6 +431,115 @@ fn stateful_select_is_thread_independent_over_a_file() {
     }
 }
 
+// --- select context (-A/-B) --------------------------------------------------
+
+const ONE_TO_EIGHT: &str = "v\n1\n2\n3\n4\n5\n6\n7\n8\n";
+
+#[test]
+fn select_before_shows_the_row_above_each_match() {
+    // The row above a match is the row entering the select, so it carries
+    // its own d.
+    let input = "v\n1\n2\n30\n31\n4\n50\n";
+    let want = "v,d\n2,1\n30,28\n4,-27\n50,46\n";
+    assert_eq!(
+        run_checked("add d = v - prev(v) | select -B 1 d > 10", input),
+        want
+    );
+    assert_eq!(
+        run_checked("add d = v - prev(v) | select -B1 d > 10", input),
+        want
+    );
+}
+
+#[test]
+fn select_after_shows_the_rows_below_each_match() {
+    assert_eq!(
+        run_checked("select -A 2 v == 3", ONE_TO_EIGHT),
+        "v\n3\n4\n5\n"
+    );
+    assert_eq!(
+        run_checked("select -A2 v == 3", ONE_TO_EIGHT),
+        "v\n3\n4\n5\n"
+    );
+    // Past the last row there is nothing more to show.
+    assert_eq!(run_checked("select -A 5 v == 7", ONE_TO_EIGHT), "v\n7\n8\n");
+}
+
+#[test]
+fn select_context_windows_merge_without_repeating_a_row() {
+    assert_eq!(
+        run_checked("select -B 2 -A 1 v % 3 == 0", ONE_TO_EIGHT),
+        "v\n1\n2\n3\n4\n5\n6\n7\n"
+    );
+    // A match inside another's -A window restarts the count.
+    assert_eq!(
+        run_checked("select -A 1 v >= 2 && v <= 3", ONE_TO_EIGHT),
+        "v\n2\n3\n4\n"
+    );
+}
+
+#[test]
+fn select_before_a_match_on_the_first_row_shows_nothing_above() {
+    assert_eq!(run_checked("select -B 3 v == 1", ONE_TO_EIGHT), "v\n1\n");
+}
+
+#[test]
+fn select_context_of_zero_is_a_plain_select() {
+    assert_eq!(
+        run_checked("select -B 0 -A 0 v == 4", ONE_TO_EIGHT),
+        "v\n4\n"
+    );
+    // A plain select is a statement, which can run sharded.
+    let plan = csvm::parse::parse("select -B 0 -A 0 v == 4").unwrap();
+    assert!(
+        matches!(plan.stages.as_slice(), [csvm::plan::Stage::Transform(_)]),
+        "{:?}",
+        plan.stages
+    );
+}
+
+#[test]
+fn select_negated_columns_named_like_its_flags_stay_expressions() {
+    // A bare -A or -B is a flag only when a count follows it.
+    let input = "A,Ax,v\n-1,-1,1\n1,1,2\n";
+    assert_eq!(run_checked("select -A > 0", input), "A,Ax,v\n-1,-1,1\n");
+    assert_eq!(run_checked("select -Ax > 0", input), "A,Ax,v\n-1,-1,1\n");
+    // A second -v starts the expression too: `-v > -2` holds on the first
+    // row only.
+    assert_eq!(run_checked("select -v -v > -2", input), "A,Ax,v\n1,1,2\n");
+}
+
+#[test]
+fn select_context_with_v_surrounds_the_rows_that_do_not_match() {
+    for script in [
+        "select -v -B 1 v != 3",
+        "select -B 1 -v v != 3",
+        "select -B1 -v v != 3",
+    ] {
+        assert_eq!(
+            run_checked(script, "v\n1\n2\n3\n4\n5\n"),
+            "v\n2\n3\n",
+            "{script}"
+        );
+    }
+}
+
+#[test]
+fn select_context_errors_name_the_flag() {
+    for (script, want) in [
+        ("select -B 1 -B 2 v > 1", "select takes -B only once"),
+        ("select -A1 -A 1 v > 1", "select takes -A only once"),
+        (
+            "select -B 99999999999999999999999 v > 1",
+            "select -B expects a row count, got '99999999999999999999999'",
+        ),
+        ("select -B 1", "select expects an expression"),
+    ] {
+        let err = run(script, ONE_TO_EIGHT, 1).unwrap_err();
+        assert!(err.contains(want), "{script}: {err}");
+    }
+}
+
 #[test]
 fn num_casts_and_normalises() {
     // num() reads the cell as a number, so the output is the normalised

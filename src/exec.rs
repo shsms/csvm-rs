@@ -3149,6 +3149,20 @@ mod tests {
         run(&plan, &out_header, &opts, &mut reader, out)
     }
 
+    #[test]
+    fn a_select_with_context_runs_in_the_ordered_chain() {
+        let plan = parse("select -B 1 v == 1").unwrap();
+        let opts = RunOpts {
+            chunk_size: 1 << 20,
+            threads: 4,
+            temp_dir: std::env::temp_dir(),
+            sort_buffer: crate::sort::DEFAULT_BUDGET_BYTES,
+            shard_bytes: DEFAULT_SHARD_BYTES,
+        };
+        let (chain, rest) = RowChain::front(&plan.stages, &opts);
+        assert!(chain.preferred() && rest.is_empty());
+    }
+
     /// Run a sort plan with a tiny sort buffer so the external merge (temp-file
     /// spilling) path is exercised end to end.
     fn run_spilled(script: &str, input: &str) -> Result<String, Error> {

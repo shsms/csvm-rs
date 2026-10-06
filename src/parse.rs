@@ -22,9 +22,9 @@ use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
-    ColorRule, ColorScope, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt, JoinType,
-    OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources, Span, Stage,
-    StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
+    ColorRule, ColorScope, ContextStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
+    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources,
+    Span, Stage, StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -1576,25 +1576,65 @@ impl<'a> Builder<'a> {
         // `||` survives the stage split (see `split_stages`). A leading `-v`
         // (like `cols -v`) negates the *whole* expression — `select -v EXPR`
         // drops the matching rows — which is `!(EXPR)`, sidestepping the De
-        // Morgan trap of negating each operator.
-        let rest = rest.trim();
-        let (negate, expr_src) = match rest.strip_prefix("-v") {
-            Some(r) if r.is_empty() || r.starts_with(char::is_whitespace) => {
-                self.note(&rest[..2], SpanKind::Option);
-                (true, r.trim())
+        // Morgan trap of negating each operator. `-B N` / `-A M` (or `-BN`,
+        // `-AM`), in any order with `-v`, also keep N rows before and M after
+        // each match, like grep's. A word that reads as none of these flags
+        // (`-A` with no count after it, `-Ax`, a second `-v`) starts the
+        // expression, as a negated column.
+        let mut s = rest.trim();
+        let mut negate = false;
+        let (mut before, mut after) = (None, None);
+        loop {
+            let (word, rest_after) = split_first_word(s);
+            if word == "-v" && !negate {
+                negate = true;
+                self.note(word, SpanKind::Option);
+                s = rest_after;
+                continue;
             }
-            _ => (false, rest),
-        };
-        if expr_src.is_empty() {
+            let Some(flag) = word.get(..2) else { break };
+            let slot = match flag {
+                "-A" => &mut after,
+                "-B" => &mut before,
+                _ => break,
+            };
+            let (count, tail) = match &word[2..] {
+                "" => split_first_word(rest_after),
+                attached => (attached, rest_after),
+            };
+            if count.is_empty() || !count.bytes().all(|b| b.is_ascii_digit()) {
+                break;
+            }
+            let n = count
+                .parse()
+                .map_err(|_| err(format!("select {flag} expects a row count, got '{count}'")))?;
+            if slot.replace(n).is_some() {
+                return Err(err(format!("select takes {flag} only once")));
+            }
+            self.note(flag, SpanKind::Option);
+            self.note(count, SpanKind::Number);
+            s = tail;
+        }
+        if s.is_empty() {
             return Err(err("select expects an expression"));
         }
-        let expr = self.parse_expr(expr_src, ExprParser::parse)?;
+        let expr = self.parse_expr(s, ExprParser::parse)?;
         let expr = if negate {
             BoolExpr::Not(Box::new(expr))
         } else {
             expr
         };
-        self.items.push(Item::Stmt(Stmt::Select(expr)));
+        let select = Stmt::Select(expr);
+        let (before, after) = (before.unwrap_or(0), after.unwrap_or(0));
+        self.items.push(if before == 0 && after == 0 {
+            Item::Stmt(select)
+        } else {
+            Item::Stage(Stage::Context(ContextStmt {
+                select,
+                before,
+                after,
+            }))
+        });
         Ok(())
     }
 }
@@ -6038,6 +6078,19 @@ mod tests {
                 vec![
                     ("select", "command"),
                     ("-v", "option"),
+                    ("a", "variable"),
+                    (">", "operator"),
+                    ("1", "number"),
+                ],
+            ),
+            (
+                "select -B1 -A 2 a > 1",
+                vec![
+                    ("select", "command"),
+                    ("-B", "option"),
+                    ("1", "number"),
+                    ("-A", "option"),
+                    ("2", "number"),
                     ("a", "variable"),
                     (">", "operator"),
                     ("1", "number"),
