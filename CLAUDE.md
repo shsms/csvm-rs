@@ -90,7 +90,14 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
   on a row with no row above it, in `select`, `add` and `color` alike, while
   `prev()` as a value reads the row's own cell there. A parenthesized
   expression makes `select (…)` fall out for free, and chaining `select`s ANDs
-  them. Comparison mode (numeric / lexical / per-row auto) is covered under
+  them. `select -B N -A M` (grep's context; `-BN` too) is its own
+  `Stage::Context`, not a `Stmt`, since a match releases the rows held
+  above it: `exec::Context` holds the last `N` unmatched rows and counts down
+  `M` after a match, as a `RowStep` in the in-order chain and over
+  materialized rows alike. `prev()` in it reads every row entering it. `-A`
+  or `-B` is a flag only with a count after it (`-B 1`, `-B1`); otherwise,
+  like a second `-v`, it starts the expression as a negated column.
+  Comparison mode (numeric / lexical / per-row auto) is covered under
   *Implicit conversions* below.
 - **`sort`** specs: a bare `col`, or `col=flags` where flags are `n` (numeric),
   `s` (lexical / string), and/or `r` (reverse) — e.g. `amount=nr`. Multi-key,
@@ -109,11 +116,12 @@ cols a,b,c | select amount > 1000 && flag == 't' | sort amount=nr id
 - **`head [N]`** keeps the first N rows reaching it (default 10 when omitted;
   also `head -n N`, `-nN`, `--lines N`, and the obsolete `-N`). Own stage.
   Among the stages at the front of a plan that pass rows on one at a time
-  (transforms, stateful ones too, `tail +N`, `uniq`, an inner or left `join`),
-  it stops the reading once full, wherever it sits: `RowChain` in `exec.rs` runs
-  those stages row by row as the input is read (`scan`; for parquet, per batch),
-  and streams the rows out when nothing follows, else hands them to the rest of
-  the plan, which runs in memory over them (so `uniq id | head 19 | sort qty`
+  (transforms, stateful ones too, `tail +N`, `uniq`, an inner or left `join`,
+  a `select -B`/`-A`), it stops the reading once full, wherever it sits:
+  `RowChain` in `exec.rs` runs those stages row by row as the input is read
+  (`scan`; for parquet, per batch), and streams the rows out when nothing
+  follows, else hands them to the rest of the plan, which runs in memory over
+  them (so `uniq id | head 19 | sort qty`
   reads only up to its 19th distinct id). After a single `sort` the stages
   that pass rows on one at a time are a chain over the merge output, so the
   external sort still applies and a full `head` stops the merge; else it
@@ -660,11 +668,11 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   applies the stage with borrowed rows, and outputs are concatenated in file
   order. stdin (or `-n1`) streams chunk-by-chunk instead. Fully zero-copy.
 - **Streaming reads what's available, not a full chunk.** The streaming paths
-  (`head`, `tail +N`, `uniq` and a stateful statement through `RowChain`'s
-  `scan`; a lone transform or no stage at all through `scan` at `-n1`, or
-  through `stream_transform_parallel` with `-n>1`) read via
-  `next_chunk_available` (a single `read` completed to a line boundary, into
-  a `ChunkSpace` kept from chunk to chunk) and
+  (`head`, `tail +N`, `uniq`, a stateful statement and a `select -B`/`-A`
+  through `RowChain`'s `scan`; a lone transform or no stage at all through
+  `scan` at `-n1`, or through `stream_transform_parallel` with `-n>1`) read
+  via `next_chunk_available` (a single `read` completed to a line boundary,
+  into a `ChunkSpace` kept from chunk to chunk) and
   flush output per chunk, so a slow or unbounded stream emits promptly
   instead of stalling until a 1 MB buffer fills (which made `head` hang and
   `select` withhold output). `sort` and the
@@ -685,8 +693,9 @@ lean dep tree — `--features parquet` pulls `parquet` + `arrow` + codecs (the s
   no per-field allocation, no re-serialization on output. A block is a
   contiguous input range, so its sequence number keeps the merge stable. The
   stages after the sort that pass rows on one at a time (statements, stateful
-  ones too, windows, `uniq`, an inner or left `join`) run on the merge output as
-  a `RowChain` in `run_staged`, and a full `head` stops the merge; anything else
+  ones too, windows, `uniq`, an inner or left `join`, a `select -B`/`-A`) run
+  on the merge output as a `RowChain` in `run_staged`, and a full `head` stops
+  the merge; anything else
   after the sort materializes. The row's serialized form is the `LineFormat`:
   the output CSV line when only windows follow the sort
   (`RowChain::only_windows`), else the typed cell codec (`encode_row` /

@@ -265,6 +265,7 @@ comma- or space-separated arguments:
 | `cols -v a,b`      | keep everything *except* these columns                     |
 | `cols 1,3 2-4 a:d` | columns by 1-based position, position range, or name range |
 | `select EXPR`      | keep rows where `EXPR` is true                             |
+| `select -B N -A M EXPR` | also keep `N` rows before and `M` after each match (like grep) |
 | `sort SPEC...`     | sort rows (stable, multi-key; `col=nr` flags: `n` numeric, `s` string, `r` reverse) |
 | `head [N]`         | keep the first `N` rows (default 10; `head -n -N` keeps all *but* the last N) |
 | `tail [N]`         | keep the last `N` rows (default 10; blocking); `tail +N` starts at row `N` (streams) |
@@ -314,6 +315,10 @@ A few things worth knowing up front:
   Single-quote the whole script so the shell keeps `>`/`|`/spaces. Operators:
   `== != < > <= >=`, `=~`/`!~` (regex), `^=`/`*=`/`$=` (begins/contains/ends),
   and `&& || !` with parens; a leading `-v` negates the whole expression.
+  `-B N` / `-A M` (or `-BN` / `-AM`) also keep the `N` rows before and `M`
+  after each match, as grep does:
+  `add d = value - prev(value) | select -B1 d > 10000` shows each jump with
+  the row before it. Mark the match itself with `color`.
 - **Conversions are implicit.** A comparison against a number is numeric, against
   a string lexical — `amount > 1000` just works, and numbers print correctly with
   no cast. A bare `sort col` auto-detects too: cells that are numbers sort
