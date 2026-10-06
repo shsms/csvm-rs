@@ -27,7 +27,7 @@ use crate::pattern;
 use crate::plan::{
     AggFunc, BoolExpr, CmpMode, CmpOp, ColorRule, ColorScope, ContextStmt, EvalCtx, GraphOpts,
     GraphSpec, GroupStmt, JoinStmt, OutputFormat, Plan, SortMode, SortStmt, Stage, StatsStmt, Stmt,
-    TableOpts, ValExpr, apply_stmts, stmts_keep_cells,
+    SuffixStmt, TableOpts, ValExpr, apply_stmts, stmts_keep_cells,
 };
 use crate::progress::{Counted, Progress};
 use crate::sort::{self, LineFormat, Sorter};
@@ -1981,6 +1981,97 @@ fn read_join_headers(plan: &mut Plan) -> Result<(), Error> {
     Ok(())
 }
 
+/// The input a `from` names: its first file, and whether more files are
+/// joined onto it.
+#[derive(Debug)]
+pub struct FromInput {
+    pub path: String,
+    pub several: bool,
+}
+
+/// Turn the plan's `from` into its input: expand its items, put the first
+/// file's sub-pipeline (then, when it has a part, a suffix on its non-key
+/// columns) at the front of the plan, and join every other file after
+/// them. Returns the first file; `None` when there is no `from`.
+pub fn prepare_from(
+    plan: &mut Plan,
+    base: Option<&Path>,
+    fs: &mut dyn pattern::Fs,
+) -> Result<Option<FromInput>, Error> {
+    let Some(from) = plan.from.take() else {
+        return Ok(None);
+    };
+    let written = std::mem::take(&mut plan.sources.from);
+    let mut files: Vec<JoinStmt> = Vec::new();
+    for item in from.items {
+        files.extend(expand_item(item, base, fs).map_err(|e| written.place_whole(e))?);
+    }
+    let mut files = files.into_iter();
+    let first = files.next().expect("from has an item");
+    let others: Vec<JoinStmt> = files.collect();
+    // The parser gives every item keys, or none.
+    if !others.is_empty() && first.keys.is_empty() {
+        return Err(written.place_whole(Error::Other(
+            "from joins several files: give `on KEYS`".into(),
+        )));
+    }
+    let sub = *first.right_plan;
+    let mut stages = sub.stages;
+    let mut sources = sub.sources.stages;
+    sources.resize_with(stages.len(), || vec![written.clone()]);
+    // The first file's part, and a check of its keys: nothing else reads
+    // them, so a file after a shared `on` read as a key would be lost.
+    if first.part.is_some() || !first.keys.is_empty() {
+        let keys = first.keys.iter().map(|(l, _)| l.clone()).collect();
+        stages.push(Stage::Transform(vec![Stmt::Suffix(SuffixStmt {
+            suffix: first
+                .part
+                .as_ref()
+                .map(|p| format!("_{p}"))
+                .unwrap_or_default(),
+            keys,
+            own_keys: first.own_keys,
+        })]));
+        sources.push(vec![written.clone()]);
+    }
+    let several = !others.is_empty();
+    for j in others {
+        stages.push(Stage::Join(j));
+        sources.push(vec![written.clone()]);
+    }
+    plan.stages.splice(0..0, stages);
+    plan.sources.stages.splice(0..0, sources);
+    merge_transforms(plan);
+    Ok(Some(FromInput {
+        path: first.file,
+        several,
+    }))
+}
+
+/// Merge each run of adjacent transform stages into one, as the parser
+/// would have built them, so `from`'s front stages and the script's first
+/// ones run as a single transform (and keep its fast paths).
+fn merge_transforms(plan: &mut Plan) {
+    let mut i = 1;
+    while i < plan.stages.len() {
+        if let (Stage::Transform(_), Stage::Transform(_)) = (&plan.stages[i - 1], &plan.stages[i]) {
+            let Stage::Transform(next) = plan.stages.remove(i) else {
+                unreachable!("matched a transform above")
+            };
+            let Stage::Transform(prev) = &mut plan.stages[i - 1] else {
+                unreachable!("matched a transform above")
+            };
+            prev.extend(next);
+            if i < plan.sources.stages.len() {
+                let next = plan.sources.stages.remove(i);
+                plan.sources.stages[i - 1].extend(next);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 /// Expand each join's file pattern into one join per file, in place, its
 /// sub-pipeline's joins too; every copy keeps the item's place in the
 /// script, and its file's part. `base` is the directory a
@@ -3005,6 +3096,7 @@ fn describe_stmt(stmt: &Stmt) -> String {
         }
         Stmt::Select(e) => format!("select {}", fmt_expr(e)),
         Stmt::Rename(r) => format!("rename {:?}", r.pairs),
+        Stmt::Suffix(s) => format!("suffix {:?} except {:?}", s.suffix, s.keys),
         Stmt::Add(a) => {
             let target = match a.pos {
                 Some(i) => format!("{}[{i}]", a.name),

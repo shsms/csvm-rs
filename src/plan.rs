@@ -545,6 +545,27 @@ pub struct RenameStmt {
     pub pairs: Vec<(String, String)>,
 }
 
+/// Append `suffix` to every column name but the `keys` (a header-only
+/// change, like `rename`). `from` adds it for its first file: its part, and
+/// a check that its keys are there.
+#[derive(Clone, Debug)]
+pub struct SuffixStmt {
+    pub suffix: String,
+    pub keys: Vec<String>,
+    /// How many leading `keys` came from an explicit `on` (see
+    /// [`JoinStmt::own_keys`]); a missing one past them gets the
+    /// forgotten-`on` hint.
+    pub own_keys: usize,
+}
+
+/// `from ITEM[, ITEM…] [on KEYS]`: the files the script reads, joined on
+/// their keys when there are several. `exec::prepare_from` turns it into
+/// the input and the stages that begin the plan.
+#[derive(Clone, Debug)]
+pub struct FromStmt {
+    pub items: Vec<JoinStmt>,
+}
+
 /// `uniq [cols]`: drop duplicate rows, keeping the first occurrence, comparing
 /// either the whole row (empty `cols`) or just the named key columns. Global
 /// (not adjacent-only like Unix `uniq`), so the input needn't be pre-sorted.
@@ -707,25 +728,12 @@ impl JoinStmt {
     }
 
     /// Where one side's keys (`side` picks it from a pair) are in `header`.
-    /// A key past the item's own `on` gets [`join_key_err`]'s hint.
     fn key_positions(
         &self,
         header: &[String],
         side: fn(&(String, String)) -> &String,
     ) -> Result<Vec<usize>, Error> {
-        self.keys
-            .iter()
-            .enumerate()
-            .map(|(i, key)| {
-                resolve_col(side(key), header).map_err(|e| {
-                    if i < self.own_keys {
-                        e
-                    } else {
-                        join_key_err(e)
-                    }
-                })
-            })
-            .collect()
+        key_positions(self.keys.iter().map(side), self.own_keys, header)
     }
 
     /// After [`JoinStmt::resolve_left_keys`], resolve the right key columns
@@ -802,6 +810,8 @@ pub enum Stmt {
     Rename(RenameStmt),
     /// Append or replace a computed column (`add NAME EXPR`).
     Add(AddStmt),
+    /// Suffix every column but the keys (`from`'s first file).
+    Suffix(SuffixStmt),
 }
 
 /// A pipeline stage. Transforms run streaming; a sort blocks on all its rows;
@@ -1055,6 +1065,9 @@ pub struct Plan {
     /// Where in the script each part was written, for placing an error
     /// [`Plan::resolve`] finds.
     pub sources: Sources,
+    /// The files the script names as its input, until
+    /// `exec::prepare_from` takes it.
+    pub from: Option<FromStmt>,
 }
 
 /// Where in the script the parts of a [`Plan`] were written (a fragment's
@@ -1068,6 +1081,8 @@ pub struct Sources {
     pub colors: Vec<Written>,
     /// The graph sink.
     pub graph: Written,
+    /// The `from` stage.
+    pub from: Written,
 }
 
 impl Sources {
@@ -1120,6 +1135,21 @@ impl Written {
             None => e,
         }
     }
+}
+
+/// Where `keys` are in `header`. A key past the first `own_keys`, the ones
+/// an explicit `on` gave, gets [`join_key_err`]'s hint.
+fn key_positions<'a>(
+    keys: impl IntoIterator<Item = &'a String>,
+    own_keys: usize,
+    header: &[String],
+) -> Result<Vec<usize>, Error> {
+    keys.into_iter()
+        .enumerate()
+        .map(|(i, key)| {
+            resolve_col(key, header).map_err(|e| if i < own_keys { e } else { join_key_err(e) })
+        })
+        .collect()
 }
 
 /// A continuation key (appended after an item's own `on` clause) that fails to
@@ -1862,7 +1892,7 @@ impl Stmt {
                 Ok(true)
             }
             // Rename is a header-only change; row data is untouched.
-            Stmt::Rename(_) => Ok(true),
+            Stmt::Rename(_) | Stmt::Suffix(_) => Ok(true),
         }
     }
 
@@ -1887,6 +1917,14 @@ impl Stmt {
                 }
             }
             Stmt::Add(a) => a.resolve(header, types)?,
+            Stmt::Suffix(s) => {
+                let keys = key_positions(&s.keys, s.own_keys, header)?;
+                for (i, h) in header.iter_mut().enumerate() {
+                    if !keys.contains(&i) {
+                        h.push_str(&s.suffix);
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1895,7 +1933,7 @@ impl Stmt {
     /// drop the row.
     pub fn keeps_cells(&self) -> bool {
         match self {
-            Stmt::Select(_) | Stmt::Rename(_) => true,
+            Stmt::Select(_) | Stmt::Rename(_) | Stmt::Suffix(_) => true,
             Stmt::Cols(_) | Stmt::Add(_) => false,
         }
     }
@@ -1918,7 +1956,7 @@ impl Stmt {
         match self {
             Stmt::Add(a) => a.expr.prev_positions(&mut positions),
             Stmt::Select(e) => e.prev_positions(&mut positions),
-            Stmt::Cols(_) | Stmt::Rename(_) => {}
+            Stmt::Cols(_) | Stmt::Rename(_) | Stmt::Suffix(_) => {}
         }
         positions.sort_unstable();
         positions.dedup();
@@ -2355,6 +2393,7 @@ mod tests {
             colors: Vec::new(),
             graph: None,
             sources: Sources::default(),
+            from: None,
         };
         let out = plan.resolve(&["a".into(), "b".into(), "c".into()]).unwrap();
         assert_eq!(out, vec!["c", "a"]);
@@ -2511,6 +2550,7 @@ mod tests {
             colors: Vec::new(),
             graph: None,
             sources: Sources::default(),
+            from: None,
         };
         let err = plan.resolve(&["a".into()]).unwrap_err();
         assert!(matches!(err, Error::Column { name, .. } if name == "nope"));

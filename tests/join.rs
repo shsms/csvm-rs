@@ -338,3 +338,117 @@ fn per_item_suffixes_apply_to_their_own_file() {
         "k,v,v_b,v_c\n1,1,2,3\n"
     );
 }
+
+/// Run a script that names its input with `from`.
+fn run_from(script: &str) -> Result<String, String> {
+    let mut plan = csvm::parse::parse(script).map_err(|e| e.to_string())?;
+    let input = exec::prepare_from(&mut plan, None, &mut csvm::pattern::RealFs)
+        .map_err(|e| e.to_string())?
+        .expect("the script has a from")
+        .path;
+    exec::prepare_joins(&mut plan).map_err(|e| e.to_string())?;
+    let path = std::path::Path::new(&input);
+    let (header, data_start, len) = exec::read_header_from_path(path).map_err(|e| e.to_string())?;
+    let out_header = plan.resolve(&header).map_err(|e| e.to_string())?;
+    let opts = RunOpts {
+        chunk_size: 64,
+        threads: 1,
+        temp_dir: std::env::temp_dir(),
+        sort_buffer: 8 << 20,
+        shard_bytes: exec::DEFAULT_SHARD_BYTES,
+    };
+    let mut out = Vec::new();
+    exec::run_file(
+        &plan,
+        &out_header,
+        &opts,
+        exec::InputFile {
+            path,
+            data_start,
+            len,
+        },
+        &Default::default(),
+        &mut out,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(String::from_utf8(out).unwrap())
+}
+
+#[test]
+fn from_joins_every_file_and_suffixes_the_first_too() {
+    let dir = common::TempDir::new();
+    dir.write("pv.1.csv", "timestamp,value\n1,nan\n2,10\n3,14\n");
+    dir.write("pv.2.csv", "timestamp,value\n1,5\n2,7\n3,nan\n");
+    let script = format!(
+        "fn prep() {{ select value != \"nan\" | add diff = value - prev(value) }}\n\
+         from (prep()) {} on timestamp",
+        dir.at("pv.{1..2}.csv")
+    );
+    assert_eq!(
+        run_from(&script).unwrap(),
+        "timestamp,value_1,diff_1,value_2,diff_2\n2,10,0,7,2\n"
+    );
+}
+
+#[test]
+fn from_one_file_is_that_file_as_the_input() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "k,v\n1,2\n3,4\n");
+    assert_eq!(
+        run_from(&format!("from {a} | select v > 2")).unwrap(),
+        "k,v\n3,4\n"
+    );
+    assert_eq!(
+        run_from(&format!("from (add w = v * 2) {a}")).unwrap(),
+        "k,v,w\n1,2,4\n3,4,8\n"
+    );
+}
+
+#[test]
+fn from_a_pattern_of_one_file_is_still_suffixed() {
+    let dir = common::TempDir::new();
+    dir.write("only.7.csv", "k,v\n1,2\n");
+    assert_eq!(
+        run_from(&format!("from {}", dir.at("only.*.csv"))).unwrap(),
+        "k_7,v_7\n1,2\n"
+    );
+    assert_eq!(
+        run_from(&format!("from {} on k", dir.at("only.*.csv"))).unwrap(),
+        "k,v_7\n1,2\n"
+    );
+}
+
+#[test]
+fn from_several_files_needs_on() {
+    let dir = common::TempDir::new();
+    dir.write("p.1.csv", "k,v\n1,2\n");
+    dir.write("p.2.csv", "k,v\n1,3\n");
+    let e = run_from(&format!("from {}", dir.at("p.*.csv"))).unwrap_err();
+    assert!(
+        e.contains("from joins several files: give `on KEYS`"),
+        "{e}"
+    );
+}
+
+#[test]
+fn from_a_file_after_a_shared_on_is_not_dropped() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "k,v\n1,2\n");
+    let b = dir.write("b.csv", "k,w\n1,3\n");
+    let e = run_from(&format!("from {a} on k, {b}")).unwrap_err();
+    assert!(e.contains("did you forget its `on`?"), "{e}");
+}
+
+#[test]
+fn from_items_without_on_after_one_with_it_are_an_error() {
+    let dir = common::TempDir::new();
+    let a = dir.write("a.csv", "ts,v\n1,a\n2,b\n");
+    let b = dir.write("b.csv", "ts,w\n1,x\n2,y\n");
+    for script in [
+        format!("from {a} on ts, (cols ts,w) {b}"),
+        format!("from {a} on ts, -R _b {b}"),
+    ] {
+        let e = run_from(&script).unwrap_err();
+        assert!(e.contains("give every file its own `on`"), "{script}: {e}");
+    }
+}

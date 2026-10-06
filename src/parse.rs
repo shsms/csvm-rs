@@ -22,9 +22,9 @@ use crate::color::{Ramp, parse_ramp, parse_style};
 use crate::error::Error;
 use crate::plan::{
     AddStmt, AffixKind, AggFunc, AggSpec, ArithOp, BoolExpr, Cmp, CmpMode, CmpOp, ColRef,
-    ColorRule, ColorScope, ContextStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt, JoinStmt,
-    JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt, Sources,
-    Span, Stage, StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
+    ColorRule, ColorScope, ContextStmt, FromStmt, Func, GraphKind, GraphOpts, GraphSpec, GroupStmt,
+    JoinStmt, JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt,
+    Sources, Span, Stage, StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
 use std::cell::OnceCell;
 use std::ops::Range;
@@ -86,6 +86,7 @@ fn parse_stages(
         && builder.output == OutputFormat::Csv
         && builder.colors.is_empty()
         && builder.graph.is_none()
+        && builder.from.is_none()
     {
         return Err(err("empty script"));
     }
@@ -197,8 +198,8 @@ impl Recorder {
 /// Known command names, for the "did you mean …?" hint on an unknown verb and
 /// the help registry's drift check (see `crate::help`).
 pub(crate) const COMMANDS: &[&str] = &[
-    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "join",
-    "add", "agg", "graph", "fn",
+    "cols", "select", "sort", "head", "tail", "stats", "uniq", "color", "rename", "fmt", "from",
+    "join", "add", "agg", "graph", "fn",
 ];
 
 /// A command that was removed, with the advice that replaces a use of it.
@@ -373,6 +374,10 @@ struct Builder<'a> {
     item_written: Vec<Written>,
     color_written: Vec<Written>,
     graph_written: Option<Written>,
+    /// A `from` stage (plan metadata; the input files, it begins the pipe).
+    from: Option<FromStmt>,
+    /// Where the `from` stage was written.
+    from_written: Option<Written>,
     /// The columns read since the last [`Builder::written_at`], and where
     /// each is written (see [`Builder::read_column`]).
     columns: Vec<(String, Range<usize>)>,
@@ -395,6 +400,8 @@ impl<'a> Builder<'a> {
             item_written: Vec::new(),
             color_written: Vec::new(),
             graph_written: None,
+            from: None,
+            from_written: None,
             columns: Vec::new(),
             rec,
         }
@@ -408,6 +415,9 @@ impl<'a> Builder<'a> {
             span,
             columns: std::mem::take(&mut self.columns),
         };
+        if self.from.is_some() && self.from_written.is_none() {
+            self.from_written = Some(written.clone());
+        }
         self.item_written
             .resize_with(self.items.len(), || written.clone());
         self.color_written
@@ -648,7 +658,9 @@ impl<'a> Builder<'a> {
                 stages: written,
                 colors: std::mem::take(&mut self.color_written),
                 graph: self.graph_written.take().unwrap_or_default(),
+                from: self.from_written.take().unwrap_or_default(),
             },
+            from: self.from.take(),
         }
     }
 
@@ -708,6 +720,7 @@ impl<'a> Builder<'a> {
             "agg" => self.parse_agg(rest),
             "graph" => self.parse_graph(rest),
             "uniq" => self.parse_uniq(rest),
+            "from" => self.parse_from(rest),
             "join" => self.parse_join(rest),
             "color" | "colour" => self.parse_color(rest),
             "rename" => self.parse_rename(rest),
@@ -912,6 +925,16 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// `from [FLAGS] ITEM[, ITEM…] [on KEYS]`: the script's input files.
+    fn parse_from(&mut self, rest: &str) -> Result<(), Error> {
+        if !self.items.is_empty() || self.from.is_some() {
+            return Err(err("from must be the first stage"));
+        }
+        let items = self.parse_join_items("from", rest)?;
+        self.from = Some(FromStmt { items });
+        Ok(())
+    }
+
     /// `join [FLAGS] ITEM[, ITEM...]` where `ITEM := [(SUBPIPELINE)] FILE [on
     /// KEYS]` merges one or more right-side files into the stream by key
     /// (desugaring to one join stage per file, left to right). Flags pick the
@@ -1059,14 +1082,20 @@ impl<'a> Builder<'a> {
                 if inner.trim().is_empty() {
                     Box::new(identity_plan())
                 } else {
-                    Box::new(parse_stages(
+                    let sub = parse_stages(
                         inner,
                         self.fns,
                         self.depth,
                         self.script,
                         self.stage_at,
                         self.rec.as_deref_mut(),
-                    )?)
+                    )?;
+                    if sub.from.is_some() {
+                        return Err(err(
+                            "from names the script's input; it cannot be inside a group",
+                        ));
+                    }
+                    Box::new(sub)
                 }
             } else {
                 Box::new(identity_plan())
@@ -2063,6 +2092,7 @@ fn identity_plan() -> Plan {
         colors: Vec::new(),
         graph: None,
         sources: Sources::default(),
+        from: None,
     }
 }
 
@@ -2234,7 +2264,7 @@ pub(crate) fn command_word(head: &str) -> CommandWord {
         return CommandWord::Other;
     }
     match word {
-        "join" => CommandWord::Join,
+        "join" | "from" => CommandWord::Join,
         "fn" => CommandWord::Fn,
         _ => CommandWord::Other,
     }
@@ -6206,6 +6236,32 @@ mod tests {
             panic!("{:?}", plan.stages)
         };
         assert_eq!(j.file, "pv.{1,2}.csv");
+    }
+
+    #[test]
+    fn from_must_be_the_first_stage() {
+        let e = parse("cols a | from x.csv").unwrap_err();
+        assert!(
+            e.to_string().contains("from must be the first stage"),
+            "{e}"
+        );
+        let e = parse("from x.csv | from y.csv").unwrap_err();
+        assert!(
+            e.to_string().contains("from must be the first stage"),
+            "{e}"
+        );
+        let e = parse("join (from x.csv) y.csv on k").unwrap_err();
+        assert!(e.to_string().contains("from"), "{e}");
+    }
+
+    #[test]
+    fn from_keeps_its_items_and_lets_one_file_skip_on() {
+        let plan = parse("fn f() { cols a }\nfrom (f()) a.{1,2}.csv on ts | head 3").unwrap();
+        let from = plan.from.as_ref().unwrap();
+        assert_eq!(from.items.len(), 1);
+        assert!(from.items[0].pattern);
+        assert_eq!(plan.stages.len(), 1);
+        assert!(parse("from a.csv").unwrap().from.is_some());
     }
 
     #[test]

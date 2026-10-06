@@ -478,6 +478,20 @@ a column with add first.",
         flags: &[],
     },
     CmdHelp {
+        name: "from",
+        aliases: &[],
+        summary: "read the named files as the input, joined on keys",
+        synopsis: &[
+            "from [(SUB)] FILE              the input is FILE, run through SUB",
+            "from [FLAGS] ITEM[, ITEM...] on KEYS   join the files; the first is the left",
+        ],
+        detail: "from must be the first stage, and replaces the input file. A FILE may be a \
+pattern: * and ? in its name, {a,b} and {x..y} anywhere; each matched file's non-key columns \
+are suffixed _PART, PART being what the pattern matched. Items and flags are as for join.",
+        examples: &["csvm 'from (select v != \"nan\") pv.{572..575}.csv on timestamp | fmt'"],
+        flags: &[],
+    },
+    CmdHelp {
         name: "join",
         aliases: &[],
         summary: "merge one or more CSVs by key",
