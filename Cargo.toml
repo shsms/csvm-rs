@@ -43,6 +43,8 @@ arrow = { version = "59", optional = true, default-features = false }
 libc = "0.2"
 # A fast hasher for every hash table in exec.rs.
 foldhash = "0.2"
+# Reads requests and writes replies for `--inkline-mode`.
+inkline-mode-protocol = { git = "https://github.com/shsms/inkline-mode-protocol", rev = "9e9cee9d11f4f876f9f39366e79a3abbbba9b4ee" }
 
 [dev-dependencies]
 # Reference RFC-4180 parser, used only to confirm our scanner's conformance.

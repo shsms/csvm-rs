@@ -8,8 +8,9 @@
 
 use std::ops::Range;
 
+use inkline_mode_protocol::{Item, MAX_MESSAGE};
+
 use crate::help::COMMANDS;
-use crate::mode_server::{Item, MAX_MESSAGE};
 use crate::parse::{
     CommandWord, bracket_kind, command_word, is_ident, split_first_word, strip_comments,
     strip_comments_noting, take_token,

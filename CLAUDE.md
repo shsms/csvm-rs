@@ -800,10 +800,15 @@ otherwise mirror csvm.)
 `--inkline-mode` (alone) makes csvm a mode server for inkline
 (`src/mode_server.rs`; inkline's `docs/mode-protocol.md` describes the
 inkline mode protocol): `mode_server::serve` reads requests on stdin and
-answers each on stdout. A request's first `:arg` is the command's name as
-typed (`csvm`, `c`, `./target/debug/csvm`); csvm skips it.
-A `mode_server::Session` runs `cli::parse_at` (a usage error says which
-argument it is about) and `parse::parse_recorded`, the real parser with a
+answers each on stdout. The `inkline-mode-protocol` crate, a git
+dependency on `github.com/shsms/inkline-mode-protocol`, reads requests
+and writes replies. Its `serve` loop calls the `Mode` trait, which
+`mode_server::Session` implements. A request's first `:arg` is the
+command's name as typed (`csvm`, `c`, `./target/debug/csvm`); csvm skips
+it (`Request::words`).
+For a colour request, `Session::colors` runs `cli::parse_at` (a usage
+error says which argument it is about) and `parse::parse_recorded`, the
+real parser with a
 `parse::Recorder` that notes each part's byte range and kind where the
 parser reads it (`Builder::note`; a `|` between stages is a `separator`, a
 `||` an `operator`); a plain `parse` passes no recorder and
@@ -828,11 +833,10 @@ protocol ends it with exit status 1 and the reason on stderr; a closed
 stdout, or a connection reset (inkline's socket closed with a reply still
 unread), ends it quietly, like any run whose reader stopped
 (`Failure::Closed`).
-The first line, `inkline-mode 1 indent complete` (`mode_server::GREETING`),
-names `indent` and `complete`, so inkline also sends `:indent` and
-`:complete` requests: the same `:cwd`/`:arg` blocks, then `:at ARG OFFSET`
-before `:done` (`Ask::Indent`/`Ask::Complete` hold that pair; `read_request`
-puts either into `Request.ask`).
+The first line, `inkline-mode 1 indent complete`, names `indent` and
+`complete` (`Session` sets `Mode::INDENT` and `Mode::COMPLETE`), so
+inkline also sends `:indent` and `:complete` requests: the same
+`:cwd`/`:arg` blocks, then `:at ARG OFFSET` before `:done`.
 `mode_server::indent` finds the script as for colours and answers
 `:depth NEW CURRENT` from `parse::depths`, `CURRENT` being `-` when the
 line the split is on stays as it is, or only `:end` when `:at` is not in
@@ -860,8 +864,8 @@ one, so a line indented by hand never moves. Each open bracket is kept on
 one stack per closing kind, so a closer finds what it closes without a
 walk, and the pass stays linear. Nothing on the run path calls it.
 
-`:complete` requests are answered by `Session::complete`
-(`Ask::Complete`): it finds the script as `indent` does (`script_args`),
+`:complete` requests are answered by `Session::complete`: it finds the
+script as `indent` does (`script_args`),
 then hands the script and the cursor's offset to `complete::find`
 (`src/complete.rs`). `find` reads the text before the cursor once, with
 the parser's own rules for quotes, comments, stages, `join ( … )` groups
@@ -911,13 +915,10 @@ break), or whose item text is over `MAX_MESSAGE` (4 KiB), is left out. A
 `raw` argument anywhere on the line makes `input_header` return `None`,
 so the pipeline's columns are left out; the commands, flags, functions
 and a join group's columns still come. A `raw` script gets no items,
-since `script_args` returns none for it. `write_items` writes the reply:
-each item as `:item START END TEXT`, a `:note TEXT` right after it when
-it has one, then `:end ID`; an item whose text is empty once `one_line`
-runs on it, and its note, are left out. It writes at most `MAX_ITEMS`
-(1000) items, and stops before their lines pass `MAX_ITEM_BYTES`
-(900 KiB); when not all fit, `typed_first` has put the items that start
-with the typed part of the word first.
+since `script_args` returns none for it. The crate's `write_items`
+writes the reply, within its `MAX_ITEMS` and `MAX_ITEM_BYTES` limits;
+when not all items fit (`items_fit`), `typed_first` has put the items
+that start with the typed part of the word first.
 
 ## Performance
 

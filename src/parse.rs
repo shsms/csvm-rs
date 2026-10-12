@@ -26,6 +26,7 @@ use crate::plan::{
     JoinStmt, JoinType, OutputFormat, Plan, ProjectStmt, RenameStmt, SortKey, SortMode, SortStmt,
     Sources, Span, Stage, StatsStmt, Stmt, TableOpts, UniqStmt, ValExpr, Written,
 };
+use inkline_mode_protocol::{Depths, SpanKind};
 use std::cell::OnceCell;
 use std::ops::Range;
 
@@ -121,43 +122,9 @@ fn place_on(script: &str, part: &str, e: Error) -> Error {
     }
 }
 
-/// What a part of the script is, for `csvm --inkline-mode`: each kind is a
-/// colour the editor paints that part with.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SpanKind {
-    Command,
-    Keyword,
-    Option,
-    Operator,
-    /// A `|` that ends a stage.
-    Separator,
-    String,
-    Number,
-    Variable,
-    Function,
-    Comment,
-}
-
-impl SpanKind {
-    /// The kind's name in the inkline mode protocol.
-    pub fn name(self) -> &'static str {
-        match self {
-            SpanKind::Command => "command",
-            SpanKind::Keyword => "keyword",
-            SpanKind::Option => "option",
-            SpanKind::Operator => "operator",
-            SpanKind::Separator => "separator",
-            SpanKind::String => "string",
-            SpanKind::Number => "number",
-            SpanKind::Variable => "variable",
-            SpanKind::Function => "function",
-            SpanKind::Comment => "comment",
-        }
-    }
-}
-
 /// The parts of a script [`parse_recorded`] noted: byte ranges of the
-/// script, each with its kind.
+/// script, each with its kind, the colour an editor paints that part with
+/// (`csvm --inkline-mode`). A `|` that ends a stage is a `Separator`.
 #[derive(Debug, Default)]
 pub struct Recorder {
     spans: Vec<(Range<usize>, SpanKind)>,
@@ -2154,19 +2121,8 @@ fn take_brace_group(s: &str) -> Result<(&str, &str), Error> {
 
 // --- nesting, for indenting a line ------------------------------------------
 
-/// Where two lines of a script go, counted in steps, for an editor that
-/// indents a line it is splitting (`csvm --inkline-mode`). Each is a line's
-/// level, the depth inkline's `:depth` reply carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Depths {
-    /// The line that starts where the split is.
-    pub new: usize,
-    /// The line the split is on, when it starts with a closing bracket and
-    /// so moves back out; `None` leaves that line as it is.
-    pub current: Option<usize>,
-}
-
-/// The [`Depths`] for splitting `script` at byte `at` (at most its length).
+/// The [`Depths`] for splitting `script` at byte `at` (at most its length), for
+/// an editor that indents a line it is splitting (`csvm --inkline-mode`).
 ///
 /// Each line gets a level, in steps, from the lines before it:
 ///
@@ -5969,37 +5925,6 @@ mod tests {
             .into_iter()
             .map(|(at, kind)| (&script[at], kind.name()))
             .collect()
-    }
-
-    #[test]
-    fn every_kind_has_its_protocol_name() {
-        let kinds = [
-            SpanKind::Command,
-            SpanKind::Keyword,
-            SpanKind::Option,
-            SpanKind::Operator,
-            SpanKind::Separator,
-            SpanKind::String,
-            SpanKind::Number,
-            SpanKind::Variable,
-            SpanKind::Function,
-            SpanKind::Comment,
-        ];
-        assert_eq!(
-            kinds.map(SpanKind::name),
-            [
-                "command",
-                "keyword",
-                "option",
-                "operator",
-                "separator",
-                "string",
-                "number",
-                "variable",
-                "function",
-                "comment"
-            ]
-        );
     }
 
     #[test]

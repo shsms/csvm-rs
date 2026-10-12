@@ -1,52 +1,25 @@
 //! `csvm --inkline-mode`: the mode server inkline asks to colour, indent
 //! and complete a csvm command line while it is typed.
 //!
-//! inkline writes requests to stdin:
-//!
-//! ```text
-//! :request ID
-//! :cwd LEN
-//! BYTES
-//! :arg final|raw LEN
-//! BYTES
-//! :done
-//! ```
-//!
-//! with one `:arg` per argument, the command's name first. csvm answers
-//! each on stdout, in order:
-//!
-//! ```text
-//! :span ARG START END KIND
-//! :error ARG START END MESSAGE      (or :error - - - MESSAGE)
-//! :end ID
-//! ```
-//!
-//! csvm names `indent` on its first line, so inkline may also ask where a
-//! new line in the script goes: an `:indent ID` request, with the same
-//! `:cwd` and `:arg` blocks and then `:at ARG OFFSET` (where the line
-//! breaks) before `:done`. csvm answers `:depth NEW CURRENT` (how deep the
-//! new line goes, and how deep the line being split goes, or `-` to leave
-//! it as it is), or nothing, then `:end ID`. A `:span`'s `KIND` is one of
-//! `parse::SpanKind`'s names; a `|` between two stages is a `separator`.
-//!
-//! csvm also names `complete` on its first line, so inkline may ask for
-//! completion items at a place in an argument: a `:complete ID` request,
-//! with the same `:cwd` and `:arg` blocks and then `:at ARG OFFSET` before
-//! `:done`, as for `:indent`. csvm answers zero or more items, each an
-//! `:item START END TEXT` line (the bytes `START..END` of the `:at`
-//! argument that the item replaces) with an optional `:note TEXT` line
-//! right after it, then `:end ID`.
-//!
-//! Lengths and offsets count bytes. inkline's `docs/mode-protocol.md`
-//! describes the whole of the inkline mode protocol.
+//! `inkline_mode_protocol` reads the requests and writes the replies;
+//! this module decides what csvm answers. A request's first argument is the
+//! command's name as typed, which csvm skips. A colour reply's spans are
+//! the script's parts as the parser reads them (`parse::Recorder`), a `|`
+//! between two stages being a `separator`, and its error is the first
+//! thing csvm would reject on the line. csvm names `indent` and `complete`
+//! on its first line: an `:indent` request is answered from
+//! `parse::depths`, and a `:complete` one from `complete::find`.
 
 use crate::cli::{self, InputFormat, Parsed};
 use crate::complete::{self, Found, Group, Place};
 use crate::error::Error;
 use crate::exec;
-use crate::parse::{self, Depths, Recorder, SpanKind};
+use crate::parse::{self, Recorder};
 use crate::pattern;
 use crate::plan::{Plan, Stage};
+use inkline_mode_protocol::{
+    Depths, Item, MAX_ITEMS, Mode, Reply, ReplyError, Request, Span, items_fit,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -54,128 +27,21 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// The line csvm writes first: the protocol's name and version, and the
-/// extra requests csvm answers, `:indent` and `:complete`.
-pub const GREETING: &str = "inkline-mode 1 indent complete";
-
-/// The longest `:` line a request may have, newline included.
-const MAX_LINE: u64 = 256;
-
-/// The most bytes one `:cwd` or `:arg` may hold. A command line is far
-/// smaller; the limit keeps a corrupt length from asking for any amount of
-/// memory.
-const MAX_BYTES: usize = 16 << 20;
-
-/// The most bytes of `:span` lines one reply may hold. inkline turns a mode
-/// server off when a reply passes 1 MiB, so the spans past this are not
-/// sent (the end of a very long script is then not coloured), which leaves
-/// room for the error and `:end`.
-const MAX_SPAN_BYTES: usize = 900 << 10;
-
-/// The most items one reply to a `:complete` request holds.
-const MAX_ITEMS: usize = 1000;
-
-/// The most bytes of `:item` and `:note` lines one reply holds, well under
-/// inkline's 1 MiB limit, past which it turns a mode server off.
-const MAX_ITEM_BYTES: usize = MAX_SPAN_BYTES;
-
-/// The most bytes of an error's message, or of an item's text or note, that
-/// are sent, so that a message quoting a very long word cannot push a reply
-/// past inkline's limit either.
-pub const MAX_MESSAGE: usize = 4 << 10;
-
-/// One request: the shell's directory and the command's arguments.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Request {
-    pub id: u64,
-    pub cwd: Vec<u8>,
-    /// Argument 0 is the command's name.
-    pub args: Vec<Arg>,
-    /// What kind of request this is, and its `:at` place when it has one.
-    pub ask: Ask,
-}
-
-/// What one request asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Ask {
-    /// A colour request: the script's spans and its first error.
-    Colors,
-    /// An `:indent` request, with its `:at` place: an argument's index and
-    /// a byte offset in it, at most its length.
-    Indent((usize, usize)),
-    /// A `:complete` request, with its `:at` place, the same shape as
-    /// `Indent`'s.
-    Complete((usize, usize)),
-}
-
-/// One argument of the command line.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Arg {
-    /// Bash will still expand it, so `bytes` is the text as typed, not what
-    /// csvm will get.
-    pub raw: bool,
-    pub bytes: Vec<u8>,
-}
-
-/// The answer to one request.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Reply {
-    /// In order, none overlapping another.
-    pub spans: Vec<Span>,
-    pub error: Option<ReplyError>,
-}
-
-/// A coloured part of one argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Span {
-    /// The argument's index in the request.
-    pub arg: usize,
-    /// Byte offsets in the argument.
-    pub at: Range<usize>,
-    pub kind: SpanKind,
-}
-
-/// One completion item, the answer to a `:complete` request: it replaces
-/// the bytes `at` of the `:at` argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Item {
-    pub at: Range<usize>,
-    pub text: String,
-    pub note: Option<String>,
-}
-
-/// The one error a reply may carry.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplyError {
-    /// The argument, and the bytes of it, the error is about; `None` when
-    /// it has no place in the arguments.
-    pub place: Option<(usize, Range<usize>)>,
-    /// One line of text.
-    pub message: String,
-}
-
-impl ReplyError {
-    /// An error with `message` made one line, as [`write_reply`] writes it.
-    pub fn new(place: Option<(usize, Range<usize>)>, message: &str) -> ReplyError {
-        ReplyError {
-            place,
-            message: one_line(message),
-        }
-    }
-}
-
 /// What the mode server keeps from one request to the next.
 #[derive(Default)]
 pub struct Session {
     headers: Headers,
 }
 
-impl Session {
-    /// Answer one request: the script's colours, and the first thing csvm
-    /// would reject on this command line.
-    pub fn answer(&mut self, request: &Request) -> Reply {
+impl Mode for Session {
+    const INDENT: bool = true;
+    const COMPLETE: bool = true;
+
+    /// Answer a colour request: the script's colours, and the first thing
+    /// csvm would reject on this command line.
+    fn colors(&mut self, request: &Request) -> Reply {
         let mut reply = Reply::default();
-        let words = match words(request) {
+        let words = match request.words() {
             Ok(words) => words,
             Err(place) => {
                 // csvm cannot start with such an argument at all.
@@ -239,21 +105,24 @@ impl Session {
         reply
     }
 
-    /// The completion items at `at`, an argument and a byte offset in it:
-    /// what fits where the cursor is in the script (see [`complete::find`]),
-    /// each replacing the word the cursor is in. Commands and the script's
-    /// `fn` names at the start of a stage, a command's flags, the columns at
-    /// the cursor's stage, the functions in an expression, and the file
-    /// names where a `join` or `from` item takes its file. None when
-    /// `at` is not in the script argument, or csvm finds no script on the
-    /// line (an argument is not UTF-8, the line is a usage error, help, or
-    /// has `-f`), or the script is `raw`. When the columns cannot be known
-    /// (no input file, a file that cannot be read, a `raw` argument, a stage
-    /// before that does not resolve), the other items are still given.
-    /// When a reply cannot hold every item (see [`write_items`]), the ones
-    /// that start with the typed part of the word, from its start to the
-    /// cursor, come first.
-    pub fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
+    fn indent(&mut self, request: &Request, at: (usize, usize)) -> Option<Depths> {
+        indent(request, at)
+    }
+
+    /// The completion items at `at`, an argument and a byte offset in it: what
+    /// fits where the cursor is in the script (see [`complete::find`]), each
+    /// replacing the word the cursor is in. Commands and the script's `fn`
+    /// names at the start of a stage, a command's flags, the columns at the
+    /// cursor's stage, the functions in an expression, and the file names where
+    /// a `join` or `from` item takes its file. None when `at` is not in the
+    /// script argument, or csvm finds no script on the line (an argument is not
+    /// UTF-8, the line is a usage error, help, or has `-f`), or the script is
+    /// `raw`. When the columns cannot be known (no input file, a file that
+    /// cannot be read, a `raw` argument, a stage before that does not resolve),
+    /// the other items are still given. When a reply cannot hold every item
+    /// (see [`inkline_mode_protocol::write_items`]), the ones that start with
+    /// the typed part of the word, from its start to the cursor, come first.
+    fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
         let Some(args) = script_args(request, at) else {
             return Vec::new();
         };
@@ -288,7 +157,9 @@ impl Session {
         };
         typed_first(items, typed)
     }
+}
 
+impl Session {
     /// The items for a file whose path starts `typed`, replacing the bytes
     /// `at`: the entries of the directory `typed` names up to its last `/`
     /// (from the shell's directory), that start with the rest, in natural
@@ -315,7 +186,7 @@ impl Session {
             None => ("", typed),
         };
         let listed = if dir.is_empty() { "." } else { dir };
-        let Some(path) = from_dir(shell_dir(&request.cwd), Path::new(listed)) else {
+        let Some(path) = from_dir(request.shell_dir(), Path::new(listed)) else {
             return Vec::new();
         };
         let Some(mut names) = self.headers.list(&path) else {
@@ -344,7 +215,7 @@ impl Session {
         args: &cli::Args,
         found: &Found,
     ) -> Option<Vec<String>> {
-        let cwd = shell_dir(&request.cwd);
+        let cwd = request.shell_dir();
         let mut plan = if found.stages_before.is_empty() {
             None
         } else {
@@ -378,7 +249,7 @@ impl Session {
         args: &cli::Args,
         plan: &mut Plan,
     ) -> Option<Error> {
-        let cwd = shell_dir(&request.cwd);
+        let cwd = request.shell_dir();
         let header = match self.named_input_header(plan, request, args) {
             Some(header) => header?,
             None => self.input_header(request, args)?,
@@ -403,7 +274,7 @@ impl Session {
         let mut fs = SessionFs {
             headers: &mut self.headers,
         };
-        let Ok(Some(from)) = exec::prepare_from(plan, shell_dir(&request.cwd), &mut fs) else {
+        let Ok(Some(from)) = exec::prepare_from(plan, request.shell_dir(), &mut fs) else {
             return Some(None);
         };
         // Arguments csvm refuses to run have no header to check against.
@@ -425,7 +296,7 @@ impl Session {
             return None;
         }
         let path = args.in_path()?;
-        let path = from_dir(shell_dir(&request.cwd), Path::new(path))?;
+        let path = from_dir(request.shell_dir(), Path::new(path))?;
         let format = args.input_format();
         match (&args.header, format) {
             // csvm rejects `--header` for Parquet, which names its own columns.
@@ -459,30 +330,12 @@ pub fn indent(request: &Request, at: (usize, usize)) -> Option<Depths> {
 /// has `-f`), when `at` is in another argument, or when the script is
 /// `raw`.
 fn script_args(request: &Request, at: (usize, usize)) -> Option<Box<cli::Args>> {
-    let words = words(request).ok()?;
+    let words = request.words().ok()?;
     let Ok(Parsed::Run(args)) = cli::parse_at(words) else {
         return None;
     };
     let arg = args.script_at? + 1;
     (at.0 == arg && !request.args[arg].raw).then_some(args)
-}
-
-/// The arguments after the command's name as text; `Err` with the place of
-/// the first bytes that are not UTF-8.
-fn words(request: &Request) -> Result<Vec<String>, (usize, Range<usize>)> {
-    let mut words = Vec::with_capacity(request.args.len());
-    // Argument 0 is the command's name; csvm's own parser reads the rest.
-    for (i, arg) in request.args.iter().enumerate().skip(1) {
-        match std::str::from_utf8(&arg.bytes) {
-            Ok(text) => words.push(text.to_string()),
-            Err(e) => {
-                let start = e.valid_up_to();
-                let end = e.error_len().map_or(arg.bytes.len(), |n| start + n);
-                return Err((i, start..end));
-            }
-        }
-    }
-    Ok(words)
 }
 
 /// `e`, found in the script, which is argument `arg`, as a reply's error:
@@ -495,13 +348,6 @@ fn script_error(arg: usize, script: &str, e: Error) -> ReplyError {
         (arg, at.start.min(end)..end)
     });
     ReplyError::new(place, &e.to_string())
-}
-
-/// The shell's directory, from a request's `:cwd`. `None` when that is not
-/// an absolute UTF-8 path: bash sends an empty one when `PWD` is unset.
-fn shell_dir(cwd: &[u8]) -> Option<&Path> {
-    let dir = Path::new(std::str::from_utf8(cwd).ok()?);
-    dir.is_absolute().then_some(dir)
 }
 
 /// `path` as the shell sees it from its directory `cwd`. `None` for a
@@ -672,138 +518,12 @@ fn read_first_line(path: &Path, format: InputFormat, len: u64) -> Option<Vec<Str
     }
 }
 
-/// Read the next request, a colour (`:request`), an `:indent` or a
-/// `:complete` one; `None` when the input ends before one starts. Input
-/// that is not a request is an [`io::ErrorKind::InvalidData`] error: after
-/// it, the stream cannot be followed. So is an `:indent` or `:complete`
-/// request without `:at` just before its `:done`, an `:at` in a colour
-/// request, and an `:at` outside the request's arguments.
-pub fn read_request(input: &mut impl BufRead) -> io::Result<Option<Request>> {
-    let Some(line) = read_line(input)? else {
-        return Ok(None);
-    };
-    // When this request needs an `:at` before its `:done`, the word its
-    // kind is named by and the `Ask` it makes of the place; `None` for a
-    // colour request, which does not.
-    type MakeAsk = fn((usize, usize)) -> Ask;
-    let (id, needs_at): (u64, Option<(&str, MakeAsk)>) =
-        if let Some(id) = line.strip_prefix(":indent ") {
-            (number(id)?, Some(("indent", Ask::Indent)))
-        } else if let Some(id) = line.strip_prefix(":complete ") {
-            (number(id)?, Some(("complete", Ask::Complete)))
-        } else {
-            (number(field(&line, ":request ")?)?, None)
-        };
-    let line = need_line(input)?;
-    let cwd = read_bytes(input, number(field(&line, ":cwd ")?)?)?;
-    let mut args = Vec::new();
-    let ask = loop {
-        let line = need_line(input)?;
-        if line == ":done" {
-            if let Some((name, _)) = needs_at {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("an :{name} request needs :at before :done"),
-                ));
-            }
-            break Ask::Colors;
-        }
-        if let Some((_, ask)) = needs_at
-            && let Some(at) = line.strip_prefix(":at ")
-        {
-            let at = read_at(at, &args)?;
-            let done = need_line(input)?;
-            if done != ":done" {
-                return Err(bad(&done));
-            }
-            break ask(at);
-        }
-        let (kind, len) = field(&line, ":arg ")?
-            .split_once(' ')
-            .ok_or_else(|| bad(&line))?;
-        let raw = match kind {
-            "final" => false,
-            "raw" => true,
-            _ => return Err(bad(&line)),
-        };
-        args.push(Arg {
-            raw,
-            bytes: read_bytes(input, number(len)?)?,
-        });
-    };
-    Ok(Some(Request { id, cwd, args, ask }))
-}
-
-/// The fields of an `:at` line, `ARG OFFSET`: an argument of `args` and a
-/// byte offset in it, at most its length.
-fn read_at(fields: &str, args: &[Arg]) -> io::Result<(usize, usize)> {
-    let (arg, offset) = fields.split_once(' ').ok_or_else(|| bad(fields))?;
-    let (arg, offset): (usize, usize) = (number(arg)?, number(offset)?);
-    match args.get(arg) {
-        Some(a) if offset <= a.bytes.len() => Ok((arg, offset)),
-        _ => Err(bad(&format!(":at {fields}"))),
-    }
-}
-
-/// Write the answer to `:indent` request `id`: `:depth NEW CURRENT` when
-/// there are depths, `CURRENT` being `-` when the line the split is on stays
-/// as it is, then `:end ID`.
-pub fn write_indent(out: &mut impl Write, id: u64, depths: Option<Depths>) -> io::Result<()> {
-    if let Some(d) = depths {
-        match d.current {
-            Some(current) => writeln!(out, ":depth {} {current}", d.new)?,
-            None => writeln!(out, ":depth {} -", d.new)?,
-        }
-    }
-    writeln!(out, ":end {id}")
-}
-
-/// Write the answer to a `:complete` request `id`: each item as `:item
-/// START END TEXT`, then `:note TEXT` when it has one, then `:end ID`. An
-/// item's text and note go through `one_line`, so a newline in either can
-/// never break a line; an item whose text is empty once it does is not
-/// written (nor is its note). At most `MAX_ITEMS` items are written, and
-/// they stop before their lines pass `MAX_ITEM_BYTES`.
-pub fn write_items(out: &mut impl Write, id: u64, items: &[Item]) -> io::Result<()> {
-    let mut written = 0;
-    for lines in items.iter().filter_map(item_lines).take(MAX_ITEMS) {
-        written += lines.len();
-        if written > MAX_ITEM_BYTES {
-            break;
-        }
-        out.write_all(lines.as_bytes())?;
-    }
-    writeln!(out, ":end {id}")
-}
-
-/// The lines [`write_items`] writes for `item`: its `:item` line and its
-/// `:note` line, if any. `None` when its text is empty once it is one line.
-fn item_lines(item: &Item) -> Option<String> {
-    let text = one_line(&item.text);
-    if text.is_empty() {
-        return None;
-    }
-    let mut lines = format!(":item {} {} {text}\n", item.at.start, item.at.end);
-    if let Some(note) = &item.note {
-        lines.push_str(&format!(":note {}\n", one_line(note)));
-    }
-    Some(lines)
-}
-
 /// `items`, with the ones whose text starts with `typed` first when a reply
-/// cannot hold them all, so that the ones cut are the others. A backtick at
-/// the start of either is not compared. The order is kept otherwise.
+/// cannot hold them all, so that the ones cut are the others. A backtick or
+/// double quote at the start of either is not compared. The order is kept
+/// otherwise.
 fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
-    // Stops at the first item past either limit.
-    let fits = items
-        .iter()
-        .filter_map(item_lines)
-        .try_fold((0, 0), |(n, b), l| {
-            let (n, b) = (n + 1, b + l.len());
-            (n <= MAX_ITEMS && b <= MAX_ITEM_BYTES).then_some((n, b))
-        })
-        .is_some();
-    if fits {
+    if items_fit(&items) {
         return items;
     }
     fn unquoted(text: &str) -> &str {
@@ -817,399 +537,16 @@ fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
     first
 }
 
-/// Write `reply` to request `id`, ending with `:end ID`. The spans stop
-/// before they pass `MAX_SPAN_BYTES`; the error, on one line of at most
-/// `MAX_MESSAGE` bytes, and the end are always written.
-pub fn write_reply(out: &mut impl Write, id: u64, reply: &Reply) -> io::Result<()> {
-    let mut written = 0;
-    for span in &reply.spans {
-        let line = format!(
-            ":span {} {} {} {}\n",
-            span.arg,
-            span.at.start,
-            span.at.end,
-            span.kind.name()
-        );
-        written += line.len();
-        if written > MAX_SPAN_BYTES {
-            break;
-        }
-        out.write_all(line.as_bytes())?;
-    }
-    if let Some(error) = &reply.error {
-        let message = one_line(&error.message);
-        match &error.place {
-            Some((arg, at)) => writeln!(out, ":error {arg} {} {} {message}", at.start, at.end)?,
-            None => writeln!(out, ":error - - - {message}")?,
-        }
-    }
-    writeln!(out, ":end {id}")
-}
-
-/// Be the mode server: write [`GREETING`], then answer each request read
-/// from `input` on `output`, a colour request with [`Session::answer`], an
-/// `:indent` one with [`indent`], and a `:complete` one with
-/// [`Session::complete`], flushing after each reply, until `input` ends.
+/// Be csvm's mode server: [`inkline_mode_protocol::serve`] with a new
+/// [`Session`], until `input` ends.
 pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
-    writeln!(output, "{GREETING}")?;
-    output.flush()?;
-    let mut session = Session::default();
-    while let Some(request) = read_request(input)? {
-        match request.ask {
-            Ask::Colors => write_reply(output, request.id, &session.answer(&request))?,
-            Ask::Indent(at) => write_indent(output, request.id, indent(&request, at))?,
-            Ask::Complete(at) => write_items(output, request.id, &session.complete(&request, at))?,
-        }
-        output.flush()?;
-    }
-    Ok(())
-}
-
-/// `message` as one line: up to its first newline, at most [`MAX_MESSAGE`]
-/// bytes, cut between two characters, a `\r` as a space, and no spaces at
-/// the end.
-fn one_line(message: &str) -> String {
-    let first = message.split('\n').next().unwrap_or("");
-    let first = &first[..first.floor_char_boundary(MAX_MESSAGE)];
-    first.replace('\r', " ").trim_end().to_string()
-}
-
-/// The rest of `line` after `keyword`, which it must start with.
-fn field<'l>(line: &'l str, keyword: &str) -> io::Result<&'l str> {
-    line.strip_prefix(keyword).ok_or_else(|| bad(line))
-}
-
-/// A decimal number: ASCII digits only.
-fn number<T: std::str::FromStr>(text: &str) -> io::Result<T> {
-    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(bad(text));
-    }
-    text.parse().map_err(|_| bad(text))
-}
-
-/// One `:` line, without its newline; `None` at the end of the input.
-fn read_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
-    let mut line = Vec::new();
-    input.by_ref().take(MAX_LINE).read_until(b'\n', &mut line)?;
-    if line.is_empty() {
-        return Ok(None);
-    }
-    if line.pop() != Some(b'\n') {
-        return Err(bad(&String::from_utf8_lossy(&line)));
-    }
-    String::from_utf8(line)
-        .map(Some)
-        .map_err(|e| bad(&String::from_utf8_lossy(e.as_bytes())))
-}
-
-/// [`read_line`], where the end of the input is an error.
-fn need_line(input: &mut impl BufRead) -> io::Result<String> {
-    read_line(input)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "the input ended inside a request",
-        )
-    })
-}
-
-/// `len` bytes, then the newline after them.
-fn read_bytes(input: &mut impl BufRead, len: usize) -> io::Result<Vec<u8>> {
-    if len > MAX_BYTES {
-        return Err(bad(&format!("{len} bytes")));
-    }
-    let mut bytes = vec![0; len + 1];
-    input.read_exact(&mut bytes)?;
-    if bytes.pop() != Some(b'\n') {
-        return Err(bad("no newline after the bytes"));
-    }
-    Ok(bytes)
-}
-
-/// The error for input that is not a request.
-fn bad(what: &str) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("not an inkline mode request: {what:?}"),
-    )
+    inkline_mode_protocol::serve(input, output, &mut Session::default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_request_is_read_with_its_bytes_as_given() {
-        let input = b":request 7\n:cwd 4\n/tmp\n:arg final 4\ncsvm\n:arg final 5\na\n\0|b\n\
-                      :arg raw 7\n$HOME/x\n:arg final 0\n\n:done\n";
-        let mut r = &input[..];
-        assert_eq!(
-            read_request(&mut r).unwrap(),
-            Some(Request {
-                id: 7,
-                cwd: b"/tmp".to_vec(),
-                args: vec![
-                    Arg {
-                        raw: false,
-                        bytes: b"csvm".to_vec()
-                    },
-                    Arg {
-                        raw: false,
-                        bytes: b"a\n\0|b".to_vec()
-                    },
-                    Arg {
-                        raw: true,
-                        bytes: b"$HOME/x".to_vec()
-                    },
-                    Arg {
-                        raw: false,
-                        bytes: Vec::new()
-                    },
-                ],
-                ask: Ask::Colors,
-            })
-        );
-        // Then the input ends: no more requests.
-        assert_eq!(read_request(&mut r).unwrap(), None);
-    }
-
-    #[test]
-    fn a_request_that_breaks_the_protocol_is_an_error() {
-        use io::ErrorKind::{InvalidData, UnexpectedEof};
-        let bad = |input: &[u8]| {
-            let mut r = input;
-            read_request(&mut r).unwrap_err().kind()
-        };
-        assert_eq!(bad(b"hello\n"), InvalidData);
-        assert_eq!(bad(b":request x\n"), InvalidData);
-        assert_eq!(bad(b":request +1\n"), InvalidData);
-        // A line cut off, or too long to be a `:` line.
-        assert_eq!(bad(b":request 1"), InvalidData);
-        assert_eq!(
-            bad(format!(":request {}\n", "1".repeat(300)).as_bytes()),
-            InvalidData
-        );
-        // No `:cwd`, or a kind that is neither final nor raw.
-        assert_eq!(bad(b":request 1\n:arg final 1\na\n"), InvalidData);
-        assert_eq!(
-            bad(b":request 1\n:cwd 1\n/\n:arg odd 1\na\n:done\n"),
-            InvalidData
-        );
-        // Fewer bytes than the length says, or no newline after them.
-        assert_eq!(bad(b":request 1\n:cwd 2\n/\n"), UnexpectedEof);
-        assert_eq!(bad(b":request 1\n:cwd 1\n/x:done\n"), InvalidData);
-        // A length too large to be a command line.
-        assert_eq!(bad(b":request 1\n:cwd 99999999999\n"), InvalidData);
-        // The input ends before `:done`.
-        assert_eq!(bad(b":request 1\n:cwd 1\n/\n"), UnexpectedEof);
-    }
-
-    #[test]
-    fn a_reply_is_written_line_by_line() {
-        let reply = Reply {
-            spans: vec![
-                Span {
-                    arg: 1,
-                    at: 0..4,
-                    kind: SpanKind::Command,
-                },
-                Span {
-                    arg: 1,
-                    at: 5..6,
-                    kind: SpanKind::Variable,
-                },
-            ],
-            error: Some(ReplyError::new(Some((1, 7..7)), "bad thing\nsecond line")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 3, &reply).unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            ":span 1 0 4 command\n:span 1 5 6 variable\n:error 1 7 7 bad thing\n:end 3\n"
-        );
-        // An error with no place; a stray `\r` does not reach the line.
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError::new(None, "no place\r")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 4, &reply).unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            ":error - - - no place\n:end 4\n"
-        );
-        // Nothing to say: only the end.
-        let mut out = Vec::new();
-        write_reply(&mut out, 5, &Reply::default()).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), ":end 5\n");
-    }
-
-    /// inkline's reader requires the space before `MESSAGE` even when the
-    /// message is empty (`:error ARG START END ` / `:error - - - `), so a
-    /// consumer can always split off four fields. This checks the exact
-    /// bytes for both an empty message with a place and one without.
-    #[test]
-    fn an_error_with_an_empty_message_still_gets_its_trailing_space() {
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError::new(Some((0, 3..3)), "")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 1, &reply).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), ":error 0 3 3 \n:end 1\n");
-
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError::new(None, "")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 2, &reply).unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), ":error - - - \n:end 2\n");
-    }
-
-    #[test]
-    fn a_message_is_written_on_one_line_however_it_was_built() {
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError {
-                place: None,
-                message: "a\nb".to_string(),
-            }),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 1, &reply).unwrap();
-        assert_eq!(out, b":error - - - a\n:end 1\n");
-        // A `\r` is a space; a message too long is cut on a character.
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError {
-                place: Some((1, 0..1)),
-                message: format!("a\rb{}", "é".repeat(MAX_MESSAGE)),
-            }),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 2, &reply).unwrap();
-        let text = String::from_utf8(out).unwrap();
-        let message = text
-            .strip_prefix(":error 1 0 1 ")
-            .and_then(|t| t.strip_suffix("\n:end 2\n"))
-            .unwrap();
-        assert!(message.starts_with("a b\u{e9}"));
-        assert!(message.len() <= MAX_MESSAGE);
-        assert!(message.len() > MAX_MESSAGE - 2);
-    }
-
-    /// Check that `bytes` is a well-formed reply to request `id`, by the
-    /// protocol's shape: every line ends in a newline and is a `:span`,
-    /// `:error` or `:end` line; a number field is plain ASCII digits, no
-    /// sign; `:span` and `:error` each carry exactly four space-separated
-    /// fields (so `MESSAGE`'s leading space is required even when it is
-    /// empty); a span has `START < END` and a placed error `START <= END`;
-    /// a placeless error is exactly `- - -`; there is at most one `:error`;
-    /// and the reply ends with `:end ID`, naming the request's `ID`, and
-    /// nothing after it. It does not know the arguments, so it cannot check
-    /// an offset against an argument's length, nor that spans do not
-    /// overlap, nor a span's `KIND`.
-    fn check_reply_is_well_formed(bytes: &[u8], id: u64) {
-        fn is_number(s: &str) -> bool {
-            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
-        }
-
-        let text = std::str::from_utf8(bytes).expect("reply must be UTF-8");
-        let mut lines: Vec<&str> = text.split('\n').collect();
-        assert_eq!(
-            lines.pop(),
-            Some(""),
-            "every line, :end included, ends in a newline"
-        );
-        assert!(!lines.is_empty(), "a reply always has :end");
-
-        let mut error_seen = false;
-        for (i, line) in lines.iter().enumerate() {
-            assert!(
-                line.starts_with(':'),
-                "a reply line starts with ':': {line:?}"
-            );
-            if let Some(rest) = line.strip_prefix(":span ") {
-                let fields: Vec<&str> = rest.splitn(4, ' ').collect();
-                assert_eq!(fields.len(), 4, ":span needs ARG START END KIND: {line:?}");
-                assert!(is_number(fields[0]), "ARG is not plain digits: {line:?}");
-                assert!(is_number(fields[1]), "START is not plain digits: {line:?}");
-                assert!(is_number(fields[2]), "END is not plain digits: {line:?}");
-                let start: u64 = fields[1].parse().unwrap();
-                let end: u64 = fields[2].parse().unwrap();
-                assert!(start < end, "a span needs START < END: {line:?}");
-                assert!(!fields[3].is_empty(), "KIND is missing: {line:?}");
-            } else if let Some(rest) = line.strip_prefix(":error ") {
-                assert!(!error_seen, "at most one :error line per reply");
-                error_seen = true;
-                let fields: Vec<&str> = rest.splitn(4, ' ').collect();
-                assert_eq!(
-                    fields.len(),
-                    4,
-                    ":error needs ARG START END MESSAGE, MESSAGE's leading \
-                     space included even when it is empty: {line:?}"
-                );
-                if fields[0] == "-" || fields[1] == "-" || fields[2] == "-" {
-                    assert_eq!(
-                        (fields[0], fields[1], fields[2]),
-                        ("-", "-", "-"),
-                        "a placeless error is exactly '- - -': {line:?}"
-                    );
-                } else {
-                    assert!(is_number(fields[0]), "ARG is not plain digits: {line:?}");
-                    assert!(is_number(fields[1]), "START is not plain digits: {line:?}");
-                    assert!(is_number(fields[2]), "END is not plain digits: {line:?}");
-                    let start: u64 = fields[1].parse().unwrap();
-                    let end: u64 = fields[2].parse().unwrap();
-                    assert!(start <= end, "an error needs START <= END: {line:?}");
-                }
-            } else if let Some(rest) = line.strip_prefix(":end ") {
-                assert_eq!(i, lines.len() - 1, ":end must be the reply's last line");
-                assert!(is_number(rest), "ID is not plain digits: {line:?}");
-                assert_eq!(rest.parse::<u64>().unwrap(), id, "wrong :end ID");
-            } else {
-                panic!("not a reply line: {line:?}");
-            }
-        }
-        assert!(
-            lines.last().unwrap().starts_with(":end "),
-            "a reply must end with :end"
-        );
-    }
-
-    #[test]
-    fn a_written_reply_is_well_formed() {
-        let reply = Reply {
-            spans: vec![
-                Span {
-                    arg: 1,
-                    at: 0..4,
-                    kind: SpanKind::Command,
-                },
-                Span {
-                    arg: 1,
-                    at: 5..6,
-                    kind: SpanKind::Variable,
-                },
-            ],
-            error: Some(ReplyError::new(Some((1, 7..7)), "bad thing")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 9, &reply).unwrap();
-        check_reply_is_well_formed(&out, 9);
-
-        let reply = Reply {
-            spans: Vec::new(),
-            error: Some(ReplyError::new(None, "")),
-        };
-        let mut out = Vec::new();
-        write_reply(&mut out, 10, &reply).unwrap();
-        check_reply_is_well_formed(&out, 10);
-
-        let mut out = Vec::new();
-        write_reply(&mut out, 11, &Reply::default()).unwrap();
-        check_reply_is_well_formed(&out, 11);
-    }
+    use inkline_mode_protocol::{Arg, Ask, MAX_ITEM_BYTES, write_items, write_reply};
 
     /// A request for the command line `args` (the command's name first),
     /// every argument `final`, from the directory `cwd`.
@@ -1242,7 +579,7 @@ mod tests {
 
     /// The reply's lines for the command line `args`, from `/`.
     fn ask(args: &[&str]) -> Vec<String> {
-        reply_lines(&Session::default().answer(&request("/", args)))
+        reply_lines(&Session::default().colors(&request("/", args)))
     }
 
     /// [`ask`], with the arguments at `raw` sent as `raw`.
@@ -1251,7 +588,7 @@ mod tests {
         for &i in raw {
             req.args[i].raw = true;
         }
-        reply_lines(&Session::default().answer(&req))
+        reply_lines(&Session::default().colors(&req))
     }
 
     #[test]
@@ -1458,7 +795,7 @@ mod tests {
         }
         let mut req = request("/", &["csvm", "select a >> 1"]);
         req.args[0].bytes = b"c\xff".to_vec();
-        assert_eq!(reply_lines(&Session::default().answer(&req)), want);
+        assert_eq!(reply_lines(&Session::default().colors(&req)), want);
     }
 
     #[test]
@@ -1466,13 +803,13 @@ mod tests {
         let mut req = request("/", &["csvm", "cols a"]);
         req.args[1].bytes = b"cols \xff a".to_vec();
         assert_eq!(
-            reply_lines(&Session::default().answer(&req)),
+            reply_lines(&Session::default().colors(&req)),
             [":error 1 5 6 this argument is not valid UTF-8"]
         );
         // Cut off inside a character: up to the end.
         req.args[1].bytes = b"cols \xc3".to_vec();
         assert_eq!(
-            reply_lines(&Session::default().answer(&req)),
+            reply_lines(&Session::default().colors(&req)),
             [":error 1 5 6 this argument is not valid UTF-8"]
         );
     }
@@ -1480,7 +817,7 @@ mod tests {
     #[test]
     fn an_empty_cwd_is_answered_like_any_other() {
         assert_eq!(
-            reply_lines(&Session::default().answer(&request("", &["csvm", "cols a"]))),
+            reply_lines(&Session::default().colors(&request("", &["csvm", "cols a"]))),
             [":span 1 0 4 command", ":span 1 5 6 variable"]
         );
     }
@@ -1489,13 +826,12 @@ mod tests {
     fn a_reply_to_a_very_long_script_stays_under_inklines_limit() {
         // Over 3 MiB of spans in all, and an error at the very end.
         let script = format!("cols {}| selct", "a ".repeat(100_000));
-        let reply = Session::default().answer(&request("/", &["csvm", &script]));
+        let reply = Session::default().colors(&request("/", &["csvm", &script]));
         // `cols`, each `a` and the `|`.
         assert_eq!(reply.spans.len(), 100_002);
         let mut out = Vec::new();
         write_reply(&mut out, 1, &reply).unwrap();
         assert!(out.len() < 1 << 20, "{} bytes", out.len());
-        check_reply_is_well_formed(&out, 1);
         let lines = reply_lines(&reply);
         let (error, spans) = lines.split_last().unwrap();
         // The spans written are the first ones, as many as fit.
@@ -1559,7 +895,7 @@ mod tests {
         let dir = TempDir::new("columns");
         dir.write("data.csv", "amount,region\n1,x\n");
         let mut session = Session::default();
-        let mut ask_in = |args: &[&str]| reply_lines(&session.answer(&request(dir.path(), args)));
+        let mut ask_in = |args: &[&str]| reply_lines(&session.colors(&request(dir.path(), args)));
         assert_eq!(
             ask_in(&["csvm", "select amont > 1", "data.csv"])
                 .last()
@@ -1589,7 +925,7 @@ mod tests {
         dir.write("data.csv", "a\n1\n");
         dir.write("empty.csv", "");
         let ask_in =
-            |args: &[&str]| reply_lines(&Session::default().answer(&request(dir.path(), args)));
+            |args: &[&str]| reply_lines(&Session::default().colors(&request(dir.path(), args)));
         // stdin
         assert!(no_error(&ask_in(&["csvm", "cols zz"])));
         assert!(no_error(&ask_in(&["csvm", "cols zz", "-"])));
@@ -1600,7 +936,7 @@ mod tests {
         // The input as bash will still change it.
         let mut req = request(dir.path(), &["csvm", "cols zz", "data.csv"]);
         req.args[2].raw = true;
-        assert!(no_error(&reply_lines(&Session::default().answer(&req))));
+        assert!(no_error(&reply_lines(&Session::default().colors(&req))));
         // Any other raw argument: before the script, csvm may take another
         // argument as its script or its input; after it, `$H` may not be
         // the header, and `$OUT` may add an argument.
@@ -1611,7 +947,7 @@ mod tests {
         ] {
             let mut req = request(dir.path(), args);
             req.args[raw].raw = true;
-            assert!(no_error(&reply_lines(&Session::default().answer(&req))));
+            assert!(no_error(&reply_lines(&Session::default().colors(&req))));
         }
         // Parquet with `--header` is csvm's own error, not a column one.
         assert!(no_error(&ask_in(&[
@@ -1633,7 +969,7 @@ mod tests {
         let ask_from = |cwd: &[u8], args: &[&str]| {
             let mut req = request("", args);
             req.cwd = cwd.to_vec();
-            reply_lines(&Session::default().answer(&req))
+            reply_lines(&Session::default().colors(&req))
         };
         // bash sends an empty `:cwd` when `PWD` is unset. A relative path
         // is then not looked up at all, and never from the mode server's own
@@ -1670,7 +1006,7 @@ mod tests {
             let req = request(dir.path(), args);
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(reply_lines(&Session::default().answer(&req)));
+                let _ = tx.send(reply_lines(&Session::default().colors(&req)));
             });
             rx.recv_timeout(Duration::from_secs(5))
                 .expect("the answer waited on the FIFO")
@@ -1752,7 +1088,7 @@ mod tests {
         dir.write("right.csv", "k,b\n1,3\n");
         let ask_in = |script: &str| {
             reply_lines(
-                &Session::default().answer(&request(dir.path(), &["csvm", script, "left.csv"])),
+                &Session::default().colors(&request(dir.path(), &["csvm", script, "left.csv"])),
             )
         };
         // A column the join brings in is there after it.
@@ -1787,7 +1123,7 @@ mod tests {
         dir.write("pv.1.csv", "ts,v\n1,2\n");
         dir.write("pv.2.csv", "ts,v\n1,3\n");
         let ask_in = |script: &str| {
-            reply_lines(&Session::default().answer(&request(dir.path(), &["csvm", script])))
+            reply_lines(&Session::default().colors(&request(dir.path(), &["csvm", script])))
         };
         assert!(no_error(&ask_in("from pv.{1,2}.csv on ts | cols v_1, v_2")));
         let last = ask_in("from pv.{1,2}.csv on ts | cols zz")
@@ -1801,14 +1137,14 @@ mod tests {
         // A pattern that matches nothing is not a column error here.
         assert!(no_error(&ask_in("from q.*.csv on ts | cols zz")));
         // `--header` names the first file's columns, as for an input file.
-        let named = reply_lines(&Session::default().answer(&request(
+        let named = reply_lines(&Session::default().colors(&request(
             dir.path(),
             &["csvm", "--header", "x,y", "from pv.1.csv | cols x"],
         )));
         assert!(no_error(&named), "{named:?}");
         // csvm refuses `--header` when from joins several files, so there is
         // no header to check against.
-        let refused = reply_lines(&Session::default().answer(&request(
+        let refused = reply_lines(&Session::default().colors(&request(
             dir.path(),
             &[
                 "csvm",
@@ -1828,7 +1164,7 @@ mod tests {
         dir.write("r.y.csv", "ts,b\n1,4\n");
         let ask_in = |script: &str| {
             reply_lines(
-                &Session::default().answer(&request(dir.path(), &["csvm", script, "left.csv"])),
+                &Session::default().colors(&request(dir.path(), &["csvm", script, "left.csv"])),
             )
         };
         assert!(no_error(&ask_in("join r.*.csv on ts | cols b_x, b_y")));
@@ -1853,7 +1189,7 @@ mod tests {
         let right = dir.write("right.csv", "k,bb\n1,3\n");
         let mut session = Session::default();
         let mut ask_in = |script: &str| {
-            reply_lines(&session.answer(&request(dir.path(), &["csvm", script, "left.csv"])))
+            reply_lines(&session.colors(&request(dir.path(), &["csvm", script, "left.csv"])))
         };
         let script = "join right.csv on k | cols bb";
         assert!(no_error(&ask_in(script)));
@@ -1876,7 +1212,7 @@ mod tests {
         dir.write("left.csv", "k,a\n1,2\n");
         let mut session = Session::default();
         let mut ask_in = |script: &str| {
-            reply_lines(&session.answer(&request(dir.path(), &["csvm", script, "left.csv"])))
+            reply_lines(&session.colors(&request(dir.path(), &["csvm", script, "left.csv"])))
         };
         // A first line too long to read: no check, and while the file is
         // unchanged it is not read again, though its first line is now
@@ -1908,180 +1244,6 @@ mod tests {
              :span 1 0 3 command\n:end 1\n\
              :error 1 0 6 unknown option: --colr\n:end 2\n"
         );
-    }
-
-    #[test]
-    fn an_indent_request_is_read_with_where_it_splits() {
-        let input = b":indent 8\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 7\njoin (\n\n\
-                      :at 1 7\n:done\n";
-        let mut r = &input[..];
-        let request = read_request(&mut r).unwrap().unwrap();
-        assert_eq!(request.id, 8);
-        assert_eq!(request.args.len(), 2);
-        assert_eq!(request.args[1].bytes, b"join (\n");
-        assert_eq!(request.ask, Ask::Indent((1, 7)));
-        assert_eq!(read_request(&mut r).unwrap(), None);
-        // A split at the start of an argument, or in the command's name.
-        let mut r = &b":indent 9\n:cwd 0\n\n:arg final 4\ncsvm\n:at 0 0\n:done\n"[..];
-        assert_eq!(
-            read_request(&mut r).unwrap().unwrap().ask,
-            Ask::Indent((0, 0))
-        );
-    }
-
-    #[test]
-    fn an_indent_request_that_breaks_the_protocol_is_an_error() {
-        use io::ErrorKind::InvalidData;
-        let bad = |input: &[u8]| {
-            let mut r = input;
-            read_request(&mut r).unwrap_err().kind()
-        };
-        let head = ":indent 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 3\nabc\n";
-        let with = |tail: &str| format!("{head}{tail}").into_bytes();
-        // No `:at`, which the error names, or more than one.
-        assert_eq!(bad(&with(":done\n")), InvalidData);
-        let no_at = with(":done\n");
-        assert_eq!(
-            read_request(&mut &no_at[..]).unwrap_err().to_string(),
-            "an :indent request needs :at before :done"
-        );
-        assert_eq!(bad(&with(":at 1 0\n:at 1 1\n:done\n")), InvalidData);
-        // Anything but `:done` after it.
-        assert_eq!(bad(&with(":at 1 0\n:arg final 1\nx\n:done\n")), InvalidData);
-        // Fields that are not two plain numbers.
-        assert_eq!(bad(&with(":at 1\n:done\n")), InvalidData);
-        assert_eq!(bad(&with(":at 1 -1\n:done\n")), InvalidData);
-        assert_eq!(bad(&with(":at x 0\n:done\n")), InvalidData);
-        assert_eq!(bad(&with(":at 1 0 0\n:done\n")), InvalidData);
-        // Outside the arguments: no argument 2, and argument 1 has 3 bytes.
-        assert_eq!(bad(&with(":at 2 0\n:done\n")), InvalidData);
-        assert_eq!(bad(&with(":at 1 4\n:done\n")), InvalidData);
-        // A colour request has no `:at`.
-        assert_eq!(
-            bad(b":request 1\n:cwd 1\n/\n:arg final 4\ncsvm\n:at 0 0\n:done\n"),
-            InvalidData
-        );
-    }
-
-    #[test]
-    fn an_indent_reply_is_its_depths_and_the_end() {
-        let mut out = Vec::new();
-        let depths = Depths {
-            new: 2,
-            current: Some(1),
-        };
-        write_indent(&mut out, 4, Some(depths)).unwrap();
-        assert_eq!(out, b":depth 2 1\n:end 4\n");
-        // The line the split is on stays as it is.
-        let mut out = Vec::new();
-        let depths = Depths {
-            new: 2,
-            current: None,
-        };
-        write_indent(&mut out, 6, Some(depths)).unwrap();
-        assert_eq!(out, b":depth 2 -\n:end 6\n");
-        let mut out = Vec::new();
-        write_indent(&mut out, 5, None).unwrap();
-        assert_eq!(out, b":end 5\n");
-    }
-
-    /// Read `bytes` as inkline reads an indent reply to request `id`, and
-    /// return its depths. inkline's rules: each line ends in a newline and
-    /// splits at its first space into a keyword and the rest; a line that
-    /// does not start with `:` is a failure; `:depth` comes at most once,
-    /// and its rest is exactly two fields, one space apart, each a number
-    /// made only of ASCII digits (no sign) that fits a `usize`, except that
-    /// the second may be `-` instead (read as `None`); `:end`'s rest is
-    /// such a number, equal to `id`, and ends the reply; any other `:` line
-    /// is passed over. csvm writes nothing after `:end`, so the reply must
-    /// end there too.
-    fn read_as_inkline(bytes: &[u8], id: u64) -> Option<(usize, Option<usize>)> {
-        fn number<T: std::str::FromStr>(field: &str) -> T {
-            assert!(
-                !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit()),
-                "not plain digits: {field:?}"
-            );
-            field.parse().ok().expect("a number too large")
-        }
-        let text = std::str::from_utf8(bytes).expect("a reply in UTF-8");
-        let body = text
-            .strip_suffix('\n')
-            .expect("the last line ends in a newline");
-        let mut depths = None;
-        let lines: Vec<&str> = body.split('\n').collect();
-        for (i, line) in lines.iter().enumerate() {
-            assert!(line.starts_with(':'), "not a reply line: {line:?}");
-            let (keyword, rest) = line.split_once(' ').unwrap_or((line, ""));
-            match keyword {
-                ":depth" => {
-                    assert!(depths.is_none(), "a second :depth: {line:?}");
-                    let fields: Vec<&str> = rest.split(' ').collect();
-                    let [new, current] = fields[..] else {
-                        panic!(":depth needs two fields: {line:?}");
-                    };
-                    let current = (current != "-").then(|| number(current));
-                    depths = Some((number(new), current));
-                }
-                ":end" => {
-                    assert_eq!(number::<u64>(rest), id, "the wrong :end ID");
-                    assert_eq!(i, lines.len() - 1, "a line after :end");
-                    return depths;
-                }
-                _ => {}
-            }
-        }
-        panic!("no :end");
-    }
-
-    #[test]
-    fn an_indent_reply_reads_as_inkline_reads_it() {
-        for (id, depths) in [
-            (
-                1,
-                Some(Depths {
-                    new: 0,
-                    current: Some(0),
-                }),
-            ),
-            (
-                2,
-                Some(Depths {
-                    new: 3,
-                    current: Some(12),
-                }),
-            ),
-            (3, None),
-            (
-                u64::MAX,
-                Some(Depths {
-                    new: usize::MAX,
-                    current: Some(1),
-                }),
-            ),
-            (
-                4,
-                Some(Depths {
-                    new: 1,
-                    current: None,
-                }),
-            ),
-        ] {
-            let mut out = Vec::new();
-            write_indent(&mut out, id, depths).unwrap();
-            assert_eq!(
-                read_as_inkline(&out, id),
-                depths.map(|d| (d.new, d.current))
-            );
-        }
-        // And a reply `serve` writes for a script split inside a group.
-        let input = b":indent 7\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 15\n\
-                      fn f() {\n  head\n:at 1 15\n:done\n";
-        let mut out = Vec::new();
-        serve(&mut &input[..], &mut out).unwrap();
-        let reply = out
-            .strip_prefix(format!("{GREETING}\n").as_bytes())
-            .unwrap();
-        assert_eq!(read_as_inkline(reply, 7), Some((1, None)));
     }
 
     #[test]
@@ -2181,72 +1343,6 @@ mod tests {
              :depth 1 -\n:end 2\n\
              :end 3\n"
         );
-    }
-
-    #[test]
-    fn a_complete_request_is_read_with_its_place() {
-        let input =
-            ":complete 4\n:cwd 1\n/\n:arg final 4\ncsvm\n:arg final 2\nso\n:at 1 2\n:done\n";
-        let request = read_request(&mut input.as_bytes()).unwrap().unwrap();
-        assert_eq!(request.id, 4);
-        assert_eq!(request.ask, Ask::Complete((1, 2)));
-        // `:at` is needed, and must be inside the arguments.
-        let no_at = ":complete 4\n:cwd 0\n\n:arg final 1\nx\n:done\n";
-        assert!(read_request(&mut no_at.as_bytes()).is_err());
-        let outside = ":complete 4\n:cwd 0\n\n:arg final 1\nx\n:at 0 5\n:done\n";
-        assert!(read_request(&mut outside.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn items_are_written_one_per_line_with_their_notes() {
-        let mut out = Vec::new();
-        let items = [
-            Item {
-                at: 5..7,
-                text: "amount".into(),
-                note: Some("column".into()),
-            },
-            Item {
-                at: 5..7,
-                text: "first name".into(),
-                note: None,
-            },
-        ];
-        write_items(&mut out, 9, &items).unwrap();
-        assert_eq!(
-            String::from_utf8(out).unwrap(),
-            ":item 5 7 amount\n:note column\n:item 5 7 first name\n:end 9\n"
-        );
-    }
-
-    #[test]
-    fn a_reply_holds_at_most_so_many_items_and_bytes() {
-        let items = |n: usize, len: usize| -> Vec<Item> {
-            (0..n)
-                .map(|i| Item {
-                    at: 0..0,
-                    text: format!("{i:0len$}"),
-                    note: Some("column".into()),
-                })
-                .collect()
-        };
-        let written = |items: &[Item]| {
-            let mut out = Vec::new();
-            write_items(&mut out, 1, items).unwrap();
-            let out = String::from_utf8(out).unwrap();
-            assert!(out.ends_with(":end 1\n"));
-            let bytes = out.len() - ":end 1\n".len();
-            (
-                out.lines().filter(|l| l.starts_with(":item")).count(),
-                bytes,
-            )
-        };
-        let (count, bytes) = written(&items(MAX_ITEMS + 5, 4));
-        assert_eq!(count, MAX_ITEMS);
-        assert!(bytes <= MAX_ITEM_BYTES);
-        let (count, bytes) = written(&items(500, 4000));
-        assert!(count < 500);
-        assert!(bytes <= MAX_ITEM_BYTES && bytes > MAX_ITEM_BYTES - 4100);
     }
 
     /// The `:item` texts of the reply to a `:complete` request for the

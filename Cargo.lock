@@ -537,6 +537,7 @@ dependencies = [
  "crossbeam-channel",
  "csv",
  "foldhash",
+ "inkline-mode-protocol",
  "libc",
  "memchr",
  "parquet",
@@ -694,6 +695,11 @@ checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "inkline-mode-protocol"
+version = "0.1.0"
+source = "git+https://github.com/shsms/inkline-mode-protocol?rev=9e9cee9d11f4f876f9f39366e79a3abbbba9b4ee#9e9cee9d11f4f876f9f39366e79a3abbbba9b4ee"
 
 [[package]]
 name = "is-terminal"
