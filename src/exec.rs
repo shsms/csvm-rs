@@ -2461,7 +2461,7 @@ fn render_graph<W: Write>(
 /// is a cosmetic overlay, so one bad cell shouldn't kill the whole output. A
 /// predicate that reads such a cell through `prev()` errors on the row below
 /// it too.
-fn compute_styles(rules: &[ColorRule], rows: &[&[Cow<str>]]) -> Vec<Vec<Style>> {
+pub(crate) fn compute_styles(rules: &[ColorRule], rows: &[&[Cow<str>]]) -> Vec<Vec<Style>> {
     let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut styles = vec![vec![Style::default(); ncols]; rows.len()];
     for rule in rules {

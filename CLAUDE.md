@@ -742,14 +742,17 @@ lifetime, so there is one `apply` implementation.
 ## Embedding
 
 `csvm::embed::run(script, input)` runs a script over a `.parquet` or CSV file
-in-process, as `main` would, and returns an `embed::Output`: the output
-columns typed (`Values::Num`, NaN for an empty cell, when every non-empty
-cell is a number, as `numeric_columns` decides; else `Values::Text`) and
-notices. A blank script passes the input through. The caller draws its own
-table and charts, so `fmt` is dropped silently and a `graph` sink with a
-notice; a `from` stage is refused at its place, since the caller names the
-input. Errors keep their spans. It runs at `-n 1` and adds nothing to the
-hot path.
+in-process, as `main` would, and returns an `embed::Output`: the output columns
+typed (`Values::Num`, NaN for an empty cell, when every non-empty cell is a
+number, as `numeric_columns` decides, or when every cell is empty; else
+`Values::Text`), the cells the `color` rules paint (`embed::Paint`, from
+`compute_styles`, so a `prev()` reads the output rows as in the terminal) and
+notices.
+
+A blank script passes the input through. The caller draws its own table and
+charts, so `fmt` is dropped silently and a `graph` sink with a notice. A `from`
+stage is refused at its place, since the caller names the input. Errors keep
+their spans. It runs at `-n 1` and adds nothing to the hot path.
 
 ## CLI
 

@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::path::Path;
 
+use crate::color::Style;
 use crate::error::Error;
 use crate::exec::{self, RunOpts};
 use crate::plan::{OutputFormat, Plan, Sources};
@@ -15,6 +16,8 @@ use crate::{cli, csv, field, parse, pattern};
 #[derive(Debug)]
 pub struct Output {
     pub columns: Vec<Column>,
+    /// The cells the script's `color` rules paint, row by row.
+    pub styles: Vec<Paint>,
     /// One line per thing the run ignored (a `graph` sink).
     pub notices: Vec<String>,
 }
@@ -24,6 +27,15 @@ pub struct Output {
 pub struct Column {
     pub name: String,
     pub values: Values,
+}
+
+/// One painted cell. `row` counts the data rows from 0, the header not counted;
+/// a rule that paints a whole row paints each of its cells.
+#[derive(Debug)]
+pub struct Paint {
+    pub row: usize,
+    pub col: usize,
+    pub style: Style,
 }
 
 #[derive(Debug)]
@@ -87,8 +99,14 @@ pub fn run(script: &str, input: &Path) -> Result<Output, Error> {
     }
     let text = String::from_utf8(buf)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {}", e.utf8_error())))?;
+    let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
+    csv::parse_chunk(&text, |r| {
+        rows.push(r.drain(..).map(|f| f.into_text()).collect())
+    });
+    let rows: Vec<&[Cow<str>]> = rows.iter().map(Vec::as_slice).collect();
     Ok(Output {
-        columns: columns(&text),
+        columns: columns(&rows),
+        styles: paints(&plan, &rows),
         notices,
     })
 }
@@ -122,14 +140,30 @@ fn cell<'r>(row: &'r [Cow<str>], i: usize) -> &'r str {
     row.get(i).map_or("", |c| c.as_ref())
 }
 
-/// The CSV `text` (header first) as columns.
-fn columns(text: &str) -> Vec<Column> {
-    let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
-    csv::parse_chunk(text, |r| {
-        rows.push(r.drain(..).map(|f| f.into_text()).collect())
-    });
-    let slices: Vec<&[Cow<str>]> = rows.iter().map(Vec::as_slice).collect();
-    let numeric = exec::numeric_columns(&slices);
+/// The cells `plan`'s colour rules paint in `rows` (header first).
+fn paints(plan: &Plan, rows: &[&[Cow<str>]]) -> Vec<Paint> {
+    if plan.colors.is_empty() {
+        return Vec::new();
+    }
+    let grid = exec::compute_styles(&plan.colors, rows);
+    let mut paints = Vec::new();
+    for (ri, row) in grid.into_iter().enumerate().skip(1) {
+        for (col, style) in row.into_iter().enumerate() {
+            if !style.is_empty() {
+                paints.push(Paint {
+                    row: ri - 1,
+                    col,
+                    style,
+                });
+            }
+        }
+    }
+    paints
+}
+
+/// The output `rows` (header first) as columns.
+fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
+    let numeric = exec::numeric_columns(rows);
     let Some((header, data)) = rows.split_first() else {
         return Vec::new();
     };
@@ -163,6 +197,7 @@ fn columns(text: &str) -> Vec<Column> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::color::{Base, Color};
 
     /// Writes `text` to a file named after `tag` in the temp dir.
     fn csv(tag: &str, text: &str) -> std::path::PathBuf {
@@ -267,6 +302,50 @@ mod tests {
     fn from_is_refused_at_its_place() {
         let e = run("from other.csv | cols x", &csv("from", "x\n1\n")).unwrap_err();
         assert_eq!(e.span().map(|s| s.start), Some(0), "{e}");
+    }
+
+    #[test]
+    fn gradient_paints_numeric_cells() {
+        let out = run("color -g x", &csv("grad", "x\n0\n5\n10\n")).unwrap();
+        let fg: Vec<_> = out
+            .styles
+            .iter()
+            .map(|p| (p.row, p.col, p.style.fg))
+            .collect();
+        assert_eq!(fg.len(), 3, "{fg:?}");
+        assert!(
+            fg.iter()
+                .all(|&(_, col, c)| col == 0 && matches!(c, Some(Color::Rgb(_))))
+        );
+        assert_eq!(fg.iter().map(|p| p.0).collect::<Vec<_>>(), [0, 1, 2]);
+        assert_ne!(fg[0].2, fg[2].2);
+    }
+
+    #[test]
+    fn gradient_skips_empty_cells() {
+        let out = run("color -g x", &csv("gradgap", "x\n0\n\n10\n")).unwrap();
+        let rows: Vec<_> = out.styles.iter().map(|p| p.row).collect();
+        assert_eq!(rows, [0, 2]);
+    }
+
+    #[test]
+    fn predicate_with_prev_paints_whole_rows() {
+        // `b` falls by more than 100 into the second row and the fourth.
+        let input = csv("prev", "a,b\n1,500\n2,300\n3,290\n4,100\n5,90\n");
+        let out = run("color red b - prev(b) < -100", &input).unwrap();
+        let cells: Vec<_> = out.styles.iter().map(|p| (p.row, p.col)).collect();
+        assert_eq!(cells, [(1, 0), (1, 1), (3, 0), (3, 1)]);
+        assert!(
+            out.styles
+                .iter()
+                .all(|p| p.style.fg == Some(Color::Base(Base::Red)))
+        );
+    }
+
+    #[test]
+    fn no_color_rules_no_paints() {
+        let out = run("add y = x", &csv("plain", "x\n1\n")).unwrap();
+        assert!(out.styles.is_empty());
     }
 
     #[cfg(feature = "parquet")]
