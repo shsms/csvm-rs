@@ -268,6 +268,44 @@ pub fn file_item(
     Some(item(at, &text, note))
 }
 
+/// The completion items at byte `at` of `script`: what fits where the cursor
+/// is (see [`find`]), each replacing the word the cursor is in. `columns`
+/// gives the columns at the cursor's stage, or `None` when they cannot be
+/// known; `files` gives the items for a file whose path starts with the typed
+/// text, replacing the given bytes. When there are more items than a
+/// mode-server reply holds, the ones that start with the typed part of the
+/// word come first.
+pub fn items_at(
+    script: &str,
+    at: usize,
+    columns: &mut dyn FnMut(&Found) -> Option<Vec<String>>,
+    files: &mut dyn FnMut(&Range<usize>, &str) -> Vec<Item>,
+) -> Vec<Item> {
+    let found = find(script, at);
+    let word = &found.word;
+    let typed = script.get(word.start..at).unwrap_or("");
+    let mut column_items = || -> Vec<Item> {
+        columns(&found)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|name| column_item(word, name))
+            .collect()
+    };
+    let items = match &found.place {
+        Place::StageStart => command_items(word, &found.fns),
+        Place::Flag(command) => flag_items(word, command),
+        Place::Column => column_items(),
+        Place::Expression => {
+            let mut items = column_items();
+            items.extend(function_items(word));
+            items
+        }
+        Place::File => files(word, typed),
+        Place::Nothing => Vec::new(),
+    };
+    crate::mode_server::typed_first(items, typed)
+}
+
 fn item(at: &Range<usize>, text: &str, note: &str) -> Item {
     Item {
         at: at.clone(),
@@ -940,6 +978,17 @@ fn join_place(head: &Head) -> Place {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn items_at_offers_columns_then_functions_in_an_expression() {
+        let script = "add x = a";
+        let mut columns = |_: &Found| Some(vec!["amp".to_owned(), "volt".to_owned()]);
+        let items = items_at(script, script.len(), &mut columns, &mut |_, _| Vec::new());
+        let texts: Vec<_> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts[0], "amp");
+        assert!(texts.contains(&"abs"), "{texts:?}");
+        assert!(items.iter().all(|i| i.at == (8..9)));
+    }
 
     fn at(marked: &str) -> Found {
         let at = marked.find('@').expect("a cursor mark");

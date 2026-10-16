@@ -11,7 +11,7 @@
 //! `parse::depths`, and a `:complete` one from `complete::find`.
 
 use crate::cli::{self, InputFormat, Parsed};
-use crate::complete::{self, Found, Group, Place};
+use crate::complete::{self, Found, Group};
 use crate::error::Error;
 use crate::exec;
 use crate::parse::{self, Recorder};
@@ -126,36 +126,18 @@ impl Mode for Session {
         let Some(args) = script_args(request, at) else {
             return Vec::new();
         };
-        let offset = at.1;
-        let found = complete::find(&args.script, offset);
-        let word = &found.word;
-        let typed = args.script.get(word.start..offset).unwrap_or("");
-        let columns = |session: &mut Session| -> Vec<Item> {
+        let script = &args.script;
+        // The columns and the files both read through the session's caches.
+        let session = std::cell::RefCell::new(self);
+        let mut columns = |found: &Found| session.borrow_mut().columns_at(request, &args, found);
+        let mut files = |word: &Range<usize>, typed: &str| {
+            // A closing quote, after an opening one.
+            let closed = typed.starts_with('"') && script.as_bytes().get(word.end) == Some(&b'"');
             session
-                .columns_at(request, &args, &found)
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|name| complete::column_item(word, name))
-                .collect()
+                .borrow_mut()
+                .file_items(request, word, typed, closed)
         };
-        let items = match &found.place {
-            Place::StageStart => complete::command_items(word, &found.fns),
-            Place::Flag(command) => complete::flag_items(word, command),
-            Place::Column => columns(self),
-            Place::Expression => {
-                let mut items = columns(self);
-                items.extend(complete::function_items(word));
-                items
-            }
-            Place::File => {
-                // A closing quote, after an opening one.
-                let closed =
-                    typed.starts_with('"') && args.script.as_bytes().get(word.end) == Some(&b'"');
-                self.file_items(request, word, typed, closed)
-            }
-            Place::Nothing => Vec::new(),
-        };
-        typed_first(items, typed)
+        complete::items_at(script, at.1, &mut columns, &mut files)
     }
 }
 
@@ -522,7 +504,7 @@ fn read_first_line(path: &Path, format: InputFormat, len: u64) -> Option<Vec<Str
 /// cannot hold them all, so that the ones cut are the others. A backtick or
 /// double quote at the start of either is not compared. The order is kept
 /// otherwise.
-fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
+pub(crate) fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
     if items_fit(&items) {
         return items;
     }
