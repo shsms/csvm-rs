@@ -3,14 +3,17 @@
 //! columns instead of CSV text.
 
 use std::borrow::Cow;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::color::Style;
 use crate::error::Error;
 use crate::exec::{self, RunOpts};
+use crate::mode_server::placed;
 use crate::plan::{OutputFormat, Plan, Sources, Stage};
 use crate::progress::Progress;
-use crate::{cli, csv, field, parse, pattern};
+use crate::{cli, complete, csv, field, parse, pattern};
+use inkline_mode_protocol::{Item, SpanKind};
 
 /// What a script made of its input.
 #[derive(Debug)]
@@ -73,8 +76,111 @@ pub fn run_with(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Outp
     run_inner(script, input, join_opts).map_err(|e| parse::note_missing_pipe(script, e))
 }
 
+/// A script's coloured parts and the first thing wrong with it, for an editor.
+#[derive(Debug)]
+pub struct Marks {
+    /// Byte ranges of the script, in order, none overlapping another.
+    pub spans: Vec<(Range<usize>, SpanKind)>,
+    pub error: Option<ScriptError>,
+}
+
+/// An error, with its bytes of the script when it has a place.
+#[derive(Debug)]
+pub struct ScriptError {
+    pub at: Option<Range<usize>>,
+    /// One line, with the missing-`|` note when it applies.
+    pub message: String,
+}
+
+/// The colours of `script` and its first error, as [`run_with`] would find
+/// it over an input with the columns `header`. With no header, unknown
+/// columns are not found.
+pub fn marks(script: &str, header: Option<&[String]>, join_opts: &JoinOpts) -> Marks {
+    let mut recorder = parse::Recorder::default();
+    let parsed = parse::parse_recorded(script, &mut recorder);
+    let spans = recorder.into_spans();
+    let error = if is_blank(script) {
+        None
+    } else {
+        match parsed {
+            Err(e) => Some(e),
+            Ok(mut plan) => match header {
+                Some(h) => resolve(&mut plan, h, join_opts).err(),
+                None => prepare(&mut plan, join_opts).err(),
+            },
+        }
+    };
+    let error = error.map(|e| {
+        let (at, message) = placed(script, e);
+        ScriptError { at, message }
+    });
+    Marks { spans, error }
+}
+
+/// The completion items at byte `at` of `script`, as csvm's mode server
+/// gives them: commands, flags, functions, and the columns at the cursor's
+/// stage, `header` carried through the stages before it. No columns inside a
+/// `join ( … )` group or an `fn` body, or with no header, and no file names.
+pub fn suggest(
+    script: &str,
+    at: usize,
+    header: Option<&[String]>,
+    join_opts: &JoinOpts,
+) -> Vec<Item> {
+    if !script.is_char_boundary(at) {
+        return Vec::new();
+    }
+    let mut columns = |found: &complete::Found| {
+        let header = header?;
+        if !matches!(found.group, complete::Group::Top) {
+            return None;
+        }
+        if found.stages_before.is_empty() {
+            return Some(header.to_vec());
+        }
+        let mut plan = parse::parse(&found.stages_before).ok()?;
+        resolve(&mut plan, header, join_opts).ok()
+    };
+    complete::items_at(script, at, &mut columns, &mut |_, _| Vec::new())
+}
+
+/// Whether `script` is only blanks and comments, which pass the input through.
+fn is_blank(script: &str) -> bool {
+    parse::strip_comments(script).trim().is_empty()
+}
+
+/// The header `plan` turns `header` into, checked as a run checks it.
+fn resolve(plan: &mut Plan, header: &[String], join_opts: &JoinOpts) -> Result<Vec<String>, Error> {
+    prepare(plan, join_opts)?;
+    plan.resolve(header)
+}
+
+/// What a run does to the plan before it reads the input: a `from` stage is
+/// refused at its place, and the joins are limited by `join_opts` and their
+/// headers read. The output is CSV, which a run reads back into columns: the
+/// caller draws its own table and charts, so a `fmt` is dropped, and a `graph`
+/// sink is dropped with the notice this gives.
+fn prepare(plan: &mut Plan, join_opts: &JoinOpts) -> Result<Vec<String>, Error> {
+    if plan.from.is_some() {
+        let e = Error::Compile("from: the input is given by the caller".into());
+        return Err(match plan.sources.from.span.clone() {
+            Some(span) => e.at(span),
+            None => e,
+        });
+    }
+    exec::expand_joins(plan, join_opts.dir, &mut AllowedFs(join_opts.may_read))?;
+    check_joins(plan, join_opts)?;
+    exec::read_join_headers(plan)?;
+    plan.output = OutputFormat::Csv;
+    let mut notices = Vec::new();
+    if plan.graph.take().is_some() {
+        notices.push("graph: ignored here; the caller draws its own charts".to_owned());
+    }
+    Ok(notices)
+}
+
 fn run_inner(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Output, Error> {
-    let mut plan = if parse::strip_comments(script).trim().is_empty() {
+    let mut plan = if is_blank(script) {
         Plan {
             stages: Vec::new(),
             output: OutputFormat::Csv,
@@ -86,22 +192,7 @@ fn run_inner(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Output,
     } else {
         parse::parse(script)?
     };
-    if plan.from.is_some() {
-        let e = Error::Compile("from: the input is given by the caller".into());
-        return Err(match plan.sources.from.span.clone() {
-            Some(span) => e.at(span),
-            None => e,
-        });
-    }
-    exec::expand_joins(&mut plan, join_opts.dir, &mut AllowedFs(join_opts.may_read))?;
-    check_joins(&mut plan, join_opts)?;
-    exec::read_join_headers(&mut plan)?;
-    let mut notices = Vec::new();
-    // The caller draws its own table and charts.
-    plan.output = OutputFormat::Csv;
-    if plan.graph.take().is_some() {
-        notices.push("graph: ignored here; the caller draws its own charts".to_owned());
-    }
+    let notices = prepare(&mut plan, join_opts)?;
     // A big `sort` spills rows to files: keep them from other users.
     let spill = SpillDir::new()?;
     let opts = RunOpts {
@@ -348,6 +439,110 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
 mod tests {
     use super::*;
     use crate::color::{Base, Color};
+
+    fn allow(_: &Path) -> bool {
+        true
+    }
+
+    /// Joins from the working directory, any file allowed.
+    fn any() -> JoinOpts<'static> {
+        JoinOpts {
+            dir: None,
+            may_read: &allow,
+        }
+    }
+
+    fn cols(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_owned()).collect()
+    }
+
+    #[test]
+    fn marks_place_a_missing_equals() {
+        let m = marks("add new one + two", Some(&cols(&["one", "two"])), &any());
+        assert!(m.error.expect("an error").at.is_some());
+        assert!(!m.spans.is_empty());
+    }
+
+    #[test]
+    fn marks_name_an_unknown_column_only_with_a_header() {
+        let script = "select nope > 1";
+        assert!(marks(script, Some(&cols(&["a"])), &any()).error.is_some());
+        assert!(marks(script, None, &any()).error.is_none());
+    }
+
+    #[test]
+    fn marks_ignore_a_graph_as_a_run_does() {
+        let m = marks("graph line a nope", Some(&cols(&["a"])), &any());
+        assert!(m.error.is_none(), "{:?}", m.error);
+    }
+
+    #[test]
+    fn marks_without_a_header_still_refuse_from_and_joins() {
+        assert!(
+            marks("from x.csv | select a > 1", None, &any())
+                .error
+                .is_some()
+        );
+        let there = csv("refuse-no-header", "k\n1\n");
+        let deny = limited(&|_| false);
+        let script = format!("join '{}' on k", there.display());
+        let error = marks(&script, None, &deny).error.expect("an error");
+        assert!(
+            error.message.contains("may not be read here"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn marks_of_a_blank_script_find_nothing() {
+        for script in ["", "   ", "# c\n"] {
+            let m = marks(script, Some(&cols(&["a"])), &any());
+            assert!(m.error.is_none(), "{script:?}: {:?}", m.error);
+        }
+    }
+
+    #[test]
+    fn suggest_offers_no_columns_inside_a_join_group() {
+        let s = "join ( add y = a";
+        let items = suggest(s, s.len(), Some(&cols(&["amp"])), &any());
+        assert!(!items.iter().any(|i| i.text == "amp"), "{items:?}");
+    }
+
+    #[test]
+    fn suggest_carries_a_new_column_into_later_stages() {
+        let s = "add new = a + 1 | select n";
+        let items = suggest(s, s.len(), Some(&cols(&["a"])), &any());
+        assert!(items.iter().any(|i| i.text == "new"), "{items:?}");
+    }
+
+    #[test]
+    fn suggest_after_a_space_at_a_stage_start_offers_commands() {
+        let s = "add x = 1 | ";
+        assert!(
+            suggest(s, s.len(), None, &any())
+                .iter()
+                .any(|i| i.text == "select")
+        );
+    }
+
+    #[test]
+    fn a_refused_join_reads_the_same_whether_the_file_exists() {
+        let deny = limited(&|_| false);
+        let header = cols(&["k"]);
+        let error = |s: &str| {
+            marks(s, Some(&header), &deny)
+                .error
+                .expect("an error")
+                .message
+        };
+        let there = csv("refuse-there", "k\n1\n");
+        let absent = there.with_file_name("absent.csv");
+        let a = error(&format!("join '{}' on k", there.display()));
+        let b = error(&format!("join '{}' on k", absent.display()));
+        let (there, absent) = (there.display().to_string(), absent.display().to_string());
+        assert_eq!(a.replace(&there, "X"), b.replace(&absent, "X"));
+    }
 
     /// Joins from the working directory, as `may_read` allows.
     fn limited<'a>(may_read: &'a dyn Fn(&Path) -> bool) -> JoinOpts<'a> {

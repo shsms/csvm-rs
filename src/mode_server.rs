@@ -324,12 +324,23 @@ fn script_args(request: &Request, at: (usize, usize)) -> Option<Box<cli::Args>> 
 /// on its place in the script when it has one, noting a `|` that may be
 /// missing (`parse::note_missing_pipe`).
 fn script_error(arg: usize, script: &str, e: Error) -> ReplyError {
+    let (at, message) = placed(script, e);
+    ReplyError {
+        place: at.map(|at| (arg, at)),
+        message,
+    }
+}
+
+/// An error in `script` as an editor shows it: its bytes, kept inside the
+/// script, and its message on one line, with the missing-`|` note.
+pub(crate) fn placed(script: &str, e: Error) -> (Option<Range<usize>>, String) {
     let e = parse::note_missing_pipe(script, e);
-    let place = e.span().map(|at| {
+    let at = e.span().map(|at| {
         let end = at.end.min(script.len());
-        (arg, at.start.min(end)..end)
+        at.start.min(end)..end
     });
-    ReplyError::new(place, &e.to_string())
+    // The protocol's error message rule makes the message one line.
+    (at, ReplyError::new(None, &e.to_string()).message)
 }
 
 /// `path` as the shell sees it from its directory `cwd`. `None` for a

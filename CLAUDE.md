@@ -771,6 +771,12 @@ missing one, with "may not be read here" at the join. An allowed file is read
 by the canonical path that was checked; a link inside the folder changed
 between that check and the read is not caught.
 
+For an editor, `embed::marks` gives a script's coloured spans and its first
+error (unknown columns only when the caller passes the input's header), and
+`embed::suggest` gives the completion items at a byte offset, through the
+mode server's own dispatch (`complete::items_at`), with the header carried
+through the stages before the cursor and no file names.
+
 A big `sort` spills to a new folder in the temp directory, which only this
 user can read and which is removed after the run. A name already taken is
 skipped. The output is re-read with `csv::parse_records`, which, unlike the input
