@@ -741,18 +741,28 @@ lifetime, so there is one `apply` implementation.
 
 ## Embedding
 
-`csvm::embed::run(script, input)` runs a script over a `.parquet` or CSV file
-in-process, as `main` would, and returns an `embed::Output`: the output columns
-typed (`Values::Num`, NaN for an empty cell, when every non-empty cell is a
-number, as `numeric_columns` decides, or when every cell is empty; else
-`Values::Text`), the cells the `color` rules paint (`embed::Paint`, from
-`compute_styles`, so a `prev()` reads the output rows as in the terminal) and
-notices.
+`csvm::embed::run(script, input)` runs a script over a CSV file, or a Parquet
+file in a build with the `parquet` feature, in-process, as `main` would. It
+returns an `embed::Output`:
 
-A blank script passes the input through. The caller draws its own table and
-charts, so `fmt` is dropped silently and a `graph` sink with a notice. A `from`
-stage is refused at its place, since the caller names the input. Errors keep
-their spans. It runs at `-n 1` and adds nothing to the hot path.
+- the output columns, typed. A column is `Values::Num` (NaN for an empty
+  cell) when every non-empty cell is a number, as `numeric_columns` decides,
+  and none would lose its spelling as one (`02134`, `+5`), or when it has
+  rows and every cell is empty. Otherwise it is `Values::Text`. Numbers come
+  through csvm's output text, so they keep its 15 significant digits.
+- the cells the `color` rules paint (`embed::Paint`, from `compute_styles`,
+  so a `prev()` reads the output rows as in the terminal), within the header's
+  columns.
+- notices.
+
+A script of blanks and comments passes the input through. The caller draws its
+own table and charts, so `fmt` is dropped silently and a `graph` sink with a
+notice. A `from` stage is refused at its place, since the caller names the
+input. Errors keep their spans and get `main`'s missing-`|` note.
+`embed::run_with` also takes a check on each file a `join` reads (its
+canonical path; only regular files pass). The output is re-read with
+`csv::parse_records`, which, unlike the input scanner, lets a quoted cell hold
+a line break. It runs at `-n 1` and adds nothing to the hot path.
 
 ## CLI
 

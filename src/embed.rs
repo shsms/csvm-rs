@@ -8,7 +8,7 @@ use std::path::Path;
 use crate::color::Style;
 use crate::error::Error;
 use crate::exec::{self, RunOpts};
-use crate::plan::{OutputFormat, Plan, Sources};
+use crate::plan::{OutputFormat, Plan, Sources, Stage};
 use crate::progress::Progress;
 use crate::{cli, csv, field, parse, pattern};
 
@@ -17,7 +17,7 @@ use crate::{cli, csv, field, parse, pattern};
 pub struct Output {
     pub columns: Vec<Column>,
     /// The cells the script's `color` rules paint, row by row.
-    pub styles: Vec<Paint>,
+    pub paints: Vec<Paint>,
     /// One line per thing the run ignored (a `graph` sink).
     pub notices: Vec<String>,
 }
@@ -46,10 +46,29 @@ pub enum Values {
 }
 
 /// Runs `script` over `input`, a `.parquet` file or else a CSV file with a
-/// header line. A blank script passes the input through. A script error keeps
-/// its place in the script ([`Error::span`]).
+/// header line. A blank script, or one of comments only, passes the input
+/// through. A script error keeps its place in the script ([`Error::span`]).
 pub fn run(script: &str, input: &Path) -> Result<Output, Error> {
-    let mut plan = if script.trim().is_empty() {
+    run_with(script, input, &|_| true)
+}
+
+/// [`run`], reading a file the script joins only when `may_read` allows its
+/// canonical path, and only a regular file.
+pub fn run_with(
+    script: &str,
+    input: &Path,
+    may_read: &dyn Fn(&Path) -> bool,
+) -> Result<Output, Error> {
+    // As the CLI does, an error says when a `|` may be missing.
+    run_inner(script, input, may_read).map_err(|e| parse::note_missing_pipe(script, e))
+}
+
+fn run_inner(
+    script: &str,
+    input: &Path,
+    may_read: &dyn Fn(&Path) -> bool,
+) -> Result<Output, Error> {
+    let mut plan = if parse::strip_comments(script).trim().is_empty() {
         Plan {
             stages: Vec::new(),
             output: OutputFormat::Csv,
@@ -68,8 +87,9 @@ pub fn run(script: &str, input: &Path) -> Result<Output, Error> {
             None => e,
         });
     }
-    exec::prepare_from(&mut plan, None, &mut pattern::RealFs)?;
-    exec::prepare_joins(&mut plan)?;
+    exec::expand_joins(&mut plan, None, &mut pattern::RealFs)?;
+    check_joins(&plan, may_read)?;
+    exec::read_join_headers(&mut plan)?;
     let mut notices = Vec::new();
     // The caller draws its own table and charts.
     plan.output = OutputFormat::Csv;
@@ -100,15 +120,32 @@ pub fn run(script: &str, input: &Path) -> Result<Output, Error> {
     let text = String::from_utf8(buf)
         .map_err(|e| Error::Other(format!("output is not valid UTF-8: {}", e.utf8_error())))?;
     let mut rows: Vec<Vec<Cow<str>>> = Vec::new();
-    csv::parse_chunk(&text, |r| {
+    csv::parse_records(&text, |r| {
         rows.push(r.drain(..).map(|f| f.into_text()).collect())
     });
     let rows: Vec<&[Cow<str>]> = rows.iter().map(Vec::as_slice).collect();
     Ok(Output {
         columns: columns(&rows),
-        styles: paints(&plan, &rows),
+        paints: paints(&plan, &rows),
         notices,
     })
+}
+
+/// Refuses a joined file that `may_read` does not allow, or that is not a
+/// regular file, in `plan` and the plans it joins.
+fn check_joins(plan: &Plan, may_read: &dyn Fn(&Path) -> bool) -> Result<(), Error> {
+    for stage in &plan.stages {
+        if let Stage::Join(j) = stage {
+            check_joins(&j.right_plan, may_read)?;
+            let path = Path::new(&j.file)
+                .canonicalize()
+                .map_err(|e| Error::Other(format!("{}: {e}", j.file)))?;
+            if !path.is_file() || !may_read(&path) {
+                return Err(Error::Other(format!("{}: may not be read here", j.file)));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(feature = "parquet")]
@@ -146,9 +183,11 @@ fn paints(plan: &Plan, rows: &[&[Cow<str>]]) -> Vec<Paint> {
         return Vec::new();
     }
     let grid = exec::compute_styles(&plan.colors, rows);
+    // A ragged row's extra cells are not columns.
+    let width = rows.first().map_or(0, |header| header.len());
     let mut paints = Vec::new();
     for (ri, row) in grid.into_iter().enumerate().skip(1) {
-        for (col, style) in row.into_iter().enumerate() {
+        for (col, style) in row.into_iter().enumerate().take(width) {
             if !style.is_empty() {
                 paints.push(Paint {
                     row: ri - 1,
@@ -159,6 +198,14 @@ fn paints(plan: &Plan, rows: &[&[Cow<str>]]) -> Vec<Paint> {
         }
     }
     paints
+}
+
+/// Whether `cell` would lose its spelling as a number: a leading `+`, or a
+/// leading zero before another digit.
+fn id_like(cell: &str) -> bool {
+    let digits = cell.strip_prefix('-').unwrap_or(cell);
+    cell.starts_with('+')
+        || (digits.len() > 1 && digits.starts_with('0') && digits.as_bytes()[1].is_ascii_digit())
 }
 
 /// The output `rows` (header first) as columns.
@@ -177,7 +224,11 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
                 && data
                     .iter()
                     .all(|row| field::trim_cell(cell(row, i)).is_empty());
-            let values = if numeric.get(i) == Some(&true) || blank {
+            // `02134` and `+5` read as numbers, but they are names: text.
+            let named = data
+                .iter()
+                .any(|row| id_like(field::trim_cell(cell(row, i))));
+            let values = if (numeric.get(i) == Some(&true) && !named) || blank {
                 Values::Num(
                     data.iter()
                         .map(|row| field::trim_cell(cell(row, i)).parse().unwrap_or(f64::NAN))
@@ -244,9 +295,10 @@ mod tests {
     fn header_only_output_keeps_columns() {
         let out = run("select x > 100", &csv("none", "t,x\na,1\n")).unwrap();
         assert_eq!(out.columns.len(), 2);
+        // No cell tells the type: text.
         assert!(out.columns.iter().all(|c| match &c.values {
-            Values::Num(v) => v.is_empty(),
             Values::Text(v) => v.is_empty(),
+            Values::Num(v) => panic!("{} is numeric: {v:?}", c.name),
         }));
     }
 
@@ -261,6 +313,58 @@ mod tests {
         // A series with no data: numbers, not text.
         let out = run("cols x", &csv("allempty", "t,x\na,\nb,\n")).unwrap();
         assert!(same(&nums(&out, "x"), &[f64::NAN, f64::NAN]));
+    }
+
+    #[test]
+    fn a_newline_in_a_cell_keeps_the_rows() {
+        let out = run("add z = 'p\nq'", &csv("newline", "x\n1\n2\n")).unwrap();
+        assert!(same(&nums(&out, "x"), &[1.0, 2.0]));
+        match &out.columns[1].values {
+            Values::Text(v) => assert_eq!(v, &["p\nq", "p\nq"]),
+            Values::Num(v) => panic!("numeric: {v:?}"),
+        }
+    }
+
+    #[test]
+    fn paints_stay_inside_the_columns() {
+        let out = run("color red x > 0", &csv("ragged", "x\n1\n2,3\n")).unwrap();
+        assert!(!out.paints.is_empty());
+        assert!(out.paints.iter().all(|p| p.col < out.columns.len()));
+    }
+
+    #[test]
+    fn a_script_of_comments_is_blank() {
+        let out = run("# nothing yet\n", &csv("comment", "x\n1\n")).unwrap();
+        assert!(same(&nums(&out, "x"), &[1.0]));
+    }
+
+    #[test]
+    fn a_missing_pipe_is_named() {
+        let e = run("add y = x\nselect y > 1", &csv("pipe", "x\n1\n")).unwrap_err();
+        assert!(e.to_string().contains("missing `|`"), "{e}");
+    }
+
+    #[test]
+    fn id_like_columns_stay_text() {
+        let out = run("", &csv("ids", "id,plus,n\n02134,+5,0\n00001,+6,-0.5\n")).unwrap();
+        for name in ["id", "plus"] {
+            let col = out.columns.iter().find(|c| c.name == name).unwrap();
+            assert!(matches!(col.values, Values::Text(_)), "{name}");
+        }
+        assert!(same(&nums(&out, "n"), &[0.0, -0.5]));
+    }
+
+    #[test]
+    fn joined_files_are_checked() {
+        let dir = std::env::temp_dir();
+        let right = dir.join(format!("csvm-embed-right-{}.csv", std::process::id()));
+        std::fs::write(&right, "k,v\n1,a\n").unwrap();
+        let script = format!("join '{}' on k", right.display());
+        let input = csv("joinpolicy", "k\n1\n");
+        let e = run_with(&script, &input, &|_| false).unwrap_err();
+        assert!(e.to_string().contains("may not be read"), "{e}");
+        let out = run_with(&script, &input, &|p| p == right.canonicalize().unwrap()).unwrap();
+        assert_eq!(out.columns.len(), 2);
     }
 
     #[test]
@@ -308,7 +412,7 @@ mod tests {
     fn gradient_paints_numeric_cells() {
         let out = run("color -g x", &csv("grad", "x\n0\n5\n10\n")).unwrap();
         let fg: Vec<_> = out
-            .styles
+            .paints
             .iter()
             .map(|p| (p.row, p.col, p.style.fg))
             .collect();
@@ -324,7 +428,7 @@ mod tests {
     #[test]
     fn gradient_skips_empty_cells() {
         let out = run("color -g x", &csv("gradgap", "x\n0\n\n10\n")).unwrap();
-        let rows: Vec<_> = out.styles.iter().map(|p| p.row).collect();
+        let rows: Vec<_> = out.paints.iter().map(|p| p.row).collect();
         assert_eq!(rows, [0, 2]);
     }
 
@@ -333,10 +437,10 @@ mod tests {
         // `b` falls by more than 100 into the second row and the fourth.
         let input = csv("prev", "a,b\n1,500\n2,300\n3,290\n4,100\n5,90\n");
         let out = run("color red b - prev(b) < -100", &input).unwrap();
-        let cells: Vec<_> = out.styles.iter().map(|p| (p.row, p.col)).collect();
+        let cells: Vec<_> = out.paints.iter().map(|p| (p.row, p.col)).collect();
         assert_eq!(cells, [(1, 0), (1, 1), (3, 0), (3, 1)]);
         assert!(
-            out.styles
+            out.paints
                 .iter()
                 .all(|p| p.style.fg == Some(Color::Base(Base::Red)))
         );
@@ -345,7 +449,7 @@ mod tests {
     #[test]
     fn no_color_rules_no_paints() {
         let out = run("add y = x", &csv("plain", "x\n1\n")).unwrap();
-        assert!(out.styles.is_empty());
+        assert!(out.paints.is_empty());
     }
 
     #[cfg(feature = "parquet")]

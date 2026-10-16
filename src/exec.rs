@@ -1970,7 +1970,7 @@ pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
 }
 
 /// Read each join's right file header and resolve its sub-plan.
-fn read_join_headers(plan: &mut Plan) -> Result<(), Error> {
+pub(crate) fn read_join_headers(plan: &mut Plan) -> Result<(), Error> {
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
             read_join_headers(&mut j.right_plan)?;

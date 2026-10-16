@@ -35,6 +35,30 @@ pub fn parse_chunk<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>
     }
 }
 
+/// [`parse_chunk`] for CSV that csvm wrote: a quoted cell may hold a line
+/// break, so a row ends only at a line break outside quotes. Input CSV never
+/// has one (a row is a line), so the input path keeps `parse_chunk`.
+pub fn parse_records<'a>(text: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>>)) {
+    let mut row: Vec<Field<'a>> = Vec::new();
+    let mut fields_before = 1;
+    let mut start = 0;
+    let mut quoted = false;
+    for at in memchr2_iter(b'\n', b'"', text.as_bytes()) {
+        if text.as_bytes()[at] == b'"' {
+            quoted = !quoted;
+        } else if !quoted {
+            parse_line(strip_cr(&text[start..at]), &mut row, fields_before);
+            fields_before = row.len();
+            on_row(&mut row);
+            start = at + 1;
+        }
+    }
+    if start < text.len() {
+        parse_line(strip_cr(&text[start..]), &mut row, fields_before);
+        on_row(&mut row);
+    }
+}
+
 /// [`parse_chunk`], calling `on_row` with each row's line too, without its
 /// line break: for [`write_unchanged`].
 pub fn parse_chunk_lines<'a>(chunk: &'a str, mut on_row: impl FnMut(&mut Vec<Field<'a>>, &'a str)) {
