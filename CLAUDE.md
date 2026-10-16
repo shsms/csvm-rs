@@ -747,22 +747,31 @@ returns an `embed::Output`:
 
 - the output columns, typed. A column is `Values::Num` (NaN for an empty
   cell) when every non-empty cell is a number, as `numeric_columns` decides,
-  and none would lose its spelling as one (`02134`, `+5`), or when it has
-  rows and every cell is empty. Otherwise it is `Values::Text`. Numbers come
-  through csvm's output text, so they keep its 15 significant digits.
+  and no cell reads as an id (digits only, after a `+` or with a leading zero:
+  `+5`, `02134`); or when it has rows and every cell is empty. Otherwise it
+  is `Values::Text`. Numbers come through csvm's output text, so they keep
+  its 15 significant digits.
 - the cells the `color` rules paint (`embed::Paint`, from `compute_styles`,
   so a `prev()` reads the output rows as in the terminal), within the header's
   columns.
 - notices.
 
-A script of blanks and comments passes the input through. The caller draws its
-own table and charts, so `fmt` is dropped silently and a `graph` sink with a
-notice. A `from` stage is refused at its place, since the caller names the
-input. Errors keep their spans and get `main`'s missing-`|` note.
-`embed::run_with` also takes a check on each file a `join` reads (its
-canonical path; only regular files pass). The output is re-read with
-`csv::parse_records`, which, unlike the input scanner, lets a quoted cell hold
-a line break. It runs at `-n 1` and adds nothing to the hot path.
+A script of blanks and comments passes the input through; one of `fn`
+definitions only is an error, as in the CLI. The caller draws its own table
+and charts, so `fmt` is dropped silently and a `graph` sink with a notice. A
+`from` stage is refused at its place, since the caller names the input.
+Errors keep their spans and get `main`'s missing-`|` note.
+
+`embed::run_with` also takes a check on each file a `join` reads, by its
+canonical path, and `run` allows any. Either way only regular files are
+joined. Patterns expand over the allowed files alone, a refused file fails
+like a missing one ("may not be read here", at the join), and an allowed one
+is read by the canonical path that was checked.
+
+A big `sort` spills to a folder only this user can read, removed after the
+run. The output is re-read with `csv::parse_records`, which, unlike the input
+scanner, lets a quoted cell hold a line break. It runs at `-n 1` and adds
+nothing to the hot path.
 
 ## CLI
 

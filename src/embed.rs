@@ -87,8 +87,8 @@ fn run_inner(
             None => e,
         });
     }
-    exec::expand_joins(&mut plan, None, &mut pattern::RealFs)?;
-    check_joins(&plan, may_read)?;
+    exec::expand_joins(&mut plan, None, &mut Allowed(may_read))?;
+    check_joins(&mut plan, may_read)?;
     exec::read_join_headers(&mut plan)?;
     let mut notices = Vec::new();
     // The caller draws its own table and charts.
@@ -96,10 +96,12 @@ fn run_inner(
     if plan.graph.take().is_some() {
         notices.push("graph: ignored here; the caller draws its own charts".to_owned());
     }
+    // A big `sort` spills rows to files: keep them from other users.
+    let spill = Spill::new()?;
     let opts = RunOpts {
         chunk_size: 1 << 20,
         threads: 1,
-        temp_dir: std::env::temp_dir(),
+        temp_dir: spill.path().to_owned(),
         sort_buffer: 256 << 20,
         shard_bytes: exec::DEFAULT_SHARD_BYTES,
     };
@@ -131,21 +133,75 @@ fn run_inner(
     })
 }
 
+/// A folder only this user can read, removed when dropped.
+struct Spill(std::path::PathBuf);
+
+impl Spill {
+    fn new() -> Result<Self, Error> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("csvm-embed-{}-{n}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path)?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for Spill {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Refuses a joined file that `may_read` does not allow, or that is not a
-/// regular file, in `plan` and the plans it joins.
-fn check_joins(plan: &Plan, may_read: &dyn Fn(&Path) -> bool) -> Result<(), Error> {
-    for stage in &plan.stages {
+/// regular file, in `plan` and the plans it joins. The plan then reads each
+/// allowed file by its checked, canonical path. A refusal says the same whether
+/// the file exists or not.
+fn check_joins(plan: &mut Plan, may_read: &dyn Fn(&Path) -> bool) -> Result<(), Error> {
+    for (i, stage) in plan.stages.iter_mut().enumerate() {
         if let Stage::Join(j) = stage {
-            check_joins(&j.right_plan, may_read)?;
-            let path = Path::new(&j.file)
-                .canonicalize()
-                .map_err(|e| Error::Other(format!("{}: {e}", j.file)))?;
-            if !path.is_file() || !may_read(&path) {
-                return Err(Error::Other(format!("{}: may not be read here", j.file)));
-            }
+            check_joins(&mut j.right_plan, may_read)?;
+            let refused = || Error::Other(format!("{}: may not be read here", j.file));
+            let path = allowed(Path::new(&j.file), may_read).ok_or_else(|| {
+                let written = plan.sources.stages.get(i).and_then(|w| w.first());
+                written.map_or_else(refused, |w| w.place_whole(refused()))
+            })?;
+            j.file = path.to_string_lossy().into_owned();
         }
     }
     Ok(())
+}
+
+/// `path`'s canonical form, when it is a regular file `may_read` allows.
+fn allowed(path: &Path, may_read: &dyn Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
+    let path = path.canonicalize().ok()?;
+    (path.is_file() && may_read(&path)).then_some(path)
+}
+
+/// The filesystem as a join pattern sees it: only the files the caller may
+/// read, so a pattern names nothing else.
+struct Allowed<'a>(&'a dyn Fn(&Path) -> bool);
+
+impl pattern::Fs for Allowed<'_> {
+    fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
+        let names = pattern::RealFs.list(dir)?;
+        Some(
+            names
+                .into_iter()
+                .filter(|name| allowed(&dir.join(name), self.0).is_some())
+                .collect(),
+        )
+    }
+
+    fn is_file(&mut self, path: &Path) -> bool {
+        allowed(path, self.0).is_some()
+    }
 }
 
 #[cfg(feature = "parquet")]
@@ -200,16 +256,27 @@ fn paints(plan: &Plan, rows: &[&[Cow<str>]]) -> Vec<Paint> {
     paints
 }
 
-/// Whether `cell` would lose its spelling as a number: a leading `+`, or a
-/// leading zero before another digit.
+/// Whether `cell` reads as an id, not a number: digits only, after a leading
+/// `+`, or with a leading zero before another digit.
 fn id_like(cell: &str) -> bool {
-    let digits = cell.strip_prefix('-').unwrap_or(cell);
-    cell.starts_with('+')
-        || (digits.len() > 1 && digits.starts_with('0') && digits.as_bytes()[1].is_ascii_digit())
+    let (plus, digits) = match cell.strip_prefix('+') {
+        Some(rest) => (true, rest),
+        None => (false, cell.strip_prefix('-').unwrap_or(cell)),
+    };
+    let whole = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+    whole && (plus || (digits.len() > 1 && digits.starts_with('0')))
 }
 
 /// The output `rows` (header first) as columns.
 fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
+    // An output with no columns writes empty lines: no columns, not one
+    // named "".
+    if rows
+        .iter()
+        .all(|row| matches!(row, [only] if only.is_empty()))
+    {
+        return Vec::new();
+    }
     let numeric = exec::numeric_columns(rows);
     let Some((header, data)) = rows.split_first() else {
         return Vec::new();
@@ -366,6 +433,75 @@ mod tests {
         assert!(e.to_string().contains("may not be read"), "{e}");
         let out = run_with(&script, &input, &|p| p == right.canonicalize().unwrap()).unwrap();
         assert_eq!(out.columns.len(), 2);
+    }
+
+    #[test]
+    fn nested_joins_and_folders_are_checked() {
+        let dir = std::env::temp_dir().join(format!("csvm-embed-nest-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let right = dir.join("r.csv");
+        std::fs::write(&right, "k,v\n1,a\n").unwrap();
+        let input = csv("nest", "k\n1\n");
+        let only = |p: &Path| p == right.canonicalize().unwrap();
+        // The outer file is allowed, the inner one is not.
+        let inner = dir.join("sub").join("s.csv");
+        std::fs::write(&inner, "k,w\n1,x\n").unwrap();
+        let script = format!(
+            "join (join '{}' on k) '{}' on k",
+            inner.display(),
+            right.display()
+        );
+        assert!(run_with(&script, &input, &only).is_err());
+        // A folder is not a file.
+        let script = format!("join '{}' on k", dir.join("sub").display());
+        assert!(run_with(&script, &input, &|_| true).is_err());
+    }
+
+    #[test]
+    fn a_refused_path_says_nothing_about_the_disk() {
+        let dir = std::env::temp_dir().join(format!("csvm-embed-hide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("secret.csv"), "k,v\n1,a\n").unwrap();
+        let input = csv("hide", "k\n1\n");
+        let deny = |_: &Path| false;
+        let errors: Vec<String> = ["secret.csv", "nothing.csv", "*.csv"]
+            .iter()
+            .map(|name| {
+                let script = format!("join '{}' on k", dir.join(name).display());
+                run_with(&script, &input, &deny).unwrap_err().to_string()
+            })
+            .collect();
+        // A refused file reads like a missing one, and a pattern names no
+        // file it was not given.
+        assert!(
+            errors.iter().all(|e| e.contains("may not be read")),
+            "{errors:?}"
+        );
+        assert!(!errors[2].contains("secret"), "{}", errors[2]);
+    }
+
+    #[test]
+    fn signed_decimals_are_numbers() {
+        let out = run("", &csv("signed", "d\n+0.5\n-0.3\n")).unwrap();
+        assert!(same(&nums(&out, "d"), &[0.5, -0.3]));
+    }
+
+    #[test]
+    fn no_columns_is_no_columns() {
+        let out = run("cols -v a,b", &csv("nocols", "a,b\n1,2\n")).unwrap();
+        assert!(out.columns.is_empty(), "{:?}", out.columns);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spills_go_to_a_private_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let spill = Spill::new().unwrap();
+        let path = spill.path().to_owned();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        drop(spill);
+        assert!(!path.exists());
     }
 
     #[test]
