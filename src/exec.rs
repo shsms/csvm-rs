@@ -2556,7 +2556,7 @@ fn style_at(styles: Option<&[Vec<Style>]>, ri: usize, ci: usize) -> Style {
 
 /// Which columns are numeric: every data cell reads as a number (blanks
 /// allowed, but at least one must be a real number).
-fn numeric_columns(rows: &[&[Cow<str>]]) -> Vec<bool> {
+pub(crate) fn numeric_columns(rows: &[&[Cow<str>]]) -> Vec<bool> {
     let ncols = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     (0..ncols)
         .map(|i| {

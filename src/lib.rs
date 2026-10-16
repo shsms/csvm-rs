@@ -12,6 +12,7 @@ pub mod complete;
 pub mod console;
 pub mod csv;
 pub mod datetime;
+pub mod embed;
 pub mod error;
 pub mod exec;
 pub mod field;

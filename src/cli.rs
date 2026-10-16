@@ -12,6 +12,15 @@
 
 use std::path::PathBuf;
 
+/// Why a Parquet input fails in a build without the `parquet` feature.
+pub const NO_PARQUET: &str = "parquet input requires building csvm with --features parquet";
+
+/// Whether `path` names a Parquet file, by its extension.
+pub fn is_parquet_path(path: &std::path::Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
+}
+
 /// Parsed command-line arguments.
 #[derive(Debug, Clone)]
 pub struct Args {
@@ -81,13 +90,7 @@ impl Args {
             return f;
         }
         match self.in_file.as_deref() {
-            Some(p)
-                if std::path::Path::new(p)
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("parquet")) =>
-            {
-                InputFormat::Parquet
-            }
+            Some(p) if is_parquet_path(std::path::Path::new(p)) => InputFormat::Parquet,
             _ => InputFormat::Csv,
         }
     }

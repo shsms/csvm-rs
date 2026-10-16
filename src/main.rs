@@ -336,7 +336,7 @@ fn open_parquet(args: &cli::Args) -> Result<(Source, Vec<String>), String> {
 
 #[cfg(not(feature = "parquet"))]
 fn open_parquet(_args: &cli::Args) -> Result<(Source, Vec<String>), String> {
-    Err("parquet input requires building csvm with --features parquet".to_string())
+    Err(cli::NO_PARQUET.to_string())
 }
 
 /// The CSV a buffered run renders: with no stage, a CSV input's rows as they

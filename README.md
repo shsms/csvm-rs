@@ -491,6 +491,8 @@ stage 3 (transform):
   past `--sort-buffer`). Groups of runs are merged in parallel (multi-level, so
   huge inputs stay file-descriptor-bounded), then a binary-heap k-way merge
   copies the already-serialized line bytes out in order.
+- **Embeddable.** `csvm::embed::run(script, path)` runs a script over a CSV or
+  Parquet file from another Rust program and returns typed columns.
 
 ## Benchmarking
 
