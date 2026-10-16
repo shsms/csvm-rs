@@ -225,10 +225,11 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
                     .iter()
                     .all(|row| field::trim_cell(cell(row, i)).is_empty());
             // `02134` and `+5` read as numbers, but they are names: text.
-            let named = data
-                .iter()
-                .any(|row| id_like(field::trim_cell(cell(row, i))));
-            let values = if (numeric.get(i) == Some(&true) && !named) || blank {
+            let number = numeric.get(i) == Some(&true)
+                && !data
+                    .iter()
+                    .any(|row| id_like(field::trim_cell(cell(row, i))));
+            let values = if number || blank {
                 Values::Num(
                     data.iter()
                         .map(|row| field::trim_cell(cell(row, i)).parse().unwrap_or(f64::NAN))

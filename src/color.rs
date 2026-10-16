@@ -10,13 +10,13 @@
 use std::fmt;
 
 /// An RGB triple. Named colours are kept as RGB so gradients can interpolate.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rgb(pub u8, pub u8, pub u8);
 
 /// One of the terminal's base colours: the eight ANSI colours and grey (bright
 /// black). It is painted with its own SGR code, so it shows in the shade the
 /// terminal's theme gives it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Base {
     Black,
     Red,
@@ -160,7 +160,7 @@ impl Depth {
 }
 
 /// A colour as the terminal is asked for it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Color {
     /// One of the terminal's base colours, drawn in its theme's shade.
     Base(Base),
@@ -246,7 +246,7 @@ fn ansi256(c: Rgb) -> u8 {
 pub const RESET: &str = "\x1b[0m";
 
 /// A foreground/background/attribute set.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Style {
     pub fg: Option<Color>,
     pub bg: Option<Color>,
