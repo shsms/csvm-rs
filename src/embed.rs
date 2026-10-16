@@ -49,25 +49,31 @@ pub enum Values {
 /// header line. A blank script, or one of comments only, passes the input
 /// through. A script error keeps its place in the script ([`Error::span`]).
 pub fn run(script: &str, input: &Path) -> Result<Output, Error> {
-    run_with(script, input, &|_| true)
+    let join_opts = JoinOpts {
+        dir: None,
+        may_read: &|_| true,
+    };
+    run_with(script, input, &join_opts)
 }
 
-/// [`run`], reading a file the script joins only when `may_read` allows its
-/// canonical path, and only a regular file.
-pub fn run_with(
-    script: &str,
-    input: &Path,
-    may_read: &dyn Fn(&Path) -> bool,
-) -> Result<Output, Error> {
+/// Where a script's `join` may read.
+pub struct JoinOpts<'a> {
+    /// The folder a relative join path starts from; `None` for the process's
+    /// working directory.
+    pub dir: Option<&'a Path>,
+    /// Whether a joined file may be read, given its canonical path. Only a
+    /// regular file with a UTF-8 path is read.
+    pub may_read: &'a dyn Fn(&Path) -> bool,
+}
+
+/// [`run`], with `join_opts` setting where a relative join path starts and
+/// which files the script may join.
+pub fn run_with(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Output, Error> {
     // As the CLI does, an error says when a `|` may be missing.
-    run_inner(script, input, may_read).map_err(|e| parse::note_missing_pipe(script, e))
+    run_inner(script, input, join_opts).map_err(|e| parse::note_missing_pipe(script, e))
 }
 
-fn run_inner(
-    script: &str,
-    input: &Path,
-    may_read: &dyn Fn(&Path) -> bool,
-) -> Result<Output, Error> {
+fn run_inner(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Output, Error> {
     let mut plan = if parse::strip_comments(script).trim().is_empty() {
         Plan {
             stages: Vec::new(),
@@ -87,8 +93,8 @@ fn run_inner(
             None => e,
         });
     }
-    exec::expand_joins(&mut plan, None, &mut Allowed(may_read))?;
-    check_joins(&mut plan, may_read)?;
+    exec::expand_joins(&mut plan, join_opts.dir, &mut AllowedFs(join_opts.may_read))?;
+    check_joins(&mut plan, join_opts)?;
     exec::read_join_headers(&mut plan)?;
     let mut notices = Vec::new();
     // The caller draws its own table and charts.
@@ -97,7 +103,7 @@ fn run_inner(
         notices.push("graph: ignored here; the caller draws its own charts".to_owned());
     }
     // A big `sort` spills rows to files: keep them from other users.
-    let spill = Spill::new()?;
+    let spill = SpillDir::new()?;
     let opts = RunOpts {
         chunk_size: 1 << 20,
         threads: 1,
@@ -133,19 +139,40 @@ fn run_inner(
     })
 }
 
-/// A folder only this user can read, removed when dropped.
-struct Spill(std::path::PathBuf);
+/// A new folder in the temp directory that only this user can read, removed
+/// when dropped.
+struct SpillDir(std::path::PathBuf);
 
-impl Spill {
+impl SpillDir {
     fn new() -> Result<Self, Error> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("csvm-embed-{}-{n}", std::process::id()));
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-        builder.create(&path)?;
-        Ok(Self(path))
+        // A name someone else took is skipped: the clock makes the next one
+        // hard to guess.
+        let mut tries = 0;
+        loop {
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.subsec_nanos());
+            let name = format!("csvm-embed-{}-{n}-{nanos:x}", std::process::id());
+            let path = std::env::temp_dir().join(name);
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 100 => {
+                    tries += 1;
+                }
+                Err(e) => {
+                    let text = format!(
+                        "cannot make a folder for sorting in {}: {e}",
+                        path.display()
+                    );
+                    return Err(Error::Io(std::io::Error::new(e.kind(), text)));
+                }
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -153,42 +180,46 @@ impl Spill {
     }
 }
 
-impl Drop for Spill {
+impl Drop for SpillDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-/// Refuses a joined file that `may_read` does not allow, or that is not a
-/// regular file, in `plan` and the plans it joins. The plan then reads each
-/// allowed file by its checked, canonical path. A refusal says the same whether
-/// the file exists or not.
-fn check_joins(plan: &mut Plan, may_read: &dyn Fn(&Path) -> bool) -> Result<(), Error> {
+/// Refuses a joined file that `join_opts` does not allow, or that is not a
+/// regular file with a UTF-8 path, in `plan` and the plans it joins. The plan
+/// then reads each allowed file by its checked, canonical path. A refusal says
+/// the same whether the file exists or not.
+fn check_joins(plan: &mut Plan, join_opts: &JoinOpts) -> Result<(), Error> {
     for (i, stage) in plan.stages.iter_mut().enumerate() {
         if let Stage::Join(j) = stage {
-            check_joins(&mut j.right_plan, may_read)?;
+            check_joins(&mut j.right_plan, join_opts)?;
             let refused = || Error::Other(format!("{}: may not be read here", j.file));
-            let path = allowed(Path::new(&j.file), may_read).ok_or_else(|| {
-                let written = plan.sources.stages.get(i).and_then(|w| w.first());
-                written.map_or_else(refused, |w| w.place_whole(refused()))
-            })?;
+            let path = allowed(&pattern::full(join_opts.dir, &j.file), join_opts.may_read)
+                .ok_or_else(|| {
+                    let written = plan.sources.stages.get(i).and_then(|w| w.first());
+                    written.map_or_else(refused, |w| w.place_whole(refused()))
+                })?;
+            // `allowed` takes only paths that are valid UTF-8.
             j.file = path.to_string_lossy().into_owned();
         }
     }
     Ok(())
 }
 
-/// `path`'s canonical form, when it is a regular file `may_read` allows.
+/// `path`'s canonical form, when it is valid UTF-8 and a regular file
+/// `may_read` allows.
 fn allowed(path: &Path, may_read: &dyn Fn(&Path) -> bool) -> Option<std::path::PathBuf> {
     let path = path.canonicalize().ok()?;
-    (path.is_file() && may_read(&path)).then_some(path)
+    (path.to_str().is_some() && path.is_file() && may_read(&path)).then_some(path)
 }
 
-/// The filesystem as a join pattern sees it: only the files the caller may
-/// read, so a pattern names nothing else.
-struct Allowed<'a>(&'a dyn Fn(&Path) -> bool);
+/// The filesystem as a join pattern sees it: a wildcard matches only the files
+/// the caller may read, so it names nothing else. A name spelled out in braces
+/// is left to [`check_joins`], which refuses it as it refuses a plain path.
+struct AllowedFs<'a>(&'a dyn Fn(&Path) -> bool);
 
-impl pattern::Fs for Allowed<'_> {
+impl pattern::Fs for AllowedFs<'_> {
     fn list(&mut self, dir: &Path) -> Option<Vec<String>> {
         let names = pattern::RealFs.list(dir)?;
         Some(
@@ -199,8 +230,8 @@ impl pattern::Fs for Allowed<'_> {
         )
     }
 
-    fn is_file(&mut self, path: &Path) -> bool {
-        allowed(path, self.0).is_some()
+    fn is_file(&mut self, _: &Path) -> bool {
+        true
     }
 }
 
@@ -291,7 +322,7 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
                 && data
                     .iter()
                     .all(|row| field::trim_cell(cell(row, i)).is_empty());
-            // `02134` and `+5` read as numbers, but they are names: text.
+            // `02134` and `+5` read as numbers, but they are ids: text.
             let number = numeric.get(i) == Some(&true)
                 && !data
                     .iter()
@@ -317,6 +348,14 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
 mod tests {
     use super::*;
     use crate::color::{Base, Color};
+
+    /// Joins from the working directory, as `may_read` allows.
+    fn limited<'a>(may_read: &'a dyn Fn(&Path) -> bool) -> JoinOpts<'a> {
+        JoinOpts {
+            dir: None,
+            may_read,
+        }
+    }
 
     /// Writes `text` to a file named after `tag` in the temp dir.
     fn csv(tag: &str, text: &str) -> std::path::PathBuf {
@@ -429,9 +468,10 @@ mod tests {
         std::fs::write(&right, "k,v\n1,a\n").unwrap();
         let script = format!("join '{}' on k", right.display());
         let input = csv("joinpolicy", "k\n1\n");
-        let e = run_with(&script, &input, &|_| false).unwrap_err();
+        let e = run_with(&script, &input, &limited(&|_| false)).unwrap_err();
         assert!(e.to_string().contains("may not be read"), "{e}");
-        let out = run_with(&script, &input, &|p| p == right.canonicalize().unwrap()).unwrap();
+        let only = |p: &Path| p == right.canonicalize().unwrap();
+        let out = run_with(&script, &input, &limited(&only)).unwrap();
         assert_eq!(out.columns.len(), 2);
     }
 
@@ -451,10 +491,49 @@ mod tests {
             inner.display(),
             right.display()
         );
-        assert!(run_with(&script, &input, &only).is_err());
+        assert!(run_with(&script, &input, &limited(&only)).is_err());
         // A folder is not a file.
         let script = format!("join '{}' on k", dir.join("sub").display());
-        assert!(run_with(&script, &input, &|_| true).is_err());
+        assert!(run_with(&script, &input, &limited(&|_| true)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("csvm-embed-utf8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let odd = dir.join(std::ffi::OsStr::from_bytes(b"r\xff.csv"));
+        std::fs::write(&odd, "k,v\n1,a\n").unwrap();
+        let link = dir.join("link.csv");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&odd, &link).unwrap();
+        let script = format!("join '{}' on k", link.display());
+        let input = csv("utf8", "k\n1\n");
+        let e = run_with(&script, &input, &limited(&|_| true)).unwrap_err();
+        assert!(e.to_string().contains("may not be read"), "{e}");
+    }
+
+    #[test]
+    fn a_relative_join_starts_in_the_given_folder() {
+        let dir = std::env::temp_dir().join(format!("csvm-embed-rel-{}", std::process::id()));
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("r.csv"), "k,v\n1,a\n").unwrap();
+        std::fs::write(dir.join("out.csv"), "k,v\n1,a\n").unwrap();
+        let input = csv("rel", "k\n1\n");
+        let inside = data.canonicalize().unwrap();
+        let may_read = |p: &Path| p.starts_with(&inside);
+        let join_opts = JoinOpts {
+            dir: Some(&data),
+            may_read: &may_read,
+        };
+        for script in ["join r.csv on k", "join r*.csv on k"] {
+            let out = run_with(script, &input, &join_opts).unwrap();
+            assert_eq!(out.columns.len(), 2, "{script}");
+        }
+        let e = run_with("join '../out.csv' on k", &input, &join_opts).unwrap_err();
+        assert!(e.to_string().contains("may not be read"), "{e}");
     }
 
     #[test]
@@ -463,21 +542,17 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("secret.csv"), "k,v\n1,a\n").unwrap();
         let input = csv("hide", "k\n1\n");
-        let deny = |_: &Path| false;
-        let errors: Vec<String> = ["secret.csv", "nothing.csv", "*.csv"]
-            .iter()
-            .map(|name| {
-                let script = format!("join '{}' on k", dir.join(name).display());
-                run_with(&script, &input, &deny).unwrap_err().to_string()
-            })
-            .collect();
-        // A refused file reads like a missing one, and a pattern names no
-        // file it was not given.
-        assert!(
-            errors.iter().all(|e| e.contains("may not be read")),
-            "{errors:?}"
-        );
-        assert!(!errors[2].contains("secret"), "{}", errors[2]);
+        let deny = limited(&|_: &Path| false);
+        let error = |script: String| run_with(&script, &input, &deny).unwrap_err().to_string();
+        // A refused file reads like a missing one, named or in braces.
+        for name in ["'secret.csv'", "'nothing.csv'", "{secret,nothing}.csv"] {
+            let e = error(format!("join {}/{name} on k", dir.display()));
+            assert!(e.contains("may not be read"), "{e}");
+        }
+        // A wildcard matches no file it was not given.
+        let e = error(format!("join {}/*.csv on k", dir.display()));
+        assert!(e.contains("no file matches"), "{e}");
+        assert!(!e.contains("secret"), "{e}");
     }
 
     #[test]
@@ -496,7 +571,7 @@ mod tests {
     #[test]
     fn spills_go_to_a_private_folder() {
         use std::os::unix::fs::PermissionsExt;
-        let spill = Spill::new().unwrap();
+        let spill = SpillDir::new().unwrap();
         let path = spill.path().to_owned();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);

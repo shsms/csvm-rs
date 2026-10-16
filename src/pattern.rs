@@ -23,7 +23,8 @@ pub struct Expanded {
 pub trait Fs {
     /// The names in directory `dir`, or `None` when it cannot be listed.
     fn list(&mut self, dir: &Path) -> Option<Vec<String>>;
-    /// Whether `path` is a file.
+    /// Whether `path` is a file. An `Fs` may answer yes for any name spelled
+    /// out in a pattern and leave the check to whoever reads the file.
     fn is_file(&mut self, path: &Path) -> bool;
 }
 
@@ -132,7 +133,8 @@ fn expanded(path: String, parts: Vec<String>) -> Expanded {
     Expanded { path, part }
 }
 
-fn full(base: Option<&Path>, path: &str) -> PathBuf {
+/// `path`, read from `base` when it is relative.
+pub(crate) fn full(base: Option<&Path>, path: &str) -> PathBuf {
     match base {
         Some(b) => b.join(path),
         None => PathBuf::from(path),

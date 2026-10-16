@@ -762,14 +762,18 @@ and charts, so `fmt` is dropped silently and a `graph` sink with a notice. A
 `from` stage is refused at its place, since the caller names the input.
 Errors keep their spans and get `main`'s missing-`|` note.
 
-`embed::run_with` also takes a check on each file a `join` reads, by its
-canonical path, and `run` allows any. Either way only regular files are
-joined. Patterns expand over the allowed files alone, a refused file fails
-like a missing one ("may not be read here", at the join), and an allowed one
-is read by the canonical path that was checked.
+`embed::run_with` also takes an `embed::JoinOpts`: the folder a relative join
+path starts from, and a check on each file a `join` reads, by its canonical
+path. `run` starts from the working directory and allows any file. Either way
+only regular files with UTF-8 paths are joined. A wildcard (`*`, `?`) matches
+only the allowed files. A refused file named in full or in braces fails like a
+missing one, with "may not be read here" at the join. An allowed file is read
+by the canonical path that was checked; a link inside the folder changed
+between that check and the read is not caught.
 
-A big `sort` spills to a folder only this user can read, removed after the
-run. The output is re-read with `csv::parse_records`, which, unlike the input
+A big `sort` spills to a new folder in the temp directory, which only this
+user can read and which is removed after the run. A name already taken is
+skipped. The output is re-read with `csv::parse_records`, which, unlike the input
 scanner, lets a quoted cell hold a line break. It runs at `-n 1` and adds
 nothing to the hot path.
 
