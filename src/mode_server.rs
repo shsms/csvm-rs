@@ -396,7 +396,7 @@ fn file_header(headers: &mut Headers, cwd: Option<&Path>, file: &str) -> Option<
 const MAX_FILES: usize = 64;
 
 /// The most bytes read looking for the end of a CSV file's first line.
-const MAX_HEADER_BYTES: u64 = 1 << 20;
+pub(crate) const MAX_HEADER_BYTES: u64 = 1 << 20;
 
 /// The first line of each file read so far, by path and format. An entry
 /// is used again only while the file's size and modification time are
@@ -404,7 +404,7 @@ const MAX_HEADER_BYTES: u64 = 1 << 20;
 /// its size and time per request. A read that failed is kept too, so it is
 /// not tried again until the file changes.
 #[derive(Default)]
-struct Headers {
+pub(crate) struct Headers {
     files: HashMap<(PathBuf, InputFormat), Seen>,
     /// Each directory a pattern was matched in: its names, and its time
     /// when they were listed.
@@ -440,7 +440,7 @@ impl Headers {
     /// The columns of the first line of the file at `path`, read as csvm
     /// reads its input's. `None` when it is not a regular file (a FIFO or a
     /// device could block or never end) or cannot be read as `format`.
-    fn first_line(&mut self, path: &Path, format: InputFormat) -> Option<Vec<String>> {
+    pub(crate) fn first_line(&mut self, path: &Path, format: InputFormat) -> Option<Vec<String>> {
         let meta = std::fs::metadata(path).ok().filter(|m| m.is_file())?;
         let modified = meta.modified().ok();
         let key = (path.to_path_buf(), format);

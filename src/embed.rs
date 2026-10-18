@@ -5,11 +5,13 @@
 use std::borrow::Cow;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Mutex;
 
+use crate::cli::InputFormat;
 use crate::color::Style;
 use crate::error::Error;
 use crate::exec::{self, RunOpts};
-use crate::mode_server::placed;
+use crate::mode_server::{Headers, MAX_HEADER_BYTES, placed};
 use crate::plan::{OutputFormat, Plan, Sources, Stage};
 use crate::progress::Progress;
 use crate::{cli, complete, csv, field, parse, pattern};
@@ -92,10 +94,39 @@ pub struct ScriptError {
     pub message: String,
 }
 
+/// The headers of the files that scripts join, kept between calls to
+/// [`marks`] and [`suggest`]. A file's first line is read again when its
+/// size or modification time changes, and only its first MiB is read. It
+/// keeps at most 64 files: when it holds 64 and reads a file, new or
+/// changed, it forgets all the others.
+#[derive(Default)]
+pub struct JoinHeaders(Mutex<Headers>);
+
+impl JoinHeaders {
+    fn read(&self, path: &Path) -> Result<Vec<String>, Error> {
+        let mut headers = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        headers.first_line(path, InputFormat::Csv).ok_or_else(|| {
+            Error::Other(format!(
+                "{}: the first line cannot be read as a header (unreadable, \
+                 empty, not UTF-8, or over {} MiB with its line break)",
+                path.display(),
+                MAX_HEADER_BYTES >> 20
+            ))
+        })
+    }
+}
+
 /// The colours of `script` and its first error, as [`run_with`] would find
 /// it over an input with the columns `header`. With no header, unknown
-/// columns are not found.
-pub fn marks(script: &str, header: Option<&[String]>, join_opts: &JoinOpts) -> Marks {
+/// columns are not found. The joined files' headers come from
+/// `join_headers`, so a first line over 1 MiB, counting its line break, is
+/// an error here, though a run reads it.
+pub fn marks(
+    script: &str,
+    header: Option<&[String]>,
+    join_opts: &JoinOpts,
+    join_headers: &JoinHeaders,
+) -> Marks {
     let mut recorder = parse::Recorder::default();
     let parsed = parse::parse_recorded(script, &mut recorder);
     let spans = recorder.into_spans();
@@ -105,8 +136,8 @@ pub fn marks(script: &str, header: Option<&[String]>, join_opts: &JoinOpts) -> M
         match parsed {
             Err(e) => Some(e),
             Ok(mut plan) => match header {
-                Some(h) => resolve(&mut plan, h, join_opts).err(),
-                None => prepare(&mut plan, join_opts).err(),
+                Some(h) => resolve(&mut plan, h, join_opts, join_headers).err(),
+                None => prepare(&mut plan, join_opts, &|p| join_headers.read(p)).err(),
             },
         }
     };
@@ -121,12 +152,14 @@ pub fn marks(script: &str, header: Option<&[String]>, join_opts: &JoinOpts) -> M
 /// gives them: commands, flags, functions, and the columns at the cursor's
 /// stage, `header` carried through the stages before it. No columns inside a
 /// `join ( … )` group or an `fn` body, or with no header, no file names, and
-/// no `from` stage, which [`run_with`] refuses.
+/// no `from` stage, which [`run_with`] refuses. The joined files' headers
+/// come from `join_headers`.
 pub fn suggest(
     script: &str,
     at: usize,
     header: Option<&[String]>,
     join_opts: &JoinOpts,
+    join_headers: &JoinHeaders,
 ) -> Vec<Item> {
     if !script.is_char_boundary(at) {
         return Vec::new();
@@ -140,7 +173,7 @@ pub fn suggest(
             return Some(header.to_vec());
         }
         let mut plan = parse::parse(&found.stages_before).ok()?;
-        resolve(&mut plan, header, join_opts).ok()
+        resolve(&mut plan, header, join_opts, join_headers).ok()
     };
     let mut items = complete::items_at(script, at, &mut columns, &mut |_, _| Vec::new());
     // The caller names the input, so a run refuses a `from` stage. `from`
@@ -157,18 +190,28 @@ fn is_blank(script: &str) -> bool {
     parse::strip_comments(script).trim().is_empty()
 }
 
-/// The header `plan` turns `header` into, checked as a run checks it.
-fn resolve(plan: &mut Plan, header: &[String], join_opts: &JoinOpts) -> Result<Vec<String>, Error> {
-    prepare(plan, join_opts)?;
+/// The header `plan` turns `header` into, checked as a run checks it, but
+/// with the joined files' headers from `join_headers`.
+fn resolve(
+    plan: &mut Plan,
+    header: &[String],
+    join_opts: &JoinOpts,
+    join_headers: &JoinHeaders,
+) -> Result<Vec<String>, Error> {
+    prepare(plan, join_opts, &|p| join_headers.read(p))?;
     plan.resolve(header)
 }
 
 /// What a run does to the plan before it reads the input: a `from` stage is
 /// refused at its place, and the joins are limited by `join_opts` and their
-/// headers read. The output is CSV, which a run reads back into columns: the
-/// caller draws its own table and charts, so a `fmt` is dropped, and a `graph`
-/// sink is dropped with the notice this gives.
-fn prepare(plan: &mut Plan, join_opts: &JoinOpts) -> Result<Vec<String>, Error> {
+/// headers read with `header_of`. The output is CSV, which a run reads back
+/// into columns: the caller draws its own table and charts, so a `fmt` is
+/// dropped, and a `graph` sink is dropped with the notice this gives.
+fn prepare(
+    plan: &mut Plan,
+    join_opts: &JoinOpts,
+    header_of: &dyn Fn(&Path) -> Result<Vec<String>, Error>,
+) -> Result<Vec<String>, Error> {
     if plan.from.is_some() {
         let e = Error::Compile("from: the input is given by the caller".into());
         return Err(match plan.sources.from.span.clone() {
@@ -178,7 +221,7 @@ fn prepare(plan: &mut Plan, join_opts: &JoinOpts) -> Result<Vec<String>, Error> 
     }
     exec::expand_joins(plan, join_opts.dir, &mut AllowedFs(join_opts.may_read))?;
     check_joins(plan, join_opts)?;
-    exec::read_join_headers(plan)?;
+    exec::read_join_headers(plan, header_of)?;
     plan.output = OutputFormat::Csv;
     let mut notices = Vec::new();
     if plan.graph.take().is_some() {
@@ -200,7 +243,9 @@ fn run_inner(script: &str, input: &Path, join_opts: &JoinOpts) -> Result<Output,
     } else {
         parse::parse(script)?
     };
-    let notices = prepare(&mut plan, join_opts)?;
+    let notices = prepare(&mut plan, join_opts, &|path| {
+        Ok(exec::read_header_from_path(path)?.0)
+    })?;
     // A big `sort` spills rows to files: keep them from other users.
     let spill = SpillDir::new()?;
     let opts = RunOpts {
@@ -445,6 +490,8 @@ fn columns(rows: &[&[Cow<str>]]) -> Vec<Column> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
+
     use super::*;
     use crate::color::{Base, Color};
 
@@ -460,13 +507,23 @@ mod tests {
         }
     }
 
+    /// A cache with no header read yet.
+    fn fresh() -> JoinHeaders {
+        JoinHeaders::default()
+    }
+
     fn cols(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
     }
 
     #[test]
     fn marks_place_a_missing_equals() {
-        let m = marks("add new one + two", Some(&cols(&["one", "two"])), &any());
+        let m = marks(
+            "add new one + two",
+            Some(&cols(&["one", "two"])),
+            &any(),
+            &fresh(),
+        );
         assert!(m.error.expect("an error").at.is_some());
         assert!(!m.spans.is_empty());
     }
@@ -474,27 +531,33 @@ mod tests {
     #[test]
     fn marks_name_an_unknown_column_only_with_a_header() {
         let script = "select nope > 1";
-        assert!(marks(script, Some(&cols(&["a"])), &any()).error.is_some());
-        assert!(marks(script, None, &any()).error.is_none());
+        assert!(
+            marks(script, Some(&cols(&["a"])), &any(), &fresh())
+                .error
+                .is_some()
+        );
+        assert!(marks(script, None, &any(), &fresh()).error.is_none());
     }
 
     #[test]
     fn marks_ignore_a_graph_as_a_run_does() {
-        let m = marks("graph line a nope", Some(&cols(&["a"])), &any());
+        let m = marks("graph line a nope", Some(&cols(&["a"])), &any(), &fresh());
         assert!(m.error.is_none(), "{:?}", m.error);
     }
 
     #[test]
     fn marks_without_a_header_still_refuse_from_and_joins() {
         assert!(
-            marks("from x.csv | select a > 1", None, &any())
+            marks("from x.csv | select a > 1", None, &any(), &fresh())
                 .error
                 .is_some()
         );
         let there = csv("refuse-no-header", "k\n1\n");
         let deny = limited(&|_| false);
         let script = format!("join '{}' on k", there.display());
-        let error = marks(&script, None, &deny).error.expect("an error");
+        let error = marks(&script, None, &deny, &fresh())
+            .error
+            .expect("an error");
         assert!(
             error.message.contains("may not be read here"),
             "{}",
@@ -505,7 +568,7 @@ mod tests {
     #[test]
     fn marks_of_a_blank_script_find_nothing() {
         for script in ["", "   ", "# c\n"] {
-            let m = marks(script, Some(&cols(&["a"])), &any());
+            let m = marks(script, Some(&cols(&["a"])), &any(), &fresh());
             assert!(m.error.is_none(), "{script:?}: {:?}", m.error);
         }
     }
@@ -513,14 +576,14 @@ mod tests {
     #[test]
     fn suggest_offers_no_columns_inside_a_join_group() {
         let s = "join ( add y = a";
-        let items = suggest(s, s.len(), Some(&cols(&["amp"])), &any());
+        let items = suggest(s, s.len(), Some(&cols(&["amp"])), &any(), &fresh());
         assert!(!items.iter().any(|i| i.text == "amp"), "{items:?}");
     }
 
     #[test]
     fn suggest_carries_a_new_column_into_later_stages() {
         let s = "add new = a + 1 | select n";
-        let items = suggest(s, s.len(), Some(&cols(&["a"])), &any());
+        let items = suggest(s, s.len(), Some(&cols(&["a"])), &any(), &fresh());
         assert!(items.iter().any(|i| i.text == "new"), "{items:?}");
     }
 
@@ -528,7 +591,7 @@ mod tests {
     fn suggest_after_a_space_at_a_stage_start_offers_commands() {
         let s = "add x = 1 | ";
         assert!(
-            suggest(s, s.len(), None, &any())
+            suggest(s, s.len(), None, &any(), &fresh())
                 .iter()
                 .any(|i| i.text == "select")
         );
@@ -537,11 +600,11 @@ mod tests {
     #[test]
     fn suggest_offers_no_from_stage_but_a_from_column() {
         for s in ["", "f", "add x = 1 | ", "join ( "] {
-            let items = suggest(s, s.len(), None, &any());
+            let items = suggest(s, s.len(), None, &any(), &fresh());
             assert!(!items.iter().any(|i| i.text == "from"), "{s:?}: {items:?}");
         }
         let s = "select f";
-        let items = suggest(s, s.len(), Some(&cols(&["from"])), &any());
+        let items = suggest(s, s.len(), Some(&cols(&["from"])), &any(), &fresh());
         assert!(items.iter().any(|i| i.text == "from"), "{items:?}");
     }
 
@@ -550,7 +613,7 @@ mod tests {
         let deny = limited(&|_| false);
         let header = cols(&["k"]);
         let error = |s: &str| {
-            marks(s, Some(&header), &deny)
+            marks(s, Some(&header), &deny, &fresh())
                 .error
                 .expect("an error")
                 .message
@@ -561,6 +624,81 @@ mod tests {
         let b = error(&format!("join '{}' on k", absent.display()));
         let (there, absent) = (there.display().to_string(), absent.display().to_string());
         assert_eq!(a.replace(&there, "X"), b.replace(&absent, "X"));
+    }
+
+    #[test]
+    fn marks_read_a_joined_header_again_only_when_its_file_changes() {
+        let path = csv("seen-again", "k,a\n1,2\n");
+        let script = format!("join '{}' on k | select a > 1", path.display());
+        let join_headers = fresh();
+        let error = || marks(&script, Some(&cols(&["k"])), &any(), &join_headers).error;
+        assert!(error().is_none(), "{:?}", error());
+        let time = rewrite_keeping_time(&path, "k,b\n1,2\n");
+        assert!(error().is_none(), "{:?}", error());
+        set_time(&path, time + Duration::from_secs(1));
+        assert!(error().is_some());
+    }
+
+    #[test]
+    fn marks_without_a_header_read_joined_headers_through_the_cache() {
+        let path = csv("seen-no-header", "k,a\n");
+        let script = format!("join '{}' on k", path.display());
+        let join_headers = fresh();
+        let error = || marks(&script, None, &any(), &join_headers).error;
+        assert!(error().is_none(), "{:?}", error());
+        let time = rewrite_keeping_time(&path, b"\xff\xff\xff\n");
+        assert!(error().is_none(), "{:?}", error());
+        set_time(&path, time + Duration::from_secs(1));
+        let message = error().expect("an error").message;
+        assert!(message.contains("not UTF-8"), "{message}");
+        let path = path.canonicalize().unwrap();
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    #[test]
+    fn suggest_reads_joined_headers_through_the_cache() {
+        let path = csv("seen-suggest", "k,a\n");
+        let s = format!("join '{}' on k | select ", path.display());
+        let join_headers = fresh();
+        let offered = |name: &str| {
+            suggest(&s, s.len(), Some(&cols(&["k"])), &any(), &join_headers)
+                .iter()
+                .any(|i| i.text == name)
+        };
+        assert!(offered("a"));
+        let time = rewrite_keeping_time(&path, "k,b\n");
+        assert!(offered("a"));
+        set_time(&path, time + Duration::from_secs(1));
+        assert!(offered("b"));
+    }
+
+    #[test]
+    fn marks_refuse_a_joined_first_line_over_the_limit() {
+        let max = crate::mode_server::MAX_HEADER_BYTES as usize;
+        let error = |tag: &str, first: usize| {
+            let line = format!("k,{}", "x".repeat(first - 2));
+            let path = csv(tag, &format!("{line}\n1,2\n"));
+            let script = format!("join '{}' on k", path.display());
+            marks(&script, Some(&cols(&["k"])), &any(), &fresh()).error
+        };
+        // The limit counts the line break.
+        assert!(error("fits", max - 1).is_none());
+        let message = error("wide", max).expect("an error").message;
+        assert!(message.contains("over 1 MiB"), "{message}");
+    }
+
+    /// Writes `text` over the file at `path`, keeping its modification
+    /// time, and returns that time.
+    fn rewrite_keeping_time(path: &Path, text: impl AsRef<[u8]>) -> SystemTime {
+        let time = std::fs::metadata(path).unwrap().modified().unwrap();
+        std::fs::write(path, text).unwrap();
+        set_time(path, time);
+        time
+    }
+
+    fn set_time(path: &Path, time: SystemTime) {
+        let file = std::fs::File::options().write(true).open(path).unwrap();
+        file.set_modified(time).unwrap();
     }
 
     /// Joins from the working directory, as `may_read` allows.

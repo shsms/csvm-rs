@@ -778,6 +778,16 @@ mode server's own dispatch (`complete::items_at`), with the header carried
 through the stages before the cursor, no file names, and no `from` stage,
 which a run refuses.
 
+Both take an `embed::JoinHeaders`, which the caller keeps between calls.
+It holds the mode server's `Headers` cache: a joined file's first line is
+read again when its size or time changes, and at most its first MiB is
+read. The cache keeps at most 64 files: when it holds 64 and reads a
+file, new or changed, it forgets all the others.
+
+A first line over 1 MiB, counting its line break, is an error in `marks`,
+and `suggest` offers no columns after its join, though a run reads it in
+full.
+
 A big `sort` spills to a new folder in the temp directory, which only this
 user can read and which is removed after the run. A name already taken is
 skipped. The output is re-read with `csv::parse_records`, which, unlike the input

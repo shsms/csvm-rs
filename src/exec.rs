@@ -1966,15 +1966,19 @@ fn apply_stages_over_rows(
 /// so a join nested inside a right sub-pipeline is prepared too.
 pub fn prepare_joins(plan: &mut Plan) -> Result<(), Error> {
     expand_joins(plan, None, &mut pattern::RealFs)?;
-    read_join_headers(plan)
+    read_join_headers(plan, &|path| Ok(read_header_from_path(path)?.0))
 }
 
-/// Read each join's right file header and resolve its sub-plan.
-pub(crate) fn read_join_headers(plan: &mut Plan) -> Result<(), Error> {
+/// Read each join's right file header with `header_of`, given the file's
+/// path, and resolve its sub-plan.
+pub(crate) fn read_join_headers(
+    plan: &mut Plan,
+    header_of: &dyn Fn(&Path) -> Result<Vec<String>, Error>,
+) -> Result<(), Error> {
     for stage in &mut plan.stages {
         if let Stage::Join(j) = stage {
-            read_join_headers(&mut j.right_plan)?;
-            let in_header = read_header_from_path(Path::new(&j.file))?.0;
+            read_join_headers(&mut j.right_plan, header_of)?;
+            let in_header = header_of(Path::new(&j.file))?;
             j.right_header = j.right_plan.resolve(&in_header)?;
         }
     }
