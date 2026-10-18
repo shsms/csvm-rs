@@ -120,7 +120,8 @@ pub fn marks(script: &str, header: Option<&[String]>, join_opts: &JoinOpts) -> M
 /// The completion items at byte `at` of `script`, as csvm's mode server
 /// gives them: commands, flags, functions, and the columns at the cursor's
 /// stage, `header` carried through the stages before it. No columns inside a
-/// `join ( … )` group or an `fn` body, or with no header, and no file names.
+/// `join ( … )` group or an `fn` body, or with no header, no file names, and
+/// no `from` stage, which [`run_with`] refuses.
 pub fn suggest(
     script: &str,
     at: usize,
@@ -141,7 +142,14 @@ pub fn suggest(
         let mut plan = parse::parse(&found.stages_before).ok()?;
         resolve(&mut plan, header, join_opts).ok()
     };
-    complete::items_at(script, at, &mut columns, &mut |_, _| Vec::new())
+    let mut items = complete::items_at(script, at, &mut columns, &mut |_, _| Vec::new());
+    // The caller names the input, so a run refuses a `from` stage. `from`
+    // is reserved, so no `fn` that parses is named `from`, and dropping
+    // every `from` item loses none.
+    if complete::find(script, at).place == complete::Place::StageStart {
+        items.retain(|i| i.text != "from");
+    }
+    items
 }
 
 /// Whether `script` is only blanks and comments, which pass the input through.
@@ -524,6 +532,17 @@ mod tests {
                 .iter()
                 .any(|i| i.text == "select")
         );
+    }
+
+    #[test]
+    fn suggest_offers_no_from_stage_but_a_from_column() {
+        for s in ["", "f", "add x = 1 | ", "join ( "] {
+            let items = suggest(s, s.len(), None, &any());
+            assert!(!items.iter().any(|i| i.text == "from"), "{s:?}: {items:?}");
+        }
+        let s = "select f";
+        let items = suggest(s, s.len(), Some(&cols(&["from"])), &any());
+        assert!(items.iter().any(|i| i.text == "from"), "{items:?}");
     }
 
     #[test]

@@ -775,7 +775,8 @@ For an editor, `embed::marks` gives a script's coloured spans and its first
 error (unknown columns only when the caller passes the input's header), and
 `embed::suggest` gives the completion items at a byte offset, through the
 mode server's own dispatch (`complete::items_at`), with the header carried
-through the stages before the cursor and no file names.
+through the stages before the cursor, no file names, and no `from` stage,
+which a run refuses.
 
 A big `sort` spills to a new folder in the temp directory, which only this
 user can read and which is removed after the run. A name already taken is
