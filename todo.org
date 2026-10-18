@@ -26,6 +26,10 @@ git history; this file is the "what next / what was decided" scratchpad.
   sharing them would keep the mode server and a real run from drifting
   apart. The functions that build test requests in =src/mode_server.rs=
   and =tests/mode_server.rs= could be one.
+- =mode_server::placed= gets its one-line message from
+  =ReplyError::new(None, …).message=, as =inkline-mode-protocol= keeps
+  =one_line= private. Exporting it from the crate would make that a plain
+  call.
 
 ** TODO Correctness / edges
 - sort: a string sort key containing a literal =\0= (rare in CSV) sorts
