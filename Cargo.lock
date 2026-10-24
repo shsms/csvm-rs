@@ -699,7 +699,7 @@ dependencies = [
 [[package]]
 name = "inkline-mode-protocol"
 version = "0.1.0"
-source = "git+https://github.com/shsms/inkline-mode-protocol?rev=9e9cee9d11f4f876f9f39366e79a3abbbba9b4ee#9e9cee9d11f4f876f9f39366e79a3abbbba9b4ee"
+source = "git+https://github.com/shsms/inkline-mode-protocol?rev=1ef5f7c1067302b28ba42c99b8c018d93da78667#1ef5f7c1067302b28ba42c99b8c018d93da78667"
 
 [[package]]
 name = "is-terminal"

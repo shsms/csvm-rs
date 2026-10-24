@@ -18,7 +18,7 @@ use crate::parse::{self, Recorder};
 use crate::pattern;
 use crate::plan::{Plan, Stage};
 use inkline_mode_protocol::{
-    Depths, Item, MAX_ITEMS, Mode, Reply, ReplyError, Request, Span, items_fit,
+    At, Depths, Item, MAX_ITEMS, Mode, Reply, ReplyError, Request, Span, items_fit,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -105,7 +105,7 @@ impl Mode for Session {
         reply
     }
 
-    fn indent(&mut self, request: &Request, at: (usize, usize)) -> Option<Depths> {
+    fn indent(&mut self, request: &Request, at: At) -> Option<Depths> {
         indent(request, at)
     }
 
@@ -122,7 +122,9 @@ impl Mode for Session {
     /// the other items are still given. When a reply cannot hold every item
     /// (see [`inkline_mode_protocol::write_items`]), the ones that start with
     /// the typed part of the word, from its start to the cursor, come first.
-    fn complete(&mut self, request: &Request, at: (usize, usize)) -> Vec<Item> {
+    /// [`inkline_mode_protocol::serve`] then applies the crate's own
+    /// [`inkline_mode_protocol::typed_first`].
+    fn complete(&mut self, request: &Request, at: At) -> Vec<Item> {
         let Some(args) = script_args(request, at) else {
             return Vec::new();
         };
@@ -137,7 +139,7 @@ impl Mode for Session {
                 .borrow_mut()
                 .file_items(request, word, typed, closed)
         };
-        complete::items_at(script, at.1, &mut columns, &mut files)
+        complete::items_at(script, at.offset, &mut columns, &mut files)
     }
 }
 
@@ -302,8 +304,8 @@ impl Session {
 /// when the script is `raw`: bash will still change it, so its text is not
 /// what csvm gets. Unlike a colour request, a script that does not parse
 /// still gets depths.
-pub fn indent(request: &Request, at: (usize, usize)) -> Option<Depths> {
-    script_args(request, at).map(|args| parse::depths(&args.script, at.1))
+pub fn indent(request: &Request, at: At) -> Option<Depths> {
+    script_args(request, at).map(|args| parse::depths(&args.script, at.offset))
 }
 
 /// What csvm makes of `request`'s command line, when `at`, its `:at`
@@ -311,13 +313,13 @@ pub fn indent(request: &Request, at: (usize, usize)) -> Option<Depths> {
 /// the line (an argument is not UTF-8, the line is a usage error, help, or
 /// has `-f`), when `at` is in another argument, or when the script is
 /// `raw`.
-fn script_args(request: &Request, at: (usize, usize)) -> Option<Box<cli::Args>> {
+fn script_args(request: &Request, at: At) -> Option<Box<cli::Args>> {
     let words = request.words().ok()?;
     let Ok(Parsed::Run(args)) = cli::parse_at(words) else {
         return None;
     };
     let arg = args.script_at? + 1;
-    (at.0 == arg && !request.args[arg].raw).then_some(args)
+    (at.arg == arg && !request.args[arg].raw).then_some(args)
 }
 
 /// `e`, found in the script, which is argument `arg`, as a reply's error:
@@ -540,6 +542,11 @@ pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()
 mod tests {
     use super::*;
     use inkline_mode_protocol::{Arg, Ask, MAX_ITEM_BYTES, write_items, write_reply};
+
+    /// The place at byte `offset` of argument `arg`.
+    fn at(arg: usize, offset: usize) -> At {
+        At { arg, offset }
+    }
 
     /// A request for the command line `args` (the command's name first),
     /// every argument `final`, from the directory `cwd`.
@@ -1245,7 +1252,7 @@ mod tests {
         assert_eq!(
             indent(
                 &request("/", &["csvm", "-n", "2", script, "x.csv"]),
-                (3, script.len())
+                at(3, script.len())
             ),
             Some(Depths {
                 new: 1,
@@ -1254,7 +1261,7 @@ mod tests {
         );
         let script = "head\n| join (";
         assert_eq!(
-            indent(&request("/", &["csvm", script]), (1, script.len())),
+            indent(&request("/", &["csvm", script]), at(1, script.len())),
             Some(Depths {
                 new: 1,
                 current: None
@@ -1263,7 +1270,7 @@ mod tests {
         // Offsets count bytes, as for colours.
         let script = "select a == 'é' | join (\n  cols b";
         assert_eq!(
-            indent(&request("/", &["csvm", script]), (1, script.len())),
+            indent(&request("/", &["csvm", script]), at(1, script.len())),
             Some(Depths {
                 new: 1,
                 current: None
@@ -1272,7 +1279,7 @@ mod tests {
         // A script that does not parse still gets depths from its brackets.
         let script = "selct a\nfn f() {";
         assert_eq!(
-            indent(&request("/", &["csvm", script]), (1, script.len())),
+            indent(&request("/", &["csvm", script]), at(1, script.len())),
             Some(Depths {
                 new: 1,
                 current: None
@@ -1284,37 +1291,37 @@ mod tests {
     fn no_depths_without_a_script_to_split() {
         // The split is in another argument than the script.
         assert_eq!(
-            indent(&request("/", &["csvm", "join (", "x.csv"]), (2, 1)),
+            indent(&request("/", &["csvm", "join (", "x.csv"]), at(2, 1)),
             None
         );
-        assert_eq!(indent(&request("/", &["csvm", "join ("]), (0, 2)), None);
+        assert_eq!(indent(&request("/", &["csvm", "join ("]), at(0, 2)), None);
         // No script on the line: `-f`, help, a usage error, nothing yet.
         assert_eq!(
-            indent(&request("/", &["csvm", "-f", "p.csvm", "x"]), (3, 1)),
+            indent(&request("/", &["csvm", "-f", "p.csvm", "x"]), at(3, 1)),
             None
         );
         assert_eq!(
-            indent(&request("/", &["csvm", "help", "join"]), (2, 1)),
+            indent(&request("/", &["csvm", "help", "join"]), at(2, 1)),
             None
         );
         assert_eq!(
-            indent(&request("/", &["csvm", "--colr", "join ("]), (2, 6)),
+            indent(&request("/", &["csvm", "--colr", "join ("]), at(2, 6)),
             None
         );
-        assert_eq!(indent(&request("/", &["csvm"]), (0, 4)), None);
+        assert_eq!(indent(&request("/", &["csvm"]), at(0, 4)), None);
         // An argument that is not UTF-8.
         let mut req = request("/", &["csvm", "join ("]);
         req.args[1].bytes = b"join (\xff".to_vec();
-        assert_eq!(indent(&req, (1, 6)), None);
+        assert_eq!(indent(&req, at(1, 6)), None);
         // A raw script is not the text csvm gets.
         let mut req = request("/", &["csvm", "\"join (\n\""]);
         req.args[1].raw = true;
-        assert_eq!(indent(&req, (1, 8)), None);
+        assert_eq!(indent(&req, at(1, 8)), None);
         // A raw argument elsewhere does not stop it, as for colours.
         let mut req = request("/", &["csvm", "join (", "$f"]);
         req.args[2].raw = true;
         assert_eq!(
-            indent(&req, (1, 6)),
+            indent(&req, at(1, 6)),
             Some(Depths {
                 new: 1,
                 current: None
@@ -1338,14 +1345,16 @@ mod tests {
         );
     }
 
-    /// The `:item` texts of the reply to a `:complete` request for the
-    /// script `script` with the cursor at its end, on `data.csv` in `dir`,
-    /// and the reply's length in bytes.
+    /// The `:item` texts that `write_items` writes for the items
+    /// `Session::complete` gives for the script `script` with the cursor at its
+    /// end, on `data.csv` in `dir`, and the length in bytes of what it writes.
+    /// It does not run `serve`, so the crate's own `typed_first` is not
+    /// applied.
     fn reply_items(dir: &TempDir, script: &str) -> (Vec<String>, usize) {
         let mut session = Session::default();
         let req = request(dir.path(), &["csvm", script, "data.csv"]);
         let mut out = Vec::new();
-        write_items(&mut out, 1, &session.complete(&req, (1, script.len()))).unwrap();
+        write_items(&mut out, 1, &session.complete(&req, at(1, script.len()))).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.ends_with(":end 1\n"));
         let texts = out
@@ -1434,7 +1443,7 @@ mod tests {
     /// `dir`, with the argument `SCRIPT` replaced by `marked` less its `@`,
     /// which marks the cursor, as (text, note) pairs.
     fn complete_in(dir: &TempDir, args: &[&str], marked: &str) -> Vec<(String, Option<String>)> {
-        let at = marked.find('@').unwrap();
+        let offset = marked.find('@').unwrap();
         let script = marked.replacen('@', "", 1);
         let pos = args.iter().position(|a| *a == "SCRIPT").unwrap();
         let mut all = vec!["csvm"];
@@ -1445,7 +1454,7 @@ mod tests {
         let mut session = Session::default();
         let req = request(dir.path(), &all);
         session
-            .complete(&req, (pos + 1, at))
+            .complete(&req, at(pos + 1, offset))
             .into_iter()
             .map(|i| (i.text, i.note))
             .collect()
@@ -1657,9 +1666,9 @@ mod tests {
         dir.write("data.csv", "id\n");
         let mut session = Session::default();
         let mut req = request(dir.path(), &["csvm", "sort ", "data.csv"]);
-        assert_eq!(session.complete(&req, (1, 5)).len(), 1);
+        assert_eq!(session.complete(&req, at(1, 5)).len(), 1);
         req.args[2].raw = true;
-        assert!(session.complete(&req, (1, 5)).is_empty());
+        assert!(session.complete(&req, at(1, 5)).is_empty());
     }
 
     #[test]
@@ -1668,21 +1677,21 @@ mod tests {
         let mut session = Session::default();
         let req = request(dir.path(), &["csvm", "sort a", "data.csv"]);
         assert!(
-            session.complete(&req, (2, 4)).is_empty(),
+            session.complete(&req, at(2, 4)).is_empty(),
             "the file argument"
         );
         let mut req = request(dir.path(), &["csvm", "sort $x", "data.csv"]);
         req.args[1].raw = true;
-        assert!(session.complete(&req, (1, 7)).is_empty(), "a raw script");
+        assert!(session.complete(&req, at(1, 7)).is_empty(), "a raw script");
         let req = request(dir.path(), &["csvm", "-f", "s.csvm", "data.csv"]);
-        assert!(session.complete(&req, (2, 0)).is_empty(), "a script file");
+        assert!(session.complete(&req, at(2, 0)).is_empty(), "a script file");
         let req = request(dir.path(), &["csvm", "--help", "sort"]);
-        assert!(session.complete(&req, (2, 0)).is_empty(), "help");
+        assert!(session.complete(&req, at(2, 0)).is_empty(), "help");
         let req = request(dir.path(), &["csvm", "--nope", "sort"]);
-        assert!(session.complete(&req, (2, 0)).is_empty(), "a usage error");
+        assert!(session.complete(&req, at(2, 0)).is_empty(), "a usage error");
         let mut req = request(dir.path(), &["csvm", "so"]);
         req.args[1].bytes.push(0xff);
-        assert!(session.complete(&req, (1, 2)).is_empty(), "not UTF-8");
+        assert!(session.complete(&req, at(1, 2)).is_empty(), "not UTF-8");
     }
 
     #[test]
@@ -1704,7 +1713,7 @@ mod tests {
         let dir = TempDir::new("complete-word");
         let mut session = Session::default();
         let req = request(dir.path(), &["csvm", "sort id | he"]);
-        let items = session.complete(&req, (1, 12));
+        let items = session.complete(&req, at(1, 12));
         assert!(!items.is_empty());
         assert!(items.iter().all(|i| i.at == (10..12)));
     }

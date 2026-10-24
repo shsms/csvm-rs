@@ -244,14 +244,16 @@ that group's own file carried through its stages (an
 `fn` body has no header to check columns against, so none are offered
 there). A name a script cannot write bare, such as `first name` or `2024`,
 is offered in backticks, as the script needs it; a name backticks cannot
-hold either is left out. A backticked name does not work in `color -c`,
-`color -g` or `graph -c=COL` (`--color-by=COL`), and a name with a blank
-in it cannot be one of `graph`'s positional columns (`graph -c COL` takes
-one). The input file's columns need the same readable input file the
-colouring above does: an argument bash will still change anywhere on the
-line, such as `$f` or `-o $out`, leaves them out (the commands, flags
-and functions still come, and so do the columns inside a `join ( … )`
-group, which reads its own file). A reply holds at most 1000 items; when
+hold either is left out. So is a column or file name that holds a control
+character other than a tab: a reply cannot carry one. A backticked name does
+not work in `color -c`, `color -g` or `graph -c=COL` (`--color-by=COL`), and a
+name with a blank in it cannot be one of `graph`'s positional columns
+(`graph -c COL` takes one). The input file's columns need the same readable
+input file the colouring above does: an argument bash will still change
+anywhere on the line, such as `$f` or `-o $out`, leaves them out (the
+commands, flags and functions still come, and so do the columns inside
+a `join ( … )` group, which reads its own file).
+A reply holds at most 1000 items; when
 a very wide file has more columns than that, the ones that start with
 what is typed come first. A script given with `-f`, or one that is
 itself `raw`, gets no completion items at all: with `-f` the script is

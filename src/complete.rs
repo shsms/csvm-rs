@@ -8,7 +8,7 @@
 
 use std::ops::Range;
 
-use inkline_mode_protocol::{Item, MAX_MESSAGE};
+use inkline_mode_protocol::{Item, MAX_TEXT_BYTES};
 
 use crate::help::COMMANDS;
 use crate::parse::{
@@ -208,8 +208,8 @@ pub fn function_items(at: &Range<usize>) -> Vec<Item> {
 /// (`--color-by=COL`), and `graph` splits its column list at blanks, so there a
 /// backticked item may not work. `None` for a name a script cannot write in
 /// backticks: an empty one, or one with a backtick or a line break in it; and
-/// for one whose text is longer than [`MAX_MESSAGE`], which an item line would
-/// cut short.
+/// for one whose text is longer than [`MAX_TEXT_BYTES`], which a reply does not
+/// send.
 pub fn column_item(at: &Range<usize>, name: &str) -> Option<Item> {
     if name.is_empty() || name.contains(['`', '\n', '\r']) {
         return None;
@@ -220,7 +220,7 @@ pub fn column_item(at: &Range<usize>, name: &str) -> Option<Item> {
     } else {
         format!("`{name}`")
     };
-    if text.len() > MAX_MESSAGE {
+    if text.len() > MAX_TEXT_BYTES {
         return None;
     }
     Some(Item {
@@ -237,7 +237,7 @@ pub fn column_item(at: &Range<usize>, name: &str) -> Option<Item> {
 /// double-quoted, which the parser takes literally. A directory's quote is
 /// left open, to go on into it, and so is any quote when `closed`: a closing
 /// quote already follows the word. `None` for a path a double-quoted one
-/// cannot hold (with a `"` or a line break), or longer than [`MAX_MESSAGE`].
+/// cannot hold (with a `"` or a line break), or longer than [`MAX_TEXT_BYTES`].
 pub fn file_item(
     at: &Range<usize>,
     dir: &str,
@@ -261,7 +261,7 @@ pub fn file_item(
     } else {
         format!("\"{path}\"")
     };
-    if text.len() > MAX_MESSAGE {
+    if text.len() > MAX_TEXT_BYTES {
         return None;
     }
     let note = if is_dir { "directory" } else { "file" };
@@ -1238,7 +1238,7 @@ mod tests {
             file_item(
                 &(0..0),
                 "",
-                &"a".repeat(MAX_MESSAGE + 1),
+                &"a".repeat(MAX_TEXT_BYTES + 1),
                 false,
                 false,
                 false
@@ -1425,11 +1425,11 @@ mod tests {
         assert_eq!(text(""), None);
         assert_eq!(text("a`b"), None);
         assert_eq!(text("a\nb"), None);
-        // A name too long for one item line would be cut: left out.
-        let long = "a".repeat(MAX_MESSAGE + 1);
+        // A name whose item text is over `MAX_TEXT_BYTES` is left out.
+        let long = "a".repeat(MAX_TEXT_BYTES + 1);
         assert_eq!(text(&long), None);
-        let fits = format!("a {}", "b".repeat(MAX_MESSAGE - 4));
-        assert_eq!(text(&fits).map(|t| t.len()), Some(MAX_MESSAGE));
+        let fits = format!("a {}", "b".repeat(MAX_TEXT_BYTES - 4));
+        assert_eq!(text(&fits).map(|t| t.len()), Some(MAX_TEXT_BYTES));
         assert_eq!(text(&format!("{fits}c")), None);
         let item = column_item(&(3..5), "id").unwrap();
         assert_eq!((item.at, item.note.as_deref()), (3..5, Some("column")));

@@ -966,14 +966,19 @@ check a column against, so `columns_at` returns none there.
 read as a number (`inf`/`NaN` included), else in backticks, so
 `first name`, `a-b`, `2024` and `inf` are all offered quoted; a name
 backticks cannot hold either (empty, or holding a backtick or a line
-break), or whose item text is over `MAX_MESSAGE` (4 KiB), is left out. A
+break), or whose item text is over `MAX_TEXT_BYTES` (4 KiB), is left out. The
+crate's `write_items` also leaves out an item whose text holds a control
+character other than a tab, which `column_item` and `file_item` still give
+(`embed::suggest` offers such a column item unchanged). A
 `raw` argument anywhere on the line makes `input_header` return `None`,
 so the pipeline's columns are left out; the commands, flags, functions
 and a join group's columns still come. A `raw` script gets no items,
 since `script_args` returns none for it. The crate's `write_items`
 writes the reply, within its `MAX_ITEMS` and `MAX_ITEM_BYTES` limits;
-when not all items fit (`items_fit`), `typed_first` has put the items
-that start with the typed part of the word first.
+when not all items fit (`items_fit`), csvm's `mode_server::typed_first` has
+put the items that start with the typed part of the word first. The crate's
+`serve` then applies its own `typed_first`, whose rule differs a little from
+csvm's.
 
 ## Performance
 
