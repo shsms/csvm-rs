@@ -330,6 +330,28 @@ fn csvm_mode_server_answers_complete_requests_between_colour_ones() {
 }
 
 #[test]
+fn csvm_mode_server_sends_a_control_character_as_a_space_or_not_at_all() {
+    let mut server = Server::start();
+    // The second column's name holds an ESC.
+    let data = temp_csv("id,a\x1bb\n");
+    let dir = data.parent().unwrap().to_str().unwrap();
+    let name = data.file_name().unwrap().to_str().unwrap();
+    // In an error message the ESC is a space.
+    let lines = server.ask(dir, &["csvm", "sort zz", name]);
+    let error = lines.last().expect("an error line");
+    assert!(error.starts_with(":error "), "{lines:?}");
+    assert!(error.ends_with("have: id, a b"), "{error:?}");
+    // An item whose text holds an ESC is left out.
+    assert_eq!(
+        server.complete(dir, &["csvm", "sort a", name], (1, 6)),
+        [":item 5 6 id", ":note column"]
+    );
+    let (status, err) = server.finish();
+    assert!(status.success(), "{status}: {err}");
+    assert_eq!(err, "");
+}
+
+#[test]
 fn csvm_mode_server_stops_with_an_error_on_a_broken_request() {
     let mut server = Server::start();
     server.send(b"hello\n");
