@@ -3,7 +3,7 @@ name = "csvm-rs"
 version = "0.1.0"
 edition = "2024"
 description = "A fast, multithreaded CSV manipulation tool with a pipe command language."
-license = "GPL-3.0"
+license = "MIT"
 
 [lib]
 name = "csvm"

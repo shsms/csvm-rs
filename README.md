@@ -534,4 +534,4 @@ design notes.
 
 ## License
 
-GPL-3.0.
+MIT.
