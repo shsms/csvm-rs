@@ -91,13 +91,10 @@ fn run() -> Result<(), Failure> {
             // inkline's mode server: requests on stdin, replies on stdout,
             // and never the terminal, a pager or colour.
             let mut output = BufWriter::new(io::stdout().lock());
-            return match csvm::mode_server::serve(&mut io::stdin().lock(), &mut output) {
-                // inkline talks to the mode server over a socket, which it
-                // may close with a reply still unread. That resets the
-                // connection: inkline has gone, as when a pipe is closed.
-                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => Err(Failure::Closed),
-                done => Ok(done?),
-            };
+            return Ok(csvm::mode_server::serve(
+                &mut io::stdin().lock(),
+                &mut output,
+            )?);
         }
         // On a usage error show the brief synopsis, not the whole manual.
         Err(e) => {

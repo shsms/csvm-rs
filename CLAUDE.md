@@ -886,8 +886,7 @@ asks the terminal anything. `serve` flushes after the greeting and after
 each `:end`, and returns when stdin ends. A request that breaks the
 protocol ends it with exit status 1 and the reason on stderr; a closed
 stdout, or a connection reset (inkline's socket closed with a reply still
-unread), ends it quietly, like any run whose reader stopped
-(`Failure::Closed`).
+unread), ends it quietly: the crate's `serve` returns `Ok` for both.
 The first line, `inkline-mode 1 indent complete`, names `indent` and
 `complete` (`Session` sets `Mode::INDENT` and `Mode::COMPLETE`), so
 inkline also sends `:indent` and `:complete` requests: the same

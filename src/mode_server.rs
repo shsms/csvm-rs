@@ -533,7 +533,7 @@ pub(crate) fn typed_first(items: Vec<Item>, typed: &str) -> Vec<Item> {
 }
 
 /// Be csvm's mode server: [`inkline_mode_protocol::serve`] with a new
-/// [`Session`], until `input` ends.
+/// [`Session`], until `input` ends or inkline goes (see the crate's `serve`).
 pub fn serve(input: &mut impl BufRead, output: &mut impl Write) -> io::Result<()> {
     inkline_mode_protocol::serve(input, output, &mut Session::default())
 }
